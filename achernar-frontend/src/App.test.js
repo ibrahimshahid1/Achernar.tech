@@ -1,8 +1,24 @@
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import App from './App';
 
-test('renders learn react link', () => {
+beforeEach(() => {
+  global.fetch = jest.fn(() =>
+    Promise.resolve({
+      json: () => Promise.resolve({ message: 'Hello from API' }),
+    }),
+  );
+});
+
+afterEach(() => {
+  jest.resetAllMocks();
+});
+
+test('renders dashboard heading and API message', async () => {
   render(<App />);
-  const linkElement = screen.getByText(/learn react/i);
-  expect(linkElement).toBeInTheDocument();
+
+  expect(screen.getByText(/Achernar Dashboard \(MVP\)/i)).toBeInTheDocument();
+
+  await waitFor(() =>
+    expect(screen.getByText(/Hello from API/i)).toBeInTheDocument()
+  );
 });
