@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import Dashboard from './pages/Dashboard';
 
 function App() {
   const [apiMessage, setApiMessage] = useState('');
@@ -15,7 +16,7 @@ function App() {
       <div style={{ margin: '2rem 0' }}>
         <strong>Django API says:</strong> {apiMessage}
       </div>
-      {/* Add more dashboard features here */}
+      <Dashboard />
     </div>
   );
 }
