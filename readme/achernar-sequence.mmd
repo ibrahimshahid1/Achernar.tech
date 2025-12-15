@@ -1,0 +1,26 @@
+
+%% Achernar — Real-Time Control & Telemetry (Sequence)
+%% Save as docs/achernar-sequence.mmd
+sequenceDiagram
+  autonumber
+  actor User as User (Browser/PWA)
+  participant Web as Web App (Django API)
+  participant Sig as Signaling/TURN
+  participant Edge as Edge Node
+  participant Cam as Camera/Drivers
+
+  User->>Web: Change exposure to 90s (UI)
+  Web->>Sig: Send control message (DataChannel)
+  Sig->>Edge: Deliver command (WebRTC)
+  Edge->>Cam: SetExposure(90s)
+  Cam-->>Edge: OK
+  Edge-->>Sig: Ack + New Telemetry (metrics JSON)
+  Edge-->>Sig: Live Video (H.264/MJPEG)
+  Sig-->>Web: Forward video + telemetry
+  Web-->>User: Update UI (live view + metrics)
+
+  rect rgba(200,200,255,0.1)
+    Note over Edge,Web: If LAN-only (offline), WebRTC hop is replaced by direct WS/HTTP between Browser and Edge
+  end
+
+  Note over Edge: Latency budget<br/>Control: 10–50ms<br/>Metrics: 100–500ms<br/>Video: 200–800ms (network dependent)

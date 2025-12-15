@@ -1,0 +1,78 @@
+
+%% Achernar — AI/ML Data & Training Pipeline
+%% Save as docs/achernar-ai-pipeline.mmd
+flowchart TB
+  subgraph Edge["On-Device (Edge Node)"]
+    A1[Live Frame (downscaled)]
+    A2[Classical Features<br/>FWHM/HFR • Background • Elongation • Star Count]
+    A3[Focus / Cloud / Quality Models (ONNX, int8)]
+    A4[Bandit/Rules Recommender<br/>Exposure • Gain • Filter]
+    A5[Per-Sub Record (JSON + FITS refs)]
+    A6[LiteFS/SQLite Queue]
+  end
+
+  subgraph Sync["Sync Layer"]
+    S1[Uploader]
+    S2[Auth & Job Sync]
+  end
+
+  subgraph Cloud["Cloud Training & Services"]
+    C0[Ingestion Workers]
+    C1[Feature Store (Parquet/Polars)]
+    C2[Labelers & Weak Supervision<br/>(HFR targets, Rules, Snorkel)]
+    C3[Training: Edge Models<br/>(MobileNetV3/ViT-Tiny → ONNX)]
+    C4[Training: Recommenders<br/>(LinUCB / LightGBM / Hierarchical Bayes)]
+    C5[Training: Embeddings<br/>(Bi/Tri-Modal CLIP-style + InfoNCE)]
+    C6[Evaluation & Calibration<br/>(AUROC/MAE/Recall@K • Platt/Isotonic)]
+    C7[Model Registry & Versioning<br/>(MLflow + Artifacts)]
+    C8[Retrieval Index (FAISS)]
+    C9[Planner (OR-Tools) + SNR Models]
+  end
+
+  %% Edge realtime
+  A1 --> A2
+  A1 --> A3
+  A2 --> A3
+  A2 --> A4
+  A3 --> A4
+  A2 --> A5
+  A3 --> A5
+  A4 --> A5
+  A5 --> A6
+
+  %% Sync to cloud
+  A6 --> S1
+  S1 --> C0
+
+  %% Cloud ETL
+  C0 --> C1
+  C1 --> C2
+  C1 --> C3
+  C1 --> C4
+  C1 --> C5
+
+  C2 --> C3
+  C2 --> C4
+  C2 --> C5
+
+  %% Train → Eval → Register
+  C3 --> C6
+  C4 --> C6
+  C5 --> C6
+  C6 --> C7
+
+  %% Deploy back & serve
+  C7 --> |ONNX Edge Models| A3
+  C7 --> |Recommender Params| A4
+  C5 --> C8
+  C1 --> C8
+  C1 --> C9
+
+  %% Cloud services feed UI
+  C8 --> |Similar Sessions / Framings| C9
+  C9 --> |Schedules & Target Ranking| C7
+
+  classDef edge fill:#102317,stroke:#2f7d43,color:#d9f5e1;
+  classDef cloud fill:#121a2b,stroke:#4a5bd7,color:#dbe1ff;
+  class Edge edge;
+  class Cloud cloud;

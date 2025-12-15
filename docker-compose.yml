@@ -1,0 +1,82 @@
+services:
+  postgres:
+    image: postgis/postgis:15-3.3
+    container_name: achernar_postgres
+    environment:
+      POSTGRES_DB: achernar
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: achernar_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: achernar_backend
+    command: daphne -b 0.0.0.0 -p 8000 achernar_backend.asgi:application
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/achernar
+      - REDIS_URL=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=achernar_backend.settings
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: achernar_celery
+    command: celery -A achernar_backend worker -l info
+    volumes:
+      - .:/app
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/achernar
+      - REDIS_URL=redis://redis:6379/0
+      - DJANGO_SETTINGS_MODULE=achernar_backend.settings
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  web:
+    image: node:20
+    container_name: achernar_web
+    working_dir: /app/packages/web
+    command: sh -c "corepack enable && pnpm install && pnpm dev --host"
+    volumes:
+      - .:/app
+      - /app/node_modules
+      - /app/packages/ui/node_modules
+      - /app/packages/web/node_modules
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:8000
+
+volumes:
+  postgres_data:

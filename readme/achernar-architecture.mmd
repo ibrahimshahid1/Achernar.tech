@@ -1,0 +1,81 @@
+
+%% Achernar — System & Data Flow (Edge + Cloud)
+%% Save as docs/achernar-architecture.mmd
+flowchart LR
+  subgraph UserDevices["User Devices"]
+    U1[Phone / Tablet (PWA)]
+    U2[Laptop (Browser)]
+    U3[Desktop (Browser)]
+  end
+
+  subgraph EdgeNode["Achernar Edge Node (C++/Rust service + local UI)"]
+    E0[Local Web Server<br/>achernar.local (HTTP/WS)]
+    E1[Driver Layer<br/>INDI / ASCOM-Alpaca]
+    E2[Devices: Camera • Mount • Focuser • Filter Wheel]
+    E3[Live Encoder<br/>H.264 / MJPEG / WebRTC]
+    E4[Metrics Engine<br/>FWHM/HFR • Background • Elongation]
+    E5[ONNX Inferencer<br/>Focus • Clouds • Settings Hints]
+    E6[LiteFS/SQLite Store<br/>Subs • Logs • Metrics]
+    E7[Sync Agent<br/>Uploader • Catalog Cache]
+  end
+
+  subgraph CloudHub["Achernar Cloud (Django + Services)"]
+    C0[Web App (React/Next) + API (REST/GraphQL)]
+    C1[Signaling + TURN/STUN (WebRTC)]
+    C2[Metadata DB (PostgreSQL)]
+    C3[Object Store (S3-compatible)<br/>FITS • Thumbs • Stacks]
+    C4[Model Registry (ONNX/PyTorch) + Feature Store]
+    C5[Planning & Scheduler (OR-Tools)]
+    C6[Retrieval + Similarity (FAISS)]
+    C7[External Catalogs Cache<br/>Gaia • Pan-STARRS • MPC]
+  end
+
+  %% User connects locally (offline ok)
+  U1 <--> |HTTP/WS over LAN/Hotspot| E0
+  U2 <--> |HTTP/WS over LAN| E0
+  U3 <--> |HTTP/WS over LAN| E0
+
+  %% Local control path
+  E0 --> |REST/WS| E1
+  E1 --> E2
+  E2 --> |Raw frames / status| E4
+  E4 --> E5
+  E2 --> |Raw frames| E3
+  E3 --> |Live video| E0
+  E4 --> |Metrics JSON| E0
+  E5 --> |AI Hints| E0
+  E0 --> |UI: live view, metrics, controls| U1
+
+  %% Local logging
+  E4 --> E6
+  E5 --> E6
+  E2 --> |Subs (FITS)| E6
+
+  %% WAN available: cloud mode
+  E7 --> |Auth + Job Sync| C0
+  E7 --> |Upload FITS/Thumbs| C3
+  E7 --> |Push Metrics/Logs| C2
+  C0 --> |Pull session state| E7
+
+  %% Live remote ops relay
+  C0 <--> |Control API| C1
+  C1 <--> |WebRTC tunnel| E3
+  C1 <--> |DataChannel (metrics)| E4
+
+  %% Cloud intelligence
+  C2 --> C5
+  C3 --> C5
+  C2 --> C6
+  C3 --> C6
+  C2 --> C4
+  C3 --> C4
+  C7 --> C5
+  C7 --> C0
+
+  %% Model delivery
+  C4 --> |New ONNX models| E5
+
+  classDef edge fill:#101820,stroke:#6e6e6e,color:#c9d1d9;
+  classDef cloud fill:#0e1430,stroke:#5f6dd8,color:#c9d1d9;
+  class EdgeNode edge;
+  class CloudHub cloud;
