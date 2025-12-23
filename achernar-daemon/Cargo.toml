@@ -11,11 +11,11 @@ path = "src/main.rs"
 
 [dependencies]
 # Async Runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.35", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 
 # Web Server & API
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 
@@ -29,19 +29,20 @@ serde_json = "1"
 toml = "0.8"
 
 # Database
-sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite"] }
 
-# Astronomy Hardware - CRITICAL
-indi = "0.2"           # INDI protocol client
-serialport = "4"       # Serial mount control
-rusb = "0.9"           # Raw USB access for cameras
+# Cross-platform Serial Communication
+serialport = "4"
+
+# Cross-platform USB Access
+rusb = "0.9"
 
 # Image Processing
 image = "0.24"
 ndarray = "0.15"
 
 # AI/ML
-ort = { version = "1.16", features = ["download-binaries"] }  # ONNX Runtime
+ort = { version = "2.0.0-rc.9", features = ["download-binaries"] }
 
 # Logging & Tracing
 tracing = "0.1"
@@ -55,12 +56,23 @@ thiserror = "1"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 
+# Linux-only dependencies (INDI protocol, Video4Linux)
 [target.'cfg(target_os = "linux")'.dependencies]
-v4l = "0.14"  # Video4Linux for webcams
+# INDI client - only on Linux where INDI servers typically run
+# Using git dependency since crates.io version may be outdated
+#indi = { git = "https://github.com/twinkle-astronomy/indi.git", optional = true }
+#v4l = "0.14"
 
+# Windows-only dependencies (ASCOM Alpaca for telescope/camera control)
 [target.'cfg(target_os = "windows")'.dependencies]
-# Windows-specific astronomy drivers if needed
-# ascom-alpaca crate doesn't exist yet, placeholder for future
+# ASCOM Alpaca client for Windows astronomy hardware
+ascom-alpaca = { version = "1.0.0-beta.6", optional = true }
+
+[features]
+# Optional features for hardware support
+default = []
+#indi-support = ["indi"]
+ascom-support = ["ascom-alpaca"]
 
 [profile.release]
 opt-level = 3

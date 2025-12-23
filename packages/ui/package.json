@@ -20,11 +20,11 @@
         "clean": "rm -rf dist"
     },
     "dependencies": {
-        "react": "^18.2.0",
-        "react-dom": "^18.2.0",
-        "@tanstack/react-query": "^5.17.0",
-        "d3": "^7.8.5",
-        "fit-file-parser": "^1.0.0"
+        "react": "18.2.0",
+        "react-dom": "18.2.0",
+        "@tanstack/react-query": "5.17.0",
+        "d3": "7.8.5",
+        "@observerly/fits": "0.1.0"
     },
     "devDependencies": {
         "@types/react": "^18.2.45",
@@ -36,7 +36,7 @@
         "vite-plugin-dts": "^3.7.0"
     },
     "peerDependencies": {
-        "react": "^18.2.0",
-        "react-dom": "^18.2.0"
+        "react": "18.2.0",
+        "react-dom": "18.2.0"
     }
 }
