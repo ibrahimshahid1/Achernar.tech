@@ -1,9 +1,9 @@
-node_modules
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
+*.pyc
+*.pyo
+*.pyd
 .Python
 build/
 develop-eggs/
@@ -20,46 +20,58 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+.coverage
+.pytest_cache/
+.tox/
+.env
+.venv
+env/
 venv/
 ENV/
-env/
-.venv
 
 # Django
-*.log
-local_settings.py
 db.sqlite3
-db.sqlite3-journal
-/media
-/staticfiles
+*.sqlite3
+/local_settings.py
+staticfiles/
 
-# IDE
+# Node.js
+node_modules/
+package-lock.json
+npm-debug.log
+yarn-error.log
+.npm
+
+# Rust (achernar-daemon)
+target/
+Cargo.lock
+*.rs.bk
+
+# Tauri/Desktop
+achernar-desktop/target/
+achernar-desktop/src-tauri/target/
+
+# IDE & Editor
 .vscode/
 .idea/
 *.swp
 *.swo
+*.swn
 *~
-.DS_Store
-
-# Rust
-achernar-daemon/target/
-achernar-desktop/src-tauri/target/
-Cargo.lock
-
-# Frontend builds
-achernar-frontend/dist/
-achernar-frontend/build/
-achernar-desktop/dist/
-
-# Environment files
-.env
-.env.local
-.env.*.local
+.sublime-project
+.sublime-workspace
 
 # OS
 .DS_Store
 Thumbs.db
+.thumbsdb
 
-# pnpm
-.pnpm-debug.log
+# Temporary/Build files
+*.log
+*.tmp
+*.bak
+.cache/
+dist/
+out/
