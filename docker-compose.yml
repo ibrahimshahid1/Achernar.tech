@@ -11,7 +11,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -22,7 +22,7 @@ services:
     ports:
       - "6379:6379"
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: [ "CMD", "redis-cli", "ping" ]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -63,20 +63,34 @@ services:
       redis:
         condition: service_healthy
 
+  daemon:
+    build:
+      context: ./achernar-daemon
+      dockerfile: Dockerfile
+    container_name: achernar_daemon
+    ports:
+      - "3030:3030"
+    environment:
+      - ACHERNAR_PORT=3030
+      - RUST_LOG=info
+    volumes:
+      - ./achernar-daemon/config:/app/config:ro
+
   web:
     image: node:20
     container_name: achernar_web
-    working_dir: /app/packages/web
+    working_dir: /app/achernar-frontend
     command: sh -c "corepack enable && pnpm install && pnpm dev --host"
     volumes:
       - .:/app
       - /app/node_modules
       - /app/packages/ui/node_modules
-      - /app/packages/web/node_modules
+      - /app/achernar-frontend/node_modules
     ports:
       - "5173:5173"
     environment:
-      - VITE_API_URL=http://localhost:8000
+      - VITE_DAEMON_URL=http://daemon:3030/api/v1
+      - VITE_CLOUD_API=http://backend:8000/api/v1
 
 volumes:
   postgres_data:

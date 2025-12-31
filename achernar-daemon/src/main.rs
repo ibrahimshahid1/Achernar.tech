@@ -26,14 +26,18 @@ async fn main() -> anyhow::Result<()> {
     info!("Starting Achernar Daemon v{}", env!("CARGO_PKG_VERSION"));
 
     // Build our application with routes
-    let app = Router::new()
-        .route("/health", get(health_check))
+    // Wrapped in /api/v1 per PDF Section 5.1.1
+    let api_v1 = Router::new()
         .route("/status", get(api::get_status))
         .route("/connect", post(api::connect_equipment))
         .route("/disconnect", post(api::disconnect_equipment))
         .nest("/camera", camera_routes())
         .nest("/mount", mount_routes())
-        .nest("/focuser", focuser_routes())
+        .nest("/focuser", focuser_routes());
+    
+    let app = Router::new()
+        .route("/health", get(health_check))
+        .nest("/api/v1", api_v1)
         .layer(CorsLayer::permissive()); // Allow CORS for local access
 
     // Bind to localhost with dynamic port or default 3030

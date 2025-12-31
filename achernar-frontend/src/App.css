@@ -1,38 +1,506 @@
-.App {
-  text-align: center;
+:root {
+  font-family: Inter, system-ui, Avenir, Helvetica, Arial, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+
+  color-scheme: dark;
+  color: rgba(255, 255, 255, 0.87);
+  background-color: #0a0e1a;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-.App-logo {
-  height: 40vmin;
-  pointer-events: none;
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  .App-logo {
-    animation: App-logo-spin infinite 20s linear;
-  }
-}
-
-.App-header {
-  background-color: #282c34;
+.app {
   min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-header {
+  background: linear-gradient(135deg, #1a1f3a 0%, #0a0e1a 100%);
+  padding: 2rem;
+  text-align: center;
+  border-bottom: 1px solid rgba(100, 149, 237, 0.2);
+}
+
+.app-header h1 {
+  font-size: 3rem;
+  margin-bottom: 0.5rem;
+  background: linear-gradient(135deg, #6495ED 0%, #4169E1 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.tagline {
+  color: rgba(255, 255, 255, 0.6);
+  font-size: 1.1rem;
+  margin-bottom: 1rem;
+}
+
+.connection-status {
+  margin-top: 1rem;
+  font-size: 0.9rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+}
+
+.separator {
+  color: rgba(255, 255, 255, 0.3);
+}
+
+.status-connected {
+  color: #4ade80;
+}
+
+.status-disconnected {
+  color: #f87171;
+}
+
+.app-main {
+  flex: 1;
+  padding: 2rem;
+  max-width: 1400px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.error-banner {
+  background: linear-gradient(135deg, #7f1d1d 0%, #991b1b 100%);
+  border: 1px solid #dc2626;
+  border-radius: 8px;
+  padding: 1rem;
+  margin-bottom: 2rem;
+}
+
+.error-banner code {
+  display: block;
+  margin-top: 0.5rem;
+  padding: 0.5rem;
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 4px;
+  font-family: 'Courier New', monospace;
+}
+
+.loading {
   display: flex;
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  font-size: calc(10px + 2vmin);
-  color: white;
+  min-height: 400px;
+  gap: 1rem;
 }
 
-.App-link {
-  color: #61dafb;
+/* Loading, Error, and Empty States */
+.loading-message,
+.error-message,
+.empty-message {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  padding: 4rem 2rem;
+  text-align: center;
+  color: rgba(255, 255, 255, 0.6);
+  /* var(--text-muted) */
+  font-size: 1.1rem;
 }
 
-@keyframes App-logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
+.loading-message {
+  color: #6495ED;
+  /* var(--accent-blue) */
+}
+
+.error-message {
+  color: #f87171;
+  /* var(--accent-red) */
+  background: rgba(255, 100, 100, 0.05);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 100, 100, 0.2);
+}
+
+.error-details {
+  font-size: 0.9rem;
+  opacity: 0.8;
+}
+
+.error-hint,
+.empty-hint {
+  font-size: 0.85rem;
+  opacity: 0.6;
+}
+
+.spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid rgba(74, 144, 226, 0.2);
+  border-top-color: #6495ED;
+  /* var(--accent-blue) */
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
   to {
     transform: rotate(360deg);
+  }
+}
+
+/* Equipment Card Enhancements */
+.card {
+  position: relative;
+  background: linear-gradient(135deg,
+      rgba(30, 30, 40, 0.95) 0%,
+      rgba(20, 20, 30, 0.98) 100%);
+  border: 1px solid rgba(74, 144, 226, 0.15);
+  border-radius: 12px;
+  padding: 1.25rem;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  overflow: hidden;
+}
+
+.card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg,
+      transparent,
+      #6495ED,
+      /* var(--accent-blue) */
+      transparent);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.card:hover {
+  transform: translateY(-2px);
+  border-color: rgba(74, 144, 226, 0.3);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.4),
+    0 0 0 1px rgba(74, 144, 226, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+.card:hover::before {
+  opacity: 1;
+}
+
+/* Connection Status LED */
+.card-header::after {
+  content: '';
+  position: absolute;
+  top: 0.75rem;
+  right: 0.75rem;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.6);
+  /* var(--text-muted) */
+  box-shadow: 0 0 8px currentColor;
+}
+
+.card.status-nominal .card-header::after {
+  background: #00ff88;
+  animation: pulse-green 2s ease-in-out infinite;
+}
+
+.card.status-warning .card-header::after {
+  background: #ffaa00;
+  animation: pulse-yellow 2s ease-in-out infinite;
+}
+
+.card.status-offline .card-header::after {
+  background: #ff4444;
+  opacity: 0.5;
+}
+
+@keyframes pulse-green {
+
+  0%,
+  100% {
+    box-shadow: 0 0 8px rgba(0, 255, 136, 0.8);
+  }
+
+  50% {
+    box-shadow: 0 0 16px rgba(0, 255, 136, 1);
+  }
+}
+
+@keyframes pulse-yellow {
+
+  0%,
+  100% {
+    box-shadow: 0 0 8px rgba(255, 170, 0, 0.8);
+  }
+
+  50% {
+    box-shadow: 0 0 16px rgba(255, 170, 0, 1);
+  }
+}
+
+/* Equipment Type Icons */
+.card[data-type="mount"] .card-title::before {
+  content: '🜨';
+  margin-right: 0.5rem;
+  filter: grayscale(0.3);
+}
+
+.card[data-type="camera"] .card-title::before {
+  content: '📷';
+  margin-right: 0.5rem;
+}
+
+.card[data-type="focuser"] .card-title::before {
+  content: '⚙️';
+  margin-right: 0.5rem;
+}
+
+.card[data-type="filter-wheel"] .card-title::before {
+  content: '⬤';
+  margin-right: 0.5rem;
+  color: #93c5fd;
+  /* var(--accent-purple) - using a similar blue for now */
+}
+
+.card[data-type="dome"] .card-title::before {
+  content: '🏛️';
+  margin-right: 0.5rem;
+}
+
+/* Badge Status Colors */
+.badge.nominal {
+  background: rgba(0, 255, 136, 0.15);
+  color: #00ff88;
+  border: 1px solid rgba(0, 255, 136, 0.3);
+}
+
+.badge.warning {
+  background: rgba(255, 170, 0, 0.15);
+  color: #ffaa00;
+  border: 1px solid rgba(255, 170, 0, 0.3);
+}
+
+.badge.offline {
+  background: rgba(255, 68, 68, 0.15);
+  color: #ff4444;
+  border: 1px solid rgba(255, 68, 68, 0.3);
+}
+
+/* Card Actions */
+.card-actions .btn {
+  transition: all 0.2s ease;
+}
+
+.card-actions .btn:hover {
+  transform: scale(1.05);
+}
+
+.card.status-offline .btn.primary {
+  background: rgba(255, 255, 255, 0.6);
+  /* var(--text-muted) */
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.card.status-offline .btn.primary:hover {
+  transform: none;
+}
+
+.dashboard {
+  display: flex;
+  flex-direction: column;
+  gap: 2rem;
+}
+
+.telemetry-section,
+.control-section,
+.info-section {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  padding: 1.5rem;
+  border: 1px solid rgba(100, 149, 237, 0.2);
+}
+
+.telemetry-section h2,
+.control-section h2,
+.info-section h2 {
+  margin-bottom: 1rem;
+  color: #6495ED;
+  font-size: 1.3rem;
+}
+
+.telemetry-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+}
+
+.telemetry-card {
+  background: rgba(0, 0, 0, 0.3);
+  border-radius: 8px;
+  padding: 1rem;
+  border: 1px solid rgba(100, 149, 237, 0.15);
+}
+
+.telemetry-card h3 {
+  margin-bottom: 0.75rem;
+  font-size: 1rem;
+  color: #93c5fd;
+}
+
+.telemetry-card ul {
+  list-style: none;
+  padding: 0;
+}
+
+.telemetry-card li {
+  padding: 0.25rem 0;
+  font-size: 0.9rem;
+  color: rgba(255, 255, 255, 0.8);
+  font-family: 'Courier New', monospace;
+}
+
+.camera-control {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 8px;
+  padding: 1.5rem;
+}
+
+.control-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+
+.control-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  color: rgba(255, 255, 255, 0.9);
+  font-size: 0.9rem;
+}
+
+.control-grid input,
+.control-grid select {
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(100, 149, 237, 0.3);
+  border-radius: 4px;
+  padding: 0.5rem;
+  color: white;
+  font-size: 1rem;
+}
+
+.control-grid input:focus,
+.control-grid select:focus {
+  outline: none;
+  border-color: #6495ED;
+}
+
+.button-group {
+  display: flex;
+  gap: 1rem;
+}
+
+.button-group button {
+  flex: 1;
+  background: linear-gradient(135deg, #6495ED 0%, #4169E1 100%);
+  border: none;
+  border-radius: 6px;
+  padding: 0.75rem 1.5rem;
+  color: white;
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s;
+}
+
+.button-group button:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(100, 149, 237, 0.4);
+}
+
+.button-group button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.info-card {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 8px;
+  padding: 1.5rem;
+}
+
+.info-card h3 {
+  margin: 1.5rem 0 0.75rem 0;
+  color: #93c5fd;
+  font-size: 1.1rem;
+}
+
+.info-card h3:first-child {
+  margin-top: 0;
+}
+
+.info-card ul {
+  margin-left: 1.5rem;
+  color: rgba(255, 255, 255, 0.7);
+  line-height: 1.8;
+}
+
+.info-card code {
+  background: rgba(100, 149, 237, 0.2);
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  font-family: 'Courier New', monospace;
+  color: #93c5fd;
+  font-size: 0.9rem;
+}
+
+.app-footer {
+  background: rgba(0, 0, 0, 0.3);
+  padding: 1rem;
+  text-align: center;
+  border-top: 1px solid rgba(100, 149, 237, 0.1);
+  font-size: 0.85rem;
+  color: rgba(255, 255, 255, 0.5);
+}
+
+@media (max-width: 768px) {
+  .app-header h1 {
+    font-size: 2rem;
+  }
+
+  .telemetry-grid,
+  .control-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .button-group {
+    flex-direction: column;
+  }
+
+  .connection-status {
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .separator {
+    display: none;
   }
 }

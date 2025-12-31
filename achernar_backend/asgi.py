@@ -1,6 +1,10 @@
 """
 ASGI config for achernar_backend project.
+
 Enables Django Channels for WebSocket support.
+
+For more information on this file, see
+https://docs.djangoproject.com/en/5.2/howto/deployment/asgi/
 """
 
 import os
@@ -10,17 +14,17 @@ from channels.auth import AuthMiddlewareStack
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'achernar_backend.settings')
 
+# Initialize Django ASGI application early
 django_asgi_app = get_asgi_application()
 
-# Import routing after Django setup
-# from observatory import routing as observatory_routing
+# Import WebSocket routing after Django is initialized
+import realtime.routing
 
 application = ProtocolTypeRouter({
     "http": django_asgi_app,
-    # WebSocket routing will be added here
-    # "websocket": AuthMiddlewareStack(
-    #     URLRouter(
-    #         observatory_routing.websocket_urlpatterns
-    #     )
-    # ),
+    "websocket": AuthMiddlewareStack(
+        URLRouter(
+            realtime.routing.websocket_urlpatterns
+        )
+    ),
 })

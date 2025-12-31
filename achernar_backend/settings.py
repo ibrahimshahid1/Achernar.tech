@@ -36,21 +36,35 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    
     # Third party
     'rest_framework',
     'corsheaders',
     'channels',
-    # Achernar apps
-    'accounts',
-    'equipment',
-    'observatory',
-    'imaging',
-    'planning',
-    'atlas',
-    'ai_engine',
-    'processing',
-    'community',
-    'data_management',
+    
+    # Achernar core
+    'core',           # Shared utilities and base models
+    'accounts',       # User management
+    
+    # Equipment & Observatory
+    'equipment',      # Equipment database
+    'observatory',    # Single-user equipment profiles
+    
+    # Imaging & Sessions
+    'imaging',        # Session sync and frame metadata
+    
+    # Planning & AI
+    'planning',       # Target ranking and scheduling
+    'atlas',          # Celestial catalogs (Messier/NGC/IC)
+    'ai_engine',      # AI/ML cloud services (embeddings, recommender, quality, anomaly)
+    
+    # Processing & Communication
+    'processing',     # Celery tasks, sync engine, backup
+    'realtime',       # WebSocket/IoT relay for daemon connections
+    
+    # Community & Data
+    'community',      # Social features and sharing
+    'data_management',  # Data lifecycle and archival
 ]
 
 MIDDLEWARE = [
@@ -99,8 +113,13 @@ DATABASES = {
         'NAME': os.getenv('DB_NAME', 'achernar'),
         'USER': os.getenv('DB_USER', 'postgres'),
         'PASSWORD': os.getenv('DB_PASSWORD', 'postgres'),
-        'HOST': os.getenv('DB_HOST', 'localhost'),
+        'HOST': os.getenv('DB_HOST', 'postgres'),
         'PORT': os.getenv('DB_PORT', '5432'),
+    }
+} if not os.getenv('USE_SQLITE') else {
+    'default': {
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': BASE_DIR / 'db.sqlite3',
     }
 }
 
