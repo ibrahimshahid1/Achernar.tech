@@ -32,7 +32,7 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     container_name: achernar_backend
-    command: daphne -b 0.0.0.0 -p 8000 achernar_backend.asgi:application
+    command: daphne -b 0.0.0.0 -p 8000 backend.asgi:application
     volumes:
       - .:/app
     ports:
@@ -40,7 +40,7 @@ services:
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/achernar
       - REDIS_URL=redis://redis:6379/0
-      - DJANGO_SETTINGS_MODULE=achernar_backend.settings
+      - DJANGO_SETTINGS_MODULE=backend.settings
     depends_on:
       postgres:
         condition: service_healthy
@@ -52,13 +52,13 @@ services:
       context: .
       dockerfile: Dockerfile.backend
     container_name: achernar_celery
-    command: celery -A achernar_backend worker -l info
+    command: celery -A backend worker -l info
     volumes:
       - .:/app
     environment:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/achernar
       - REDIS_URL=redis://redis:6379/0
-      - DJANGO_SETTINGS_MODULE=achernar_backend.settings
+      - DJANGO_SETTINGS_MODULE=backend.settings
     depends_on:
       redis:
         condition: service_healthy
