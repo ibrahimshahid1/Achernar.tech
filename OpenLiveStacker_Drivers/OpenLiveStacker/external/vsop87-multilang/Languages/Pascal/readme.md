@@ -1,0 +1,1 @@
+Tested using Free Pascal.  It is not capable of linking the full VSOP87 due to the number of constants.  The validation works tests OK using the "small" version to a precision of 0.000009au.
