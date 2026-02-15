@@ -35,10 +35,64 @@ async fn main() -> anyhow::Result<()> {
         .nest("/mount", mount_routes())
         .nest("/focuser", focuser_routes());
     
+// ... (existing code)
+
     let app = Router::new()
         .route("/health", get(health_check))
         .nest("/api/v1", api_v1)
-        .layer(CorsLayer::permissive()); // Allow CORS for local access
+        .route("/ws/telemetry", get(telemetry_ws_handler)) // Add this
+        .layer(CorsLayer::permissive());
+
+    // ... (existing code)
+
+// Add these functions at the end
+
+async fn telemetry_ws_handler(ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(handle_telemetry_socket)
+}
+
+async fn handle_telemetry_socket(mut socket: WebSocket) {
+    info!("Telemetry stream started");
+    let mut ticker = interval(Duration::from_millis(1000));
+    
+    loop {
+        ticker.tick().await;
+        
+        // Mock telemetry data matching frontend expectation
+        let telemetry_json = r#"{
+            "type": "TELEMETRY_UPDATE",
+            "timestamp": 0,
+            "payload": {
+                "mount": {
+                    "ra": 14.22,
+                    "dec": -32.05,
+                    "pier_side": "west"
+                },
+                "camera": {
+                    "temperature": -10.1,
+                    "status": "exposing",
+                    "progress": 0.45
+                },
+                "guiding": {
+                    "rms_total": 0.35,
+                    "dx": 0.1,
+                    "dy": -0.2
+                },
+                "ai": {
+                    "focus_hfr": 2.34,
+                    "cloud_prob": 0.05,
+                    "recommended_exposure": 45.0
+                }
+            }
+        }"#;
+
+        if let Err(e) = socket.send(Message::Text(telemetry_json.to_string())).await {
+             info!("Telemetry socket closed: {}", e);
+             break;
+        }
+    }
+}
+
 
     // Bind to localhost with dynamic port or default 3030
     let port = std::env::var("ACHERNAR_PORT")
