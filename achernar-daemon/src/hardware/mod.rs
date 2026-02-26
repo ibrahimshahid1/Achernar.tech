@@ -1,9 +1,5 @@
 // Hardware abstraction modules
-// TODO: Implement INDI client, serial mount, USB camera interfaces
+// Real camera/mount/focuser support via OpenLiveStacker C++ drivers
 
-pub mod indi_client;
-pub mod serial_mount;
-pub mod usb_camera;
-
-#[cfg(target_os = "linux")]
-pub mod v4l_camera;
+pub mod ols_ffi;
+pub mod camera;

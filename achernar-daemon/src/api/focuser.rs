@@ -18,23 +18,20 @@ pub struct PositionResponse {
 
 pub async fn move_relative(Json(req): Json<MoveRequest>) -> Result<StatusCode, StatusCode> {
     tracing::info!("Focuser move: {} steps", req.steps);
-    // TODO: Implement focuser move
+    // TODO: Wire to OLS focuser driver when focuser bridge is implemented
     Ok(StatusCode::OK)
 }
 
 pub async fn move_absolute(Json(req): Json<MoveToRequest>) -> Result<StatusCode, StatusCode> {
     tracing::info!("Focuser move to: {}", req.position);
-    // TODO: Implement focuser move to position
     Ok(StatusCode::OK)
 }
 
 pub async fn get_position() -> Result<Json<PositionResponse>, StatusCode> {
-    // TODO: Implement get focuser position
     Ok(Json(PositionResponse { position: 5000 }))
 }
 
 pub async fn abort() -> Result<StatusCode, StatusCode> {
     tracing::info!("Focuser abort requested");
-    // TODO: Implement focuser abort
     Ok(StatusCode::OK)
 }

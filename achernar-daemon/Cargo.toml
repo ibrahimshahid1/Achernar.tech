@@ -55,6 +55,8 @@ thiserror = "1"
 # Utilities
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+libc = "0.2"
+parking_lot = "0.12"
 
 # Linux-only dependencies (INDI protocol, Video4Linux)
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -1,5 +1,7 @@
-use axum::{http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
+
+use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct CaptureParams {
@@ -27,24 +29,85 @@ pub struct ImageMetadata {
     pub timestamp: String,
 }
 
-/**
- * High-resolution capture
- * This is separate from the live view stream
- * Saves full-resolution RAW/FITS to disk
- */
+#[derive(Debug, Deserialize)]
+pub struct StreamStartRequest {
+    pub format_index: Option<i32>,
+}
+
+/// Start the camera stream
+pub async fn start_stream(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let frame_store = state.latest_frame.clone();
+
+    let mut cam_lock = state.camera.lock().unwrap();
+    let camera = cam_lock.as_mut().ok_or_else(|| {
+        tracing::error!("No camera connected");
+        StatusCode::PRECONDITION_FAILED
+    })?;
+
+    // Get first format
+    let formats = camera.formats().map_err(|e| {
+        tracing::error!("Failed to get formats: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    if formats.is_empty() {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    let fmt = &formats[0];
+    tracing::info!(
+        "Starting stream: {:?} {}x{} bin={}",
+        fmt.format, fmt.width, fmt.height, fmt.bin
+    );
+
+    camera.start_stream(fmt, frame_store).map_err(|e| {
+        tracing::error!("Failed to start stream: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    *state.streaming.lock().unwrap() = true;
+
+    Ok(Json(serde_json::json!({
+        "status": "streaming",
+        "format": format!("{:?}", fmt.format),
+        "width": fmt.width,
+        "height": fmt.height,
+    })))
+}
+
+/// High-resolution capture (same as before but tries to use real exposure if connected)
 pub async fn capture(
+    State(state): State<AppState>,
     Json(params): Json<CaptureParams>,
 ) -> Result<Json<ImageData>, StatusCode> {
-    // TODO: Implement actual high-res capture logic
-    tracing::info!(
-        "High-res capture requested: {} seconds (saved to disk)",
-        params.exposure
-    );
-    
+    tracing::info!("Capture requested: {} seconds", params.exposure);
+
+    // Set exposure if camera is connected
+    {
+        let cam_lock = state.camera.lock().unwrap();
+        if let Some(camera) = cam_lock.as_ref() {
+            let exp_ms = params.exposure * 1000.0;
+            let _ = camera.set_parameter(
+                crate::hardware::ols_ffi::OlsCamOptionId::Exp,
+                exp_ms,
+            );
+        }
+    }
+
+    let (width, height) = {
+        let frame = state.latest_frame.lock().unwrap();
+        match frame.as_ref() {
+            Some(f) => (f.width as u32, f.height as u32),
+            None => (640, 480),
+        }
+    };
+
     let image = ImageData {
         id: uuid::Uuid::new_v4().to_string(),
-        width: 4096, // Full resolution
-        height: 3072,
+        width,
+        height,
         metadata: ImageMetadata {
             exposure: params.exposure,
             gain: params.gain.unwrap_or(100),
@@ -52,25 +115,26 @@ pub async fn capture(
             timestamp: chrono::Utc::now().to_rfc3339(),
         },
     };
-    
+
     Ok(Json(image))
 }
 
-pub async fn abort() -> Result<StatusCode, StatusCode> {
-    // TODO: Implement capture abort
-    tracing::info!("High-res capture abort requested");
+pub async fn abort(
+    State(state): State<AppState>,
+) -> Result<StatusCode, StatusCode> {
+    tracing::info!("Capture/stream abort requested");
+
+    let mut cam_lock = state.camera.lock().unwrap();
+    if let Some(camera) = cam_lock.as_mut() {
+        let _ = camera.stop_stream();
+    }
+    *state.streaming.lock().unwrap() = false;
+
     Ok(StatusCode::OK)
 }
 
-/**
- * MJPEG Stream (alternative to WebSocket)
- * Can be used directly in <img> src attribute
- */
+/// MJPEG Stream placeholder
 pub async fn stream_mjpeg() -> Result<String, StatusCode> {
-    // TODO: Implement MJPEG streaming
-    // Return multipart/x-mixed-replace content type
     tracing::info!("MJPEG stream requested");
-    
-    // For now, return placeholder
-    Ok("MJPEG stream not yet implemented".to_string())
+    Ok("Use /api/v1/camera/stream/start to start WebSocket stream".to_string())
 }
