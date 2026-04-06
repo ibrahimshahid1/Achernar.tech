@@ -65,6 +65,11 @@ INSTALLED_APPS = [
     # Community & Data
     'apps.community',      # Social features and sharing
     'apps.data_management',  # Data lifecycle and archival
+
+    # New apps (spec compliance)
+    'apps.sessions',       # Imaging session/frame sync from daemon
+    'apps.ml',             # ML model serving and active learning
+    'apps.sync',           # Daemon ↔ cloud sync
 ]
 
 MIDDLEWARE = [

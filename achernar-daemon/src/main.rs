@@ -15,6 +15,16 @@ mod processing;
 mod ai;
 mod api;
 mod state;
+mod error;
+mod config;
+mod telemetry_log;
+mod control;
+mod focus;
+mod filter_wheel;
+mod mount;
+mod vision;
+mod models;
+mod storage;
 
 use state::AppState;
 

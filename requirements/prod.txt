@@ -1,0 +1,9 @@
+# Production dependencies
+-r base.txt
+
+# WSGI/ASGI Servers
+uvicorn[standard]>=0.25
+gunicorn>=21.2
+
+# Monitoring
+sentry-sdk>=1.39

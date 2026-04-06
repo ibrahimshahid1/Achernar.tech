@@ -1,6 +1,8 @@
 pub mod camera;
 pub mod mount;
 pub mod focuser;
+pub mod focus;
+pub mod websocket;
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};

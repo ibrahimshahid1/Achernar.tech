@@ -3,3 +3,7 @@
 
 pub mod ols_ffi;
 pub mod camera;
+pub mod focuser;
+pub mod filter_wheel;
+pub mod mount;
+pub mod sensors;

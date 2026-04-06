@@ -1,0 +1,17 @@
+# Development dependencies
+-r base.txt
+
+# Testing
+pytest>=7.4
+pytest-django>=4.7
+pytest-cov>=4.1
+factory-boy>=3.3
+
+# Dev Tools
+ipython>=8.18
+django-extensions>=3.2
+django-debug-toolbar>=4.2
+
+# Linting
+ruff>=0.1
+mypy>=1.7
