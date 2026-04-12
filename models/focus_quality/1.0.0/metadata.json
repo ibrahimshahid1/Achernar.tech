@@ -1,0 +1,34 @@
+{
+  "model_name": "focus_quality_estimator",
+  "version": "1.0.0",
+  "task": "focus_quality",
+  "description": "MobileNetV3-Small backbone for focus quality scoring. Predicts a [0,1] quality score from 64x64 grayscale star crops.",
+  "spec_section": "7.6.1",
+  "architecture": "MobileNetV3-Small",
+  "input_shape": [1, 1, 64, 64],
+  "input_dtype": "float32",
+  "output_shape": [1, 1],
+  "output_dtype": "float32",
+  "output_range": [0.0, 1.0],
+  "training": {
+    "framework": "PyTorch",
+    "optimizer": "AdamW",
+    "loss": "MSELoss",
+    "epochs": 50,
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "dataset_size": null,
+    "val_metric": "mae"
+  },
+  "export": {
+    "format": "ONNX",
+    "opset_version": 17,
+    "dynamic_axes": {
+      "input": { "0": "batch" },
+      "output": { "0": "batch" }
+    }
+  },
+  "sha256": null,
+  "created_at": null,
+  "deployed_at": null
+}

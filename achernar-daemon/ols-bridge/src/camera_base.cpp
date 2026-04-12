@@ -16,8 +16,25 @@ CamError::CamError(std::string const &msg) : std::runtime_error(msg) {}
 
 // We don't use the dynamic driver loading, so these are stubs
 static std::vector<std::string> driver_names;
+static std::vector<std::unique_ptr<CameraDriver>> loaded_drivers;
 
 std::vector<std::string> CameraDriver::drivers() { return driver_names; }
+
+void CameraDriver::load_driver(std::string const &name, std::string base_path, char const *option, std::string camera_log, int cam_debug) {
+    (void)base_path;
+    (void)option;
+    (void)camera_log;
+    (void)cam_debug;
+    // Alpaca camera loading is handled directly in ols_bridge.cpp
+    // This stub exists only to satisfy the linker
+    driver_names.push_back(name);
+}
+
+std::unique_ptr<CameraDriver> CameraDriver::get(int id, int external_options) {
+    (void)external_options;
+    (void)id;
+    return nullptr; // Direct driver instantiation is done in ols_bridge.cpp
+}
 
 std::ostream &operator<<(std::ostream &out, CamStreamFormat const &fmt) {
   std::string fmt_name = stream_type_to_str(fmt.format);

@@ -1,0 +1,16 @@
+{
+  "description": "Per-rig drift profile registry. Stores learned temperature coefficients and historical drift patterns for each equipment configuration.",
+  "spec_section": "7.6.3",
+  "profiles": {},
+  "schema": {
+    "rig_id": "string — unique rig identifier",
+    "focuser_name": "string — focuser device name",
+    "telescope": "string — telescope model",
+    "temperature_coefficient": "float — steps per °C, learned from historical data",
+    "coefficient_confidence": "float — [0,1] confidence in the learned coefficient",
+    "sample_count": "int — number of focus-temperature pairs used to learn coefficient",
+    "last_updated": "ISO8601 datetime",
+    "drift_events": "array of {timestamp, predicted_drift, actual_drift, temperature}"
+  },
+  "created_at": null
+}

@@ -91,7 +91,7 @@ pub struct FrameData {
 
 /// OLS Camera Driver - manages driver lifecycle and camera enumeration
 pub struct OlsCameraDriver {
-    handle: *mut ols_ffi::OlsCameraDriver_t,
+    handle: *mut ols_ffi::OlsCameraDriver,
 }
 
 // Safety: The OLS driver uses internal locking
@@ -104,6 +104,16 @@ impl OlsCameraDriver {
         let mut handle = std::ptr::null_mut();
         unsafe {
             check(ols_ffi::ols_sim_driver_create(c_dir.as_ptr(), &mut handle))?;
+        }
+        Ok(Self { handle })
+    }
+
+    /// Create an Alpaca camera driver (connects to Alpaca server over network).
+    pub fn new_alpaca(url: &str) -> Result<Self> {
+        let c_url = CString::new(url)?;
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            check(ols_ffi::ols_alpaca_camera_driver_create(c_url.as_ptr(), &mut handle))?;
         }
         Ok(Self { handle })
     }
@@ -163,7 +173,7 @@ impl Drop for OlsCameraDriver {
 
 /// OLS Camera - wraps a single camera instance
 pub struct OlsCamera {
-    handle: *mut ols_ffi::OlsCamera_t,
+    handle: *mut ols_ffi::OlsCamera,
     _callback_data: Option<Box<CallbackData>>,
 }
 
@@ -240,7 +250,7 @@ impl OlsCamera {
             check(ols_ffi::ols_camera_start_stream(
                 self.handle,
                 &ffi_fmt,
-                Some(frame_callback_trampoline),
+                frame_callback_trampoline,
                 user_data,
             ))?;
         }

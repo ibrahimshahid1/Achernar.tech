@@ -1,0 +1,10 @@
+{
+  "calibration_method": "temperature_scaling",
+  "temperature": 1.0,
+  "description": "Post-hoc calibration parameters for focus quality uncertainty estimates. Temperature scaling applied to logits before sigmoid.",
+  "spec_section": "7.7.3",
+  "calibration_dataset": null,
+  "ece_before": null,
+  "ece_after": null,
+  "calibrated_at": null
+}

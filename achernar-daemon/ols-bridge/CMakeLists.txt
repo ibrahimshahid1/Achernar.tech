@@ -1,68 +1,221 @@
 cmake_minimum_required(VERSION 3.16)
-project(ols_bridge CXX)
+project(ols_bridge LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# ─── OLS source directory ───
-set(OLS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../OpenLiveStacker_Drivers/OpenLiveStacker")
-set(OLS_INCLUDE "${OLS_ROOT}/include")
+# ─── Paths ───
+set(PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
+set(OLS_ROOT "${PROJECT_ROOT}/OpenLiveStacker_Drivers/OpenLiveStacker")
+set(OLS_INC "${OLS_ROOT}/include")
 set(OLS_SRC "${OLS_ROOT}/src")
+set(SDKS_ROOT "${PROJECT_ROOT}/sdks")
+set(BRIDGE_INC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set(BRIDGE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+set(SHIMS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shims")
+set(EXTERNAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external")
 
-# ─── Find OpenCV ───
-find_package(OpenCV REQUIRED COMPONENTS core imgcodecs imgproc)
-
-# ─── Find libtiff ───
-find_library(LIBTIFF tiff)
-if(NOT LIBTIFF)
-    message(FATAL_ERROR "libtiff not found. Install with: brew install libtiff")
-endif()
-# Find tiff include directory
-find_path(TIFF_INCLUDE_DIR tiffio.h
-    HINTS /opt/homebrew/include /usr/local/include /usr/include
-)
-
-# ─── Build the bridge as a static library ───
-add_library(ols_bridge STATIC
-    # Bridge code
-    src/ols_bridge.cpp
-    # Our own minimal camera base (no booster/cppcms dependency!)
-    src/camera_base.cpp
-    # OLS utility sources
-    ${OLS_SRC}/tiffmat.cpp
-    ${OLS_SRC}/util.cpp
-)
-
-target_include_directories(ols_bridge PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${OLS_INCLUDE}
-)
-
-# Add tiff include if found
-if(TIFF_INCLUDE_DIR)
-    target_include_directories(ols_bridge PRIVATE ${TIFF_INCLUDE_DIR})
+# ─── Detect macOS architecture ───
+if(APPLE)
+    execute_process(COMMAND uname -m OUTPUT_VARIABLE HOST_ARCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+    message(STATUS "Host architecture: ${HOST_ARCH}")
 endif()
 
-target_link_libraries(ols_bridge PUBLIC
-    ${OpenCV_LIBS}
-    ${LIBTIFF}
+# ─── Find required packages ───
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(OPENCV REQUIRED opencv4)
+pkg_check_modules(TIFF REQUIRED libtiff-4)
+
+# ─── Core sources (always compiled) ───
+set(BRIDGE_SOURCES
+    # Our bridge layer
+    ${BRIDGE_SRC}/ols_bridge.cpp
+    ${BRIDGE_SRC}/camera_base.cpp
+
+    # OLS Alpaca drivers (no vendor SDK needed)
+    ${OLS_SRC}/mount.cpp
+    ${OLS_SRC}/alpaca_mount.cpp
+    ${OLS_SRC}/focuser.cpp
+    ${OLS_SRC}/alpaca_focuser.cpp
+    ${OLS_SRC}/alpaca_client.cpp
 )
 
-# Suppress warnings from OLS code
+set(EXTRA_INCLUDE_DIRS "")
+set(EXTRA_LINK_DIRS "")
+set(EXTRA_LIBS "")
+
+# ═══════════════════════════════════════════════════════════════════
+#  ASI (ZWO) Camera SDK
+# ═══════════════════════════════════════════════════════════════════
+set(ASI_SDK_DIR "${SDKS_ROOT}/ASI/ASI_Camera_SDK/ASI_linux_mac_SDK_V1.41")
+set(ASI_INC "${ASI_SDK_DIR}/include")
+
+if(EXISTS "${ASI_INC}/ASICamera2.h")
+    message(STATUS "✅ ASI SDK found at ${ASI_SDK_DIR}")
+    list(APPEND BRIDGE_SOURCES ${OLS_SRC}/asi_camera.cpp)
+    list(APPEND EXTRA_INCLUDE_DIRS ${ASI_INC})
+    add_definitions(-DWITH_ASI)
+
+    # Select correct library for platform/arch
+    if(APPLE)
+        if(HOST_ARCH STREQUAL "arm64")
+            set(ASI_LIB_DIR "${ASI_SDK_DIR}/lib/mac_arm64")
+        else()
+            set(ASI_LIB_DIR "${ASI_SDK_DIR}/lib/mac")
+        endif()
+    else()
+        set(ASI_LIB_DIR "${ASI_SDK_DIR}/lib/x64")
+    endif()
+    list(APPEND EXTRA_LINK_DIRS ${ASI_LIB_DIR})
+    list(APPEND EXTRA_LIBS ASICamera2)
+else()
+    message(STATUS "❌ ASI SDK not found — ASI camera driver disabled")
+endif()
+
+# ═══════════════════════════════════════════════════════════════════
+#  SVBony Camera SDK
+# ═══════════════════════════════════════════════════════════════════
+set(SVB_SDK_DIR "${SDKS_ROOT}/Svbony/macos/SVBCameraSDK")
+set(SVB_INC "${SVB_SDK_DIR}/include")
+
+if(EXISTS "${SVB_INC}/SVBCameraSDK.h")
+    message(STATUS "✅ SVBony SDK found at ${SVB_SDK_DIR}")
+    list(APPEND BRIDGE_SOURCES ${OLS_SRC}/svb_camera.cpp)
+    list(APPEND EXTRA_INCLUDE_DIRS ${SVB_INC})
+    add_definitions(-DWITH_SVB)
+
+    # Select correct library for arch
+    if(APPLE AND HOST_ARCH STREQUAL "arm64")
+        set(SVB_LIB_DIR "${SVB_SDK_DIR}/lib/arm64")
+    elseif(APPLE)
+        set(SVB_LIB_DIR "${SVB_SDK_DIR}/lib/x64")
+    else()
+        set(SVB_LIB_DIR "${SVB_SDK_DIR}/lib/x64")
+    endif()
+    list(APPEND EXTRA_LINK_DIRS ${SVB_LIB_DIR})
+    list(APPEND EXTRA_LIBS SVBCameraSDK)
+else()
+    message(STATUS "❌ SVBony SDK not found — SVBony camera driver disabled")
+endif()
+
+# ═══════════════════════════════════════════════════════════════════
+#  ToupTek Camera SDK
+# ═══════════════════════════════════════════════════════════════════
+set(TOUP_SDK_DIR "${SDKS_ROOT}/touptek")
+
+# ToupTek uses "inc/" not "include/", and "mac/" not "lib/"
+find_file(TOUPCAM_HEADER toupcam.h
+    PATHS "${TOUP_SDK_DIR}/inc" "${TOUP_SDK_DIR}/include" "${TOUP_SDK_DIR}"
+    NO_DEFAULT_PATH
+)
+
+if(TOUPCAM_HEADER)
+    get_filename_component(TOUP_INC "${TOUPCAM_HEADER}" DIRECTORY)
+    message(STATUS "✅ ToupTek SDK found: ${TOUPCAM_HEADER}")
+    list(APPEND BRIDGE_SOURCES ${OLS_SRC}/toup_camera.cpp)
+    list(APPEND EXTRA_INCLUDE_DIRS ${TOUP_INC})
+    add_definitions(-DWITH_TOUP)
+
+    # ToupTek uses mac/ for macOS, linux/ for Linux
+    if(APPLE)
+        set(TOUP_LIB_DIR "${TOUP_SDK_DIR}/mac")
+    else()
+        set(TOUP_LIB_DIR "${TOUP_SDK_DIR}/linux/x64")
+    endif()
+    if(EXISTS "${TOUP_LIB_DIR}")
+        list(APPEND EXTRA_LINK_DIRS ${TOUP_LIB_DIR})
+        list(APPEND EXTRA_LIBS toupcam)
+    endif()
+else()
+    message(STATUS "❌ ToupTek SDK not found — ToupTek camera driver disabled")
+endif()
+
+# ═══════════════════════════════════════════════════════════════════
+#  INDI (Linux only, optional)
+# ═══════════════════════════════════════════════════════════════════
+if(EXISTS "/usr/include/libindi" OR EXISTS "/usr/local/include/libindi")
+    message(STATUS "✅ INDI found — INDI mount/camera drivers enabled")
+    list(APPEND BRIDGE_SOURCES ${OLS_SRC}/indi_mount.cpp)
+    list(APPEND BRIDGE_SOURCES ${OLS_SRC}/indi_camera.cpp)
+    add_definitions(-DWITH_INDI)
+else()
+    message(STATUS "ℹ️  INDI not found — INDI drivers disabled (Linux only)")
+endif()
+
+# ═══════════════════════════════════════════════════════════════════
+#  GPhoto2 (DSLR support, optional)
+# ═══════════════════════════════════════════════════════════════════
+find_file(GPHOTO2_HEADER gphoto2/gphoto2.h
+    PATHS "/opt/homebrew/include" "/usr/local/include" "/usr/include"
+)
+if(GPHOTO2_HEADER)
+    message(STATUS "✅ GPhoto2 found — DSLR camera driver enabled")
+    list(APPEND BRIDGE_SOURCES ${OLS_SRC}/gphoto2_camera.cpp)
+    add_definitions(-DWITH_GPHOTO2)
+    list(APPEND EXTRA_LIBS gphoto2 gphoto2_port)
+else()
+    message(STATUS "ℹ️  GPhoto2 not found — DSLR camera driver disabled")
+endif()
+
+# ═══════════════════════════════════════════════════════════════════
+#  Build the static library
+# ═══════════════════════════════════════════════════════════════════
+add_library(ols_bridge STATIC ${BRIDGE_SOURCES})
+
+target_include_directories(ols_bridge PRIVATE
+    ${BRIDGE_INC}
+    ${OLS_INC}
+    ${OPENCV_INCLUDE_DIRS}
+    ${TIFF_INCLUDE_DIRS}
+    # Shims MUST come before system paths so our cppcms/booster
+    # replacements are found instead of any real installations
+    ${SHIMS_DIR}
+    ${EXTERNAL_DIR}
+    # Vendor SDK includes
+    ${EXTRA_INCLUDE_DIRS}
+)
+
+target_link_directories(ols_bridge PRIVATE ${EXTRA_LINK_DIRS})
+
+target_link_libraries(ols_bridge
+    ${OPENCV_LIBRARIES}
+    ${TIFF_LIBRARIES}
+    ${EXTRA_LIBS}
+)
+
+target_compile_definitions(ols_bridge PRIVATE
+    OLS_BRIDGE_NO_CPPCMS=1
+)
+
+# Suppress warnings in third-party code
 target_compile_options(ols_bridge PRIVATE
+    -Wno-deprecated-declarations
     -Wno-unused-parameter
     -Wno-sign-compare
     -Wno-unused-variable
+    -Wno-unused-function
+    -Wno-missing-field-initializers
 )
 
-# We define ACHERNAR_BRIDGE to allow conditional compilation in bridge code
-target_compile_definitions(ols_bridge PRIVATE ACHERNAR_BRIDGE)
-
-# ─── Install target for the Rust build.rs to find ───
-install(TARGETS ols_bridge
-    ARCHIVE DESTINATION lib
-)
-install(FILES include/ols_bridge.h
-    DESTINATION include
-)
+# ─── Status Summary ───
+message(STATUS "")
+message(STATUS "═══ OLS Bridge Build Summary ═══")
+message(STATUS "  Core:     Mount (Alpaca), Focuser (Alpaca), Sim Camera")
+get_directory_property(COMPILE_DEFS COMPILE_DEFINITIONS)
+if("WITH_ASI" IN_LIST COMPILE_DEFS)
+    message(STATUS "  Camera:   ✅ ASI (ZWO)")
+endif()
+if("WITH_SVB" IN_LIST COMPILE_DEFS)
+    message(STATUS "  Camera:   ✅ SVBony")
+endif()
+if("WITH_TOUP" IN_LIST COMPILE_DEFS)
+    message(STATUS "  Camera:   ✅ ToupTek")
+endif()
+if("WITH_INDI" IN_LIST COMPILE_DEFS)
+    message(STATUS "  Protocol: ✅ INDI")
+endif()
+if("WITH_GPHOTO2" IN_LIST COMPILE_DEFS)
+    message(STATUS "  Camera:   ✅ GPhoto2 (DSLR)")
+endif()
+message(STATUS "════════════════════════════════")

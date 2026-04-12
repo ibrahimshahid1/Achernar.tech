@@ -1,0 +1,29 @@
+{
+  "description": "Initial Kalman filter state for focus drift prediction. Updated at runtime as temperature-focus correlation is learned.",
+  "spec_section": "7.6.3",
+  "model_name": "focus_drift_kalman",
+  "version": "0.1.0",
+  "state_vector": {
+    "focus_position": 0,
+    "drift_rate": 0.0,
+    "temperature_coefficient": 0.0
+  },
+  "process_noise_Q": {
+    "position_var": 1.0,
+    "drift_rate_var": 0.01,
+    "temp_coeff_var": 0.001
+  },
+  "measurement_noise_R": {
+    "hfr_var": 0.1,
+    "temperature_var": 0.5
+  },
+  "initial_covariance_P": {
+    "position_var": 100.0,
+    "drift_rate_var": 1.0,
+    "temp_coeff_var": 0.1
+  },
+  "dt_seconds": 60,
+  "refocus_threshold_steps": 50,
+  "min_confidence_to_act": 0.7,
+  "initialized_at": null
+}

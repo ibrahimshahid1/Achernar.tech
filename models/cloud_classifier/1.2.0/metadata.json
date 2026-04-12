@@ -1,0 +1,34 @@
+{
+  "model_name": "cloud_mask_classifier",
+  "version": "1.2.0",
+  "task": "cloud_classification",
+  "description": "Classifies sky conditions from full-frame images into 5 categories: Clear, Thin, Moderate, Heavy, Overcast. Uses lightweight CNN on downsampled frames.",
+  "spec_section": "8.2",
+  "architecture": "Lightweight CNN (custom)",
+  "input_shape": [1, 1, 128, 128],
+  "input_dtype": "float32",
+  "output_shape": [1, 5],
+  "output_dtype": "float32",
+  "output_classes": ["clear", "thin", "moderate", "heavy", "overcast"],
+  "training": {
+    "framework": "PyTorch",
+    "optimizer": "AdamW",
+    "loss": "CrossEntropyLoss",
+    "epochs": 30,
+    "batch_size": 32,
+    "learning_rate": 0.0005,
+    "dataset_size": null,
+    "val_metric": "accuracy"
+  },
+  "export": {
+    "format": "ONNX",
+    "opset_version": 17,
+    "dynamic_axes": {
+      "input": { "0": "batch" },
+      "output": { "0": "batch" }
+    }
+  },
+  "sha256": null,
+  "created_at": null,
+  "deployed_at": null
+}

@@ -78,10 +78,64 @@ fn main() {
         println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
     }
 
+    // ─── Vendor Camera SDK linking ───
+    // These SDKs are auto-detected by CMake, but Rust linker also
+    // needs to know where to find the dynamic libraries.
+    let project_root = PathBuf::from(&manifest_dir).parent().unwrap().to_path_buf();
+    let sdks_root = project_root.join("sdks");
+
+    // ASI (ZWO) Camera SDK
+    let asi_sdk = sdks_root.join("ASI/ASI_Camera_SDK/ASI_linux_mac_SDK_V1.41");
+    if asi_sdk.join("include/ASICamera2.h").exists() {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let asi_lib = asi_sdk.join("lib/mac_arm64");
+        #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+        let asi_lib = asi_sdk.join("lib/mac");
+        #[cfg(target_os = "linux")]
+        let asi_lib = asi_sdk.join("lib/x64");
+        if asi_lib.exists() {
+            println!("cargo:rustc-link-search=native={}", asi_lib.display());
+            println!("cargo:rustc-link-lib=dylib=ASICamera2");
+        }
+    }
+
+    // SVBony Camera SDK
+    let svb_sdk = sdks_root.join("Svbony/macos/SVBCameraSDK");
+    if svb_sdk.join("include/SVBCameraSDK.h").exists() {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let svb_lib = svb_sdk.join("lib/arm64");
+        #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+        let svb_lib = svb_sdk.join("lib/x64");
+        #[cfg(target_os = "linux")]
+        let svb_lib = svb_sdk.join("lib/x64");
+        if svb_lib.exists() {
+            println!("cargo:rustc-link-search=native={}", svb_lib.display());
+            println!("cargo:rustc-link-lib=dylib=SVBCameraSDK");
+        }
+    }
+
+    // ToupTek Camera SDK
+    let toup_sdk = sdks_root.join("touptek");
+    if toup_sdk.join("inc/toupcam.h").exists() {
+        #[cfg(target_os = "macos")]
+        let toup_lib = toup_sdk.join("mac");
+        #[cfg(target_os = "linux")]
+        let toup_lib = toup_sdk.join("linux/x64");
+        if toup_lib.exists() {
+            println!("cargo:rustc-link-search=native={}", toup_lib.display());
+            println!("cargo:rustc-link-lib=dylib=toupcam");
+        }
+    }
+
     // Rebuild if bridge sources change
     println!("cargo:rerun-if-changed=ols-bridge/src/ols_bridge.cpp");
+    println!("cargo:rerun-if-changed=ols-bridge/src/camera_base.cpp");
     println!("cargo:rerun-if-changed=ols-bridge/include/ols_bridge.h");
     println!("cargo:rerun-if-changed=ols-bridge/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=ols-bridge/shims/cppcms/json.h");
+    println!("cargo:rerun-if-changed=ols-bridge/shims/booster/aio/endpoint.h");
+    println!("cargo:rerun-if-changed=ols-bridge/shims/booster/aio/basic_socket.h");
+    println!("cargo:rerun-if-changed=ols-bridge/shims/booster/log.h");
 }
 
 struct PkgConfigResult {
@@ -116,4 +170,26 @@ fn pkg_config_libs(name: &str) -> PkgConfigResult {
     }
 
     PkgConfigResult { link_paths, libs }
+}
+
+/// Search a directory tree for a file whose name starts with `prefix`.
+/// Returns the parent directory of the first match.
+fn find_file_in_dir(dir: &std::path::Path, prefix: &str) -> Option<PathBuf> {
+    if !dir.exists() {
+        return None;
+    }
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_file_in_dir(&path, prefix) {
+                return Some(found);
+            }
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with(prefix) {
+                return path.parent().map(|p| p.to_path_buf());
+            }
+        }
+    }
+    None
 }

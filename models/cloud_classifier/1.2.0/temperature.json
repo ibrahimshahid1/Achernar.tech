@@ -1,0 +1,16 @@
+{
+  "calibration_method": "temperature_scaling",
+  "temperature": 1.0,
+  "description": "Temperature scaling parameter for cloud classifier softmax calibration. Applied to logits before softmax to improve probability calibration.",
+  "spec_section": "8.2",
+  "per_class_temperature": {
+    "clear": 1.0,
+    "thin": 1.0,
+    "moderate": 1.0,
+    "heavy": 1.0,
+    "overcast": 1.0
+  },
+  "ece_before": null,
+  "ece_after": null,
+  "calibrated_at": null
+}

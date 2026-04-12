@@ -1,0 +1,20 @@
+{
+  "description": "Normalization parameters for focus quality model input preprocessing.",
+  "spec_section": "7.6.1",
+  "image": {
+    "mean": [0.0],
+    "std": [1.0],
+    "min_clip": 0.0,
+    "max_clip": 65535.0,
+    "scale_to": [0.0, 1.0],
+    "dtype": "float32"
+  },
+  "features": {
+    "hfr": { "mean": null, "std": null },
+    "fwhm": { "mean": null, "std": null },
+    "star_count": { "mean": null, "std": null },
+    "background_adu": { "mean": null, "std": null }
+  },
+  "computed_from_dataset": null,
+  "computed_at": null
+}

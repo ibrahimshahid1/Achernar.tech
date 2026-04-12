@@ -1,0 +1,47 @@
+{
+  "model_name": "trailing_detector",
+  "version": "0.8.0",
+  "task": "trailing_detection",
+  "description": "Detects star trailing in sub-frames. Outputs trailing probability, dominant axis (RA/Dec/Both), and estimated magnitude in pixels.",
+  "spec_section": "8.3",
+  "architecture": "Lightweight CNN",
+  "input_shape": [1, 1, 64, 64],
+  "input_dtype": "float32",
+  "outputs": {
+    "trailing_probability": {
+      "shape": [1, 1],
+      "dtype": "float32",
+      "range": [0.0, 1.0]
+    },
+    "trailing_axis": {
+      "shape": [1, 4],
+      "dtype": "float32",
+      "classes": ["none", "ra", "dec", "both"]
+    },
+    "trailing_magnitude": {
+      "shape": [1, 1],
+      "dtype": "float32",
+      "unit": "pixels"
+    }
+  },
+  "training": {
+    "framework": "PyTorch",
+    "optimizer": "AdamW",
+    "loss": "MultiTaskLoss (BCE + CE + MSE)",
+    "epochs": 40,
+    "batch_size": 64,
+    "learning_rate": 0.001,
+    "dataset_size": null,
+    "val_metric": "f1_trailing"
+  },
+  "export": {
+    "format": "ONNX",
+    "opset_version": 17,
+    "dynamic_axes": {
+      "input": { "0": "batch" }
+    }
+  },
+  "sha256": null,
+  "created_at": null,
+  "deployed_at": null
+}

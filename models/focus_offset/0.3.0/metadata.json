@@ -1,0 +1,45 @@
+{
+  "model_name": "focus_offset_predictor",
+  "version": "0.3.0",
+  "task": "focus_offset",
+  "description": "Predicts optimal focuser offset from current position using tabular features (HFR, temperature, filter, altitude, etc.). Dual-head: MLP for direct prediction, LightGBM for ensemble.",
+  "spec_section": "7.6.2",
+  "architecture": "MLP + LightGBM ensemble",
+  "input_features": [
+    "hfr",
+    "fwhm",
+    "star_count",
+    "temperature",
+    "temperature_delta",
+    "filter_index",
+    "altitude",
+    "current_position",
+    "background_adu",
+    "quality_score"
+  ],
+  "output": {
+    "name": "predicted_offset",
+    "dtype": "float32",
+    "unit": "focuser_steps"
+  },
+  "uncertainty": {
+    "method": "ensemble_disagreement",
+    "heads": ["mlp", "lgbm"]
+  },
+  "training": {
+    "framework": "PyTorch + LightGBM",
+    "mlp_optimizer": "AdamW",
+    "mlp_loss": "HuberLoss",
+    "mlp_epochs": 100,
+    "lgbm_n_estimators": 500,
+    "dataset_size": null,
+    "val_metric": "mae_steps"
+  },
+  "export": {
+    "format": "ONNX",
+    "opset_version": 17
+  },
+  "sha256": null,
+  "created_at": null,
+  "deployed_at": null
+}

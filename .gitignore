@@ -75,3 +75,7 @@ Thumbs.db
 .cache/
 dist/
 out/
+
+# SDKs
+sdk/
+sdks/
