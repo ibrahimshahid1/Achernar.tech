@@ -118,6 +118,33 @@ impl OlsCameraDriver {
         Ok(Self { handle })
     }
 
+    /// Create an ASI (ZWO) camera driver.
+    pub fn new_asi() -> Result<Self> {
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            check(ols_ffi::ols_asi_camera_driver_create(&mut handle))?;
+        }
+        Ok(Self { handle })
+    }
+
+    /// Create an SVBony camera driver.
+    pub fn new_svb() -> Result<Self> {
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            check(ols_ffi::ols_svb_camera_driver_create(&mut handle))?;
+        }
+        Ok(Self { handle })
+    }
+
+    /// Create a ToupTek camera driver.
+    pub fn new_toup() -> Result<Self> {
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            check(ols_ffi::ols_toup_camera_driver_create(&mut handle))?;
+        }
+        Ok(Self { handle })
+    }
+
     /// List available cameras
     pub fn list_cameras(&mut self) -> Result<Vec<String>> {
         let mut count: i32 = 0;

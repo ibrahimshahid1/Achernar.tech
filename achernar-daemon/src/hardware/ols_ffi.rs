@@ -242,6 +242,18 @@ extern "C" {
         out_driver: *mut *mut OlsCameraDriver,
     ) -> c_int;
 
+    pub fn ols_asi_camera_driver_create(
+        out_driver: *mut *mut OlsCameraDriver,
+    ) -> c_int;
+
+    pub fn ols_svb_camera_driver_create(
+        out_driver: *mut *mut OlsCameraDriver,
+    ) -> c_int;
+
+    pub fn ols_toup_camera_driver_create(
+        out_driver: *mut *mut OlsCameraDriver,
+    ) -> c_int;
+
     pub fn ols_driver_list_cameras(
         driver: *mut OlsCameraDriver,
         out_count: *mut i32,

@@ -430,6 +430,75 @@ OlsError ols_driver_list_cameras(OlsCameraDriver *driver, int32_t *out_count) {
   }
 }
 
+// ─── Vendor SDK Camera Driver Factories ───
+
+// Forward declarations for the externally defined drivers from the OLS codebase
+extern "C" {
+  ols::CameraDriver *ols_get_asi_driver(int cam_id, ols::CamErrorCode *e);
+  ols::CameraDriver *ols_get_svb_driver(int cam_id, ols::CamErrorCode *e);
+  ols::CameraDriver *ols_get_toup_driver(int cam_id, ols::CamErrorCode *e);
+}
+
+OlsError ols_asi_camera_driver_create(OlsCameraDriver **out_driver) {
+#ifdef WITH_ASI
+  try {
+    ols::CamErrorCode e;
+    ols::CameraDriver *d = ols_get_asi_driver(0, &e);
+    if (e) return set_error(OLS_ERR_IO, e.message());
+    if (!d) return set_error(OLS_ERR_IO, "Failed to instantiate ASI driver");
+    
+    auto *wrapper = new OlsCameraDriver_t();
+    wrapper->driver.reset(d);
+    *out_driver = wrapper;
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+#else
+  return set_error(OLS_ERR_NOT_FOUND, "ASI SDK support not compiled into ols_bridge");
+#endif
+}
+
+OlsError ols_svb_camera_driver_create(OlsCameraDriver **out_driver) {
+#ifdef WITH_SVB
+  try {
+    ols::CamErrorCode e;
+    ols::CameraDriver *d = ols_get_svb_driver(0, &e);
+    if (e) return set_error(OLS_ERR_IO, e.message());
+    if (!d) return set_error(OLS_ERR_IO, "Failed to instantiate SVBony driver");
+    
+    auto *wrapper = new OlsCameraDriver_t();
+    wrapper->driver.reset(d);
+    *out_driver = wrapper;
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+#else
+  return set_error(OLS_ERR_NOT_FOUND, "SVBony SDK support not compiled into ols_bridge");
+#endif
+}
+
+OlsError ols_toup_camera_driver_create(OlsCameraDriver **out_driver) {
+#ifdef WITH_TOUP
+  try {
+    ols::CamErrorCode e;
+    ols::CameraDriver *d = ols_get_toup_driver(0, &e);
+    if (e) return set_error(OLS_ERR_IO, e.message());
+    if (!d) return set_error(OLS_ERR_IO, "Failed to instantiate ToupTek driver");
+    
+    auto *wrapper = new OlsCameraDriver_t();
+    wrapper->driver.reset(d);
+    *out_driver = wrapper;
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+#else
+  return set_error(OLS_ERR_NOT_FOUND, "ToupTek SDK support not compiled into ols_bridge");
+#endif
+}
+
 OlsError ols_driver_camera_name(OlsCameraDriver *driver, int32_t index,
                                 char *name_buf, int32_t name_buf_len) {
   if (index < 0 || (size_t)index >= driver->camera_names.size())

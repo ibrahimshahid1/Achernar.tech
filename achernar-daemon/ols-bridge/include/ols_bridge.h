@@ -137,6 +137,15 @@ OlsError ols_sim_driver_create(const char* sim_data_dir, OlsCameraDriver** out_d
 /** Create an Alpaca camera driver (connects to Alpaca server over network). */
 OlsError ols_alpaca_camera_driver_create(const char* url, OlsCameraDriver** out_driver);
 
+/** Create an ASI camera driver (requires ASI SDK). */
+OlsError ols_asi_camera_driver_create(OlsCameraDriver** out_driver);
+
+/** Create an SVBony camera driver (requires SVBony SDK). */
+OlsError ols_svb_camera_driver_create(OlsCameraDriver** out_driver);
+
+/** Create a ToupTek camera driver (requires ToupTek SDK). */
+OlsError ols_toup_camera_driver_create(OlsCameraDriver** out_driver);
+
 /** Get the number of cameras from this driver. */
 OlsError ols_driver_list_cameras(OlsCameraDriver* driver, int32_t* out_count);
 

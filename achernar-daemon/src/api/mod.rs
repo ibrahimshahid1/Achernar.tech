@@ -98,52 +98,57 @@ pub async fn connect_equipment(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     tracing::info!("Connect request: driver={}, option={:?}", req.driver, req.option);
 
-    match req.driver.as_str() {
+    let driver_result = match req.driver.as_str() {
         "sim" => {
             let sim_dir = req.option.unwrap_or_else(|| "./sim".to_string());
-            match crate::hardware::camera::OlsCameraDriver::new_sim(&sim_dir) {
-                Ok(mut driver) => {
-                    // List cameras
-                    let cameras = driver.list_cameras().map_err(|e| {
-                        tracing::error!("Failed to list cameras: {}", e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-
-                    tracing::info!("Found cameras: {:?}", cameras);
-
-                    if cameras.is_empty() {
-                        return Err(StatusCode::NOT_FOUND);
-                    }
-
-                    // Open first camera
-                    let camera = driver.open_camera(0).map_err(|e| {
-                        tracing::error!("Failed to open camera: {}", e);
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?;
-
-                    let cam_name = camera.name().unwrap_or_else(|_| "Unknown".to_string());
-
-                    // Store in state
-                    *state.camera_driver.lock().unwrap() = Some(driver);
-                    *state.camera_name.lock().unwrap() = Some(cam_name.clone());
-                    *state.camera.lock().unwrap() = Some(camera);
-
-                    Ok(Json(serde_json::json!({
-                        "status": "connected",
-                        "driver": "sim",
-                        "camera": cam_name,
-                        "cameras_found": cameras,
-                    })))
-                }
-                Err(e) => {
-                    tracing::error!("Failed to create sim driver: {}", e);
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
+            crate::hardware::camera::OlsCameraDriver::new_sim(&sim_dir)
         }
+        "asi" => crate::hardware::camera::OlsCameraDriver::new_asi(),
+        "svb" => crate::hardware::camera::OlsCameraDriver::new_svb(),
+        "toup" => crate::hardware::camera::OlsCameraDriver::new_toup(),
         _ => {
             tracing::warn!("Unsupported driver: {}", req.driver);
-            Err(StatusCode::BAD_REQUEST)
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    match driver_result {
+        Ok(mut driver) => {
+            // List cameras
+            let cameras = driver.list_cameras().map_err(|e| {
+                tracing::error!("Failed to list cameras: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            tracing::info!("Found cameras: {:?}", cameras);
+
+            if cameras.is_empty() {
+                return Err(StatusCode::NOT_FOUND);
+            }
+
+            // Open first camera
+            let camera = driver.open_camera(0).map_err(|e| {
+                tracing::error!("Failed to open camera: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+            let cam_name = camera.name().unwrap_or_else(|_| "Unknown".to_string());
+
+            // Store in state
+            *state.camera_driver.lock().unwrap() = Some(driver);
+            *state.camera_name.lock().unwrap() = Some(cam_name.clone());
+            *state.camera.lock().unwrap() = Some(camera);
+
+            Ok(Json(serde_json::json!({
+                "status": "connected",
+                "driver": req.driver,
+                "camera": cam_name,
+                "cameras_found": cameras,
+            })))
+        }
+        Err(e) => {
+            tracing::error!("Failed to create {} driver: {}", req.driver, e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }

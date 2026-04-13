@@ -114,9 +114,14 @@ fn main() {
         #[cfg(target_os = "linux")]
         let asi_lib = asi_sdk.join("lib/x64");
         if asi_lib.exists() {
-            println!("cargo:rustc-link-search=native={}", asi_lib.display());
+            #[cfg(target_os = "macos")]
+            let link_dir = prepare_macos_dylib(&asi_lib, "ASICamera2", std::path::Path::new(&out_dir));
+            #[cfg(target_os = "linux")]
+            let link_dir = asi_lib.clone();
+
+            println!("cargo:rustc-link-search=native={}", link_dir.display());
             println!("cargo:rustc-link-lib=dylib=ASICamera2");
-            // Runtime rpath so dyld can find the library
+            // Runtime rpath so dyld can find the original library in original SDK folder
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", asi_lib.display());
         }
     }
@@ -131,7 +136,12 @@ fn main() {
         #[cfg(target_os = "linux")]
         let svb_lib = svb_sdk.join("lib/x64");
         if svb_lib.exists() {
-            println!("cargo:rustc-link-search=native={}", svb_lib.display());
+            #[cfg(target_os = "macos")]
+            let link_dir = prepare_macos_dylib(&svb_lib, "SVBCameraSDK", std::path::Path::new(&out_dir));
+            #[cfg(target_os = "linux")]
+            let link_dir = svb_lib.clone();
+
+            println!("cargo:rustc-link-search=native={}", link_dir.display());
             println!("cargo:rustc-link-lib=dylib=SVBCameraSDK");
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", svb_lib.display());
         }
@@ -145,7 +155,12 @@ fn main() {
         #[cfg(target_os = "linux")]
         let toup_lib = toup_sdk.join("linux/x64");
         if toup_lib.exists() {
-            println!("cargo:rustc-link-search=native={}", toup_lib.display());
+            #[cfg(target_os = "macos")]
+            let link_dir = prepare_macos_dylib(&toup_lib, "toupcam", std::path::Path::new(&out_dir));
+            #[cfg(target_os = "linux")]
+            let link_dir = toup_lib.clone();
+
+            println!("cargo:rustc-link-search=native={}", link_dir.display());
             println!("cargo:rustc-link-lib=dylib=toupcam");
             println!("cargo:rustc-link-arg=-Wl,-rpath,{}", toup_lib.display());
         }
@@ -229,4 +244,28 @@ fn find_file_in_dir(dir: &std::path::Path, prefix: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// On macOS, vendors often ship dylibs with `@loader_path/libFoo.dylib` hardcoded.
+/// We copy the library to OUT_DIR and patch its ID to `@rpath/libFoo.dylib` so the built executable
+/// uses an rpath-based lookup, avoiding crash upon `cargo run`.
+#[cfg(target_os = "macos")]
+fn prepare_macos_dylib(sdk_lib_dir: &std::path::Path, lib_name: &str, out_dir: &std::path::Path) -> PathBuf {
+    let dylib_name = format!("lib{}.dylib", lib_name);
+    let src_path = sdk_lib_dir.join(&dylib_name);
+    if src_path.exists() {
+        let dest_path = out_dir.join(&dylib_name);
+        
+        // Copy the dylib
+        let _ = std::fs::copy(&src_path, &dest_path);
+        
+        // Change the id to @rpath
+        let new_id = format!("@rpath/{}", dylib_name);
+        let _ = Command::new("install_name_tool")
+            .args(["-id", &new_id, dest_path.to_str().unwrap()])
+            .status();
+        
+        return out_dir.to_path_buf();
+    }
+    sdk_lib_dir.to_path_buf()
 }
