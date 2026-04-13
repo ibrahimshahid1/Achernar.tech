@@ -39,6 +39,10 @@ set(BRIDGE_SOURCES
     ${OLS_SRC}/focuser.cpp
     ${OLS_SRC}/alpaca_focuser.cpp
     ${OLS_SRC}/alpaca_client.cpp
+
+    # OLS utilities (needed by sim camera for file I/O)
+    ${OLS_SRC}/util.cpp
+    ${OLS_SRC}/tiffmat.cpp
 )
 
 set(EXTRA_INCLUDE_DIRS "")
@@ -150,8 +154,13 @@ find_file(GPHOTO2_HEADER gphoto2/gphoto2.h
     PATHS "/opt/homebrew/include" "/usr/local/include" "/usr/include"
 )
 if(GPHOTO2_HEADER)
-    message(STATUS "✅ GPhoto2 found — DSLR camera driver enabled")
+    # GPHOTO2_HEADER is e.g. /opt/homebrew/.../include/gphoto2/gphoto2.h
+    # We need the grandparent dir (the "include/" dir) on the include path
+    get_filename_component(GPHOTO2_INC_DIR "${GPHOTO2_HEADER}" DIRECTORY)  # .../gphoto2/
+    get_filename_component(GPHOTO2_INC_DIR "${GPHOTO2_INC_DIR}" DIRECTORY) # .../include/
+    message(STATUS "✅ GPhoto2 found — DSLR camera driver enabled (${GPHOTO2_INC_DIR})")
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/gphoto2_camera.cpp)
+    list(APPEND EXTRA_INCLUDE_DIRS ${GPHOTO2_INC_DIR})
     add_definitions(-DWITH_GPHOTO2)
     list(APPEND EXTRA_LIBS gphoto2 gphoto2_port)
 else()

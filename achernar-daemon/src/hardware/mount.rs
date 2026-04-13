@@ -172,9 +172,9 @@ impl Mount {
     /// Connect to the mount with a specific driver option (e.g., Alpaca URL).
     pub async fn connect_with_option(&mut self, option: &str) -> crate::error::Result<()> {
         let driver_name = CString::new(self.driver_type.ols_name())
-            .map_err(|_| crate::error::DaemonError::Hardware("Invalid driver name".into()))?;
+            .map_err(|_| crate::error::HardwareError::Communication("Invalid driver name".into()))?;
         let option_c = CString::new(option)
-            .map_err(|_| crate::error::DaemonError::Hardware("Invalid option string".into()))?;
+            .map_err(|_| crate::error::HardwareError::Communication("Invalid option string".into()))?;
 
         // Load driver
         info!(driver = ?self.driver_type, option = option, "Loading mount driver");

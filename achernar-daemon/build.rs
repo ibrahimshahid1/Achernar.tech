@@ -2,7 +2,27 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Find cmake binary - cargo build scripts don't always inherit the full user PATH
+fn find_cmake() -> String {
+    // Check PATH first
+    if Command::new("cmake").arg("--version").output().is_ok() {
+        return "cmake".to_string();
+    }
+    // Common locations
+    for path in &[
+        "/opt/homebrew/bin/cmake",
+        "/usr/local/bin/cmake",
+        "/Applications/CMake.app/Contents/bin/cmake",
+    ] {
+        if std::path::Path::new(path).exists() {
+            return path.to_string();
+        }
+    }
+    panic!("cmake not found! Install with: brew install cmake");
+}
+
 fn main() {
+    let cmake = find_cmake();
     let out_dir = env::var("OUT_DIR").unwrap();
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let bridge_dir = PathBuf::from(&manifest_dir).join("ols-bridge");
@@ -12,7 +32,7 @@ fn main() {
     std::fs::create_dir_all(&build_dir).expect("Failed to create build dir");
 
     // Run cmake configure
-    let cmake_status = Command::new("cmake")
+    let cmake_status = Command::new(&cmake)
         .args([
             "-S",
             bridge_dir.to_str().unwrap(),
@@ -28,7 +48,7 @@ fn main() {
     }
 
     // Run cmake build
-    let build_status = Command::new("cmake")
+    let build_status = Command::new(&cmake)
         .args([
             "--build",
             build_dir.to_str().unwrap(),
@@ -96,6 +116,8 @@ fn main() {
         if asi_lib.exists() {
             println!("cargo:rustc-link-search=native={}", asi_lib.display());
             println!("cargo:rustc-link-lib=dylib=ASICamera2");
+            // Runtime rpath so dyld can find the library
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", asi_lib.display());
         }
     }
 
@@ -111,6 +133,7 @@ fn main() {
         if svb_lib.exists() {
             println!("cargo:rustc-link-search=native={}", svb_lib.display());
             println!("cargo:rustc-link-lib=dylib=SVBCameraSDK");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", svb_lib.display());
         }
     }
 
@@ -124,6 +147,7 @@ fn main() {
         if toup_lib.exists() {
             println!("cargo:rustc-link-search=native={}", toup_lib.display());
             println!("cargo:rustc-link-lib=dylib=toupcam");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", toup_lib.display());
         }
     }
 
@@ -143,8 +167,21 @@ struct PkgConfigResult {
     libs: Vec<String>,
 }
 
+fn find_pkg_config() -> String {
+    if Command::new("pkg-config").arg("--version").output().is_ok() {
+        return "pkg-config".to_string();
+    }
+    for path in &["/opt/homebrew/bin/pkg-config", "/usr/local/bin/pkg-config"] {
+        if std::path::Path::new(path).exists() {
+            return path.to_string();
+        }
+    }
+    panic!("pkg-config not found! Install with: brew install pkg-config");
+}
+
 fn pkg_config_libs(name: &str) -> PkgConfigResult {
-    let output = Command::new("pkg-config")
+    let pkg_config = find_pkg_config();
+    let output = Command::new(&pkg_config)
         .args(["--libs", name])
         .output()
         .unwrap_or_else(|_| panic!("pkg-config not found, cannot locate {}", name));
