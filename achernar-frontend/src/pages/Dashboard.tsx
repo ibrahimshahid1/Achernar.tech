@@ -4,6 +4,7 @@ import EquipmentCard from "../components/EquipmentCard";
 import MjpegLiveView from "../components/MjpegLiveView";
 import { useTelemetrySocket } from "../lib/hooks/useTelemetrySocket";
 import { useConnectedEquipment } from "../hooks/useEquipment";
+import { getHardwareTransport } from "../lib/runtime";
 import type { EquipmentCardModel, EquipmentType } from "../types/achernar";
 
 const PILL_TYPES: Array<{ key: "all" | EquipmentType; label: string; icon: string }> = [
@@ -22,8 +23,9 @@ export default function Dashboard() {
     const [active, setActive] = useState<"all" | EquipmentType>("all");
     const [site, setSite] = useState<string>("all");
     const [query, setQuery] = useState("");
+    const hardwareTransport = getHardwareTransport();
 
-    // Fetch connected equipment from Django (daemon relay)
+    // Fetch connected equipment directly from the local daemon.
     const { data: allCards = [], isLoading, error } = useConnectedEquipment();
 
     const cards = useMemo(() => {
@@ -104,30 +106,38 @@ export default function Dashboard() {
                     {isLoading && (
                         <div className="loading-message">
                             <div className="spinner"></div>
-                            <div>Loading equipment from daemon...</div>
+                            <div>
+                                {hardwareTransport === "django"
+                                    ? "Loading daemon state through Django..."
+                                    : "Loading equipment from local daemon..."}
+                            </div>
                         </div>
                     )}
                     {error && (
                         <div className="error-message">
                             <div>⚠️ Error loading equipment</div>
                             <div className="error-details">{(error as Error).message}</div>
-                            <div className="error-hint">Make sure Django backend is running on port 8000</div>
+                            <div className="error-hint">
+                                {hardwareTransport === "django"
+                                    ? "Make sure Django is running on port 8000"
+                                    : "Make sure the Rust daemon is running on port 3030"}
+                            </div>
                         </div>
                     )}
                     {!isLoading && !error && cards.length === 0 && (
                         <div className="empty-message">
-                            <div>No equipment connected</div>
-                            <div className="empty-hint">Connect equipment via the daemon</div>
+                            <div>No camera, mount, or focuser connected</div>
+                            <div className="empty-hint">
+                                {hardwareTransport === "django"
+                                    ? "Django is relaying daemon state, but the daemon reports no connected hardware"
+                                    : "The local daemon is online, but no supported hardware is connected"}
+                            </div>
                         </div>
                     )}
                     {!isLoading && cards.map((c: EquipmentCardModel) => (
                         <EquipmentCard
                             key={c.id}
                             model={c}
-                            onAction={(id) => {
-                                // Stub action hook: later you'll call daemonApi.slewMount/capture/etc.
-                                console.log("Action on", id);
-                            }}
                         />
                     ))}
                 </div>

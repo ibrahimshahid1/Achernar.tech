@@ -1,6 +1,6 @@
 import { env } from "../env";
 import { httpJson } from "./http";
-import type { ImagingSession } from "../types/achernar";
+import type { EquipmentState, ImagingSession } from "../types/achernar";
 
 /**
  * Cloud API (Django Apps)
@@ -28,6 +28,19 @@ export const cloudApi = {
         meta: Record<string, any>;
     }>> {
         return httpJson(`${env.cloudApiBase}/equipment/connected/`);
+    },
+
+    /**
+     * Equipment App - Raw daemon status relayed by Django
+     */
+    async getDaemonStatus(): Promise<EquipmentState> {
+        return httpJson<EquipmentState>(`${env.cloudApiBase}/equipment/daemon-status/`);
+    },
+
+    async startCameraStream(): Promise<{ status: string; format: string; width: number; height: number }> {
+        return httpJson(`${env.cloudApiBase}/equipment/camera/start-stream/`, {
+            method: "POST",
+        });
     },
 
     /**

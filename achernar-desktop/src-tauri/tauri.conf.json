@@ -4,17 +4,18 @@
   "version": "0.1.0",
   "identifier": "tech.achernar.desktop",
   "build": {
-    "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
-    "frontendDist": "../dist"
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "pnpm --dir ../achernar-frontend build",
+    "frontendDist": "../../achernar-frontend/dist"
   },
   "app": {
     "windows": [
       {
         "title": "achernar-desktop",
-        "width": 800,
-        "height": 600
+        "width": 1180,
+        "height": 760,
+        "minWidth": 760,
+        "minHeight": 580
       }
     ],
     "security": {

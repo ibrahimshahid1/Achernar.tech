@@ -15,21 +15,27 @@ export interface ImagingSession {
 export interface EquipmentState {
     connected: boolean;
     mount?: {
-        connected: boolean;
+        name?: string;
+        connected?: boolean;
         tracking: boolean;
         ra: number;
         dec: number;
+        parked?: boolean;
         pier_side?: string;
     };
     camera?: {
-        connected: boolean;
+        name?: string;
+        connected?: boolean;
         cooling: boolean;
         temperature: number;
-        status: "idle" | "exposing" | "downloading";
+        status?: "idle" | "exposing" | "downloading";
+        exposing?: boolean;
+        streaming?: boolean;
         progress?: number; // 0..1
     };
     focuser?: {
-        connected: boolean;
+        name?: string;
+        connected?: boolean;
         position: number;
         moving: boolean;
     };
@@ -40,10 +46,10 @@ export interface TelemetryUpdateEvent {
     type: "TELEMETRY_UPDATE";
     timestamp: number;
     payload: {
-        mount?: { ra?: number; dec?: number; pier_side?: string; tracking?: boolean };
-        camera?: { temperature?: number; status?: string; progress?: number };
+        mount?: { name?: string; connected?: boolean; ra?: number; dec?: number; pier_side?: string; tracking?: boolean };
+        camera?: { name?: string; connected?: boolean; temperature?: number; status?: string; progress?: number; streaming?: boolean };
         guiding?: { rms_total?: number; dx?: number; dy?: number };
-        focuser?: { position?: number; moving?: boolean };
+        focuser?: { name?: string; connected?: boolean; position?: number; moving?: boolean };
     };
 }
 
@@ -55,6 +61,13 @@ export interface EquipmentCardModel {
     status: "nominal" | "warning" | "offline";
     tags: string[];
     meta?: Record<string, string | number | boolean>;
+    summary?: string;
+    source?: string;
+    metrics?: Array<{
+        label: string;
+        value: string | number | boolean;
+        tone?: "good" | "warn" | "bad" | "muted";
+    }>;
 }
 
 export interface CaptureParams {
