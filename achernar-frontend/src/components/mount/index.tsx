@@ -1,5 +1,3 @@
-import React from "react";
-
 /** Mount status panel — RA/Dec, tracking, pier side. */
 export function MountStatus() {
     return <div id="mount-status">Mount Status — stub</div>;

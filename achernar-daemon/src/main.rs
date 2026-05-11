@@ -146,17 +146,58 @@ async fn handle_telemetry_socket(mut socket: WebSocket, state: AppState) {
             })
         };
 
+        let mount_status = {
+            let mount = state.mount.lock().unwrap();
+            match mount.as_ref() {
+                Some(mount) => {
+                    let status = mount.status();
+                    let position = status.position;
+                    serde_json::json!({
+                        "ra": position.map(|p| p.ra).unwrap_or(0.0),
+                        "dec": position.map(|p| p.dec).unwrap_or(0.0),
+                        "pier_side": "unknown",
+                        "connected": status.connected,
+                        "tracking": status.tracking.unwrap_or(false),
+                    })
+                }
+                None => serde_json::json!({
+                    "ra": 0.0,
+                    "dec": 0.0,
+                    "pier_side": "unknown",
+                    "connected": false,
+                    "tracking": false,
+                }),
+            }
+        };
+
+        let focuser_status = {
+            let focuser = state.focuser.lock().unwrap();
+            match focuser.as_ref() {
+                Some(focuser) => {
+                    let status = focuser.status();
+                    serde_json::json!({
+                        "connected": status.connected,
+                        "position": status.position.unwrap_or(0),
+                        "moving": status.is_moving,
+                        "absolute": status.is_absolute,
+                        "max_range": status.max_range,
+                    })
+                }
+                None => serde_json::json!({
+                    "connected": false,
+                    "position": 0,
+                    "moving": false,
+                }),
+            }
+        };
+
         let telemetry = serde_json::json!({
             "type": "TELEMETRY_UPDATE",
             "timestamp": chrono::Utc::now().timestamp(),
             "payload": {
                 "camera": camera_status,
-                "mount": {
-                    "ra": 0.0,
-                    "dec": 0.0,
-                    "pier_side": "unknown",
-                    "connected": false,
-                },
+                "mount": mount_status,
+                "focuser": focuser_status,
                 "guiding": {
                     "rms_total": 0.0,
                     "dx": 0.0,

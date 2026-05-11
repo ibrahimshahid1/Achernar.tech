@@ -20,7 +20,7 @@ export const daemonApi = {
      * Trigger camera capture
      * POST /camera/capture
      */
-    async captureImage(params: CaptureParams): Promise<{ job_id: string; status: string }> {
+    async captureImage(params: CaptureParams): Promise<ImageData> {
         return httpJson(`${env.daemonApiBase}/camera/capture`, {
             method: "POST",
             body: params,

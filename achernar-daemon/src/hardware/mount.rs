@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 use super::ols_ffi;
 
@@ -165,12 +165,12 @@ impl Mount {
     }
 
     /// Connect to the mount using the configured driver.
-    pub async fn connect(&mut self) -> crate::error::Result<()> {
-        self.connect_with_option("auto").await
+    pub fn connect(&mut self) -> crate::error::Result<()> {
+        self.connect_with_option("auto")
     }
 
     /// Connect to the mount with a specific driver option (e.g., Alpaca URL).
-    pub async fn connect_with_option(&mut self, option: &str) -> crate::error::Result<()> {
+    pub fn connect_with_option(&mut self, option: &str) -> crate::error::Result<()> {
         let driver_name = CString::new(self.driver_type.ols_name())
             .map_err(|_| crate::error::HardwareError::Communication("Invalid driver name".into()))?;
         let option_c = CString::new(option)
@@ -213,7 +213,7 @@ impl Mount {
     }
 
     /// Slew to target equatorial coordinates (GoTo).
-    pub async fn goto(&self, target: EqCoord) -> crate::error::Result<()> {
+    pub fn goto(&self, target: EqCoord) -> crate::error::Result<()> {
         info!(ra = target.ra, dec = target.dec, "Mount GoTo");
         let rc = unsafe { ols_ffi::ols_mount_goto(self.handle, target.ra, target.dec) };
         ols_ffi::check_ols_error(rc)
@@ -222,7 +222,7 @@ impl Mount {
     }
 
     /// Sync mount position to given coordinates.
-    pub async fn sync(&self, coord: EqCoord) -> crate::error::Result<()> {
+    pub fn sync(&self, coord: EqCoord) -> crate::error::Result<()> {
         info!(ra = coord.ra, dec = coord.dec, "Mount Sync");
         let rc = unsafe { ols_ffi::ols_mount_sync(self.handle, coord.ra, coord.dec) };
         ols_ffi::check_ols_error(rc)

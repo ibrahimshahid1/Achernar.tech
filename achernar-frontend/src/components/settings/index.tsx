@@ -1,5 +1,3 @@
-import React from "react";
-
 /** Rig profile editor — telescope, camera, focuser config. */
 export function RigProfileEditor() {
     return <div id="rig-profile-editor">Rig Profile Editor — stub</div>;

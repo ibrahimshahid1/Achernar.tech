@@ -118,12 +118,12 @@ impl Focuser {
     }
 
     /// Connect to the focuser using the configured driver.
-    pub async fn connect(&mut self) -> crate::error::Result<()> {
-        self.connect_with_option("auto").await
+    pub fn connect(&mut self) -> crate::error::Result<()> {
+        self.connect_with_option("auto")
     }
 
     /// Connect to the focuser with a specific option (e.g., Alpaca URL).
-    pub async fn connect_with_option(&mut self, option: &str) -> crate::error::Result<()> {
+    pub fn connect_with_option(&mut self, option: &str) -> crate::error::Result<()> {
         let driver_name = CString::new(self.driver_type.ols_name())
             .map_err(|_| crate::error::HardwareError::Communication("Invalid driver name".into()))?;
         let option_c = CString::new(option)
@@ -183,7 +183,7 @@ impl Focuser {
     }
 
     /// Move the focuser to an absolute position.
-    pub async fn move_absolute(&mut self, position: i32) -> crate::error::Result<()> {
+    pub fn move_absolute(&mut self, position: i32) -> crate::error::Result<()> {
         info!(position, "Moving focuser to absolute position");
         let rc = unsafe { ols_ffi::ols_focuser_move_to(self.handle, position) };
         ols_ffi::check_ols_error(rc)
@@ -192,7 +192,7 @@ impl Focuser {
     }
 
     /// Move the focuser by a relative number of steps.
-    pub async fn move_relative(&mut self, steps: i32) -> crate::error::Result<()> {
+    pub fn move_relative(&mut self, steps: i32) -> crate::error::Result<()> {
         info!(steps, "Moving focuser by relative steps");
         let rc = unsafe { ols_ffi::ols_focuser_move_by(self.handle, steps) };
         ols_ffi::check_ols_error(rc)
@@ -201,7 +201,7 @@ impl Focuser {
     }
 
     /// Abort focuser motion.
-    pub async fn abort(&mut self) -> crate::error::Result<()> {
+    pub fn abort(&mut self) -> crate::error::Result<()> {
         info!("Aborting focuser motion");
         let rc = unsafe { ols_ffi::ols_focuser_abort(self.handle) };
         ols_ffi::check_ols_error(rc)

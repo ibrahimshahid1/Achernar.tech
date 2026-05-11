@@ -66,3 +66,15 @@ export interface CaptureParams {
     offset?: number;
     temperature?: number;
 }
+
+export interface ImageData {
+    id: string;
+    width: number;
+    height: number;
+    metadata: {
+        exposure: number;
+        gain: number;
+        temperature: number;
+        timestamp: string;
+    };
+}

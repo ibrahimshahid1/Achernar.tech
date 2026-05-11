@@ -1,5 +1,3 @@
-import React from "react";
-
 /** Daemon-cloud sync status display. */
 export function SyncStatus() {
     return <div id="sync-status">Sync Status — stub</div>;

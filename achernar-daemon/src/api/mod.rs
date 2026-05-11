@@ -7,6 +7,11 @@ pub mod websocket;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
+use crate::hardware::{
+    camera::OlsCameraDriver,
+    focuser::{Focuser, FocuserDriver},
+    mount::{Mount, MountDriver},
+};
 use crate::state::AppState;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -44,6 +49,9 @@ pub struct FocuserStatus {
 
 #[derive(Debug, Deserialize)]
 pub struct ConnectRequest {
+    /// Equipment kind: "camera", "mount", or "focuser". Defaults to "camera"
+    /// for compatibility with the original camera-only endpoint.
+    pub equipment_type: Option<String>,
     /// Driver type: "sim", "alpaca", "asi", "toup", etc.
     pub driver: String,
     /// Driver-specific option (e.g., sim data directory path)
@@ -80,13 +88,45 @@ pub async fn get_status(
         })
     };
 
-    let connected = camera_status.is_some();
+    let mount_status = {
+        let mount_name = state.mount_name.lock().unwrap().clone();
+        let mount = state.mount.lock().unwrap();
+        mount.as_ref().map(|m| {
+            let hw = m.status();
+            let (ra, dec) = hw
+                .position
+                .map(|pos| (pos.ra, pos.dec))
+                .unwrap_or((0.0, 0.0));
+            MountStatus {
+                name: mount_name.unwrap_or_else(|| "OpenLiveStacker mount".to_string()),
+                ra,
+                dec,
+                tracking: hw.tracking.unwrap_or(false),
+                parked: false,
+            }
+        })
+    };
+
+    let focuser_status = {
+        let focuser_name = state.focuser_name.lock().unwrap().clone();
+        let focuser = state.focuser.lock().unwrap();
+        focuser.as_ref().map(|f| {
+            let hw = f.status();
+            FocuserStatus {
+                name: focuser_name.unwrap_or_else(|| "OpenLiveStacker focuser".to_string()),
+                position: hw.position.unwrap_or(0),
+                moving: hw.is_moving,
+            }
+        })
+    };
+
+    let connected = camera_status.is_some() || mount_status.is_some() || focuser_status.is_some();
 
     let status = EquipmentStatus {
         connected,
         camera: camera_status,
-        mount: None,
-        focuser: None,
+        mount: mount_status,
+        focuser: focuser_status,
     };
 
     Ok(Json(status))
@@ -98,16 +138,43 @@ pub async fn connect_equipment(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     tracing::info!("Connect request: driver={}, option={:?}", req.driver, req.option);
 
+    let equipment_type = req
+        .equipment_type
+        .as_deref()
+        .unwrap_or("camera")
+        .to_ascii_lowercase();
+
+    match equipment_type.as_str() {
+        "camera" => connect_camera(state, req).await,
+        "mount" => connect_mount(state, req).await,
+        "focuser" => connect_focuser(state, req).await,
+        _ => {
+            tracing::warn!("Unsupported equipment type: {}", equipment_type);
+            Err(StatusCode::BAD_REQUEST)
+        }
+    }
+}
+
+async fn connect_camera(
+    state: AppState,
+    req: ConnectRequest,
+) -> Result<Json<serde_json::Value>, StatusCode> {
     let driver_result = match req.driver.as_str() {
         "sim" => {
             let sim_dir = req.option.unwrap_or_else(|| "./sim".to_string());
-            crate::hardware::camera::OlsCameraDriver::new_sim(&sim_dir)
+            OlsCameraDriver::new_sim(&sim_dir)
         }
-        "asi" => crate::hardware::camera::OlsCameraDriver::new_asi(),
-        "svb" => crate::hardware::camera::OlsCameraDriver::new_svb(),
-        "toup" => crate::hardware::camera::OlsCameraDriver::new_toup(),
+        "alpaca" => {
+            let url = req
+                .option
+                .unwrap_or_else(|| "http://localhost:11111".to_string());
+            OlsCameraDriver::new_alpaca(&url)
+        }
+        "asi" => OlsCameraDriver::new_asi(),
+        "svb" => OlsCameraDriver::new_svb(),
+        "toup" => OlsCameraDriver::new_toup(),
         _ => {
-            tracing::warn!("Unsupported driver: {}", req.driver);
+            tracing::warn!("Unsupported camera driver: {}", req.driver);
             return Err(StatusCode::BAD_REQUEST);
         }
     };
@@ -153,6 +220,82 @@ pub async fn connect_equipment(
     }
 }
 
+async fn connect_mount(
+    state: AppState,
+    req: ConnectRequest,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let driver_type = match req.driver.as_str() {
+        "alpaca" => MountDriver::Alpaca,
+        "indi" => MountDriver::Indi,
+        "sim" | "simulator" => MountDriver::Simulator,
+        _ => {
+            tracing::warn!("Unsupported mount driver: {}", req.driver);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    let option = req.option.unwrap_or_else(|| "auto".to_string());
+
+    let mut mount = Mount::new(driver_type).map_err(|e| {
+        tracing::error!("Failed to create mount interface: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    mount.connect_with_option(&option).map_err(|e| {
+        tracing::error!("Failed to connect mount: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let drivers = mount.list_drivers().unwrap_or_default();
+    *state.mount_name.lock().unwrap() = Some(format!("{driver_type:?} mount"));
+    *state.mount.lock().unwrap() = Some(mount);
+
+    Ok(Json(serde_json::json!({
+        "status": "connected",
+        "equipment_type": "mount",
+        "driver": req.driver,
+        "option": option,
+        "available_drivers": drivers,
+    })))
+}
+
+async fn connect_focuser(
+    state: AppState,
+    req: ConnectRequest,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let driver_type = match req.driver.as_str() {
+        "alpaca" => FocuserDriver::Alpaca,
+        "indi" => FocuserDriver::Indi,
+        "moonlite" => FocuserDriver::Moonlite,
+        "usb" | "usb_serial" => FocuserDriver::UsbSerial,
+        "sim" | "simulator" => FocuserDriver::Simulator,
+        _ => {
+            tracing::warn!("Unsupported focuser driver: {}", req.driver);
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    };
+    let option = req.option.unwrap_or_else(|| "auto".to_string());
+
+    let mut focuser = Focuser::new(driver_type).map_err(|e| {
+        tracing::error!("Failed to create focuser interface: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    focuser.connect_with_option(&option).map_err(|e| {
+        tracing::error!("Failed to connect focuser: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let drivers = focuser.list_drivers().unwrap_or_default();
+    *state.focuser_name.lock().unwrap() = Some(format!("{driver_type:?} focuser"));
+    *state.focuser.lock().unwrap() = Some(focuser);
+
+    Ok(Json(serde_json::json!({
+        "status": "connected",
+        "equipment_type": "focuser",
+        "driver": req.driver,
+        "option": option,
+        "available_drivers": drivers,
+    })))
+}
+
 pub async fn disconnect_equipment(
     State(state): State<AppState>,
 ) -> Result<StatusCode, StatusCode> {
@@ -171,6 +314,10 @@ pub async fn disconnect_equipment(
     *state.camera.lock().unwrap() = None;
     *state.camera_name.lock().unwrap() = None;
     *state.camera_driver.lock().unwrap() = None;
+    *state.mount.lock().unwrap() = None;
+    *state.mount_name.lock().unwrap() = None;
+    *state.focuser.lock().unwrap() = None;
+    *state.focuser_name.lock().unwrap() = None;
 
     Ok(StatusCode::OK)
 }

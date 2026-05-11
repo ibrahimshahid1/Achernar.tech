@@ -193,7 +193,7 @@ export class LocalClient implements TelescopeClient {
                 }
             };
 
-            ws.onerror = (event) => {
+            ws.onerror = (_event) => {
                 const error = new Error('WebSocket error');
                 onError?.(error);
                 reject(error);
@@ -396,7 +396,7 @@ export class CloudClient implements TelescopeClient {
                 }
             };
 
-            ws.onerror = (event) => {
+            ws.onerror = (_event) => {
                 const error = new Error('WebSocket error');
                 onError?.(error);
                 reject(error);

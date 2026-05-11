@@ -1,5 +1,7 @@
-use axum::{http::StatusCode, Json};
+use axum::{extract::State, http::StatusCode, Json};
 use serde::Deserialize;
+
+use crate::{hardware::mount::EqCoord, state::AppState};
 
 #[derive(Debug, Deserialize)]
 pub struct SlewRequest {
@@ -17,38 +19,80 @@ pub struct TrackingRequest {
     pub enabled: bool,
 }
 
-pub async fn slew(Json(req): Json<SlewRequest>) -> Result<StatusCode, StatusCode> {
+pub async fn slew(
+    State(state): State<AppState>,
+    Json(req): Json<SlewRequest>,
+) -> Result<StatusCode, StatusCode> {
     tracing::info!("Slew requested: RA={}, Dec={}", req.ra, req.dec);
-    // TODO: Wire to OLS mount driver when mount bridge is implemented
+    let mount = state.mount.lock().unwrap();
+    let mount = mount.as_ref().ok_or(StatusCode::PRECONDITION_FAILED)?;
+    mount
+        .goto(EqCoord {
+            ra: req.ra,
+            dec: req.dec,
+        })
+        .map_err(|e| {
+            tracing::error!("Mount slew failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     Ok(StatusCode::OK)
 }
 
 pub async fn slew_target(Json(req): Json<SlewTargetRequest>) -> Result<StatusCode, StatusCode> {
     tracing::info!("Slew to target: {}", req.target);
-    Ok(StatusCode::OK)
+    Err(StatusCode::NOT_IMPLEMENTED)
 }
 
-pub async fn sync(Json(req): Json<SlewRequest>) -> Result<StatusCode, StatusCode> {
+pub async fn sync(
+    State(state): State<AppState>,
+    Json(req): Json<SlewRequest>,
+) -> Result<StatusCode, StatusCode> {
     tracing::info!("Mount sync: RA={}, Dec={}", req.ra, req.dec);
+    let mount = state.mount.lock().unwrap();
+    let mount = mount.as_ref().ok_or(StatusCode::PRECONDITION_FAILED)?;
+    mount
+        .sync(EqCoord {
+            ra: req.ra,
+            dec: req.dec,
+        })
+        .map_err(|e| {
+            tracing::error!("Mount sync failed: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
     Ok(StatusCode::OK)
 }
 
 pub async fn park() -> Result<StatusCode, StatusCode> {
     tracing::info!("Park requested");
-    Ok(StatusCode::OK)
+    Err(StatusCode::NOT_IMPLEMENTED)
 }
 
 pub async fn unpark() -> Result<StatusCode, StatusCode> {
     tracing::info!("Unpark requested");
-    Ok(StatusCode::OK)
+    Err(StatusCode::NOT_IMPLEMENTED)
 }
 
-pub async fn abort() -> Result<StatusCode, StatusCode> {
+pub async fn abort(State(state): State<AppState>) -> Result<StatusCode, StatusCode> {
     tracing::info!("Mount abort requested");
+    let mount = state.mount.lock().unwrap();
+    let mount = mount.as_ref().ok_or(StatusCode::PRECONDITION_FAILED)?;
+    mount.stop().map_err(|e| {
+        tracing::error!("Mount abort failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     Ok(StatusCode::OK)
 }
 
-pub async fn set_tracking(Json(req): Json<TrackingRequest>) -> Result<StatusCode, StatusCode> {
+pub async fn set_tracking(
+    State(state): State<AppState>,
+    Json(req): Json<TrackingRequest>,
+) -> Result<StatusCode, StatusCode> {
     tracing::info!("Set tracking: {}", req.enabled);
+    let mount = state.mount.lock().unwrap();
+    let mount = mount.as_ref().ok_or(StatusCode::PRECONDITION_FAILED)?;
+    mount.set_tracking(req.enabled).map_err(|e| {
+        tracing::error!("Set tracking failed: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     Ok(StatusCode::OK)
 }

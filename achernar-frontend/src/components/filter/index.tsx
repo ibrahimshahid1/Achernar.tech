@@ -1,5 +1,3 @@
-import React from "react";
-
 /** Filter wheel position and control. */
 export function FilterWheelControl() {
     return <div id="filter-wheel-control">Filter Wheel Control — stub</div>;

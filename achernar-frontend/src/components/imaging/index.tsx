@@ -1,5 +1,3 @@
-import React from "react";
-
 /** MJPEG / WebSocket live view display. */
 export function LiveView() {
     return <div id="live-view">Live View — stub</div>;

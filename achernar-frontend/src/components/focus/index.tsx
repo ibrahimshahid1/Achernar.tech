@@ -1,5 +1,3 @@
-import React from "react";
-
 /** Focus subsystem status display. */
 export function FocusStatus() {
     return <div id="focus-status">Focus Status — stub</div>;

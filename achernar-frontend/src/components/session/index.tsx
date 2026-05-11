@@ -1,5 +1,3 @@
-import React from "react";
-
 /** Session summary card. */
 export function SessionSummary({ sessionId }: { sessionId: string }) {
     return <div id={`session-${sessionId}`}>Session Summary — stub</div>;
