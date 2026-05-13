@@ -50,7 +50,10 @@ impl CloudClientConfig {
     }
 
     fn gateway_url(&self, registration: &RegisterResponse) -> String {
-        let base = self.cloud_ws.as_deref().map(str::trim_end_matches);
+        let base = self
+            .cloud_ws
+            .as_deref()
+            .map(|url| url.trim_end_matches('/'));
         let url = if let Some(base) = base {
             if base.ends_with("/ws") {
                 format!("{base}/gateway/{}/", registration.daemon_id)

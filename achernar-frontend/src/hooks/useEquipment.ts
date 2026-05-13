@@ -29,7 +29,7 @@ function cardsFromDaemon(
             tags: [
                 status.mount.tracking ? 'tracking' : 'tracking off',
                 status.mount.parked ? 'parked' : 'unparked',
-                'OpenLiveStacker',
+                'Achernar daemon',
             ],
             metrics: [
                 { label: 'RA', value: ra.toFixed(2) },
@@ -61,7 +61,7 @@ function cardsFromDaemon(
             status: status.camera.connected === false ? 'offline' : 'nominal',
             summary: `${cameraState} at ${temperature.toFixed(1)} C`,
             source,
-            tags: [cameraState, status.camera.cooling ? 'cooling' : 'ambient', 'OpenLiveStacker'],
+            tags: [cameraState, status.camera.cooling ? 'cooling' : 'ambient', 'Achernar daemon'],
             metrics: [
                 { label: 'Mode', value: cameraState, tone: status.camera.streaming || status.camera.exposing ? 'good' : 'muted' },
                 { label: 'Temp', value: `${temperature.toFixed(1)} C` },
@@ -85,7 +85,7 @@ function cardsFromDaemon(
             status: status.focuser.connected === false ? 'offline' : 'nominal',
             summary: `Position ${status.focuser.position ?? 0}`,
             source,
-            tags: [status.focuser.moving ? 'moving' : 'idle', 'OpenLiveStacker'],
+            tags: [status.focuser.moving ? 'moving' : 'idle', 'Achernar daemon'],
             metrics: [
                 { label: 'Position', value: status.focuser.position ?? 0 },
                 { label: 'Motion', value: status.focuser.moving ? 'moving' : 'idle', tone: status.focuser.moving ? 'warn' : 'good' },

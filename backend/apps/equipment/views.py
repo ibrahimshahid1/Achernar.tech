@@ -164,7 +164,7 @@ def status_to_equipment(status_payload):
             'tags': [
                 'tracking' if mount.get('tracking') else 'tracking off',
                 'parked' if mount.get('parked') else 'unparked',
-                'OpenLiveStacker',
+                'Achernar daemon',
             ],
             'meta': {
                 'RA': round(float(mount.get('ra') or 0), 2),
@@ -173,7 +173,7 @@ def status_to_equipment(status_payload):
                 'source': 'django-daemon-relay',
             },
             'connected': True,
-            'driver': 'OpenLiveStacker',
+            'driver': 'Achernar daemon',
         })
 
     camera = status_payload.get('camera')
@@ -189,7 +189,7 @@ def status_to_equipment(status_payload):
             'name': camera.get('name') or 'Local Camera',
             'site': 'Local daemon',
             'status': 'nominal',
-            'tags': [camera_state, 'cooling' if camera.get('cooling') else 'ambient', 'OpenLiveStacker'],
+            'tags': [camera_state, 'cooling' if camera.get('cooling') else 'ambient', 'Achernar daemon'],
             'meta': {
                 'Temp': f'{float(camera.get("temperature") or 0):.1f} C',
                 'Cooling': bool(camera.get('cooling')),
@@ -197,7 +197,7 @@ def status_to_equipment(status_payload):
                 'source': 'django-daemon-relay',
             },
             'connected': True,
-            'driver': 'OpenLiveStacker',
+            'driver': 'Achernar daemon',
         })
 
     focuser = status_payload.get('focuser')
@@ -208,14 +208,14 @@ def status_to_equipment(status_payload):
             'name': focuser.get('name') or 'Local Focuser',
             'site': 'Local daemon',
             'status': 'nominal',
-            'tags': ['moving' if focuser.get('moving') else 'idle', 'OpenLiveStacker'],
+            'tags': ['moving' if focuser.get('moving') else 'idle', 'Achernar daemon'],
             'meta': {
                 'Position': int(focuser.get('position') or 0),
                 'Moving': bool(focuser.get('moving')),
                 'source': 'django-daemon-relay',
             },
             'connected': True,
-            'driver': 'OpenLiveStacker',
+            'driver': 'Achernar daemon',
         })
 
     return cards
