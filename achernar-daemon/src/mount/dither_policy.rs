@@ -14,12 +14,7 @@ pub struct DitherParams {
 pub struct DitherPolicy;
 
 impl DitherPolicy {
-    pub fn predict_dither(
-        &self,
-        _seeing: f64,
-        _guide_rms: f64,
-        _pixel_scale: f64,
-    ) -> DitherParams {
+    pub fn predict_dither(&self, _seeing: f64, _guide_rms: f64, _pixel_scale: f64) -> DitherParams {
         todo!("Implement DitherPolicyMLP inference — Section 8.3 M-2")
     }
 }

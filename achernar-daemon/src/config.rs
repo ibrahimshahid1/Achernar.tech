@@ -261,14 +261,16 @@ impl Default for TelemetryConfig {
 impl AchernarConfig {
     /// Load config from achernar.toml, falling back to defaults.
     pub fn load() -> crate::error::Result<Self> {
-        let config_path = std::env::var("ACHERNAR_CONFIG")
-            .unwrap_or_else(|_| "achernar.toml".to_string());
+        let config_path =
+            std::env::var("ACHERNAR_CONFIG").unwrap_or_else(|_| "achernar.toml".to_string());
 
         if std::path::Path::new(&config_path).exists() {
-            let content = std::fs::read_to_string(&config_path)
-                .map_err(|e| crate::error::AchernarError::Other(format!("Failed to read config: {}", e)))?;
-            toml::from_str(&content)
-                .map_err(|e| crate::error::AchernarError::Other(format!("Failed to parse config: {}", e)))
+            let content = std::fs::read_to_string(&config_path).map_err(|e| {
+                crate::error::AchernarError::Other(format!("Failed to read config: {}", e))
+            })?;
+            toml::from_str(&content).map_err(|e| {
+                crate::error::AchernarError::Other(format!("Failed to parse config: {}", e))
+            })
         } else {
             tracing::info!("No config file found at {}, using defaults", config_path);
             Ok(Self::default())
@@ -291,15 +293,39 @@ impl Default for AchernarConfig {
 }
 
 // Default value functions
-fn default_port() -> u16 { 3030 }
-fn default_log_level() -> String { "info".to_string() }
-fn default_step_size() -> i32 { 50 }
-fn default_samples_per_position() -> u32 { 3 }
-fn default_settle_ms() -> u64 { 500 }
-fn default_max_position() -> i32 { 50000 }
-fn default_max_step_single() -> i32 { 500 }
-fn default_max_total_travel() -> i32 { 5000 }
-fn default_min_confidence() -> f64 { 0.6 }
-fn default_max_failed() -> u32 { 3 }
-fn default_max_ha() -> f64 { 5.5 }
-fn default_db_path() -> String { "achernar.db".to_string() }
+fn default_port() -> u16 {
+    3030
+}
+fn default_log_level() -> String {
+    "info".to_string()
+}
+fn default_step_size() -> i32 {
+    50
+}
+fn default_samples_per_position() -> u32 {
+    3
+}
+fn default_settle_ms() -> u64 {
+    500
+}
+fn default_max_position() -> i32 {
+    50000
+}
+fn default_max_step_single() -> i32 {
+    500
+}
+fn default_max_total_travel() -> i32 {
+    5000
+}
+fn default_min_confidence() -> f64 {
+    0.6
+}
+fn default_max_failed() -> u32 {
+    3
+}
+fn default_max_ha() -> f64 {
+    5.5
+}
+fn default_db_path() -> String {
+    "achernar.db".to_string()
+}

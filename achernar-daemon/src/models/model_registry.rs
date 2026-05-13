@@ -46,7 +46,10 @@ impl ModelRegistry {
     /// Get the ONNX model path for a specific model.
     pub fn model_path(&self, model_name: &str) -> Option<PathBuf> {
         self.models.get(model_name).map(|m| {
-            self.base_path.join(model_name).join(&m.version).join("model.onnx")
+            self.base_path
+                .join(model_name)
+                .join(&m.version)
+                .join("model.onnx")
         })
     }
 

@@ -67,11 +67,11 @@ pub enum SlewDirection {
 impl SlewDirection {
     fn to_ols(self) -> ols_ffi::OlsMountSlew {
         match self {
-            SlewDirection::Stop  => ols_ffi::OlsMountSlew::Stop,
+            SlewDirection::Stop => ols_ffi::OlsMountSlew::Stop,
             SlewDirection::North => ols_ffi::OlsMountSlew::N,
             SlewDirection::South => ols_ffi::OlsMountSlew::S,
-            SlewDirection::West  => ols_ffi::OlsMountSlew::W,
-            SlewDirection::East  => ols_ffi::OlsMountSlew::E,
+            SlewDirection::West => ols_ffi::OlsMountSlew::W,
+            SlewDirection::East => ols_ffi::OlsMountSlew::E,
         }
     }
 }
@@ -122,26 +122,36 @@ impl Mount {
     pub fn new(driver: MountDriver) -> crate::error::Result<Self> {
         let mut handle: *mut ols_ffi::OlsMountInterface = std::ptr::null_mut();
         let rc = unsafe { ols_ffi::ols_mount_interface_create(&mut handle) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to create mount interface: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!(
+                "Failed to create mount interface: {e}"
+            ))
+        })?;
 
         info!(driver = ?driver, "Created mount interface");
-        Ok(Self { handle, driver_type: driver })
+        Ok(Self {
+            handle,
+            driver_type: driver,
+        })
     }
 
     /// List available mount drivers.
     pub fn list_drivers(&self) -> crate::error::Result<Vec<MountDriverInfo>> {
-        let mut infos = vec![ols_ffi::OlsMountDriverInfo {
-            name: [0i8; 128],
-            option: [0i8; 128],
-            has_option: 0,
-        }; 16];
+        let mut infos = vec![
+            ols_ffi::OlsMountDriverInfo {
+                name: [0i8; 128],
+                option: [0i8; 128],
+                has_option: 0,
+            };
+            16
+        ];
         let mut count: i32 = 0;
         let rc = unsafe {
             ols_ffi::ols_mount_driver_list(self.handle, infos.as_mut_ptr(), 16, &mut count)
         };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to list mount drivers: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to list mount drivers: {e}"))
+        })?;
 
         let result: Vec<MountDriverInfo> = infos[..count as usize]
             .iter()
@@ -171,28 +181,33 @@ impl Mount {
 
     /// Connect to the mount with a specific driver option (e.g., Alpaca URL).
     pub fn connect_with_option(&mut self, option: &str) -> crate::error::Result<()> {
-        let driver_name = CString::new(self.driver_type.ols_name())
-            .map_err(|_| crate::error::HardwareError::Communication("Invalid driver name".into()))?;
-        let option_c = CString::new(option)
-            .map_err(|_| crate::error::HardwareError::Communication("Invalid option string".into()))?;
+        let driver_name = CString::new(self.driver_type.ols_name()).map_err(|_| {
+            crate::error::HardwareError::Communication("Invalid driver name".into())
+        })?;
+        let option_c = CString::new(option).map_err(|_| {
+            crate::error::HardwareError::Communication("Invalid option string".into())
+        })?;
 
         // Load driver
         info!(driver = ?self.driver_type, option = option, "Loading mount driver");
         let rc = unsafe {
             ols_ffi::ols_mount_load_driver(self.handle, driver_name.as_ptr(), option_c.as_ptr())
         };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to load mount driver: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to load mount driver: {e}"))
+        })?;
 
         // Load mount
         let rc = unsafe { ols_ffi::ols_mount_load_mount(self.handle) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to load mount: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to load mount: {e}"))
+        })?;
 
         // Connect
         let rc = unsafe { ols_ffi::ols_mount_connect(self.handle, 0) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to connect mount: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to connect mount: {e}"))
+        })?;
 
         info!("Mount connected successfully");
         Ok(())
@@ -207,17 +222,22 @@ impl Mount {
     pub fn get_position(&self) -> crate::error::Result<EqCoord> {
         let mut coord = ols_ffi::OlsEqCoord { ra: 0.0, dec: 0.0 };
         let rc = unsafe { ols_ffi::ols_mount_get_current(self.handle, &mut coord) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to get position: {e}")))?;
-        Ok(EqCoord { ra: coord.ra, dec: coord.dec })
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to get position: {e}"))
+        })?;
+        Ok(EqCoord {
+            ra: coord.ra,
+            dec: coord.dec,
+        })
     }
 
     /// Slew to target equatorial coordinates (GoTo).
     pub fn goto(&self, target: EqCoord) -> crate::error::Result<()> {
         info!(ra = target.ra, dec = target.dec, "Mount GoTo");
         let rc = unsafe { ols_ffi::ols_mount_goto(self.handle, target.ra, target.dec) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to goto: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to goto: {e}"))
+        })?;
         Ok(())
     }
 
@@ -225,18 +245,18 @@ impl Mount {
     pub fn sync(&self, coord: EqCoord) -> crate::error::Result<()> {
         info!(ra = coord.ra, dec = coord.dec, "Mount Sync");
         let rc = unsafe { ols_ffi::ols_mount_sync(self.handle, coord.ra, coord.dec) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to sync: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to sync: {e}"))
+        })?;
         Ok(())
     }
 
     /// Manual slew in a direction at a given speed.
     pub fn slew(&self, direction: SlewDirection, speed: i32) -> crate::error::Result<()> {
-        let rc = unsafe {
-            ols_ffi::ols_mount_slew(self.handle, direction.to_ols(), speed)
-        };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to slew: {e}")))?;
+        let rc = unsafe { ols_ffi::ols_mount_slew(self.handle, direction.to_ols(), speed) };
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to slew: {e}"))
+        })?;
         Ok(())
     }
 
@@ -249,8 +269,9 @@ impl Mount {
     pub fn get_tracking_mode(&self) -> crate::error::Result<TrackingMode> {
         let mut mode = ols_ffi::OlsMountTracking::Sidereal;
         let rc = unsafe { ols_ffi::ols_mount_get_tracking(self.handle, &mut mode) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to get tracking: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to get tracking: {e}"))
+        })?;
         Ok(match mode {
             ols_ffi::OlsMountTracking::Sidereal => TrackingMode::Sidereal,
             ols_ffi::OlsMountTracking::Solar => TrackingMode::Solar,
@@ -262,8 +283,9 @@ impl Mount {
     pub fn is_tracking(&self) -> crate::error::Result<bool> {
         let mut state: i32 = 0;
         let rc = unsafe { ols_ffi::ols_mount_get_tracking_state(self.handle, &mut state) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to get tracking state: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to get tracking state: {e}"))
+        })?;
         Ok(state > 0)
     }
 
@@ -272,8 +294,9 @@ impl Mount {
         let rc = unsafe {
             ols_ffi::ols_mount_set_tracking_state(self.handle, if enabled { 1 } else { 0 })
         };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to set tracking: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to set tracking: {e}"))
+        })?;
         Ok(())
     }
 
@@ -285,16 +308,18 @@ impl Mount {
             TrackingMode::Lunar => ols_ffi::OlsMountTracking::Lunar,
         };
         let rc = unsafe { ols_ffi::ols_mount_set_tracking_mode(self.handle, ols_mode) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to set tracking mode: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to set tracking mode: {e}"))
+        })?;
         Ok(())
     }
 
     /// Set site geographic coordinates.
     pub fn set_location(&self, lat: f64, lon: f64) -> crate::error::Result<()> {
         let rc = unsafe { ols_ffi::ols_mount_set_lat_lon(self.handle, lat, lon) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to set location: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to set location: {e}"))
+        })?;
         Ok(())
     }
 
@@ -303,16 +328,18 @@ impl Mount {
         let mut lat: f64 = 0.0;
         let mut lon: f64 = 0.0;
         let rc = unsafe { ols_ffi::ols_mount_get_lat_lon(self.handle, &mut lat, &mut lon) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to get location: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to get location: {e}"))
+        })?;
         Ok((lat, lon))
     }
 
     /// Send pulse guide corrections (in milliseconds).
     pub fn pulse_guide(&self, ns_ms: f32, we_ms: f32) -> crate::error::Result<()> {
         let rc = unsafe { ols_ffi::ols_mount_pulse_guide(self.handle, ns_ms, we_ms) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to pulse guide: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to pulse guide: {e}"))
+        })?;
         Ok(())
     }
 
@@ -323,11 +350,15 @@ impl Mount {
         let mut we_rate: f32 = 0.0;
         let rc = unsafe {
             ols_ffi::ols_mount_pulse_guide_supported(
-                self.handle, &mut supported, &mut ns_rate, &mut we_rate,
+                self.handle,
+                &mut supported,
+                &mut ns_rate,
+                &mut we_rate,
             )
         };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to check pulse guide: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to check pulse guide: {e}"))
+        })?;
         Ok((supported != 0, ns_rate, we_rate))
     }
 
@@ -336,8 +367,9 @@ impl Mount {
         let mut current: i32 = 0;
         let mut count: i32 = 0;
         let rc = unsafe { ols_ffi::ols_mount_get_slew_rate(self.handle, &mut current, &mut count) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to get slew rate: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to get slew rate: {e}"))
+        })?;
         Ok((current, count))
     }
 
@@ -347,9 +379,21 @@ impl Mount {
         let driver_loaded = unsafe { ols_ffi::ols_mount_driver_loaded(self.handle) != 0 };
         let mount_loaded = unsafe { ols_ffi::ols_mount_is_loaded(self.handle) != 0 };
 
-        let position = if connected { self.get_position().ok() } else { None };
-        let tracking = if connected { self.is_tracking().ok() } else { None };
-        let tracking_mode = if connected { self.get_tracking_mode().ok() } else { None };
+        let position = if connected {
+            self.get_position().ok()
+        } else {
+            None
+        };
+        let tracking = if connected {
+            self.is_tracking().ok()
+        } else {
+            None
+        };
+        let tracking_mode = if connected {
+            self.get_tracking_mode().ok()
+        } else {
+            None
+        };
 
         MountStatus {
             connected,
@@ -365,8 +409,9 @@ impl Mount {
     pub fn shutdown(&self) -> crate::error::Result<()> {
         info!("Shutting down mount");
         let rc = unsafe { ols_ffi::ols_mount_shutdown(self.handle) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to shutdown mount: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to shutdown mount: {e}"))
+        })?;
         Ok(())
     }
 }

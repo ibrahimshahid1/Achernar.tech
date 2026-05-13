@@ -2,6 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import SidePanel from "../components/SidePanel";
 import EquipmentCard from "../components/EquipmentCard";
 import MjpegLiveView from "../components/MjpegLiveView";
+import { cloudApi } from "../api/cloud";
+import { daemonApi as localDaemonApi } from "../lib/api/daemon";
 import { useTelemetrySocket } from "../lib/hooks/useTelemetrySocket";
 import { useConnectedEquipment } from "../hooks/useEquipment";
 import { getHardwareTransport } from "../lib/runtime";
@@ -23,6 +25,7 @@ export default function Dashboard() {
     const [active, setActive] = useState<"all" | EquipmentType>("all");
     const [site, setSite] = useState<string>("all");
     const [query, setQuery] = useState("");
+    const [relayMessage, setRelayMessage] = useState("");
     const hardwareTransport = getHardwareTransport();
 
     // Fetch connected equipment directly from the local daemon.
@@ -46,6 +49,27 @@ export default function Dashboard() {
     useEffect(() => {
         // Keep it "dashboard-like": no heavy logic in first template version.
     }, []);
+
+    const handleEquipmentAction = async (action: string, payload: Record<string, unknown> = {}) => {
+        setRelayMessage(`Sending ${action}...`);
+        try {
+            const result = hardwareTransport === "django"
+                ? await cloudApi.relayCommand(action, payload)
+                : await localDaemonApi.relayCommand(action, payload);
+
+            if (result.pending) {
+                setRelayMessage(`${action} queued on daemon`);
+                return;
+            }
+            if (result.ok === false) {
+                setRelayMessage(result.error ?? `${action} failed`);
+                return;
+            }
+            setRelayMessage(`${action} accepted`);
+        } catch (error) {
+            setRelayMessage(error instanceof Error ? error.message : `${action} failed`);
+        }
+    };
 
     return (
         <main className="layout">
@@ -95,6 +119,13 @@ export default function Dashboard() {
                         />
                     </div>
 
+                    {relayMessage && (
+                        <div className="toolbar-block">
+                            <div className="filter-label">Relay</div>
+                            <div className="relay-status">{relayMessage}</div>
+                        </div>
+                    )}
+
                     <div className="toolbar-spacer" />
 
                     <div className="toolbar-block wide">
@@ -138,6 +169,7 @@ export default function Dashboard() {
                         <EquipmentCard
                             key={c.id}
                             model={c}
+                            onAction={handleEquipmentAction}
                         />
                     ))}
                 </div>

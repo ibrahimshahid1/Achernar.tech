@@ -12,7 +12,10 @@ pub struct VisionLoop {
 impl VisionLoop {
     pub fn new(rate_hz: f64) -> Self {
         let (tx, _) = broadcast::channel(64);
-        Self { publisher: tx, rate_hz }
+        Self {
+            publisher: tx,
+            rate_hz,
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<SharedObservation> {

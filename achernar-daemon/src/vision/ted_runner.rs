@@ -19,7 +19,10 @@ pub struct TedRunner {
 
 impl TedRunner {
     pub fn new(model_path: Option<String>) -> Self {
-        Self { model_path, elongation_threshold: 1.3 }
+        Self {
+            model_path,
+            elongation_threshold: 1.3,
+        }
     }
 
     /// Classical SEP-based trailing detection.

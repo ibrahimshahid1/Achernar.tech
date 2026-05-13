@@ -19,7 +19,10 @@ pub struct EnvironmentSensors {
 
 impl EnvironmentSensors {
     pub fn new(port: Option<String>) -> Self {
-        Self { port, connected: false }
+        Self {
+            port,
+            connected: false,
+        }
     }
 
     pub async fn connect(&mut self) -> crate::error::Result<()> {

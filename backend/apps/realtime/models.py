@@ -21,7 +21,13 @@ class DaemonConnection(models.Model):
     is identified by a unique UUID.
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='daemon_connections')
+    user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name='daemon_connections',
+        null=True,
+        blank=True,
+    )
     
     # Connection metadata
     daemon_version = models.CharField(max_length=50, blank=True)
@@ -50,7 +56,8 @@ class DaemonConnection(models.Model):
     
     def __str__(self):
         status = "Connected" if self.is_connected else "Disconnected"
-        return f"{self.user.username} - {self.hardware_id} ({status})"
+        owner = self.user.username if self.user else "dev-relay"
+        return f"{owner} - {self.hardware_id} ({status})"
     
     def mark_connected(self):
         """Mark daemon as connected"""
@@ -112,6 +119,7 @@ class TelemetrySnapshot(models.Model):
     # Telemetry data (JSON)
     mount_state = models.JSONField(default=dict, blank=True)
     camera_state = models.JSONField(default=dict, blank=True)
+    focuser_state = models.JSONField(default=dict, blank=True)
     guiding_state = models.JSONField(default=dict, blank=True)
     ai_metrics = models.JSONField(default=dict, blank=True)
     

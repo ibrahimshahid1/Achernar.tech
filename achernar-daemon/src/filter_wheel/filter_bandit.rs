@@ -19,13 +19,16 @@ pub struct FilterBandit {
 
 impl FilterBandit {
     pub fn new(filter_names: &[String], alpha: f64) -> Self {
-        let arms = filter_names.iter().map(|name| FilterBanditArm {
-            filter_name: name.clone(),
-            estimated_reward: 0.0,
-            uncertainty: 1.0,
-            ucb_score: f64::MAX,
-            times_pulled: 0,
-        }).collect();
+        let arms = filter_names
+            .iter()
+            .map(|name| FilterBanditArm {
+                filter_name: name.clone(),
+                estimated_reward: 0.0,
+                uncertainty: 1.0,
+                ucb_score: f64::MAX,
+                times_pulled: 0,
+            })
+            .collect();
         Self { alpha, arms }
     }
 

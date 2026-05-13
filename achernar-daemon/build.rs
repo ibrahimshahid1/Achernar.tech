@@ -115,7 +115,8 @@ fn main() {
         let asi_lib = asi_sdk.join("lib/x64");
         if asi_lib.exists() {
             #[cfg(target_os = "macos")]
-            let link_dir = prepare_macos_dylib(&asi_lib, "ASICamera2", std::path::Path::new(&out_dir));
+            let link_dir =
+                prepare_macos_dylib(&asi_lib, "ASICamera2", std::path::Path::new(&out_dir));
             #[cfg(target_os = "linux")]
             let link_dir = asi_lib.clone();
 
@@ -137,7 +138,8 @@ fn main() {
         let svb_lib = svb_sdk.join("lib/x64");
         if svb_lib.exists() {
             #[cfg(target_os = "macos")]
-            let link_dir = prepare_macos_dylib(&svb_lib, "SVBCameraSDK", std::path::Path::new(&out_dir));
+            let link_dir =
+                prepare_macos_dylib(&svb_lib, "SVBCameraSDK", std::path::Path::new(&out_dir));
             #[cfg(target_os = "linux")]
             let link_dir = svb_lib.clone();
 
@@ -156,7 +158,8 @@ fn main() {
         let toup_lib = toup_sdk.join("linux/x64");
         if toup_lib.exists() {
             #[cfg(target_os = "macos")]
-            let link_dir = prepare_macos_dylib(&toup_lib, "toupcam", std::path::Path::new(&out_dir));
+            let link_dir =
+                prepare_macos_dylib(&toup_lib, "toupcam", std::path::Path::new(&out_dir));
             #[cfg(target_os = "linux")]
             let link_dir = toup_lib.clone();
 
@@ -250,21 +253,25 @@ fn find_file_in_dir(dir: &std::path::Path, prefix: &str) -> Option<PathBuf> {
 /// We copy the library to OUT_DIR and patch its ID to `@rpath/libFoo.dylib` so the built executable
 /// uses an rpath-based lookup, avoiding crash upon `cargo run`.
 #[cfg(target_os = "macos")]
-fn prepare_macos_dylib(sdk_lib_dir: &std::path::Path, lib_name: &str, out_dir: &std::path::Path) -> PathBuf {
+fn prepare_macos_dylib(
+    sdk_lib_dir: &std::path::Path,
+    lib_name: &str,
+    out_dir: &std::path::Path,
+) -> PathBuf {
     let dylib_name = format!("lib{}.dylib", lib_name);
     let src_path = sdk_lib_dir.join(&dylib_name);
     if src_path.exists() {
         let dest_path = out_dir.join(&dylib_name);
-        
+
         // Copy the dylib
         let _ = std::fs::copy(&src_path, &dest_path);
-        
+
         // Change the id to @rpath
         let new_id = format!("@rpath/{}", dylib_name);
         let _ = Command::new("install_name_tool")
             .args(["-id", &new_id, dest_path.to_str().unwrap()])
             .status();
-        
+
         return out_dir.to_path_buf();
     }
     sdk_lib_dir.to_path_buf()

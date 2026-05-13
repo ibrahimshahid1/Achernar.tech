@@ -12,7 +12,11 @@ pub enum SafetyVerdict {
     /// Action is safe to execute
     Approved,
     /// Action modified to stay within limits
-    Modified { original: i32, clamped: i32, reason: String },
+    Modified {
+        original: i32,
+        clamped: i32,
+        reason: String,
+    },
     /// Action rejected entirely
     Rejected { reason: String },
 }
@@ -78,10 +82,8 @@ impl FocusSafetyGuard {
         }
 
         // Clamp single step size
-        let clamped_step = proposed_step.clamp(
-            -self.config.max_step_single,
-            self.config.max_step_single,
-        );
+        let clamped_step =
+            proposed_step.clamp(-self.config.max_step_single, self.config.max_step_single);
 
         // Check target position bounds
         let target = current_position + clamped_step;
@@ -144,13 +146,19 @@ impl MountSafetyGuard {
     pub fn validate_slew(&self, alt: f64, hour_angle: f64) -> SafetyVerdict {
         if alt < self.config.min_altitude {
             return SafetyVerdict::Rejected {
-                reason: format!("Altitude {:.1}° below minimum {:.1}°", alt, self.config.min_altitude),
+                reason: format!(
+                    "Altitude {:.1}° below minimum {:.1}°",
+                    alt, self.config.min_altitude
+                ),
             };
         }
 
         if hour_angle.abs() > self.config.max_hour_angle {
             return SafetyVerdict::Rejected {
-                reason: format!("Hour angle {:.2}h exceeds limit {:.2}h", hour_angle, self.config.max_hour_angle),
+                reason: format!(
+                    "Hour angle {:.2}h exceeds limit {:.2}h",
+                    hour_angle, self.config.max_hour_angle
+                ),
             };
         }
 

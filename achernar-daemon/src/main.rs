@@ -5,26 +5,29 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use tokio::time::{interval, Duration};
 use tower_http::cors::CorsLayer;
 use tracing::{info, Level};
 
-mod hardware;
-mod processing;
 mod ai;
 mod api;
-mod state;
-mod error;
+mod cloud_client;
 mod config;
-mod telemetry_log;
 mod control;
-mod focus;
+mod error;
 mod filter_wheel;
-mod mount;
-mod vision;
+mod focus;
+mod hardware;
 mod models;
+mod mount;
+mod processing;
+mod relay_commands;
+mod state;
 mod storage;
+mod telemetry;
+mod telemetry_log;
+mod vision;
 
 use state::AppState;
 
@@ -46,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create shared application state
     let app_state = AppState::new();
+    cloud_client::spawn_if_configured(app_state.clone());
 
     // Build API routes
     let api_v1 = Router::new()
@@ -69,7 +73,9 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(3030);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let host = std::env::var("ACHERNAR_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let ip: IpAddr = host.parse()?;
+    let addr = SocketAddr::from((ip, port));
     info!("Daemon listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -111,10 +117,7 @@ fn focuser_routes() -> Router<AppState> {
 }
 
 /// WebSocket handler for telemetry — now sends real hardware state
-async fn telemetry_ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> Response {
+async fn telemetry_ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| handle_telemetry_socket(socket, state))
 }
 
@@ -125,93 +128,7 @@ async fn handle_telemetry_socket(mut socket: WebSocket, state: AppState) {
     loop {
         ticker.tick().await;
 
-        // Build telemetry from real state
-        let camera_status = {
-            let name = state.camera_name.lock().unwrap();
-            let streaming = state.streaming.lock().unwrap();
-            let frame = state.latest_frame.lock().unwrap();
-            let frame_info = frame.as_ref().map(|f| {
-                serde_json::json!({
-                    "frame_counter": f.frame_counter,
-                    "width": f.width,
-                    "height": f.height,
-                    "format": format!("{:?}", f.format),
-                })
-            });
-            serde_json::json!({
-                "connected": name.is_some(),
-                "name": name.as_deref().unwrap_or("none"),
-                "streaming": *streaming,
-                "latest_frame": frame_info,
-            })
-        };
-
-        let mount_status = {
-            let mount = state.mount.lock().unwrap();
-            match mount.as_ref() {
-                Some(mount) => {
-                    let status = mount.status();
-                    let position = status.position;
-                    serde_json::json!({
-                        "ra": position.map(|p| p.ra).unwrap_or(0.0),
-                        "dec": position.map(|p| p.dec).unwrap_or(0.0),
-                        "pier_side": "unknown",
-                        "connected": status.connected,
-                        "tracking": status.tracking.unwrap_or(false),
-                    })
-                }
-                None => serde_json::json!({
-                    "ra": 0.0,
-                    "dec": 0.0,
-                    "pier_side": "unknown",
-                    "connected": false,
-                    "tracking": false,
-                }),
-            }
-        };
-
-        let focuser_status = {
-            let focuser = state.focuser.lock().unwrap();
-            match focuser.as_ref() {
-                Some(focuser) => {
-                    let status = focuser.status();
-                    serde_json::json!({
-                        "connected": status.connected,
-                        "position": status.position.unwrap_or(0),
-                        "moving": status.is_moving,
-                        "absolute": status.is_absolute,
-                        "max_range": status.max_range,
-                    })
-                }
-                None => serde_json::json!({
-                    "connected": false,
-                    "position": 0,
-                    "moving": false,
-                }),
-            }
-        };
-
-        let telemetry = serde_json::json!({
-            "type": "TELEMETRY_UPDATE",
-            "timestamp": chrono::Utc::now().timestamp(),
-            "payload": {
-                "camera": camera_status,
-                "mount": mount_status,
-                "focuser": focuser_status,
-                "guiding": {
-                    "rms_total": 0.0,
-                    "dx": 0.0,
-                    "dy": 0.0,
-                },
-                "ai": {
-                    "focus_hfr": 0.0,
-                    "cloud_prob": 0.0,
-                    "recommended_exposure": 0.0,
-                },
-            }
-        });
-
-        let telemetry_str = serde_json::to_string(&telemetry).unwrap_or_default();
+        let telemetry_str = crate::telemetry::telemetry_event(&state).to_string();
 
         if let Err(e) = socket.send(Message::Text(telemetry_str)).await {
             info!("Telemetry socket closed: {}", e);
@@ -221,10 +138,7 @@ async fn handle_telemetry_socket(mut socket: WebSocket, state: AppState) {
 }
 
 /// WebSocket handler for live view streaming — sends real frame data
-async fn camera_stream_ws(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> Response {
+async fn camera_stream_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| handle_stream_socket(socket, state))
 }
 

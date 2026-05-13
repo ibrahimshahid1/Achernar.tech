@@ -20,11 +20,21 @@ pub struct FilterWheel {
 
 impl FilterWheel {
     pub fn new(driver: FilterWheelDriver, filter_count: u32) -> Self {
-        Self { driver, position: 0, filter_count, connected: false, is_moving: false }
+        Self {
+            driver,
+            position: 0,
+            filter_count,
+            connected: false,
+            is_moving: false,
+        }
     }
 
-    pub fn position(&self) -> u32 { self.position }
-    pub fn is_connected(&self) -> bool { self.connected }
+    pub fn position(&self) -> u32 {
+        self.position
+    }
+    pub fn is_connected(&self) -> bool {
+        self.connected
+    }
 
     pub async fn connect(&mut self) -> crate::error::Result<()> {
         todo!("Connect to filter wheel via {:?}", self.driver)

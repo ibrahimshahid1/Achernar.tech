@@ -14,6 +14,9 @@ export interface ImagingSession {
 // UI-friendly subset of EquipmentState from daemon
 export interface EquipmentState {
     connected: boolean;
+    daemon_id?: string;
+    hardware_id?: string;
+    last_heartbeat?: string;
     mount?: {
         name?: string;
         connected?: boolean;
@@ -39,6 +42,25 @@ export interface EquipmentState {
         position: number;
         moving: boolean;
     };
+}
+
+export interface DaemonSummary {
+    id: string;
+    hardware_id: string;
+    daemon_version?: string;
+    site_name?: string;
+    is_connected: boolean;
+    last_heartbeat?: string;
+}
+
+export interface RelayCommandResult {
+    type?: "COMMAND_RESULT";
+    command_id?: string;
+    daemon_id?: string;
+    ok: boolean | null;
+    pending?: boolean;
+    payload?: Record<string, unknown>;
+    error?: string;
 }
 
 // Telemetry event per PDF websocket spec

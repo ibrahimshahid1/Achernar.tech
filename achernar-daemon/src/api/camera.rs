@@ -59,7 +59,10 @@ pub async fn start_stream(
     let fmt = &formats[0];
     tracing::info!(
         "Starting stream: {:?} {}x{} bin={}",
-        fmt.format, fmt.width, fmt.height, fmt.bin
+        fmt.format,
+        fmt.width,
+        fmt.height,
+        fmt.bin
     );
 
     camera.start_stream(fmt, frame_store).map_err(|e| {
@@ -89,10 +92,7 @@ pub async fn capture(
         let cam_lock = state.camera.lock().unwrap();
         if let Some(camera) = cam_lock.as_ref() {
             let exp_ms = params.exposure * 1000.0;
-            let _ = camera.set_parameter(
-                crate::hardware::ols_ffi::OlsCamOptionId::Exp,
-                exp_ms,
-            );
+            let _ = camera.set_parameter(crate::hardware::ols_ffi::OlsCamOptionId::Exp, exp_ms);
         }
     }
 
@@ -119,9 +119,7 @@ pub async fn capture(
     Ok(Json(image))
 }
 
-pub async fn abort(
-    State(state): State<AppState>,
-) -> Result<StatusCode, StatusCode> {
+pub async fn abort(State(state): State<AppState>) -> Result<StatusCode, StatusCode> {
     tracing::info!("Capture/stream abort requested");
 
     let mut cam_lock = state.camera.lock().unwrap();

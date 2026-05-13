@@ -28,7 +28,10 @@ pub struct FocusPolicy {
 
 impl FocusPolicy {
     pub fn new(use_ml: bool, fallback_step_size: i32) -> Self {
-        Self { use_ml, fallback_step_size }
+        Self {
+            use_ml,
+            fallback_step_size,
+        }
     }
 
     /// Determine the next focus action given classical and (optionally) ML outputs.

@@ -10,8 +10,10 @@ const TYPE_LABELS: Record<EquipmentCardModel["type"], string> = {
 
 export default function EquipmentCard({
     model,
+    onAction,
 }: {
     model: EquipmentCardModel;
+    onAction?: (action: string, payload?: Record<string, unknown>) => void;
 }) {
     const metrics: NonNullable<EquipmentCardModel["metrics"]> = model.metrics
         ?? Object.entries(model.meta ?? {}).map(([label, value]) => ({ label, value }));
@@ -49,6 +51,36 @@ export default function EquipmentCard({
                                 <strong>{String(metric.value)}</strong>
                             </div>
                         ))}
+                </div>
+            )}
+
+            {onAction && (
+                <div className="card-actions">
+                    {model.type === "camera" && (
+                        <button className="btn" type="button" onClick={() => onAction("camera.start_stream")}>
+                            Start Stream
+                        </button>
+                    )}
+                    {model.type === "mount" && (
+                        <>
+                            <button className="btn" type="button" onClick={() => onAction("mount.set_tracking", { enabled: true })}>
+                                Track
+                            </button>
+                            <button className="btn" type="button" onClick={() => onAction("mount.abort")}>
+                                Stop
+                            </button>
+                        </>
+                    )}
+                    {model.type === "focuser" && (
+                        <>
+                            <button className="btn" type="button" onClick={() => onAction("focuser.move_relative", { steps: -10 })}>
+                                -10
+                            </button>
+                            <button className="btn" type="button" onClick={() => onAction("focuser.move_relative", { steps: 10 })}>
+                                +10
+                            </button>
+                        </>
+                    )}
                 </div>
             )}
 

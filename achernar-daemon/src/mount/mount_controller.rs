@@ -27,10 +27,14 @@ pub struct MountController {
 
 impl MountController {
     pub fn new() -> Self {
-        Self { state: MountState::Idle }
+        Self {
+            state: MountState::Idle,
+        }
     }
 
-    pub fn state(&self) -> MountState { self.state }
+    pub fn state(&self) -> MountState {
+        self.state
+    }
 
     pub async fn slew(&mut self, _target: SlewTarget) -> crate::error::Result<()> {
         todo!("Implement slew with safety enforcement — Section 8.3")

@@ -24,7 +24,9 @@ pub struct PointingModel {
 
 impl PointingModel {
     pub fn new() -> Self {
-        Self { samples: Vec::new() }
+        Self {
+            samples: Vec::new(),
+        }
     }
 
     pub fn add_sample(&mut self, sample: PointingSample) {

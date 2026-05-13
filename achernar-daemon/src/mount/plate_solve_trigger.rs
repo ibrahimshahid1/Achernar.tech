@@ -32,7 +32,10 @@ impl PlateSolveTrigger {
         todo!("Implement plate solve trigger logic — Section 8.3 M-3")
     }
 
-    pub async fn trigger_solve(&mut self, _image_data: &[u8]) -> crate::error::Result<PlateSolveResult> {
+    pub async fn trigger_solve(
+        &mut self,
+        _image_data: &[u8],
+    ) -> crate::error::Result<PlateSolveResult> {
         todo!("Call plate solver and return result")
     }
 }

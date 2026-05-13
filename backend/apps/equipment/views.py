@@ -3,12 +3,23 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.permissions import AllowAny  # For now, no auth required for local testing
 from django.utils import timezone
+from asgiref.sync import async_to_sync
+from channels.layers import get_channel_layer
+from django.core.cache import cache
 import json
 import os
+import time
 import urllib.error
 import urllib.request
+import uuid
 from .models import ConnectedEquipment
 from .serializers import ConnectedEquipmentSerializer
+from apps.realtime.models import DaemonConnection, TelemetrySnapshot
+
+
+COMMAND_WAIT_SECONDS = 3.0
+COMMAND_POLL_SECONDS = 0.1
+COMMAND_RESULT_TTL_SECONDS = 60
 
 
 def daemon_api_base():
@@ -35,6 +46,108 @@ def post_daemon(path, payload=None, timeout=5):
     with urllib.request.urlopen(request, timeout=timeout) as response:
         body = response.read().decode('utf-8')
         return json.loads(body) if body else {}
+
+
+def command_result_key(command_id):
+    return f"achernar:command_result:{command_id}"
+
+
+def frame_preview_key(daemon_id):
+    return f"achernar:frame_preview:{daemon_id}"
+
+
+def active_daemon(daemon_id=None):
+    qs = DaemonConnection.objects.all().order_by('-last_heartbeat', '-connected_at', '-created_at')
+    if daemon_id:
+        return qs.filter(id=daemon_id).first()
+    return qs.filter(is_connected=True).first() or qs.first()
+
+
+def snapshot_to_status(daemon, snapshot=None):
+    snapshot = snapshot or TelemetrySnapshot.objects.filter(daemon=daemon).first()
+    payload = {
+        'connected': bool(daemon and daemon.is_connected),
+        'daemon_id': str(daemon.id) if daemon else None,
+        'hardware_id': daemon.hardware_id if daemon else None,
+        'last_heartbeat': daemon.last_heartbeat.isoformat() if daemon and daemon.last_heartbeat else None,
+        'camera': None,
+        'mount': None,
+        'focuser': None,
+        'guiding': {},
+        'ai': {},
+    }
+    if snapshot:
+        payload.update({
+            'camera': snapshot.camera_state or None,
+            'mount': snapshot.mount_state or None,
+            'focuser': snapshot.focuser_state or None,
+            'guiding': snapshot.guiding_state,
+            'ai': snapshot.ai_metrics,
+            'updated_at': snapshot.updated_at.isoformat(),
+        })
+    return payload
+
+
+def send_relay_command(daemon, action, payload=None, wait_seconds=COMMAND_WAIT_SECONDS):
+    if not daemon or not daemon.is_connected:
+        return {
+            'status_code': status.HTTP_503_SERVICE_UNAVAILABLE,
+            'body': {
+                'type': 'COMMAND_RESULT',
+                'ok': False,
+                'error': 'No connected daemon is available for relay commands.',
+            },
+        }
+
+    channel_layer = get_channel_layer()
+    if channel_layer is None:
+        return {
+            'status_code': status.HTTP_503_SERVICE_UNAVAILABLE,
+            'body': {
+                'type': 'COMMAND_RESULT',
+                'ok': False,
+                'error': 'Django Channels layer is not configured.',
+            },
+        }
+
+    command_id = str(uuid.uuid4())
+    cache.delete(command_result_key(command_id))
+    message = {
+        'type': 'COMMAND',
+        'command_id': command_id,
+        'action': action,
+        'payload': payload or {},
+    }
+    async_to_sync(channel_layer.group_send)(
+        f'daemon_{daemon.id}',
+        {
+            'type': 'command_relay',
+            'data': message,
+        },
+    )
+
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+    while time.monotonic() < deadline:
+        result = cache.get(command_result_key(command_id))
+        if result is not None:
+            result.setdefault('daemon_id', str(daemon.id))
+            return {
+                'status_code': status.HTTP_200_OK if result.get('ok') else status.HTTP_502_BAD_GATEWAY,
+                'body': result,
+            }
+        time.sleep(COMMAND_POLL_SECONDS)
+
+    cache.set(command_result_key(command_id), {'pending': True, 'command_id': command_id}, COMMAND_RESULT_TTL_SECONDS)
+    return {
+        'status_code': status.HTTP_202_ACCEPTED,
+        'body': {
+            'type': 'COMMAND_RESULT',
+            'command_id': command_id,
+            'daemon_id': str(daemon.id),
+            'ok': None,
+            'pending': True,
+        },
+    }
 
 
 def status_to_equipment(status_payload):
@@ -116,6 +229,25 @@ class ConnectedEquipmentViewSet(viewsets.ModelViewSet):
     queryset = ConnectedEquipment.objects.all()
     serializer_class = ConnectedEquipmentSerializer
     permission_classes = [AllowAny]  # TODO: Add proper auth later
+
+    @action(detail=False, methods=['get'], url_path='daemons')
+    def daemons(self, request):
+        """
+        GET /api/equipment/daemons/
+        Lists registered daemons for browser-side relay selection.
+        """
+        daemons = DaemonConnection.objects.all().order_by('-is_connected', '-last_heartbeat', '-created_at')
+        return Response([
+            {
+                'id': str(daemon.id),
+                'hardware_id': daemon.hardware_id,
+                'daemon_version': daemon.daemon_version,
+                'site_name': daemon.site_name,
+                'is_connected': daemon.is_connected,
+                'last_heartbeat': daemon.last_heartbeat.isoformat() if daemon.last_heartbeat else None,
+            }
+            for daemon in daemons
+        ])
     
     @action(detail=False, methods=['get'], url_path='connected')
     def connected(self, request):
@@ -124,6 +256,11 @@ class ConnectedEquipmentViewSet(viewsets.ModelViewSet):
         Returns currently connected equipment for dashboard display.
         This is the main endpoint the frontend will call.
         """
+        daemon = active_daemon(request.query_params.get('daemon_id'))
+        if daemon and daemon.is_connected:
+            return Response(status_to_equipment(snapshot_to_status(daemon)))
+
+        # Local development fallback when Django and daemon share a host.
         daemon_status = fetch_daemon_status()
         if daemon_status is not None:
             return Response(status_to_equipment(daemon_status))
@@ -139,10 +276,15 @@ class ConnectedEquipmentViewSet(viewsets.ModelViewSet):
         GET /api/equipment/daemon-status/
         Browser-facing relay to the local daemon status endpoint.
         """
+        daemon = active_daemon(request.query_params.get('daemon_id'))
+        if daemon and daemon.is_connected:
+            return Response(snapshot_to_status(daemon))
+
+        # Local development fallback when the reverse tunnel is not connected.
         daemon_status = fetch_daemon_status()
         if daemon_status is None:
             return Response(
-                {'status': 'offline', 'detail': 'Local daemon is not reachable from Django.'},
+                {'status': 'offline', 'detail': 'No connected daemon tunnel or localhost daemon is reachable.'},
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
         return Response(daemon_status)
@@ -153,8 +295,55 @@ class ConnectedEquipmentViewSet(viewsets.ModelViewSet):
         POST /api/equipment/camera/start-stream/
         Browser-facing command relay to the local daemon.
         """
+        daemon = active_daemon(request.data.get('daemon_id'))
+        if daemon and daemon.is_connected:
+            result = send_relay_command(daemon, 'camera.start_stream', request.data.get('payload', {}))
+            body = result['body']
+            if body.get('ok') and isinstance(body.get('payload'), dict):
+                return Response(body['payload'], status=result['status_code'])
+            return Response(body, status=result['status_code'])
+
+        return self._local_post_fallback('camera/stream/start', {})
+
+    @action(detail=False, methods=['post'], url_path='camera/snapshot')
+    def camera_snapshot(self, request):
+        """
+        POST /api/equipment/camera/snapshot/
+        Requests the daemon's latest low-rate preview frame through the relay.
+        """
+        daemon = active_daemon(request.data.get('daemon_id'))
+        if daemon and daemon.is_connected:
+            result = send_relay_command(daemon, 'camera.snapshot', request.data.get('payload', {}))
+            return Response(result['body'], status=result['status_code'])
+        return Response(
+            {'status': 'offline', 'detail': 'No connected daemon tunnel is available for snapshots.'},
+            status=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+
+    @action(detail=False, methods=['post'], url_path='command')
+    def command(self, request):
+        """
+        POST /api/equipment/command/
+        Generic relay command endpoint.
+        """
+        action_name = request.data.get('action')
+        if not action_name:
+            return Response(
+                {'status': 'error', 'detail': 'action is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        daemon = active_daemon(request.data.get('daemon_id'))
+        result = send_relay_command(
+            daemon,
+            action_name,
+            request.data.get('payload', {}),
+            request.data.get('wait_seconds', COMMAND_WAIT_SECONDS),
+        )
+        return Response(result['body'], status=result['status_code'])
+
+    def _local_post_fallback(self, path, payload):
         try:
-            return Response(post_daemon('camera/stream/start'))
+            return Response(post_daemon(path, payload))
         except urllib.error.HTTPError as exc:
             return Response(
                 {'status': 'error', 'detail': exc.reason},

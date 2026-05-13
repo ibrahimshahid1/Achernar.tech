@@ -11,7 +11,9 @@ pub struct HorizonModel {
 
 impl HorizonModel {
     pub fn flat(min_altitude: f64) -> Self {
-        Self { profile: vec![(0.0, min_altitude), (360.0, min_altitude)] }
+        Self {
+            profile: vec![(0.0, min_altitude), (360.0, min_altitude)],
+        }
     }
 
     pub fn from_file(_path: &str) -> crate::error::Result<Self> {

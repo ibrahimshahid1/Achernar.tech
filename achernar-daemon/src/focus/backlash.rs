@@ -35,10 +35,7 @@ impl BacklashCompensator {
 
     /// Compute the actual move sequence including backlash compensation.
     /// Returns a list of (steps, is_compensation) moves.
-    pub fn compensate_move(
-        &mut self,
-        desired_step: i32,
-    ) -> Vec<(i32, bool)> {
+    pub fn compensate_move(&mut self, desired_step: i32) -> Vec<(i32, bool)> {
         if !self.enabled || desired_step == 0 {
             return vec![(desired_step, false)];
         }
@@ -49,7 +46,8 @@ impl BacklashCompensator {
             FocusDirection::Inward
         };
 
-        let needs_compensation = self.last_direction
+        let needs_compensation = self
+            .last_direction
             .map(|last| last != desired_direction)
             .unwrap_or(false);
 
@@ -61,10 +59,7 @@ impl BacklashCompensator {
                 FocusDirection::Outward => -self.compensation_steps,
                 FocusDirection::Inward => self.compensation_steps,
             };
-            vec![
-                (desired_step + overshoot, false),
-                (-overshoot, true),
-            ]
+            vec![(desired_step + overshoot, false), (-overshoot, true)]
         } else {
             vec![(desired_step, false)]
         }

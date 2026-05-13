@@ -1,9 +1,9 @@
 //! Focus API endpoints — Section 7.5.2–7.5.4.
 //! All /api/v1/focus/* endpoints.
 
+use crate::state::AppState;
 use axum::{extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
-use crate::state::AppState;
 
 #[derive(Debug, Serialize)]
 pub struct FocusRunResponse {
@@ -30,9 +30,7 @@ pub async fn start_focus_run(
 }
 
 /// POST /api/v1/focus/abort — abort current focus run
-pub async fn abort_focus_run(
-    State(_state): State<AppState>,
-) -> Result<StatusCode, StatusCode> {
+pub async fn abort_focus_run(State(_state): State<AppState>) -> Result<StatusCode, StatusCode> {
     todo!("Implement abort focus run endpoint")
 }
 

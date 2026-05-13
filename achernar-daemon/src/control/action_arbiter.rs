@@ -2,8 +2,8 @@
 //! ActionRequest, ControlDomain, priority queue for arbitrating hardware commands.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BinaryHeap;
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
 /// Domain of control that an action targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -99,7 +99,11 @@ impl ActionArbiter {
 
     /// Submit an action request to the arbiter.
     pub fn submit(&mut self, request: ActionRequest) {
-        tracing::debug!("Action submitted: {} [{:?}]", request.description, request.priority);
+        tracing::debug!(
+            "Action submitted: {} [{:?}]",
+            request.description,
+            request.priority
+        );
         self.queue.push(request);
     }
 

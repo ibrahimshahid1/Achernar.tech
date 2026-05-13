@@ -36,11 +36,7 @@ impl FocusDriftForecaster {
     pub fn new() -> Self {
         Self {
             state: [0.0; 3],
-            covariance: [
-                1.0, 0.0, 0.0,
-                0.0, 1.0, 0.0,
-                0.0, 0.0, 1.0,
-            ],
+            covariance: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
             q: 0.01,
             r: 1.0,
             last_temperature: None,
@@ -59,11 +55,7 @@ impl FocusDriftForecaster {
     }
 
     /// Predict drift at a future time.
-    pub fn predict(
-        &self,
-        _temperature: f64,
-        _horizon_seconds: f64,
-    ) -> DriftPrediction {
+    pub fn predict(&self, _temperature: f64, _horizon_seconds: f64) -> DriftPrediction {
         todo!("Implement Kalman prediction — spec Section 7.6.3")
     }
 

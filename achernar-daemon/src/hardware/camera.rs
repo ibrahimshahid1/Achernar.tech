@@ -113,7 +113,10 @@ impl OlsCameraDriver {
         let c_url = CString::new(url)?;
         let mut handle = std::ptr::null_mut();
         unsafe {
-            check(ols_ffi::ols_alpaca_camera_driver_create(c_url.as_ptr(), &mut handle))?;
+            check(ols_ffi::ols_alpaca_camera_driver_create(
+                c_url.as_ptr(),
+                &mut handle,
+            ))?;
         }
         Ok(Self { handle })
     }
@@ -395,8 +398,7 @@ unsafe extern "C" fn frame_callback_trampoline(
     }
 
     // Copy frame data into owned Vec
-    let data_slice =
-        std::slice::from_raw_parts(frame_ref.data, frame_ref.data_size);
+    let data_slice = std::slice::from_raw_parts(frame_ref.data, frame_ref.data_size);
 
     let frame_data = FrameData {
         format: frame_ref.format,

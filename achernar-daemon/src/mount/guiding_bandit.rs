@@ -18,7 +18,10 @@ pub struct GuidingBandit {
 
 impl GuidingBandit {
     pub fn new(alpha: f64) -> Self {
-        Self { ra_alpha: alpha, dec_alpha: alpha }
+        Self {
+            ra_alpha: alpha,
+            dec_alpha: alpha,
+        }
     }
 
     pub fn select_aggressiveness(&self, _context: &[f64]) -> GuidingBanditState {

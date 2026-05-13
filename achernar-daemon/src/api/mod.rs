@@ -1,7 +1,7 @@
 pub mod camera;
-pub mod mount;
-pub mod focuser;
 pub mod focus;
+pub mod focuser;
+pub mod mount;
 pub mod websocket;
 
 use axum::{extract::State, http::StatusCode, Json};
@@ -70,10 +70,8 @@ pub async fn get_status(
                 let cam = state.camera.lock().unwrap();
                 cam.as_ref()
                     .and_then(|c| {
-                        c.get_parameter(
-                            crate::hardware::ols_ffi::OlsCamOptionId::Temperature,
-                        )
-                        .ok()
+                        c.get_parameter(crate::hardware::ols_ffi::OlsCamOptionId::Temperature)
+                            .ok()
                     })
                     .map(|p| p.cur_val)
                     .unwrap_or(-10.0)
@@ -136,7 +134,11 @@ pub async fn connect_equipment(
     State(state): State<AppState>,
     Json(req): Json<ConnectRequest>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    tracing::info!("Connect request: driver={}, option={:?}", req.driver, req.option);
+    tracing::info!(
+        "Connect request: driver={}, option={:?}",
+        req.driver,
+        req.option
+    );
 
     let equipment_type = req
         .equipment_type
@@ -296,9 +298,7 @@ async fn connect_focuser(
     })))
 }
 
-pub async fn disconnect_equipment(
-    State(state): State<AppState>,
-) -> Result<StatusCode, StatusCode> {
+pub async fn disconnect_equipment(State(state): State<AppState>) -> Result<StatusCode, StatusCode> {
     tracing::info!("Disconnect requested");
 
     // Stop stream if active

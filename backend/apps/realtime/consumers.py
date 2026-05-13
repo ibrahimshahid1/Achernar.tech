@@ -9,11 +9,29 @@ PDF Section 16.2.2 - The Control Plane (Command & Telemetry)
 """
 import json
 import logging
+import os
+from urllib.parse import parse_qs
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
+from django.core.cache import cache
 from django.utils import timezone
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_RELAY_DEV_TOKEN = "achernar-dev-token"
+COMMAND_RESULT_TTL_SECONDS = 60
+
+
+def expected_relay_token():
+    return os.getenv("ACHERNAR_RELAY_DEV_TOKEN", DEFAULT_RELAY_DEV_TOKEN)
+
+
+def command_result_key(command_id):
+    return f"achernar:command_result:{command_id}"
+
+
+def frame_preview_key(daemon_id):
+    return f"achernar:frame_preview:{daemon_id}"
 
 
 class DaemonConsumer(AsyncWebsocketConsumer):
@@ -26,11 +44,22 @@ class DaemonConsumer(AsyncWebsocketConsumer):
     
     async def connect(self):
         """Accept daemon connection and register in database"""
-        # TODO: Authenticate daemon via JWT token
         self.daemon_id = self.scope['url_route']['kwargs'].get('daemon_id')
         
         if not self.daemon_id:
             await self.close()
+            return
+
+        query = parse_qs(self.scope.get("query_string", b"").decode("utf-8"))
+        token = (query.get("token") or query.get("dev_token") or [""])[0]
+        if token != expected_relay_token():
+            logger.warning("Rejected daemon gateway connection with invalid token")
+            await self.close(code=4401)
+            return
+
+        if not await self.daemon_exists():
+            logger.warning(f"Rejected unknown daemon gateway connection: {self.daemon_id}")
+            await self.close(code=4404)
             return
         
         # Add to daemon group for broadcasting
@@ -85,6 +114,37 @@ class DaemonConsumer(AsyncWebsocketConsumer):
                         'data': data
                     }
                 )
+
+            elif message_type == 'HELLO':
+                await self.update_daemon_metadata(data)
+                await self.update_daemon_heartbeat()
+                await self.send(text_data=json.dumps({
+                    "type": "HELLO_ACK",
+                    "timestamp": timezone.now().isoformat(),
+                    "daemon_id": self.daemon_id,
+                }))
+
+            elif message_type == 'COMMAND_RESULT':
+                command_id = data.get("command_id")
+                if command_id:
+                    await self.store_command_result(command_id, data)
+                    await self.channel_layer.group_send(
+                        f'daemon_{self.daemon_id}_clients',
+                        {
+                            'type': 'command_result',
+                            'data': data
+                        }
+                    )
+
+            elif message_type == 'FRAME_PREVIEW':
+                await self.store_frame_preview(data)
+                await self.channel_layer.group_send(
+                    f'daemon_{self.daemon_id}_clients',
+                    {
+                        'type': 'frame_preview',
+                        'data': data
+                    }
+                )
             
             elif message_type == 'HEARTBEAT':
                 await self.update_daemon_heartbeat()
@@ -101,6 +161,11 @@ class DaemonConsumer(AsyncWebsocketConsumer):
         Called when a web client sends a command that needs to reach the daemon.
         """
         await self.send(text_data=json.dumps(event['data']))
+
+    @database_sync_to_async
+    def daemon_exists(self):
+        from .models import DaemonConnection
+        return DaemonConnection.objects.filter(id=self.daemon_id).exists()
     
     @database_sync_to_async
     def mark_daemon_connected(self):
@@ -111,6 +176,19 @@ class DaemonConsumer(AsyncWebsocketConsumer):
             daemon.mark_connected()
         except DaemonConnection.DoesNotExist:
             logger.warning(f"Daemon {self.daemon_id} not found in database")
+
+    @database_sync_to_async
+    def update_daemon_metadata(self, data):
+        """Update daemon version/hardware metadata from HELLO."""
+        from .models import DaemonConnection
+        try:
+            daemon = DaemonConnection.objects.get(id=self.daemon_id)
+            daemon.daemon_version = data.get("daemon_version", daemon.daemon_version)
+            daemon.hardware_id = data.get("hardware_id", daemon.hardware_id)
+            daemon.site_name = data.get("site_name", daemon.site_name)
+            daemon.save(update_fields=["daemon_version", "hardware_id", "site_name", "updated_at"])
+        except DaemonConnection.DoesNotExist:
+            pass
     
     @database_sync_to_async
     def mark_daemon_disconnected(self):
@@ -143,12 +221,21 @@ class DaemonConsumer(AsyncWebsocketConsumer):
             # Update individual state components
             snapshot.mount_state = payload.get('mount', {})
             snapshot.camera_state = payload.get('camera', {})
+            snapshot.focuser_state = payload.get('focuser', {})
             snapshot.guiding_state = payload.get('guiding', {})
             snapshot.ai_metrics = payload.get('ai', {})
             snapshot.save()
         
         except DaemonConnection.DoesNotExist:
             pass
+
+    @database_sync_to_async
+    def store_command_result(self, command_id, data):
+        cache.set(command_result_key(command_id), data, COMMAND_RESULT_TTL_SECONDS)
+
+    @database_sync_to_async
+    def store_frame_preview(self, data):
+        cache.set(frame_preview_key(self.daemon_id), data, 15)
 
 
 class TelemetryConsumer(AsyncWebsocketConsumer):
@@ -219,6 +306,12 @@ class TelemetryConsumer(AsyncWebsocketConsumer):
         Called when daemon sends telemetry update.
         """
         await self.send(text_data=json.dumps(event['data']))
+
+    async def command_result(self, event):
+        await self.send(text_data=json.dumps(event['data']))
+
+    async def frame_preview(self, event):
+        await self.send(text_data=json.dumps(event['data']))
     
     @database_sync_to_async
     def send_latest_telemetry(self):
@@ -235,6 +328,7 @@ class TelemetryConsumer(AsyncWebsocketConsumer):
                     'payload': {
                         'mount': snapshot.mount_state,
                         'camera': snapshot.camera_state,
+                        'focuser': snapshot.focuser_state,
                         'guiding': snapshot.guiding_state,
                         'ai': snapshot.ai_metrics,
                     }

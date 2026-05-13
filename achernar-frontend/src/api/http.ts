@@ -37,5 +37,9 @@ export async function httpJson<TResponse>(
         throw new HttpError(`HTTP ${res.status} for ${url}`, res.status, text);
     }
 
-    return (await res.json()) as TResponse;
+    const text = await res.text();
+    if (!text.trim()) {
+        return {} as TResponse;
+    }
+    return JSON.parse(text) as TResponse;
 }

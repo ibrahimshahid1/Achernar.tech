@@ -8,24 +8,75 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type")]
 pub enum WsEvent {
     // Telemetry
-    TelemetryUpdate { payload: serde_json::Value },
+    TelemetryUpdate {
+        payload: serde_json::Value,
+    },
 
     // Focus events — Section 7.5.5
-    FocusRunStarted { run_id: String, method: String },
-    FocusRunStateChanged { run_id: String, old_state: String, new_state: String },
-    FocusSampleCaptured { run_id: String, position: i32, hfr: f64, star_count: u32 },
-    FocusPredictionMade { run_id: String, model: String, predicted_offset: f64, confidence: f64 },
-    FocusActionProposed { run_id: String, proposed_step: i32, source: String, confidence: f64 },
-    FocusActionValidated { run_id: String, verdict: String, step: i32 },
-    FocusActionExecuted { run_id: String, step: i32, new_position: i32 },
-    FocusActionRejected { run_id: String, reason: String },
-    FocusFallbackTriggered { run_id: String, reason: String },
-    FocusRunConverged { run_id: String, best_position: i32, best_hfr: f64 },
-    FocusRunFailed { run_id: String, error: String },
-    FocusDriftAlert { predicted_drift: f64, confidence: f64, refocus_recommended: bool },
+    FocusRunStarted {
+        run_id: String,
+        method: String,
+    },
+    FocusRunStateChanged {
+        run_id: String,
+        old_state: String,
+        new_state: String,
+    },
+    FocusSampleCaptured {
+        run_id: String,
+        position: i32,
+        hfr: f64,
+        star_count: u32,
+    },
+    FocusPredictionMade {
+        run_id: String,
+        model: String,
+        predicted_offset: f64,
+        confidence: f64,
+    },
+    FocusActionProposed {
+        run_id: String,
+        proposed_step: i32,
+        source: String,
+        confidence: f64,
+    },
+    FocusActionValidated {
+        run_id: String,
+        verdict: String,
+        step: i32,
+    },
+    FocusActionExecuted {
+        run_id: String,
+        step: i32,
+        new_position: i32,
+    },
+    FocusActionRejected {
+        run_id: String,
+        reason: String,
+    },
+    FocusFallbackTriggered {
+        run_id: String,
+        reason: String,
+    },
+    FocusRunConverged {
+        run_id: String,
+        best_position: i32,
+        best_hfr: f64,
+    },
+    FocusRunFailed {
+        run_id: String,
+        error: String,
+    },
+    FocusDriftAlert {
+        predicted_drift: f64,
+        confidence: f64,
+        refocus_recommended: bool,
+    },
 
     // Vision events — Section 8.1
-    VisionUpdate { observation: serde_json::Value },
+    VisionUpdate {
+        observation: serde_json::Value,
+    },
 }
 
 impl WsEvent {

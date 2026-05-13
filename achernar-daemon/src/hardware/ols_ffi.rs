@@ -27,15 +27,15 @@ pub const OLS_ERR_NOT_CONNECTED: c_int = 5;
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OlsStreamType {
-    Yuv2   = 0,
-    Mjpeg  = 1,
-    Rgb24  = 2,
-    Rgb48  = 3,
-    Raw8   = 4,
-    Raw16  = 5,
-    Mono8  = 6,
+    Yuv2 = 0,
+    Mjpeg = 1,
+    Rgb24 = 2,
+    Rgb48 = 3,
+    Raw8 = 4,
+    Raw16 = 5,
+    Mono8 = 6,
     Mono16 = 7,
-    Error  = 8,
+    Error = 8,
 }
 
 #[repr(C)]
@@ -78,34 +78,34 @@ pub struct OlsFrame {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OlsCamOptionId {
-    AutoExp      = 0,
-    AutoWb       = 1,
-    AutoFocus    = 2,
-    Exp          = 3,
-    Wb           = 4,
-    WbR          = 5,
-    WbB          = 6,
-    Focus        = 7,
-    Gain         = 8,
-    Gamma        = 9,
-    Brightness   = 10,
-    Contrast     = 11,
-    Temperature  = 12,
+    AutoExp = 0,
+    AutoWb = 1,
+    AutoFocus = 2,
+    Exp = 3,
+    Wb = 4,
+    WbR = 5,
+    WbB = 6,
+    Focus = 7,
+    Gain = 8,
+    Gamma = 9,
+    Brightness = 10,
+    Contrast = 11,
+    Temperature = 12,
     CoolerTarget = 13,
-    CoolerOn     = 14,
-    FanOn        = 15,
+    CoolerOn = 14,
+    FanOn = 15,
     CoolerPowerPerc = 16,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OlsCamOptionType {
-    Bool      = 0,
-    Number    = 1,
-    Msec      = 2,
-    Percent   = 3,
-    Kelvin    = 4,
-    Celsius   = 5,
+    Bool = 0,
+    Number = 1,
+    Msec = 2,
+    Percent = 3,
+    Kelvin = 4,
+    Celsius = 5,
     Selection = 6,
 }
 
@@ -122,8 +122,7 @@ pub struct OlsCamParam {
     pub cur_val: f64,
 }
 
-pub type OlsFrameCallback =
-    unsafe extern "C" fn(frame: *const OlsFrame, user_data: *mut c_void);
+pub type OlsFrameCallback = unsafe extern "C" fn(frame: *const OlsFrame, user_data: *mut c_void);
 
 // ═══════════════════════════════════════════════════════════════════
 //  Mount Types
@@ -132,49 +131,49 @@ pub type OlsFrameCallback =
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OlsMountProto {
-    None   = 0,
+    None = 0,
     Serial = 1,
-    Inet   = 2,
+    Inet = 2,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OlsMountTracking {
     Sidereal = 0,
-    Solar    = 1,
-    Lunar    = 2,
+    Solar = 1,
+    Lunar = 2,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OlsMountSlew {
     Stop = 0,
-    N    = 2,   // 1<<1
-    S    = 6,   // 3<<1
-    W    = 8,   // 1<<3
-    E    = 24,  // 3<<3
+    N = 2,  // 1<<1
+    S = 6,  // 3<<1
+    W = 8,  // 1<<3
+    E = 24, // 3<<3
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OlsMeridianFlip {
     Unsupported = 0,
-    Flip        = 1,
-    Stop        = 2,
+    Flip = 1,
+    Stop = 2,
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OlsEqCoord {
-    pub ra: f64,   // hours
-    pub dec: f64,  // degrees
+    pub ra: f64,  // hours
+    pub dec: f64, // degrees
 }
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct OlsAltAzCoord {
-    pub alt: f64,  // degrees
-    pub az: f64,   // degrees
+    pub alt: f64, // degrees
+    pub az: f64,  // degrees
 }
 
 #[repr(C)]
@@ -242,22 +241,13 @@ extern "C" {
         out_driver: *mut *mut OlsCameraDriver,
     ) -> c_int;
 
-    pub fn ols_asi_camera_driver_create(
-        out_driver: *mut *mut OlsCameraDriver,
-    ) -> c_int;
+    pub fn ols_asi_camera_driver_create(out_driver: *mut *mut OlsCameraDriver) -> c_int;
 
-    pub fn ols_svb_camera_driver_create(
-        out_driver: *mut *mut OlsCameraDriver,
-    ) -> c_int;
+    pub fn ols_svb_camera_driver_create(out_driver: *mut *mut OlsCameraDriver) -> c_int;
 
-    pub fn ols_toup_camera_driver_create(
-        out_driver: *mut *mut OlsCameraDriver,
-    ) -> c_int;
+    pub fn ols_toup_camera_driver_create(out_driver: *mut *mut OlsCameraDriver) -> c_int;
 
-    pub fn ols_driver_list_cameras(
-        driver: *mut OlsCameraDriver,
-        out_count: *mut i32,
-    ) -> c_int;
+    pub fn ols_driver_list_cameras(driver: *mut OlsCameraDriver, out_count: *mut i32) -> c_int;
 
     pub fn ols_driver_camera_name(
         driver: *mut OlsCameraDriver,
@@ -275,11 +265,7 @@ extern "C" {
     pub fn ols_driver_destroy(driver: *mut OlsCameraDriver);
 
     // ═══ Camera Instance API ═══
-    pub fn ols_camera_name(
-        cam: *mut OlsCamera,
-        name_buf: *mut c_char,
-        name_buf_len: i32,
-    ) -> c_int;
+    pub fn ols_camera_name(cam: *mut OlsCamera, name_buf: *mut c_char, name_buf_len: i32) -> c_int;
 
     pub fn ols_camera_format_count(cam: *mut OlsCamera, out_count: *mut i32) -> c_int;
 
@@ -312,11 +298,7 @@ extern "C" {
         out_param: *mut OlsCamParam,
     ) -> c_int;
 
-    pub fn ols_camera_set_param(
-        cam: *mut OlsCamera,
-        id: OlsCamOptionId,
-        value: c_double,
-    ) -> c_int;
+    pub fn ols_camera_set_param(cam: *mut OlsCamera, id: OlsCamOptionId, value: c_double) -> c_int;
 
     pub fn ols_camera_destroy(cam: *mut OlsCamera);
 
@@ -346,54 +328,29 @@ extern "C" {
 
     pub fn ols_mount_connected(mi: *mut OlsMountInterface) -> i32;
 
-    pub fn ols_mount_get_current(
-        mi: *mut OlsMountInterface,
-        out_coord: *mut OlsEqCoord,
-    ) -> c_int;
+    pub fn ols_mount_get_current(mi: *mut OlsMountInterface, out_coord: *mut OlsEqCoord) -> c_int;
 
-    pub fn ols_mount_goto(
-        mi: *mut OlsMountInterface,
-        ra: c_double,
-        dec: c_double,
-    ) -> c_int;
+    pub fn ols_mount_goto(mi: *mut OlsMountInterface, ra: c_double, dec: c_double) -> c_int;
 
-    pub fn ols_mount_sync(
-        mi: *mut OlsMountInterface,
-        ra: c_double,
-        dec: c_double,
-    ) -> c_int;
+    pub fn ols_mount_sync(mi: *mut OlsMountInterface, ra: c_double, dec: c_double) -> c_int;
 
-    pub fn ols_mount_slew(
-        mi: *mut OlsMountInterface,
-        direction: OlsMountSlew,
-        speed: i32,
-    ) -> c_int;
+    pub fn ols_mount_slew(mi: *mut OlsMountInterface, direction: OlsMountSlew, speed: i32)
+        -> c_int;
 
     pub fn ols_mount_get_tracking(
         mi: *mut OlsMountInterface,
         out_mode: *mut OlsMountTracking,
     ) -> c_int;
 
-    pub fn ols_mount_get_tracking_state(
-        mi: *mut OlsMountInterface,
-        out_state: *mut i32,
-    ) -> c_int;
+    pub fn ols_mount_get_tracking_state(mi: *mut OlsMountInterface, out_state: *mut i32) -> c_int;
 
-    pub fn ols_mount_set_tracking_state(
-        mi: *mut OlsMountInterface,
-        track: i32,
-    ) -> c_int;
+    pub fn ols_mount_set_tracking_state(mi: *mut OlsMountInterface, track: i32) -> c_int;
 
-    pub fn ols_mount_set_tracking_mode(
-        mi: *mut OlsMountInterface,
-        mode: OlsMountTracking,
-    ) -> c_int;
+    pub fn ols_mount_set_tracking_mode(mi: *mut OlsMountInterface, mode: OlsMountTracking)
+        -> c_int;
 
-    pub fn ols_mount_set_lat_lon(
-        mi: *mut OlsMountInterface,
-        lat: c_double,
-        lon: c_double,
-    ) -> c_int;
+    pub fn ols_mount_set_lat_lon(mi: *mut OlsMountInterface, lat: c_double, lon: c_double)
+        -> c_int;
 
     pub fn ols_mount_get_lat_lon(
         mi: *mut OlsMountInterface,
@@ -425,10 +382,7 @@ extern "C" {
         out_flip: *mut OlsMeridianFlip,
     ) -> c_int;
 
-    pub fn ols_mount_set_meridian(
-        mi: *mut OlsMountInterface,
-        flip: OlsMeridianFlip,
-    ) -> c_int;
+    pub fn ols_mount_set_meridian(mi: *mut OlsMountInterface, flip: OlsMeridianFlip) -> c_int;
 
     pub fn ols_mount_get_alt_limits(
         mi: *mut OlsMountInterface,
@@ -436,11 +390,7 @@ extern "C" {
         out_high: *mut i32,
     ) -> c_int;
 
-    pub fn ols_mount_set_alt_limits(
-        mi: *mut OlsMountInterface,
-        low: i32,
-        high: i32,
-    ) -> c_int;
+    pub fn ols_mount_set_alt_limits(mi: *mut OlsMountInterface, low: i32, high: i32) -> c_int;
 
     pub fn ols_mount_shutdown(mi: *mut OlsMountInterface) -> c_int;
 
@@ -464,10 +414,7 @@ extern "C" {
 
     pub fn ols_focuser_is_loaded(fi: *mut OlsFocuserInterface) -> i32;
 
-    pub fn ols_focuser_position(
-        fi: *mut OlsFocuserInterface,
-        out_position: *mut i32,
-    ) -> c_int;
+    pub fn ols_focuser_position(fi: *mut OlsFocuserInterface, out_position: *mut i32) -> c_int;
 
     pub fn ols_focuser_move_to(fi: *mut OlsFocuserInterface, position: i32) -> c_int;
 
@@ -475,20 +422,11 @@ extern "C" {
 
     pub fn ols_focuser_abort(fi: *mut OlsFocuserInterface) -> c_int;
 
-    pub fn ols_focuser_is_moving(
-        fi: *mut OlsFocuserInterface,
-        out_moving: *mut i32,
-    ) -> c_int;
+    pub fn ols_focuser_is_moving(fi: *mut OlsFocuserInterface, out_moving: *mut i32) -> c_int;
 
-    pub fn ols_focuser_is_absolute(
-        fi: *mut OlsFocuserInterface,
-        out_absolute: *mut i32,
-    ) -> c_int;
+    pub fn ols_focuser_is_absolute(fi: *mut OlsFocuserInterface, out_absolute: *mut i32) -> c_int;
 
-    pub fn ols_focuser_max_range(
-        fi: *mut OlsFocuserInterface,
-        out_range: *mut i32,
-    ) -> c_int;
+    pub fn ols_focuser_max_range(fi: *mut OlsFocuserInterface, out_range: *mut i32) -> c_int;
 
     pub fn ols_focuser_unload(fi: *mut OlsFocuserInterface) -> c_int;
 
@@ -510,9 +448,7 @@ pub fn check_ols_error(code: c_int) -> Result<(), String> {
             if ptr.is_null() {
                 "Unknown OLS error".to_string()
             } else {
-                std::ffi::CStr::from_ptr(ptr)
-                    .to_string_lossy()
-                    .into_owned()
+                std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned()
             }
         };
         Err(msg)

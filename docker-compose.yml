@@ -41,6 +41,7 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/achernar
       - REDIS_URL=redis://redis:6379/0
       - DJANGO_SETTINGS_MODULE=backend.settings
+      - ACHERNAR_RELAY_DEV_TOKEN=achernar-dev-token
     depends_on:
       postgres:
         condition: service_healthy
@@ -72,6 +73,11 @@ services:
       - "3030:3030"
     environment:
       - ACHERNAR_PORT=3030
+      - ACHERNAR_HOST=0.0.0.0
+      - ACHERNAR_CLOUD_HTTP=http://backend:8000
+      - ACHERNAR_CLOUD_WS=ws://backend:8000
+      - ACHERNAR_RELAY_DEV_TOKEN=achernar-dev-token
+      - ACHERNAR_HARDWARE_ID=achernar-docker-daemon
       - RUST_LOG=info
     volumes:
       - ./achernar-daemon/config:/app/config:ro
@@ -89,8 +95,8 @@ services:
     ports:
       - "5173:5173"
     environment:
-      - VITE_DAEMON_URL=http://daemon:3030/api/v1
-      - VITE_CLOUD_API=http://backend:8000/api/v1
+      - VITE_DAEMON_URL=http://localhost:3030/api/v1
+      - VITE_CLOUD_API=http://localhost:8000/api
 
 volumes:
   postgres_data:

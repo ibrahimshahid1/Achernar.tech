@@ -1,6 +1,6 @@
 import { env } from "../env";
 import { httpJson } from "./http";
-import type { EquipmentState, ImagingSession } from "../types/achernar";
+import type { EquipmentState, ImagingSession, RelayCommandResult, DaemonSummary } from "../types/achernar";
 
 /**
  * Cloud API (Django Apps)
@@ -8,6 +8,10 @@ import type { EquipmentState, ImagingSession } from "../types/achernar";
  * Endpoints are organized by Django app modules
  */
 export const cloudApi = {
+    async listDaemons(): Promise<DaemonSummary[]> {
+        return httpJson<DaemonSummary[]>(`${env.cloudApiBase}/equipment/daemons/`);
+    },
+
     /**
      * Imaging App - Session management
      */
@@ -40,6 +44,21 @@ export const cloudApi = {
     async startCameraStream(): Promise<{ status: string; format: string; width: number; height: number }> {
         return httpJson(`${env.cloudApiBase}/equipment/camera/start-stream/`, {
             method: "POST",
+        });
+    },
+
+    async relayCommand(
+        action: string,
+        payload: Record<string, unknown> = {},
+        daemonId?: string,
+    ): Promise<RelayCommandResult> {
+        return httpJson(`${env.cloudApiBase}/equipment/command/`, {
+            method: "POST",
+            body: {
+                action,
+                payload,
+                daemon_id: daemonId,
+            },
         });
     },
 

@@ -30,7 +30,11 @@ pub enum ModeChangeReason {
 /// The control supervisor manages the overall autonomy state.
 pub struct ControlSupervisor {
     current_mode: AutonomyMode,
-    mode_history: Vec<(AutonomyMode, ModeChangeReason, chrono::DateTime<chrono::Utc>)>,
+    mode_history: Vec<(
+        AutonomyMode,
+        ModeChangeReason,
+        chrono::DateTime<chrono::Utc>,
+    )>,
 }
 
 impl ControlSupervisor {

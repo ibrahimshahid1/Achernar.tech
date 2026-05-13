@@ -35,26 +35,17 @@ impl ClassicalFocusSolver {
     }
 
     /// Fit a parabola to position-HFR samples and find the minimum.
-    pub fn fit_parabola(
-        _positions: &[i32],
-        _hfr_values: &[f64],
-    ) -> Option<CurveFitResult> {
+    pub fn fit_parabola(_positions: &[i32], _hfr_values: &[f64]) -> Option<CurveFitResult> {
         todo!("Implement parabola fit — least squares on y = a*x^2 + b*x + c")
     }
 
     /// Fit a V-curve (two linear segments) to position-HFR samples.
-    pub fn fit_v_curve(
-        _positions: &[i32],
-        _hfr_values: &[f64],
-    ) -> Option<CurveFitResult> {
+    pub fn fit_v_curve(_positions: &[i32], _hfr_values: &[f64]) -> Option<CurveFitResult> {
         todo!("Implement V-curve fit")
     }
 
     /// Fit a hyperbola to position-HFR samples.
-    pub fn fit_hyperbola(
-        _positions: &[i32],
-        _hfr_values: &[f64],
-    ) -> Option<CurveFitResult> {
+    pub fn fit_hyperbola(_positions: &[i32], _hfr_values: &[f64]) -> Option<CurveFitResult> {
         todo!("Implement hyperbola fit")
     }
 }

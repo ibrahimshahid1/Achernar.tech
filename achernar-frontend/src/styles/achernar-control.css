@@ -348,6 +348,15 @@ body {
     color: #e5e7eb;
 }
 
+.relay-status {
+    min-width: 180px;
+    max-width: 260px;
+    color: var(--text-soft);
+    font-size: 0.78rem;
+    line-height: 1.25;
+    overflow-wrap: anywhere;
+}
+
 /* Equipment grid */
 .equipment-grid {
     display: grid;

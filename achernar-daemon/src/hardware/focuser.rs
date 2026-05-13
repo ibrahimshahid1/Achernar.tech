@@ -73,8 +73,11 @@ impl Focuser {
     pub fn new(driver: FocuserDriver) -> crate::error::Result<Self> {
         let mut handle: *mut ols_ffi::OlsFocuserInterface = std::ptr::null_mut();
         let rc = unsafe { ols_ffi::ols_focuser_interface_create(&mut handle) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to create focuser interface: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!(
+                "Failed to create focuser interface: {e}"
+            ))
+        })?;
 
         info!(driver = ?driver, "Created focuser interface");
         Ok(Self {
@@ -97,8 +100,11 @@ impl Focuser {
         let rc = unsafe {
             ols_ffi::ols_focuser_driver_list(self.handle, infos.as_mut_ptr(), 16, &mut count)
         };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to list focuser drivers: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!(
+                "Failed to list focuser drivers: {e}"
+            ))
+        })?;
 
         let result: Vec<FocuserDriverInfo> = infos[..count as usize]
             .iter()
@@ -124,17 +130,22 @@ impl Focuser {
 
     /// Connect to the focuser with a specific option (e.g., Alpaca URL).
     pub fn connect_with_option(&mut self, option: &str) -> crate::error::Result<()> {
-        let driver_name = CString::new(self.driver_type.ols_name())
-            .map_err(|_| crate::error::HardwareError::Communication("Invalid driver name".into()))?;
-        let option_c = CString::new(option)
-            .map_err(|_| crate::error::HardwareError::Communication("Invalid option string".into()))?;
+        let driver_name = CString::new(self.driver_type.ols_name()).map_err(|_| {
+            crate::error::HardwareError::Communication("Invalid driver name".into())
+        })?;
+        let option_c = CString::new(option).map_err(|_| {
+            crate::error::HardwareError::Communication("Invalid option string".into())
+        })?;
 
         info!(driver = ?self.driver_type, option = option, "Loading focuser driver");
         let rc = unsafe {
             ols_ffi::ols_focuser_load_driver(self.handle, driver_name.as_ptr(), option_c.as_ptr())
         };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to load focuser driver: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!(
+                "Failed to load focuser driver: {e}"
+            ))
+        })?;
 
         self.connected = true;
         info!("Focuser connected successfully");
@@ -150,8 +161,9 @@ impl Focuser {
     pub fn position(&self) -> crate::error::Result<i32> {
         let mut pos: i32 = 0;
         let rc = unsafe { ols_ffi::ols_focuser_position(self.handle, &mut pos) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to get position: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to get position: {e}"))
+        })?;
         Ok(pos)
     }
 
@@ -159,8 +171,9 @@ impl Focuser {
     pub fn is_moving(&self) -> crate::error::Result<bool> {
         let mut moving: i32 = 0;
         let rc = unsafe { ols_ffi::ols_focuser_is_moving(self.handle, &mut moving) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to check moving: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to check moving: {e}"))
+        })?;
         Ok(moving != 0)
     }
 
@@ -168,8 +181,9 @@ impl Focuser {
     pub fn is_absolute(&self) -> crate::error::Result<bool> {
         let mut absolute: i32 = 0;
         let rc = unsafe { ols_ffi::ols_focuser_is_absolute(self.handle, &mut absolute) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to check absolute: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to check absolute: {e}"))
+        })?;
         Ok(absolute != 0)
     }
 
@@ -177,8 +191,9 @@ impl Focuser {
     pub fn max_range(&self) -> crate::error::Result<i32> {
         let mut range: i32 = 0;
         let rc = unsafe { ols_ffi::ols_focuser_max_range(self.handle, &mut range) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to get max range: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to get max range: {e}"))
+        })?;
         Ok(range)
     }
 
@@ -186,8 +201,9 @@ impl Focuser {
     pub fn move_absolute(&mut self, position: i32) -> crate::error::Result<()> {
         info!(position, "Moving focuser to absolute position");
         let rc = unsafe { ols_ffi::ols_focuser_move_to(self.handle, position) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to move to position: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to move to position: {e}"))
+        })?;
         Ok(())
     }
 
@@ -195,8 +211,9 @@ impl Focuser {
     pub fn move_relative(&mut self, steps: i32) -> crate::error::Result<()> {
         info!(steps, "Moving focuser by relative steps");
         let rc = unsafe { ols_ffi::ols_focuser_move_by(self.handle, steps) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to move by steps: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to move by steps: {e}"))
+        })?;
         Ok(())
     }
 
@@ -204,8 +221,9 @@ impl Focuser {
     pub fn abort(&mut self) -> crate::error::Result<()> {
         info!("Aborting focuser motion");
         let rc = unsafe { ols_ffi::ols_focuser_abort(self.handle) };
-        ols_ffi::check_ols_error(rc)
-            .map_err(|e| crate::error::HardwareError::Communication(format!("Failed to abort focuser: {e}")))?;
+        ols_ffi::check_ols_error(rc).map_err(|e| {
+            crate::error::HardwareError::Communication(format!("Failed to abort focuser: {e}"))
+        })?;
         Ok(())
     }
 
