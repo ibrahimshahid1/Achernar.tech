@@ -1,0 +1,71 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Achernar Daemon configuration (achernar.toml)
+#
+# Copy this file to `achernar.toml` (loaded automatically from the daemon's
+# working directory) or point ACHERNAR_CONFIG at it:
+#
+#     cp achernar.example.toml achernar.toml
+#     ACHERNAR_CONFIG=/path/to/achernar.toml cargo run
+#
+# Every section is optional; omitted keys fall back to the defaults shown.
+# Environment variables (ACHERNAR_PORT, ACHERNAR_HOST, ...) still override the
+# daemon bind address at runtime. Parsed by src/config.rs (spec Section 5.4).
+# ─────────────────────────────────────────────────────────────────────────────
+
+[daemon]
+port = 3030
+log_level = "info"
+# data_dir = "/var/lib/achernar"
+
+[focus]                       # Autofocus sweep (Section 7.3)
+initial_step_size = 50
+samples_per_position = 3
+settle_ms = 500
+
+[focus.safety]                # Hard limits enforced by safety_guard.rs (7.3.3)
+min_position = 0
+max_position = 50000
+max_step_single = 500
+max_total_travel_per_run = 5000
+min_confidence_to_act = 0.6
+max_failed_improvements = 3
+settle_ms = 500
+backlash_steps = 0
+
+[focus.backlash]              # Backlash compensation (7.3.5)
+enabled = false
+compensation_steps = 0
+# always_approach_from = "in"   # "in" | "out"
+
+[focus.models]               # Edge ONNX models (Section 7.6.10 layout)
+# quality_model_path = "../models/focus_quality/1.0.0/model.onnx"
+# offset_model_path  = "../models/focus_offset/0.3.0/model.onnx"
+# drift_model_path   = "../models/focus_drift/0.1.0/model.onnx"
+
+[mount]                       # Mount control (Section 8.3)
+guide_rate = 0.5
+max_slew_rate = 8.0
+
+[mount.safety]
+min_altitude = 0.0
+max_hour_angle = 5.5
+park_on_safety_violation = true
+# horizon_model_path = "../models/horizon/1.0.0/model.onnx"
+
+[filter_wheel]               # Filter wheel (Section 8.2)
+filter_names = ["L", "R", "G", "B", "Ha", "OIII", "SII"]
+focus_offsets = [0, 12, 8, 15, 120, 118, 122]
+
+[camera]
+# default_gain = 100
+# default_offset = 30
+# cooling_target = -10.0
+
+[storage]
+database_path = "achernar.db"
+# frames_dir = "/var/lib/achernar/frames"
+
+[telemetry]
+level = "info"
+json_output = false
+# log_dir = "/var/log/achernar"

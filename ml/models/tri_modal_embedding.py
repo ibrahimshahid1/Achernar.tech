@@ -1,29 +1,41 @@
 """
 tri_modal_embedding — Section 7.6.9.
-TME: Tri-Modal Embedding model (ViT + MLP + 1DResNet).
-Produces joint embeddings from image, metadata, and time-series inputs.
+
+The Tri-Modal Embedding (TME) in Achernar **is AstroM3** (Rizhko & Bloom 2024,
+arXiv:2411.08842) — a self-supervised CLIP model that aligns three modalities in
+one shared embedding space. The upstream implementation is vendored at
+``AstroM3-main/`` and integrated under ``ml/astrom3/``. There is no separate
+from-scratch model.
+
+AstroM3 is deployed in Achernar in two places, same model family + same 512-d
+embedding space:
+
+1. **Cloud / planning** (``apps.ai_engine``) — AstroM3 as published:
+   light curve + spectrum + metadata. Load it with::
+
+       from ml.models.tri_modal_embedding import load_cloud
+       model = load_cloud("base")          # -> ml.astrom3.loader.load_astrom3
+
+2. **Edge / daemon** — AstroM3 *retrofit* to the daemon's live modalities
+   (image crop + capture metadata + on-mount telemetry), reusing AstroM3's
+   Informer + MetaModel + CLIPLoss with a new image encoder::
+
+       from ml.models.tri_modal_embedding import build_edge
+       model = build_edge()                # -> ml.astrom3.edge.AstroM3Edge
+
+Imports are lazy so this module stays importable without torch / the AstroM3
+dependencies present.
 """
-import torch
-import torch.nn as nn
+from __future__ import annotations
 
 
-class TriModalEmbedding(nn.Module):
-    """
-    Tri-Modal Embedding network.
-    Branch A: ViT for image patches
-    Branch B: MLP for metadata features
-    Branch C: 1D ResNet for time-series (HFR curves, guider logs)
-    Output: (B, 256) joint embedding vector
-    """
-    def __init__(self, embed_dim: int = 256):
-        super().__init__()
-        self.embed_dim = embed_dim
-        raise NotImplementedError("Implement TME architecture — Section 7.6.9")
+def load_cloud(which: str = "base", source=None):
+    """Cloud AstroM3 (light curve + spectrum + metadata). See ml/astrom3/loader.py."""
+    from ml.astrom3.loader import load_astrom3
+    return load_astrom3(which=which, source=source)
 
-    def forward(
-        self,
-        image: torch.Tensor,
-        metadata: torch.Tensor,
-        timeseries: torch.Tensor,
-    ) -> torch.Tensor:
-        raise NotImplementedError
+
+def build_edge(**kwargs):
+    """Edge AstroM3 retrofit (image + metadata + telemetry). See ml/astrom3/edge.py."""
+    from ml.astrom3.edge import AstroM3Edge
+    return AstroM3Edge(**kwargs)

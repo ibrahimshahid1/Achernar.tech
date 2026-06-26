@@ -152,3 +152,30 @@ REST_FRAMEWORK = {
         'rest_framework.authentication.SessionAuthentication',
     ],
 }
+
+# Cache
+# -----------------------------------------------------------------------------
+# The daemon command relay hands a COMMAND_RESULT from the ASGI WebSocket
+# consumer (apps.realtime.consumers.DaemonConsumer) back to the synchronous DRF
+# view (apps.equipment.views.send_relay_command) through the Django cache. That
+# handoff only works if every server process shares the SAME cache. With the
+# default per-process LocMemCache this works for a single ASGI process, but
+# silently breaks the moment the deployment runs more than one process/replica
+# (the polling HTTP worker never sees the result the WS worker wrote, so every
+# relay command times out as "pending"). Whenever REDIS_URL is configured we
+# therefore back the cache with Redis so the relay stays correct under scaling;
+# otherwise we fall back to a named LocMemCache for single-process local dev.
+if os.getenv('REDIS_URL'):
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': os.getenv('REDIS_URL'),
+        }
+    }
+else:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'achernar-relay',
+        }
+    }

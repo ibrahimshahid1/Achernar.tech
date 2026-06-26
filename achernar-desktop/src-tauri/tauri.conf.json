@@ -5,13 +5,14 @@
   "identifier": "tech.achernar.desktop",
   "build": {
     "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm --dir ../achernar-frontend dev",
     "beforeBuildCommand": "pnpm --dir ../achernar-frontend build",
     "frontendDist": "../../achernar-frontend/dist"
   },
   "app": {
     "windows": [
       {
-        "title": "achernar-desktop",
+        "title": "Achernar",
         "width": 1180,
         "height": 760,
         "minWidth": 760,

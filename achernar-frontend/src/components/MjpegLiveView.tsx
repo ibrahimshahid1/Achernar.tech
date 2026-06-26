@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { cloudApi } from "../lib/api/cloud";
-import { daemonApi } from "../lib/api/daemon";
+import { cloudApi } from "../api/cloud";
+import { daemonApi } from "../api/daemon";
 import { getHardwareTransport } from "../lib/runtime";
 
 type StreamState = "idle" | "connecting" | "waiting" | "live" | "error";
@@ -14,12 +14,8 @@ export default function MjpegLiveView() {
     const hardwareTransport = getHardwareTransport();
 
     useEffect(() => {
-        if (hardwareTransport === "django") {
-            setStreamState("idle");
-            setMessage("Browser mode uses Django for hardware relay.");
-            return;
-        }
-
+        // The live view always connects straight to the daemon's frame socket
+        // (it is CORS-permissive on :3030), in both browser and desktop modes.
         let disposed = false;
         setStreamState("connecting");
         setMessage("Connecting to daemon stream...");

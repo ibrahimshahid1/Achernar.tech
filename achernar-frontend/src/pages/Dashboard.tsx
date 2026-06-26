@@ -2,9 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import SidePanel from "../components/SidePanel";
 import EquipmentCard from "../components/EquipmentCard";
 import MjpegLiveView from "../components/MjpegLiveView";
+import CameraControls from "../components/CameraControls";
 import { cloudApi } from "../api/cloud";
-import { daemonApi as localDaemonApi } from "../lib/api/daemon";
-import { useTelemetrySocket } from "../lib/hooks/useTelemetrySocket";
+import { daemonApi as localDaemonApi } from "../api/daemon";
+import { useTelemetrySocket } from "../hooks/useTelemetrySocket";
 import { useConnectedEquipment } from "../hooks/useEquipment";
 import { getHardwareTransport } from "../lib/runtime";
 import type { EquipmentCardModel, EquipmentType } from "../types/achernar";
@@ -125,12 +126,11 @@ export default function Dashboard() {
                             <div className="relay-status">{relayMessage}</div>
                         </div>
                     )}
+                </div>
 
-                    <div className="toolbar-spacer" />
-
-                    <div className="toolbar-block wide">
-                        <MjpegLiveView />
-                    </div>
+                <div className="camera-station">
+                    <MjpegLiveView />
+                    <CameraControls />
                 </div>
 
                 <div className="equipment-grid">

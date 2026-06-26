@@ -13,6 +13,12 @@ eggs/
 .eggs/
 lib/
 lib64/
+# The bare lib/ pattern above targets Python build output, but it also matches
+# the frontend's source dir achernar-frontend/src/lib (home of runtime.ts, the
+# browser/desktop hardware-transport switch). Re-include it so fresh clones and
+# CI builds are not missing the transport-switching wiring.
+!achernar-frontend/src/lib/
+!achernar-frontend/src/lib/**
 parts/
 sdist/
 var/
@@ -79,3 +85,7 @@ out/
 # SDKs
 sdk/
 sdks/
+
+# Downloaded model weights (artifacts, not source) — fetch with
+# scripts/download_astrom3.sh / ml/astrom3/download.py
+ml/checkpoints/

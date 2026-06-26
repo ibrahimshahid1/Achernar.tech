@@ -1,0 +1,42 @@
+# Wandb settings
+project: 'AstroM3'
+use_wandb: True
+
+# Dataset settings
+dataset: 'AstroMLCore/AstroM3Processed'
+classes: ['EW', 'SR', 'EA', 'RRAB', 'EB', 'ROT', 'RRC', 'HADS', 'M', 'DSCT']
+num_classes: 10
+seq_len: 200
+mode: 'photo'
+data_sub: 'full'
+
+# Photometry model parameters
+p_enc_in: 9
+p_d_model: 128
+p_dropout: 0.14904317667318695
+p_factor: 1
+p_output_attention: False
+p_n_heads: 4
+p_d_ff: 512
+p_activation: 'gelu'
+p_e_layers: 8
+
+# Training settings
+use_pretrain: True
+epochs: 50
+batch_size: 512
+lr: 0.0009337723840241396
+beta1: 0.8347684737102469
+beta2: 0.999
+weight_decay: 0.0004658149677837722
+early_stopping_patience: 6
+clip_grad: True
+clip_value: 5
+save_weights: True
+weights_path: './weights/'
+
+# Scheduler settings
+scheduler: 'ReduceLROnPlateau'
+scheduler_factor: 0.38533998014804666
+scheduler_patience: 3
+warmup_epochs: 10

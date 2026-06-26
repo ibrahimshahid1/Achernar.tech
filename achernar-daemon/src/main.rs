@@ -17,6 +17,7 @@ mod config;
 mod control;
 mod error;
 mod filter_wheel;
+mod fits;
 mod focus;
 mod hardware;
 mod models;
@@ -47,6 +48,18 @@ async fn main() -> anyhow::Result<()> {
         info!("OLS Bridge version: {}", ver.to_string_lossy());
     }
 
+    // Load achernar.toml configuration (falls back to defaults if absent).
+    // Section 5.4 — the daemon now honors achernar.toml, not just env vars.
+    // Set ACHERNAR_CONFIG to point at a specific file, otherwise ./achernar.toml.
+    let config = config::AchernarConfig::load().unwrap_or_default();
+    info!(
+        "Config: daemon.port={}, log_level={}, focus.safety.max_position={}, mount.max_slew_rate={}",
+        config.daemon.port,
+        config.daemon.log_level,
+        config.focus.safety.max_position,
+        config.mount.max_slew_rate
+    );
+
     // Create shared application state
     let app_state = AppState::new();
     cloud_client::spawn_if_configured(app_state.clone());
@@ -71,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     let port = std::env::var("ACHERNAR_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
-        .unwrap_or(3030);
+        .unwrap_or(config.daemon.port);
 
     let host = std::env::var("ACHERNAR_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let ip: IpAddr = host.parse()?;
@@ -92,6 +105,11 @@ fn camera_routes() -> Router<AppState> {
     Router::new()
         .route("/capture", post(api::camera::capture))
         .route("/abort", post(api::camera::abort))
+        .route(
+            "/parameters",
+            get(api::camera::get_parameters).post(api::camera::set_parameter),
+        )
+        .route("/formats", get(api::camera::get_formats))
         .route("/stream/start", post(api::camera::start_stream))
         .route("/stream/mjpeg", get(api::camera::stream_mjpeg))
         .route("/stream", get(camera_stream_ws))
@@ -156,17 +174,24 @@ async fn handle_stream_socket(mut socket: WebSocket, state: AppState) {
         };
 
         let frame_bytes = match frame_data {
-            Some(f) => {
-                // Build frame packet: [width(4)][height(4)][timestamp(8)][format(4)][data...]
-                let mut packet = Vec::with_capacity(20 + f.data.len());
-                packet.extend_from_slice(&(f.width as u32).to_le_bytes());
-                packet.extend_from_slice(&(f.height as u32).to_le_bytes());
-                let ts = (f.unix_timestamp * 1000.0) as u64;
-                packet.extend_from_slice(&ts.to_le_bytes());
-                packet.extend_from_slice(&(f.format as u32).to_le_bytes());
-                packet.extend_from_slice(&f.data);
-                packet
-            }
+            // JPEG-encode the frame so the browser can render it directly as an
+            // image/jpeg blob, regardless of the camera's native pixel format.
+            Some(f) => match api::camera::encode_frame_jpeg(&f) {
+                Some(jpeg) => {
+                    // Packet: [width(4)][height(4)][timestamp(8)][format(4)=JPEG][jpeg...]
+                    let mut packet = Vec::with_capacity(20 + jpeg.len());
+                    packet.extend_from_slice(&(f.width as u32).to_le_bytes());
+                    packet.extend_from_slice(&(f.height as u32).to_le_bytes());
+                    let ts = (f.unix_timestamp * 1000.0) as u64;
+                    packet.extend_from_slice(&ts.to_le_bytes());
+                    // Payload is always JPEG now (OlsStreamType::Mjpeg == 1).
+                    packet.extend_from_slice(&1u32.to_le_bytes());
+                    packet.extend_from_slice(&jpeg);
+                    packet
+                }
+                // Format we don't preview-encode yet: signal "waiting".
+                None => vec![0u8; 20],
+            },
             None => {
                 // No frame available yet, send empty packet
                 vec![0u8; 20]
