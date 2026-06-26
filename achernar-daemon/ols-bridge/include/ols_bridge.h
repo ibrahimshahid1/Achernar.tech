@@ -98,6 +98,20 @@ typedef enum {
     OLS_OPT_COOLER_ON,
     OLS_OPT_FAN_ON,
     OLS_OPT_COOLER_POWER_PERC,
+    OLS_OPT_AVERAGE_BIN,
+    OLS_OPT_BLACK_LEVEL,
+    OLS_OPT_CONV_GAIN_HCG,
+    OLS_OPT_CONV_GAIN_HDR,
+    OLS_OPT_LOW_NOISE,
+    OLS_OPT_HIGH_FULLWELL,
+    OLS_OPT_ISO,
+    OLS_OPT_SHUTTER,
+    OLS_OPT_VIEWFINDER,
+    OLS_OPT_CAPTURE_TARGET,
+    OLS_OPT_KEEP_IMAGES,
+    OLS_OPT_CAPTURE_DELAY,
+    OLS_OPT_ZOOM,
+    OLS_OPT_LIVE_STRETCH,
 } OlsCamOptionId;
 
 typedef enum {
@@ -145,6 +159,22 @@ OlsError ols_svb_camera_driver_create(OlsCameraDriver** out_driver);
 
 /** Create a ToupTek camera driver (requires ToupTek SDK). */
 OlsError ols_toup_camera_driver_create(OlsCameraDriver** out_driver);
+
+/** Create a watch-directory pseudo-camera that ingests frames from a folder.
+ *  `watch_dir` is the directory to monitor (no external dependencies). */
+OlsError ols_wdir_camera_driver_create(const char* watch_dir, OlsCameraDriver** out_driver);
+
+/** Create a gphoto2 (DSLR) camera driver (requires libgphoto2). */
+OlsError ols_gphoto2_camera_driver_create(OlsCameraDriver** out_driver);
+
+/** Create a UVC (USB video) camera driver (requires libuvc). */
+OlsError ols_uvc_camera_driver_create(OlsCameraDriver** out_driver);
+
+/** Create an INDI camera driver (requires libindi; connects to an INDI server). */
+OlsError ols_indi_camera_driver_create(OlsCameraDriver** out_driver);
+
+/** Create an INDIGO camera driver (requires INDIGO libraries). */
+OlsError ols_indigo_camera_driver_create(OlsCameraDriver** out_driver);
 
 /** Get the number of cameras from this driver. */
 OlsError ols_driver_list_cameras(OlsCameraDriver* driver, int32_t* out_count);

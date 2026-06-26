@@ -95,6 +95,20 @@ pub enum OlsCamOptionId {
     CoolerOn = 14,
     FanOn = 15,
     CoolerPowerPerc = 16,
+    AverageBin = 17,
+    BlackLevel = 18,
+    ConvGainHcg = 19,
+    ConvGainHdr = 20,
+    LowNoise = 21,
+    HighFullwell = 22,
+    Iso = 23,
+    Shutter = 24,
+    Viewfinder = 25,
+    CaptureTarget = 26,
+    KeepImages = 27,
+    CaptureDelay = 28,
+    Zoom = 29,
+    LiveStretch = 30,
 }
 
 #[repr(C)]
@@ -246,6 +260,19 @@ extern "C" {
     pub fn ols_svb_camera_driver_create(out_driver: *mut *mut OlsCameraDriver) -> c_int;
 
     pub fn ols_toup_camera_driver_create(out_driver: *mut *mut OlsCameraDriver) -> c_int;
+
+    pub fn ols_wdir_camera_driver_create(
+        watch_dir: *const c_char,
+        out_driver: *mut *mut OlsCameraDriver,
+    ) -> c_int;
+
+    pub fn ols_gphoto2_camera_driver_create(out_driver: *mut *mut OlsCameraDriver) -> c_int;
+
+    pub fn ols_uvc_camera_driver_create(out_driver: *mut *mut OlsCameraDriver) -> c_int;
+
+    pub fn ols_indi_camera_driver_create(out_driver: *mut *mut OlsCameraDriver) -> c_int;
+
+    pub fn ols_indigo_camera_driver_create(out_driver: *mut *mut OlsCameraDriver) -> c_int;
 
     pub fn ols_driver_list_cameras(driver: *mut OlsCameraDriver, out_count: *mut i32) -> c_int;
 

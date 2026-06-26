@@ -398,20 +398,29 @@ OlsError ols_sim_driver_create(const char *sim_data_dir,
   }
 }
 
+int ols_set_alpaca_driver_config(char const *s);
+ols::CameraDriver *ols_get_alpaca_driver(int cam_id, ols::CamErrorCode *e);
+
 OlsError ols_alpaca_camera_driver_create(const char *url,
                                           OlsCameraDriver **out_driver) {
   try {
-    // TODO: Direct Alpaca camera instantiation
-    // The OLS alpaca_camera.cpp uses AlpacaClient internally,
-    // which requires httplib and our nlohmann/json shim.
-    // For now, this returns an error. Enable by compiling
-    // alpaca_camera.cpp into the bridge and implementing direct
-    // factory calls here.
-    (void)url;
-    (void)out_driver;
-    return set_error(OLS_ERR_GENERIC,
-                     "Alpaca camera driver not yet compiled into bridge. "
-                     "Use ASCOM Alpaca with an installed SDK camera driver instead.");
+    if (!out_driver)
+      return set_error(OLS_ERR_INVALID, "Output driver pointer is null");
+    *out_driver = nullptr;
+
+    const char *connection = (url && url[0]) ? url : "auto";
+    if (ols_set_alpaca_driver_config(connection) != 0)
+      return set_error(OLS_ERR_INVALID, "Failed to configure Alpaca camera driver");
+
+    ols::CamErrorCode e;
+    ols::CameraDriver *d = ols_get_alpaca_driver(0, &e);
+    if (e) return set_error(OLS_ERR_IO, e.message());
+    if (!d) return set_error(OLS_ERR_IO, "Failed to instantiate Alpaca camera driver");
+
+    auto *wrapper = new OlsCameraDriver_t();
+    wrapper->driver.reset(d);
+    *out_driver = wrapper;
+    return OLS_OK;
   } catch (std::exception const &ex) {
     return set_error(OLS_ERR_GENERIC, ex);
   }
@@ -496,6 +505,122 @@ OlsError ols_toup_camera_driver_create(OlsCameraDriver **out_driver) {
   }
 #else
   return set_error(OLS_ERR_NOT_FOUND, "ToupTek SDK support not compiled into ols_bridge");
+#endif
+}
+
+// ─── Additional OLS Camera Drivers ───
+// These factory symbols are exported (extern "C") by their respective OLS
+// sources and compiled in conditionally (see CMakeLists.txt). `wdir` has no
+// external dependencies and is always available; the rest return a clear error
+// when their dependency/SDK is not present at build time.
+
+int ols_set_wdir_driver_config(char const *str);
+ols::CameraDriver *ols_get_wdir_driver(int id);
+ols::CameraDriver *ols_get_gphoto2_driver(int cam_id, ols::CamErrorCode *e);
+ols::CameraDriver *ols_get_uvc_driver(int fd, ols::CamErrorCode *e);
+ols::CameraDriver *ols_get_indi_driver(int cam_id, ols::CamErrorCode *e);
+ols::CameraDriver *ols_get_indigo_driver(int cam_id, ols::CamErrorCode *e);
+
+OlsError ols_wdir_camera_driver_create(const char *watch_dir,
+                                       OlsCameraDriver **out_driver) {
+  try {
+    if (!out_driver)
+      return set_error(OLS_ERR_INVALID, "Output driver pointer is null");
+    *out_driver = nullptr;
+
+    const char *dir = (watch_dir && watch_dir[0]) ? watch_dir : ".";
+    if (ols_set_wdir_driver_config(dir) != 0)
+      return set_error(OLS_ERR_INVALID, "Failed to configure watch-directory driver");
+
+    ols::CameraDriver *d = ols_get_wdir_driver(0);
+    if (!d) return set_error(OLS_ERR_IO, "Failed to instantiate watch-directory driver");
+
+    auto *wrapper = new OlsCameraDriver_t();
+    wrapper->driver.reset(d);
+    *out_driver = wrapper;
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+}
+
+OlsError ols_gphoto2_camera_driver_create(OlsCameraDriver **out_driver) {
+#ifdef WITH_GPHOTO2
+  try {
+    ols::CamErrorCode e;
+    ols::CameraDriver *d = ols_get_gphoto2_driver(-1, &e);
+    if (e) return set_error(OLS_ERR_IO, e.message());
+    if (!d) return set_error(OLS_ERR_IO, "Failed to instantiate gphoto2 driver");
+    auto *wrapper = new OlsCameraDriver_t();
+    wrapper->driver.reset(d);
+    *out_driver = wrapper;
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+#else
+  (void)out_driver;
+  return set_error(OLS_ERR_NOT_FOUND, "gphoto2 support not compiled into ols_bridge");
+#endif
+}
+
+OlsError ols_uvc_camera_driver_create(OlsCameraDriver **out_driver) {
+#ifdef WITH_UVC
+  try {
+    ols::CamErrorCode e;
+    ols::CameraDriver *d = ols_get_uvc_driver(-1, &e);
+    if (e) return set_error(OLS_ERR_IO, e.message());
+    if (!d) return set_error(OLS_ERR_IO, "Failed to instantiate UVC driver");
+    auto *wrapper = new OlsCameraDriver_t();
+    wrapper->driver.reset(d);
+    *out_driver = wrapper;
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+#else
+  (void)out_driver;
+  return set_error(OLS_ERR_NOT_FOUND, "UVC support not compiled into ols_bridge");
+#endif
+}
+
+OlsError ols_indi_camera_driver_create(OlsCameraDriver **out_driver) {
+#ifdef WITH_INDI
+  try {
+    ols::CamErrorCode e;
+    ols::CameraDriver *d = ols_get_indi_driver(0, &e);
+    if (e) return set_error(OLS_ERR_IO, e.message());
+    if (!d) return set_error(OLS_ERR_IO, "Failed to instantiate INDI driver");
+    auto *wrapper = new OlsCameraDriver_t();
+    wrapper->driver.reset(d);
+    *out_driver = wrapper;
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+#else
+  (void)out_driver;
+  return set_error(OLS_ERR_NOT_FOUND, "INDI support not compiled into ols_bridge");
+#endif
+}
+
+OlsError ols_indigo_camera_driver_create(OlsCameraDriver **out_driver) {
+#ifdef WITH_INDIGO
+  try {
+    ols::CamErrorCode e;
+    ols::CameraDriver *d = ols_get_indigo_driver(0, &e);
+    if (e) return set_error(OLS_ERR_IO, e.message());
+    if (!d) return set_error(OLS_ERR_IO, "Failed to instantiate INDIGO driver");
+    auto *wrapper = new OlsCameraDriver_t();
+    wrapper->driver.reset(d);
+    *out_driver = wrapper;
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+#else
+  (void)out_driver;
+  return set_error(OLS_ERR_NOT_FOUND, "INDIGO support not compiled into ols_bridge");
 #endif
 }
 

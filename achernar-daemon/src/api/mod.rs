@@ -65,21 +65,31 @@ pub async fn get_status(
         let cam_name = state.camera_name.lock().unwrap();
         let streaming = state.streaming.lock().unwrap();
         cam_name.as_ref().map(|name| {
-            // Try to get temperature from camera
-            let temperature = {
+            // Read real sensor temperature and cooler state from the camera.
+            let (temperature, cooling) = {
                 let cam = state.camera.lock().unwrap();
-                cam.as_ref()
+                let temperature = cam
+                    .as_ref()
                     .and_then(|c| {
                         c.get_parameter(crate::hardware::ols_ffi::OlsCamOptionId::Temperature)
                             .ok()
                     })
                     .map(|p| p.cur_val)
-                    .unwrap_or(-10.0)
+                    .unwrap_or(-10.0);
+                let cooling = cam
+                    .as_ref()
+                    .and_then(|c| {
+                        c.get_parameter(crate::hardware::ols_ffi::OlsCamOptionId::CoolerOn)
+                            .ok()
+                    })
+                    .map(|p| p.cur_val > 0.5)
+                    .unwrap_or(false);
+                (temperature, cooling)
             };
             CameraStatus {
                 name: name.clone(),
                 temperature,
-                cooling: false,
+                cooling,
                 exposing: *streaming,
                 streaming: *streaming,
             }
@@ -175,6 +185,14 @@ async fn connect_camera(
         "asi" => OlsCameraDriver::new_asi(),
         "svb" => OlsCameraDriver::new_svb(),
         "toup" => OlsCameraDriver::new_toup(),
+        "wdir" | "watchdir" => {
+            let dir = req.option.unwrap_or_else(|| "./watch".to_string());
+            OlsCameraDriver::new_wdir(&dir)
+        }
+        "gphoto2" | "dslr" => OlsCameraDriver::new_gphoto2(),
+        "uvc" | "webcam" => OlsCameraDriver::new_uvc(),
+        "indi" => OlsCameraDriver::new_indi(),
+        "indigo" => OlsCameraDriver::new_indigo(),
         _ => {
             tracing::warn!("Unsupported camera driver: {}", req.driver);
             return Err(StatusCode::BAD_REQUEST);

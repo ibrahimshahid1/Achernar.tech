@@ -169,6 +169,29 @@ fn main() {
         }
     }
 
+    // ─── Optional system camera libraries (gphoto2, libuvc, INDI, INDIGO) ───
+    // Mirrors the CMake driver detection. The bridge is a *static* lib, so these
+    // dependency libs must be linked at the final binary stage. Emit link flags
+    // only when present, so the default build (none installed) is unaffected.
+    link_optional_pkg("libgphoto2");
+    link_optional_pkg("libuvc");
+
+    // INDI client library (Linux); headers live under /usr[/local]/include/libindi
+    if std::path::Path::new("/usr/include/libindi").exists()
+        || std::path::Path::new("/usr/local/include/libindi").exists()
+    {
+        println!("cargo:rustc-link-lib=dylib=indiclient");
+    }
+
+    // INDIGO library
+    for inc in ["/opt/homebrew/include", "/usr/local/include", "/usr/include"] {
+        if std::path::Path::new(&format!("{inc}/indigo/indigo_bus.h")).exists() {
+            println!("cargo:rustc-link-search=native={}", inc.replace("/include", "/lib"));
+            println!("cargo:rustc-link-lib=dylib=indigo");
+            break;
+        }
+    }
+
     // Rebuild if bridge sources change
     println!("cargo:rerun-if-changed=ols-bridge/src/ols_bridge.cpp");
     println!("cargo:rerun-if-changed=ols-bridge/src/camera_base.cpp");
@@ -178,6 +201,26 @@ fn main() {
     println!("cargo:rerun-if-changed=ols-bridge/shims/booster/aio/endpoint.h");
     println!("cargo:rerun-if-changed=ols-bridge/shims/booster/aio/basic_socket.h");
     println!("cargo:rerun-if-changed=ols-bridge/shims/booster/log.h");
+    println!("cargo:rerun-if-changed=ols-bridge/shims/booster/regex.h");
+    for path in [
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_camera.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_client.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_mount.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_focuser.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/asi_camera.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/svb_camera.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/toup_camera.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/indi_camera.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/indi_mount.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/gphoto2_camera.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/wdir_camera.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/uvc_camera.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/indigo_camera.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/include/camera.h",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/include/alpaca_client.h",
+    ] {
+        println!("cargo:rerun-if-changed={path}");
+    }
 }
 
 struct PkgConfigResult {
@@ -225,6 +268,25 @@ fn pkg_config_libs(name: &str) -> PkgConfigResult {
     }
 
     PkgConfigResult { link_paths, libs }
+}
+
+/// Emit cargo link flags for an *optional* pkg-config package. No-op (and no
+/// panic) if pkg-config or the package is missing, so optional drivers don't
+/// break builds on machines without their system libraries.
+fn link_optional_pkg(name: &str) {
+    let pkg_config = find_pkg_config();
+    let output = match Command::new(&pkg_config).args(["--libs", name]).output() {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let flags = String::from_utf8_lossy(&output.stdout);
+    for flag in flags.split_whitespace() {
+        if let Some(path) = flag.strip_prefix("-L") {
+            println!("cargo:rustc-link-search=native={path}");
+        } else if let Some(lib) = flag.strip_prefix("-l") {
+            println!("cargo:rustc-link-lib=dylib={lib}");
+        }
+    }
 }
 
 /// Search a directory tree for a file whose name starts with `prefix`.

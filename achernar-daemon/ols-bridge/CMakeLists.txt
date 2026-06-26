@@ -34,6 +34,7 @@ set(BRIDGE_SOURCES
     ${BRIDGE_SRC}/camera_base.cpp
 
     # OLS Alpaca drivers (no vendor SDK needed)
+    ${OLS_SRC}/alpaca_camera.cpp
     ${OLS_SRC}/mount.cpp
     ${OLS_SRC}/alpaca_mount.cpp
     ${OLS_SRC}/focuser.cpp
@@ -43,6 +44,9 @@ set(BRIDGE_SOURCES
     # OLS utilities (needed by sim camera for file I/O)
     ${OLS_SRC}/util.cpp
     ${OLS_SRC}/tiffmat.cpp
+
+    # Watch-directory pseudo-camera (no vendor SDK / external libs needed)
+    ${OLS_SRC}/wdir_camera.cpp
 )
 
 set(EXTRA_INCLUDE_DIRS "")
@@ -143,8 +147,47 @@ if(EXISTS "/usr/include/libindi" OR EXISTS "/usr/local/include/libindi")
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/indi_mount.cpp)
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/indi_camera.cpp)
     add_definitions(-DWITH_INDI)
+    if(EXISTS "/usr/include/libindi")
+        list(APPEND EXTRA_INCLUDE_DIRS /usr/include/libindi)
+    else()
+        list(APPEND EXTRA_INCLUDE_DIRS /usr/local/include/libindi)
+    endif()
+    list(APPEND EXTRA_LIBS indiclient)
 else()
     message(STATUS "ℹ️  INDI not found — INDI drivers disabled (Linux only)")
+endif()
+
+# ═══════════════════════════════════════════════════════════════════
+#  UVC (USB video cameras / webcams, optional — requires libuvc)
+# ═══════════════════════════════════════════════════════════════════
+pkg_check_modules(LIBUVC libuvc)
+if(LIBUVC_FOUND)
+    message(STATUS "✅ libuvc found — UVC camera driver enabled")
+    list(APPEND BRIDGE_SOURCES ${OLS_SRC}/uvc_camera.cpp)
+    list(APPEND EXTRA_INCLUDE_DIRS ${LIBUVC_INCLUDE_DIRS})
+    list(APPEND EXTRA_LINK_DIRS ${LIBUVC_LIBRARY_DIRS})
+    list(APPEND EXTRA_LIBS ${LIBUVC_LIBRARIES})
+    add_definitions(-DWITH_UVC)
+else()
+    message(STATUS "ℹ️  libuvc not found — UVC camera driver disabled")
+endif()
+
+# ═══════════════════════════════════════════════════════════════════
+#  INDIGO (optional — requires INDIGO libraries)
+# ═══════════════════════════════════════════════════════════════════
+find_file(INDIGO_HEADER indigo/indigo_bus.h
+    PATHS "/opt/homebrew/include" "/usr/local/include" "/usr/include"
+)
+if(INDIGO_HEADER)
+    get_filename_component(INDIGO_INC_DIR "${INDIGO_HEADER}" DIRECTORY)  # .../indigo/
+    get_filename_component(INDIGO_INC_DIR "${INDIGO_INC_DIR}" DIRECTORY) # .../include/
+    message(STATUS "✅ INDIGO found — INDIGO camera driver enabled (${INDIGO_INC_DIR})")
+    list(APPEND BRIDGE_SOURCES ${OLS_SRC}/indigo_camera.cpp)
+    list(APPEND EXTRA_INCLUDE_DIRS ${INDIGO_INC_DIR})
+    list(APPEND EXTRA_LIBS indigo)
+    add_definitions(-DWITH_INDIGO)
+else()
+    message(STATUS "ℹ️  INDIGO not found — INDIGO camera driver disabled")
 endif()
 
 # ═══════════════════════════════════════════════════════════════════
@@ -210,7 +253,7 @@ target_compile_options(ols_bridge PRIVATE
 # ─── Status Summary ───
 message(STATUS "")
 message(STATUS "═══ OLS Bridge Build Summary ═══")
-message(STATUS "  Core:     Mount (Alpaca), Focuser (Alpaca), Sim Camera")
+message(STATUS "  Core:     Camera (Sim, Alpaca, WatchDir), Mount (Alpaca), Focuser (Alpaca)")
 get_directory_property(COMPILE_DEFS COMPILE_DEFINITIONS)
 if("WITH_ASI" IN_LIST COMPILE_DEFS)
     message(STATUS "  Camera:   ✅ ASI (ZWO)")
@@ -221,10 +264,16 @@ endif()
 if("WITH_TOUP" IN_LIST COMPILE_DEFS)
     message(STATUS "  Camera:   ✅ ToupTek")
 endif()
-if("WITH_INDI" IN_LIST COMPILE_DEFS)
-    message(STATUS "  Protocol: ✅ INDI")
+if("WITH_UVC" IN_LIST COMPILE_DEFS)
+    message(STATUS "  Camera:   ✅ UVC (USB video)")
 endif()
 if("WITH_GPHOTO2" IN_LIST COMPILE_DEFS)
     message(STATUS "  Camera:   ✅ GPhoto2 (DSLR)")
+endif()
+if("WITH_INDI" IN_LIST COMPILE_DEFS)
+    message(STATUS "  Protocol: ✅ INDI (camera + mount)")
+endif()
+if("WITH_INDIGO" IN_LIST COMPILE_DEFS)
+    message(STATUS "  Protocol: ✅ INDIGO (camera)")
 endif()
 message(STATUS "════════════════════════════════")

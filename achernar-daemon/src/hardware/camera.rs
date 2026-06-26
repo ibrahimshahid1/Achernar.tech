@@ -148,6 +148,53 @@ impl OlsCameraDriver {
         Ok(Self { handle })
     }
 
+    /// Create a watch-directory pseudo-camera that ingests frames from a folder.
+    /// Requires no vendor SDK — useful for development and bench testing.
+    pub fn new_wdir(watch_dir: &str) -> Result<Self> {
+        let c_dir = CString::new(watch_dir)?;
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            check(ols_ffi::ols_wdir_camera_driver_create(c_dir.as_ptr(), &mut handle))?;
+        }
+        Ok(Self { handle })
+    }
+
+    /// Create a gphoto2 (DSLR) camera driver. Requires libgphoto2 at build time.
+    pub fn new_gphoto2() -> Result<Self> {
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            check(ols_ffi::ols_gphoto2_camera_driver_create(&mut handle))?;
+        }
+        Ok(Self { handle })
+    }
+
+    /// Create a UVC (USB video) camera driver. Requires libuvc at build time.
+    pub fn new_uvc() -> Result<Self> {
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            check(ols_ffi::ols_uvc_camera_driver_create(&mut handle))?;
+        }
+        Ok(Self { handle })
+    }
+
+    /// Create an INDI camera driver. Requires libindi at build time.
+    pub fn new_indi() -> Result<Self> {
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            check(ols_ffi::ols_indi_camera_driver_create(&mut handle))?;
+        }
+        Ok(Self { handle })
+    }
+
+    /// Create an INDIGO camera driver. Requires the INDIGO libraries at build time.
+    pub fn new_indigo() -> Result<Self> {
+        let mut handle = std::ptr::null_mut();
+        unsafe {
+            check(ols_ffi::ols_indigo_camera_driver_create(&mut handle))?;
+        }
+        Ok(Self { handle })
+    }
+
     /// List available cameras
     pub fn list_cameras(&mut self) -> Result<Vec<String>> {
         let mut count: i32 = 0;

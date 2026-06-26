@@ -91,6 +91,11 @@ fn connect_camera(state: AppState, driver: &str, option: Option<String>) -> Resu
         "asi" => OlsCameraDriver::new_asi(),
         "svb" => OlsCameraDriver::new_svb(),
         "toup" => OlsCameraDriver::new_toup(),
+        "wdir" | "watchdir" => OlsCameraDriver::new_wdir(option.as_deref().unwrap_or("./watch")),
+        "gphoto2" | "dslr" => OlsCameraDriver::new_gphoto2(),
+        "uvc" | "webcam" => OlsCameraDriver::new_uvc(),
+        "indi" => OlsCameraDriver::new_indi(),
+        "indigo" => OlsCameraDriver::new_indigo(),
         other => return Err(format!("Unsupported camera driver: {other}")),
     };
 

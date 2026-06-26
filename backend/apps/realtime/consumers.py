@@ -218,12 +218,16 @@ class DaemonConsumer(AsyncWebsocketConsumer):
             daemon = DaemonConnection.objects.get(id=self.daemon_id)
             snapshot, created = TelemetrySnapshot.objects.get_or_create(daemon=daemon)
             
-            # Update individual state components
-            snapshot.mount_state = payload.get('mount', {})
-            snapshot.camera_state = payload.get('camera', {})
-            snapshot.focuser_state = payload.get('focuser', {})
-            snapshot.guiding_state = payload.get('guiding', {})
-            snapshot.ai_metrics = payload.get('ai', {})
+            # Update individual state components.
+            # The daemon sends explicit `null` for absent hardware, so
+            # `.get(key, {})` is not enough (the default only applies when the
+            # key is missing, not when its value is None). Coerce null -> {} to
+            # satisfy the NOT NULL JSONField columns.
+            snapshot.mount_state = payload.get('mount') or {}
+            snapshot.camera_state = payload.get('camera') or {}
+            snapshot.focuser_state = payload.get('focuser') or {}
+            snapshot.guiding_state = payload.get('guiding') or {}
+            snapshot.ai_metrics = payload.get('ai') or {}
             snapshot.save()
         
         except DaemonConnection.DoesNotExist:
