@@ -14,7 +14,7 @@ Cloud-based AI/ML services for embeddings, recommendations, quality scoring, and
 ## Models
 
 - `EmbeddingModel` — Tracks embedding model versions and deployment
-- `ObjectEmbedding` — Stores 256-D embeddings for astronomical objects
+- `ObjectEmbedding` — Stores 512-D AstroM3 embeddings for astronomical objects
 
 ## API Endpoints
 

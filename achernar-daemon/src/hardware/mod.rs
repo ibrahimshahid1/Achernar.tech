@@ -2,6 +2,7 @@
 // Real camera/mount/focuser support via OpenLiveStacker C++ drivers
 
 pub mod camera;
+pub mod capabilities;
 pub mod filter_wheel;
 pub mod focuser;
 pub mod mount;

@@ -1,27 +1,39 @@
 """
-Tri-Modal Embedding Models
+AstroM3 embedding models.
 
-Handles Image ↔ Light Curve ↔ Spectrum ↔ Metadata embeddings.
-PDF Section 6.6 - Tri-Modal Embedding
+Stores the 512-D shared embedding vectors produced by AstroM3 / AstroM3Edge.
 """
-from django.db import models
 from django.contrib.postgres.fields import ArrayField
+from django.db import models
 import uuid
 
 
+ASTROM3_EMBEDDING_DIM = 512
+ASTROM3_MODALITY_CHOICES = [
+    ('image', 'Image'),
+    ('photometry', 'Photometry'),
+    ('telemetry', 'Telemetry'),
+    ('timeseries', 'Time-Series'),
+    ('spectra', 'Spectra'),
+    ('metadata', 'Metadata'),
+    ('multimodal', 'Multi-Modal'),
+]
+
+
 class EmbeddingModel(models.Model):
-    """Tracks trained embedding models (tri-modal CLIP-style)"""
+    """Tracks trained embedding model versions."""
     id = models.UUIDField(primary_key=True, default=uuid.uuid4)
     name = models.CharField(max_length=255)
     version = models.CharField(max_length=50)
     
     # Model architecture
-    image_encoder = models.CharField(max_length=100, help_text="e.g., ViT-Small, ConvNeXt-Tiny")
-    timeseries_encoder = models.CharField(max_length=100, help_text="e.g., Transformer, InceptionTime")
-    spectra_encoder = models.CharField(max_length=100, help_text="e.g., 1D ResNet")
+    image_encoder = models.CharField(max_length=100, blank=True, help_text="Edge only, e.g. AstroM3Edge ImageEncoder")
+    timeseries_encoder = models.CharField(max_length=100, help_text="e.g., AstroM3 Informer")
+    spectra_encoder = models.CharField(max_length=100, blank=True, help_text="Cloud only, e.g. AstroM3 GalSpecNet")
+    metadata_encoder = models.CharField(max_length=100, default="AstroM3 MetaModel")
     
     # Training metadata
-    embedding_dim = models.IntegerField(default=256)
+    embedding_dim = models.IntegerField(default=ASTROM3_EMBEDDING_DIM)
     training_samples = models.IntegerField()
     training_loss = models.FloatField(null=True, blank=True)
     
@@ -49,22 +61,17 @@ class ObjectEmbedding(models.Model):
     catalog_id = models.CharField(max_length=100, blank=True)
     object_type = models.CharField(max_length=100, blank=True)
     
-    # Embedding vector (256-D)
-    embedding = ArrayField(models.FloatField(), size=256)
+    # Embedding vector (512-D for AstroM3 / AstroM3Edge)
+    embedding = ArrayField(models.FloatField(), size=ASTROM3_EMBEDDING_DIM)
     
     # Source modality
-    modality = models.CharField(max_length=20, choices=[
-        ('image', 'Image'),
-        ('timeseries', 'Time-Series'),
-        ('spectra', 'Spectra'),
-        ('multimodal', 'Multi-Modal'),
-    ])
+    modality = models.CharField(max_length=20, choices=ASTROM3_MODALITY_CHOICES)
     
     created_at = models.DateTimeField(auto_now_add=True)
     
     class Meta:
         indexes = [
-            models.Index(fields=['object_type', 'modality']),
+            models.Index(fields=['object_type', 'modality'], name='ai_obj_emb_type_mod_idx'),
         ]
     
     def __str__(self):

@@ -175,13 +175,7 @@ fn main() {
     // only when present, so the default build (none installed) is unaffected.
     link_optional_pkg("libgphoto2");
     link_optional_pkg("libuvc");
-
-    // INDI client library (Linux); headers live under /usr[/local]/include/libindi
-    if std::path::Path::new("/usr/include/libindi").exists()
-        || std::path::Path::new("/usr/local/include/libindi").exists()
-    {
-        println!("cargo:rustc-link-lib=dylib=indiclient");
-    }
+    link_optional_indi();
 
     // INDIGO library
     for inc in ["/opt/homebrew/include", "/usr/local/include", "/usr/include"] {
@@ -202,6 +196,9 @@ fn main() {
     println!("cargo:rerun-if-changed=ols-bridge/shims/booster/aio/basic_socket.h");
     println!("cargo:rerun-if-changed=ols-bridge/shims/booster/log.h");
     println!("cargo:rerun-if-changed=ols-bridge/shims/booster/regex.h");
+    println!("cargo:rerun-if-env-changed=INDI_ROOT");
+    println!("cargo:rerun-if-env-changed=INDI_DIR");
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
     for path in [
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_camera.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_client.cpp",
@@ -229,15 +226,21 @@ struct PkgConfigResult {
 }
 
 fn find_pkg_config() -> String {
+    find_pkg_config_optional().unwrap_or_else(|| {
+        panic!("pkg-config not found! Install with: brew install pkg-config");
+    })
+}
+
+fn find_pkg_config_optional() -> Option<String> {
     if Command::new("pkg-config").arg("--version").output().is_ok() {
-        return "pkg-config".to_string();
+        return Some("pkg-config".to_string());
     }
     for path in &["/opt/homebrew/bin/pkg-config", "/usr/local/bin/pkg-config"] {
         if std::path::Path::new(path).exists() {
-            return path.to_string();
+            return Some(path.to_string());
         }
     }
-    panic!("pkg-config not found! Install with: brew install pkg-config");
+    None
 }
 
 fn pkg_config_libs(name: &str) -> PkgConfigResult {
@@ -273,11 +276,13 @@ fn pkg_config_libs(name: &str) -> PkgConfigResult {
 /// Emit cargo link flags for an *optional* pkg-config package. No-op (and no
 /// panic) if pkg-config or the package is missing, so optional drivers don't
 /// break builds on machines without their system libraries.
-fn link_optional_pkg(name: &str) {
-    let pkg_config = find_pkg_config();
+fn link_optional_pkg(name: &str) -> bool {
+    let Some(pkg_config) = find_pkg_config_optional() else {
+        return false;
+    };
     let output = match Command::new(&pkg_config).args(["--libs", name]).output() {
         Ok(o) if o.status.success() => o,
-        _ => return,
+        _ => return false,
     };
     let flags = String::from_utf8_lossy(&output.stdout);
     for flag in flags.split_whitespace() {
@@ -285,6 +290,46 @@ fn link_optional_pkg(name: &str) {
             println!("cargo:rustc-link-search=native={path}");
         } else if let Some(lib) = flag.strip_prefix("-l") {
             println!("cargo:rustc-link-lib=dylib={lib}");
+        }
+    }
+    true
+}
+
+fn link_optional_indi() {
+    if link_optional_pkg("libindi") || link_optional_pkg("indiclient") {
+        return;
+    }
+
+    let mut prefixes: Vec<PathBuf> = ["INDI_ROOT", "INDI_DIR"]
+        .iter()
+        .filter_map(|name| env::var_os(name))
+        .map(PathBuf::from)
+        .collect();
+    prefixes.extend(
+        ["/opt/homebrew", "/usr/local", "/usr", "/opt/local"]
+            .iter()
+            .map(PathBuf::from),
+    );
+
+    for prefix in prefixes {
+        let lib_dir = prefix.join("lib");
+        let dylib = lib_dir.join("libindiclient.dylib");
+        let so = lib_dir.join("libindiclient.so");
+        let archive = lib_dir.join("libindiclient.a");
+
+        let link_kind = if dylib.exists() || so.exists() {
+            Some("dylib")
+        } else if archive.exists() {
+            Some("static")
+        } else {
+            None
+        };
+
+        if let Some(kind) = link_kind {
+            println!("cargo:rustc-link-search=native={}", lib_dir.display());
+            println!("cargo:rustc-link-lib={kind}=indiclient");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+            break;
         }
     }
 }

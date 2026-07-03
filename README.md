@@ -31,7 +31,7 @@ Achernar is a unified astronomy imaging and control system that democratizes hig
 - **Settings Recommender**: Contextual bandit (LinUCB) for exposure/gain optimization
 
 #### Cloud AI (Heavy Compute)
-- **Tri-Modal Embeddings**: Unified 256-D space for Image ↔ Light Curve ↔ Spectrum ↔ Metadata
+- **Tri-Modal Embeddings**: AstroM3-compatible 512-D space for Image/Telemetry ↔ Light Curve ↔ Spectrum ↔ Metadata
 - **Target Ranking**: Optimization-based scheduling (OR-Tools) with SNR prediction
 - **Quality Scoring**: Calibrated regression with SHAP explainability
 - **Anomaly Detection**: Isolation Forest / One-Class SVM for transient discovery

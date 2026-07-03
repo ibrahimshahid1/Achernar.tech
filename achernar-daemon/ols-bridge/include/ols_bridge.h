@@ -34,6 +34,25 @@ typedef int OlsError;
 const char* ols_last_error(void);
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  Build Capabilities
+ * ═══════════════════════════════════════════════════════════════════ */
+
+#define OLS_CAP_CAMERA_ASI      (1u << 0)
+#define OLS_CAP_CAMERA_SVB      (1u << 1)
+#define OLS_CAP_CAMERA_TOUP     (1u << 2)
+#define OLS_CAP_CAMERA_GPHOTO2  (1u << 3)
+#define OLS_CAP_CAMERA_UVC      (1u << 4)
+#define OLS_CAP_CAMERA_INDI     (1u << 5)
+#define OLS_CAP_CAMERA_INDIGO   (1u << 6)
+#define OLS_CAP_CAMERA_WDIR     (1u << 7)
+
+/** Get the OLS bridge version string. */
+const char* ols_bridge_version(void);
+
+/** Bitmask of native camera drivers compiled into this bridge build. */
+uint32_t ols_driver_capability_flags(void);
+
+/* ═══════════════════════════════════════════════════════════════════
  *  Stream / Pixel Format Types
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -399,12 +418,6 @@ OlsError ols_focuser_unload(OlsFocuserInterface* fi);
 
 /** Destroy the focuser interface. */
 void ols_focuser_interface_destroy(OlsFocuserInterface* fi);
-
-/* ═══════════════════════════════════════════════════════════════════
- *  Version Info
- * ═══════════════════════════════════════════════════════════════════ */
-
-const char* ols_bridge_version(void);
 
 #ifdef __cplusplus
 }

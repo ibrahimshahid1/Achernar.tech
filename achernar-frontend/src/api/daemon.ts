@@ -24,6 +24,22 @@ export interface CamFormat {
     framerate: number;
 }
 
+export interface DriverCapability {
+    id: string;
+    label: string;
+    compiled: boolean;
+    enabled: boolean;
+    reason?: string;
+    option_hint?: string;
+}
+
+export interface DriverCapabilityReport {
+    bridge_version: string;
+    camera: DriverCapability[];
+    mount: DriverCapability[];
+    focuser: DriverCapability[];
+}
+
 /** Result of a single-shot capture (from POST /camera/capture). */
 export interface CaptureResult {
     id: string;
@@ -46,6 +62,11 @@ export const daemonApi = {
     // GET /api/v1/status
     async getStatus(): Promise<EquipmentState> {
         return httpJson<EquipmentState>(`${env.daemonApiBase}/status`);
+    },
+
+    // GET /api/v1/drivers — build-time native hardware support report
+    async getDriverCapabilities(): Promise<DriverCapabilityReport> {
+        return httpJson<DriverCapabilityReport>(`${env.daemonApiBase}/drivers`);
     },
 
     // POST /api/v1/mount/slew

@@ -377,6 +377,35 @@ const char *ols_last_error(void) { return g_last_error.c_str(); }
 
 const char *ols_bridge_version(void) { return "0.2.0"; }
 
+uint32_t ols_driver_capability_flags(void) {
+  uint32_t flags = 0;
+#ifdef WITH_ASI
+  flags |= OLS_CAP_CAMERA_ASI;
+#endif
+#ifdef WITH_SVB
+  flags |= OLS_CAP_CAMERA_SVB;
+#endif
+#ifdef WITH_TOUP
+  flags |= OLS_CAP_CAMERA_TOUP;
+#endif
+#ifdef WITH_GPHOTO2
+  flags |= OLS_CAP_CAMERA_GPHOTO2;
+#endif
+#ifdef WITH_UVC
+  flags |= OLS_CAP_CAMERA_UVC;
+#endif
+#ifdef WITH_INDI
+  flags |= OLS_CAP_CAMERA_INDI;
+#endif
+#ifdef WITH_INDIGO
+  flags |= OLS_CAP_CAMERA_INDIGO;
+#endif
+#ifdef __linux__
+  flags |= OLS_CAP_CAMERA_WDIR;
+#endif
+  return flags;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Camera Driver API
 // ═══════════════════════════════════════════════════════════════════
@@ -510,12 +539,13 @@ OlsError ols_toup_camera_driver_create(OlsCameraDriver **out_driver) {
 
 // ─── Additional OLS Camera Drivers ───
 // These factory symbols are exported (extern "C") by their respective OLS
-// sources and compiled in conditionally (see CMakeLists.txt). `wdir` has no
-// external dependencies and is always available; the rest return a clear error
-// when their dependency/SDK is not present at build time.
+// sources and compiled in conditionally (see CMakeLists.txt). The rest return
+// a clear error when their dependency/SDK is not present at build time.
 
+#ifdef __linux__
 int ols_set_wdir_driver_config(char const *str);
 ols::CameraDriver *ols_get_wdir_driver(int id);
+#endif
 ols::CameraDriver *ols_get_gphoto2_driver(int cam_id, ols::CamErrorCode *e);
 ols::CameraDriver *ols_get_uvc_driver(int fd, ols::CamErrorCode *e);
 ols::CameraDriver *ols_get_indi_driver(int cam_id, ols::CamErrorCode *e);
@@ -523,6 +553,7 @@ ols::CameraDriver *ols_get_indigo_driver(int cam_id, ols::CamErrorCode *e);
 
 OlsError ols_wdir_camera_driver_create(const char *watch_dir,
                                        OlsCameraDriver **out_driver) {
+#ifdef __linux__
   try {
     if (!out_driver)
       return set_error(OLS_ERR_INVALID, "Output driver pointer is null");
@@ -542,6 +573,12 @@ OlsError ols_wdir_camera_driver_create(const char *watch_dir,
   } catch (std::exception const &ex) {
     return set_error(OLS_ERR_GENERIC, ex);
   }
+#else
+  (void)watch_dir;
+  (void)out_driver;
+  return set_error(OLS_ERR_NOT_FOUND,
+                   "watch-directory camera support is only available on Linux");
+#endif
 }
 
 OlsError ols_gphoto2_camera_driver_create(OlsCameraDriver **out_driver) {

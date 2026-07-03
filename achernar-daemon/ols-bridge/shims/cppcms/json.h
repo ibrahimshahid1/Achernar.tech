@@ -55,6 +55,14 @@ namespace json {
             return j_[key].get<T>();
         }
 
+        // get<T>(key, default) - typed access with default value
+        template<typename T>
+        T get(std::string const &key, T const &def) const {
+            if (j_.contains(key) && !j_[key].is_null())
+                return j_[key].get<T>();
+            return def;
+        }
+
         // get(key, default) - access with default value (string overload)
         std::string get(std::string const &key, std::string const &def) const {
             if (j_.contains(key) && !j_[key].is_null())

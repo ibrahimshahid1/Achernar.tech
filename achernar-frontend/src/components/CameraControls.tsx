@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { daemonApi, type CamParam, type CamFormat } from "../api/daemon";
+import { daemonApi, type CamParam, type CamFormat, type DriverCapability } from "../api/daemon";
 
 /**
  * Manual camera control panel.
@@ -14,17 +14,17 @@ import { daemonApi, type CamParam, type CamFormat } from "../api/daemon";
 
 type Mode = "manual" | "auto";
 
-const DRIVERS: Array<{ value: string; label: string }> = [
-    { value: "svb", label: "SVBony" },
-    { value: "asi", label: "ZWO ASI" },
-    { value: "toup", label: "ToupTek" },
-    { value: "uvc", label: "UVC / Webcam" },
-    { value: "gphoto2", label: "DSLR (gphoto2)" },
-    { value: "indi", label: "INDI" },
-    { value: "indigo", label: "INDIGO" },
-    { value: "alpaca", label: "Alpaca" },
-    { value: "wdir", label: "Watch Folder" },
-    { value: "sim", label: "Simulator" },
+const DRIVERS: DriverCapability[] = [
+    { id: "svb", label: "SVBony", compiled: true, enabled: true },
+    { id: "asi", label: "ZWO ASI", compiled: true, enabled: true },
+    { id: "toup", label: "ToupTek", compiled: true, enabled: true },
+    { id: "uvc", label: "UVC / Webcam", compiled: true, enabled: true },
+    { id: "gphoto2", label: "DSLR (gphoto2)", compiled: true, enabled: true },
+    { id: "indi", label: "INDI", compiled: true, enabled: true },
+    { id: "indigo", label: "INDIGO", compiled: true, enabled: true },
+    { id: "alpaca", label: "Alpaca", compiled: true, enabled: true },
+    { id: "wdir", label: "Watch Folder", compiled: true, enabled: true },
+    { id: "sim", label: "Simulator", compiled: true, enabled: true },
 ];
 
 function humanize(name: string): string {
@@ -42,6 +42,7 @@ export default function CameraControls() {
     const [selectedFormat, setSelectedFormat] = useState(0);
     const [connected, setConnected] = useState(false);
     const [driver, setDriver] = useState("svb");
+    const [driverCapabilities, setDriverCapabilities] = useState<DriverCapability[] | null>(null);
     const [streaming, setStreaming] = useState(false);
     const [message, setMessage] = useState("No camera connected.");
     const [busy, setBusy] = useState(false);
@@ -70,7 +71,51 @@ export default function CameraControls() {
         refresh();
     }, [refresh]);
 
+    useEffect(() => {
+        let cancelled = false;
+
+        daemonApi
+            .getDriverCapabilities()
+            .then((report) => {
+                if (!cancelled) {
+                    setDriverCapabilities(report.camera);
+                }
+            })
+            .catch(() => {
+                if (!cancelled) {
+                    setDriverCapabilities(null);
+                }
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, []);
+
+    const driverOptions = driverCapabilities ?? DRIVERS;
+    const selectedDriver = driverOptions.find((d) => d.id === driver);
+    const selectedDriverEnabled = selectedDriver?.enabled ?? true;
+
+    useEffect(() => {
+        if (!driverCapabilities) {
+            return;
+        }
+        const current = driverCapabilities.find((d) => d.id === driver);
+        if (current?.enabled) {
+            return;
+        }
+        const firstEnabled = driverCapabilities.find((d) => d.enabled);
+        if (firstEnabled) {
+            setDriver(firstEnabled.id);
+            setMessage(`${current?.label ?? driver} is unavailable in this build; selected ${firstEnabled.label}.`);
+        }
+    }, [driver, driverCapabilities]);
+
     const connect = async () => {
+        if (!selectedDriverEnabled) {
+            setMessage(selectedDriver?.reason ?? `${selectedDriver?.label ?? driver} is unavailable in this build.`);
+            return;
+        }
         setBusy(true);
         setMessage(`Connecting ${driver}...`);
         try {
@@ -176,13 +221,14 @@ export default function CameraControls() {
             {!connected ? (
                 <div className="cam-connect">
                     <select className="cam-select grow" value={driver} onChange={(e) => setDriver(e.target.value)}>
-                        {DRIVERS.map((d) => (
-                            <option key={d.value} value={d.value}>
+                        {driverOptions.map((d) => (
+                            <option key={d.id} value={d.id} disabled={!d.enabled} title={d.reason}>
                                 {d.label}
+                                {d.enabled ? "" : " (not compiled)"}
                             </option>
                         ))}
                     </select>
-                    <button type="button" className="cam-btn primary" onClick={connect} disabled={busy}>
+                    <button type="button" className="cam-btn primary" onClick={connect} disabled={busy || !selectedDriverEnabled}>
                         Connect
                     </button>
                 </div>

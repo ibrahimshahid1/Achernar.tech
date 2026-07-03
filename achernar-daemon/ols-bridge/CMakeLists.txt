@@ -45,13 +45,18 @@ set(BRIDGE_SOURCES
     ${OLS_SRC}/util.cpp
     ${OLS_SRC}/tiffmat.cpp
 
-    # Watch-directory pseudo-camera (no vendor SDK / external libs needed)
-    ${OLS_SRC}/wdir_camera.cpp
 )
 
 set(EXTRA_INCLUDE_DIRS "")
 set(EXTRA_LINK_DIRS "")
 set(EXTRA_LIBS "")
+
+# Watch-directory pseudo-camera uses Linux inotify via OLS DirWatch.
+if(LINUX)
+    list(APPEND BRIDGE_SOURCES ${OLS_SRC}/wdir_camera.cpp)
+else()
+    message(STATUS "ℹ️  Watch-directory camera disabled — requires Linux inotify")
+endif()
 
 # ═══════════════════════════════════════════════════════════════════
 #  ASI (ZWO) Camera SDK
@@ -140,21 +145,68 @@ else()
 endif()
 
 # ═══════════════════════════════════════════════════════════════════
-#  INDI (Linux only, optional)
+#  INDI (optional)
 # ═══════════════════════════════════════════════════════════════════
-if(EXISTS "/usr/include/libindi" OR EXISTS "/usr/local/include/libindi")
+set(INDI_HINT_PREFIXES
+    "$ENV{INDI_ROOT}"
+    "$ENV{INDI_DIR}"
+    "/opt/homebrew"
+    "/usr/local"
+    "/usr"
+    "/opt/local"
+)
+list(REMOVE_ITEM INDI_HINT_PREFIXES "")
+
+pkg_check_modules(LIBINDI QUIET libindi)
+pkg_check_modules(INDICLIENT QUIET indiclient)
+
+if(NOT LIBINDI_FOUND AND NOT INDICLIENT_FOUND)
+    find_path(INDI_INCLUDE_DIR
+        NAMES libindi/baseclient.h
+        PATHS ${INDI_HINT_PREFIXES}
+        PATH_SUFFIXES include
+    )
+    find_library(INDI_CLIENT_LIBRARY
+        NAMES indiclient libindiclient
+        PATHS ${INDI_HINT_PREFIXES}
+        PATH_SUFFIXES lib
+    )
+endif()
+
+if(LIBINDI_FOUND OR INDICLIENT_FOUND OR (INDI_INCLUDE_DIR AND INDI_CLIENT_LIBRARY))
     message(STATUS "✅ INDI found — INDI mount/camera drivers enabled")
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/indi_mount.cpp)
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/indi_camera.cpp)
     add_definitions(-DWITH_INDI)
-    if(EXISTS "/usr/include/libindi")
-        list(APPEND EXTRA_INCLUDE_DIRS /usr/include/libindi)
+
+    if(LIBINDI_FOUND)
+        foreach(INDI_PKG_INCLUDE_DIR IN LISTS LIBINDI_INCLUDE_DIRS)
+            list(APPEND EXTRA_INCLUDE_DIRS ${INDI_PKG_INCLUDE_DIR})
+            get_filename_component(INDI_PKG_INCLUDE_NAME "${INDI_PKG_INCLUDE_DIR}" NAME)
+            if(INDI_PKG_INCLUDE_NAME STREQUAL "libindi")
+                get_filename_component(INDI_PKG_INCLUDE_PARENT "${INDI_PKG_INCLUDE_DIR}" DIRECTORY)
+                list(APPEND EXTRA_INCLUDE_DIRS ${INDI_PKG_INCLUDE_PARENT})
+            endif()
+        endforeach()
+        list(APPEND EXTRA_LINK_DIRS ${LIBINDI_LIBRARY_DIRS})
+        list(APPEND EXTRA_LIBS ${LIBINDI_LIBRARIES})
+    elseif(INDICLIENT_FOUND)
+        foreach(INDI_PKG_INCLUDE_DIR IN LISTS INDICLIENT_INCLUDE_DIRS)
+            list(APPEND EXTRA_INCLUDE_DIRS ${INDI_PKG_INCLUDE_DIR})
+            get_filename_component(INDI_PKG_INCLUDE_NAME "${INDI_PKG_INCLUDE_DIR}" NAME)
+            if(INDI_PKG_INCLUDE_NAME STREQUAL "libindi")
+                get_filename_component(INDI_PKG_INCLUDE_PARENT "${INDI_PKG_INCLUDE_DIR}" DIRECTORY)
+                list(APPEND EXTRA_INCLUDE_DIRS ${INDI_PKG_INCLUDE_PARENT})
+            endif()
+        endforeach()
+        list(APPEND EXTRA_LINK_DIRS ${INDICLIENT_LIBRARY_DIRS})
+        list(APPEND EXTRA_LIBS ${INDICLIENT_LIBRARIES})
     else()
-        list(APPEND EXTRA_INCLUDE_DIRS /usr/local/include/libindi)
+        list(APPEND EXTRA_INCLUDE_DIRS ${INDI_INCLUDE_DIR})
+        list(APPEND EXTRA_LIBS ${INDI_CLIENT_LIBRARY})
     endif()
-    list(APPEND EXTRA_LIBS indiclient)
 else()
-    message(STATUS "ℹ️  INDI not found — INDI drivers disabled (Linux only)")
+    message(STATUS "ℹ️  INDI not found — INDI drivers disabled")
 endif()
 
 # ═══════════════════════════════════════════════════════════════════

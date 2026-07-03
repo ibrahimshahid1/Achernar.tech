@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
     // Build API routes
     let api_v1 = Router::new()
         .route("/status", get(api::get_status))
+        .route("/drivers", get(api::get_driver_capabilities))
         .route("/connect", post(api::connect_equipment))
         .route("/disconnect", post(api::disconnect_equipment))
         .nest("/camera", camera_routes())

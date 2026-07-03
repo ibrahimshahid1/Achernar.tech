@@ -6,6 +6,7 @@ from django.utils import timezone
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.core.cache import cache
+from datetime import timedelta
 import json
 import os
 import time
@@ -20,6 +21,7 @@ from apps.realtime.models import DaemonConnection, TelemetrySnapshot
 COMMAND_WAIT_SECONDS = 3.0
 COMMAND_POLL_SECONDS = 0.1
 COMMAND_RESULT_TTL_SECONDS = 60
+DAEMON_STALE_SECONDS = int(os.getenv('ACHERNAR_DAEMON_STALE_SECONDS', '30'))
 
 
 def daemon_api_base():
@@ -59,14 +61,24 @@ def frame_preview_key(daemon_id):
 def active_daemon(daemon_id=None):
     qs = DaemonConnection.objects.all().order_by('-last_heartbeat', '-connected_at', '-created_at')
     if daemon_id:
-        return qs.filter(id=daemon_id).first()
-    return qs.filter(is_connected=True).first() or qs.first()
+        daemon = qs.filter(id=daemon_id).first()
+        return daemon if daemon_is_live(daemon) else None
+    for daemon in qs.filter(is_connected=True):
+        if daemon_is_live(daemon):
+            return daemon
+    return None
+
+
+def daemon_is_live(daemon):
+    if not daemon or not daemon.is_connected or not daemon.last_heartbeat:
+        return False
+    return daemon.last_heartbeat >= timezone.now() - timedelta(seconds=DAEMON_STALE_SECONDS)
 
 
 def snapshot_to_status(daemon, snapshot=None):
     snapshot = snapshot or TelemetrySnapshot.objects.filter(daemon=daemon).first()
     payload = {
-        'connected': bool(daemon and daemon.is_connected),
+        'connected': daemon_is_live(daemon),
         'daemon_id': str(daemon.id) if daemon else None,
         'hardware_id': daemon.hardware_id if daemon else None,
         'last_heartbeat': daemon.last_heartbeat.isoformat() if daemon and daemon.last_heartbeat else None,

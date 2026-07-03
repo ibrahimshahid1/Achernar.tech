@@ -7,7 +7,7 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 
-use std::os::raw::{c_char, c_double, c_float, c_int, c_void};
+use std::os::raw::{c_char, c_double, c_float, c_int, c_uint, c_void};
 
 // ═══════════════════════════════════════════════════════════════════
 //  Error Constants
@@ -19,6 +19,19 @@ pub const OLS_ERR_NOT_FOUND: c_int = 2;
 pub const OLS_ERR_INVALID: c_int = 3;
 pub const OLS_ERR_IO: c_int = 4;
 pub const OLS_ERR_NOT_CONNECTED: c_int = 5;
+
+// ═══════════════════════════════════════════════════════════════════
+//  Build Capability Flags
+// ═══════════════════════════════════════════════════════════════════
+
+pub const OLS_CAP_CAMERA_ASI: u32 = 1 << 0;
+pub const OLS_CAP_CAMERA_SVB: u32 = 1 << 1;
+pub const OLS_CAP_CAMERA_TOUP: u32 = 1 << 2;
+pub const OLS_CAP_CAMERA_GPHOTO2: u32 = 1 << 3;
+pub const OLS_CAP_CAMERA_UVC: u32 = 1 << 4;
+pub const OLS_CAP_CAMERA_INDI: u32 = 1 << 5;
+pub const OLS_CAP_CAMERA_INDIGO: u32 = 1 << 6;
+pub const OLS_CAP_CAMERA_WDIR: u32 = 1 << 7;
 
 // ═══════════════════════════════════════════════════════════════════
 //  Stream / Pixel Format Enums
@@ -243,6 +256,9 @@ extern "C" {
 
     // ─── Version ───
     pub fn ols_bridge_version() -> *const c_char;
+
+    // ─── Build Capabilities ───
+    pub fn ols_driver_capability_flags() -> c_uint;
 
     // ═══ Camera Driver API ═══
     pub fn ols_sim_driver_create(

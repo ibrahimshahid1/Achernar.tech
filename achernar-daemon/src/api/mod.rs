@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::hardware::{
     camera::OlsCameraDriver,
+    capabilities::{driver_capability_report, DriverCapabilityReport},
     focuser::{Focuser, FocuserDriver},
     mount::{Mount, MountDriver},
 };
@@ -138,6 +139,10 @@ pub async fn get_status(
     };
 
     Ok(Json(status))
+}
+
+pub async fn get_driver_capabilities() -> Json<DriverCapabilityReport> {
+    Json(driver_capability_report())
 }
 
 pub async fn connect_equipment(

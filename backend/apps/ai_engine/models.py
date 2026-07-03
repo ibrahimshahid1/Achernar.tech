@@ -1,3 +1,3 @@
-from django.db import models
+from .embeddings.models import EmbeddingModel, ObjectEmbedding
 
-# Create your models here.
+__all__ = ["EmbeddingModel", "ObjectEmbedding"]
