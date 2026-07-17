@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Achernar Hardware Console Draft</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="system-header" aria-label="System status">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true"></div>
+          <div>
+            <div class="brand-name">Achernar</div>
+            <div class="site-line">Backyard Rig / Django relay / Local daemon</div>
+          </div>
+        </div>
+        <div class="header-readouts">
+          <div class="readout good"><span></span> Daemon live</div>
+          <div class="readout">Cloud relay 42 ms</div>
+          <div class="readout">Last frame 1.2 s</div>
+        </div>
+      </header>
+
+      <main id="dashboardView" class="view view-active">
+        <section class="dashboard-grid">
+          <section class="workspace-main" aria-labelledby="dashboardTitle">
+            <div class="section-heading">
+              <div>
+                <h1 id="dashboardTitle">Observatory Dashboard</h1>
+                <p>Connected equipment, active queue, relay status, and run context.</p>
+              </div>
+              <div class="night-summary">
+                <strong>Ready</strong>
+                <span id="deviceCount">4 devices online</span>
+              </div>
+            </div>
+
+            <section class="equipment-deck" aria-labelledby="equipmentTitle">
+              <div class="strip-heading">
+                <h2 id="equipmentTitle">Equipment</h2>
+                <div class="source-chip">Django to daemon status</div>
+              </div>
+
+              <div id="equipmentGrid" class="equipment-grid">
+                <div class="equipment-loading">Loading daemon equipment...</div>
+              </div>
+            </section>
+
+            <section class="dashboard-bands" aria-label="Operational overview">
+              <article class="band-panel queue-panel">
+                <div class="strip-heading">
+                  <h2>Observation Queue</h2>
+                  <span class="count-chip">3 targets</span>
+                </div>
+                <ol class="queue-list">
+                  <li><span>M42 Core</span><strong>L / 24 x 120 s</strong></li>
+                  <li><span>Horsehead</span><strong>Ha / 18 x 300 s</strong></li>
+                  <li><span>Flats</span><strong>Auto panel / dusk</strong></li>
+                </ol>
+              </article>
+
+              <article class="band-panel logs-panel">
+                <div class="strip-heading">
+                  <h2>Logs</h2>
+                  <span class="count-chip">Live</span>
+                </div>
+                <div class="log-stream">
+                  <p><time>20:24:12</time> Daemon registered with Django relay</p>
+                  <p><time>20:25:51</time> Sim camera connected, stream active</p>
+                  <p><time>20:26:20</time> Focus run converged at 9900</p>
+                </div>
+              </article>
+
+              <article class="band-panel conditions-panel">
+                <div class="strip-heading">
+                  <h2>Conditions</h2>
+                  <span class="count-chip caution">Watch</span>
+                </div>
+                <div class="condition-row"><span>Cloud probability</span><strong>12%</strong></div>
+                <div class="condition-row"><span>Moon altitude</span><strong>-18 deg</strong></div>
+                <div class="condition-row"><span>Storage buffer</span><strong>184 GB</strong></div>
+              </article>
+            </section>
+          </section>
+
+          <aside class="run-context" aria-labelledby="runBuilderTitle">
+            <div class="run-context-header">
+              <div>
+                <h2 id="runBuilderTitle">Run Context</h2>
+                <p>Selected hardware for this imaging job.</p>
+              </div>
+              <div class="readout good"><span></span> Valid</div>
+            </div>
+
+            <div id="dropZone" class="drop-zone" aria-label="Selected equipment">
+              <div class="drop-hint">Loading selected run hardware...</div>
+            </div>
+
+            <div class="run-fields">
+              <label>
+                Run name
+                <input type="text" value="M42 luminance checkout" />
+              </label>
+              <label>
+                Target
+                <input type="text" value="M42 Core" />
+              </label>
+              <label>
+                Capture recipe
+                <select>
+                  <option>L / 24 x 120 s</option>
+                  <option>Ha / 18 x 300 s</option>
+                  <option>RGB / 12 x 180 s each</option>
+                </select>
+              </label>
+            </div>
+
+            <button id="startRunButton" type="button" class="primary-action">Start Run Job</button>
+          </aside>
+        </section>
+      </main>
+
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

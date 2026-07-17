@@ -50,6 +50,12 @@ def post_daemon(path, payload=None, timeout=5):
         return json.loads(body) if body else {}
 
 
+def get_daemon(path, timeout=5):
+    with urllib.request.urlopen(f'{daemon_api_base()}/{path.lstrip("/")}', timeout=timeout) as response:
+        body = response.read().decode('utf-8')
+        return json.loads(body) if body else {}
+
+
 def command_result_key(command_id):
     return f"achernar:command_result:{command_id}"
 
@@ -315,7 +321,10 @@ class ConnectedEquipmentViewSet(viewsets.ModelViewSet):
                 return Response(body['payload'], status=result['status_code'])
             return Response(body, status=result['status_code'])
 
-        return self._local_post_fallback('camera/stream/start', {})
+        payload = request.data.get('payload', {})
+        fmt = payload.get('format_index')
+        path = f'camera/stream/start?format_index={fmt}' if fmt is not None else 'camera/stream/start'
+        return self._local_post_fallback(path, {})
 
     @action(detail=False, methods=['post'], url_path='camera/snapshot')
     def camera_snapshot(self, request):
@@ -326,11 +335,11 @@ class ConnectedEquipmentViewSet(viewsets.ModelViewSet):
         daemon = active_daemon(request.data.get('daemon_id'))
         if daemon and daemon.is_connected:
             result = send_relay_command(daemon, 'camera.snapshot', request.data.get('payload', {}))
-            return Response(result['body'], status=result['status_code'])
-        return Response(
-            {'status': 'offline', 'detail': 'No connected daemon tunnel is available for snapshots.'},
-            status=status.HTTP_503_SERVICE_UNAVAILABLE,
-        )
+            body = result['body']
+            if body.get('ok') and isinstance(body.get('payload'), dict):
+                return Response(body['payload'], status=result['status_code'])
+            return Response(body, status=result['status_code'])
+        return self._local_post_fallback('camera/snapshot', {})
 
     @action(detail=False, methods=['post'], url_path='command')
     def command(self, request):
@@ -345,6 +354,22 @@ class ConnectedEquipmentViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         daemon = active_daemon(request.data.get('daemon_id'))
+        if daemon and daemon.is_connected:
+            result = send_relay_command(
+                daemon,
+                action_name,
+                request.data.get('payload', {}),
+                request.data.get('wait_seconds', COMMAND_WAIT_SECONDS),
+            )
+            return Response(result['body'], status=result['status_code'])
+
+        result = self._local_command_fallback(
+            action_name,
+            request.data.get('payload', {}),
+        )
+        if result is not None:
+            return result
+
         result = send_relay_command(
             daemon,
             action_name,
@@ -364,6 +389,71 @@ class ConnectedEquipmentViewSet(viewsets.ModelViewSet):
         except OSError:
             return Response(
                 {'status': 'offline', 'detail': 'Local daemon is not reachable from Django.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+
+    def _local_command_fallback(self, action_name, payload):
+        payload = payload or {}
+        try:
+            if action_name == 'drivers.capabilities':
+                body = get_daemon('drivers')
+            elif action_name == 'equipment.status':
+                body = get_daemon('status')
+            elif action_name == 'equipment.connect':
+                body = post_daemon('connect', payload)
+            elif action_name == 'camera.parameters':
+                body = get_daemon('camera/parameters')
+            elif action_name == 'camera.formats':
+                body = get_daemon('camera/formats')
+            elif action_name == 'camera.set_parameter':
+                body = post_daemon('camera/parameters', payload)
+            elif action_name == 'camera.start_stream':
+                fmt = payload.get('format_index')
+                path = f'camera/stream/start?format_index={fmt}' if fmt is not None else 'camera/stream/start'
+                body = post_daemon(path, {})
+            elif action_name == 'camera.abort':
+                body = post_daemon('camera/abort', {})
+            elif action_name == 'camera.capture':
+                exposure = float(payload.get('exposure', 1))
+                body = post_daemon('camera/capture', payload, timeout=max(10, min(140, int(exposure) + 10)))
+            elif action_name == 'camera.snapshot':
+                body = post_daemon('camera/snapshot', {})
+            elif action_name == 'mount.slew':
+                body = post_daemon('mount/slew', payload)
+            elif action_name == 'mount.set_tracking':
+                body = post_daemon('mount/tracking', payload)
+            elif action_name == 'mount.abort':
+                body = post_daemon('mount/abort', {})
+            elif action_name == 'focuser.move_relative':
+                body = post_daemon('focuser/move', payload)
+            elif action_name == 'focuser.move_absolute':
+                body = post_daemon('focuser/moveto', payload)
+            elif action_name == 'focuser.abort':
+                body = post_daemon('focuser/abort', {})
+            else:
+                return None
+            return Response({
+                'type': 'COMMAND_RESULT',
+                'ok': True,
+                'pending': False,
+                'payload': body,
+            })
+        except urllib.error.HTTPError as exc:
+            return Response(
+                {
+                    'type': 'COMMAND_RESULT',
+                    'ok': False,
+                    'error': exc.reason,
+                },
+                status=exc.code,
+            )
+        except (OSError, ValueError):
+            return Response(
+                {
+                    'type': 'COMMAND_RESULT',
+                    'ok': False,
+                    'error': 'Local daemon is not reachable from Django.',
+                },
                 status=status.HTTP_503_SERVICE_UNAVAILABLE,
             )
     

@@ -143,8 +143,42 @@ export const daemonApi = {
 
     async relayCommand(action: string, payload: Record<string, unknown> = {}): Promise<RelayCommandResult> {
         switch (action) {
+            case "drivers.capabilities":
+                return { ok: true, payload: await this.getDriverCapabilities() as unknown as Record<string, unknown> };
+            case "equipment.status":
+                return { ok: true, payload: await this.getStatus() as unknown as Record<string, unknown> };
+            case "equipment.connect":
+                return {
+                    ok: true,
+                    payload: await httpJson(`${env.daemonApiBase}/connect`, {
+                        method: "POST",
+                        body: payload,
+                    }) as Record<string, unknown>,
+                };
+            case "camera.parameters":
+                return { ok: true, payload: await this.getCameraParameters() as unknown as Record<string, unknown> };
+            case "camera.formats":
+                return { ok: true, payload: await this.getCameraFormats() as unknown as Record<string, unknown> };
+            case "camera.set_parameter":
+                return {
+                    ok: true,
+                    payload: await this.setCameraParameter(
+                        String(payload.name ?? ""),
+                        Number(payload.value ?? 0),
+                    ) as unknown as Record<string, unknown>,
+                };
             case "camera.start_stream":
-                return { ok: true, payload: await this.startCameraStream() as unknown as Record<string, unknown> };
+                return {
+                    ok: true,
+                    payload: await this.startCameraStream(
+                        typeof payload.format_index === "number" ? payload.format_index : undefined,
+                    ) as unknown as Record<string, unknown>,
+                };
+            case "camera.abort":
+                await this.stopCameraStream();
+                return { ok: true, payload: { status: "stopped" } };
+            case "camera.capture":
+                return { ok: true, payload: await this.capture(payload as unknown as CaptureParams) as unknown as Record<string, unknown> };
             case "mount.slew":
                 return {
                     ok: true,
@@ -168,9 +202,40 @@ export const daemonApi = {
                         method: "POST",
                     }) as Record<string, unknown>,
                 };
+            case "mount.sync":
+                return {
+                    ok: true,
+                    payload: await httpJson(`${env.daemonApiBase}/mount/sync`, {
+                        method: "POST",
+                        body: {
+                            ra: Number(payload.ra ?? 0),
+                            dec: Number(payload.dec ?? 0),
+                        },
+                    }) as Record<string, unknown>,
+                };
             case "focuser.move_relative":
                 await this.moveFocuser({ steps: Number(payload.steps ?? 0) });
                 return { ok: true, payload: { status: "moving", steps: Number(payload.steps ?? 0) } };
+            case "focuser.move_absolute":
+                return {
+                    ok: true,
+                    payload: await httpJson(`${env.daemonApiBase}/focuser/moveto`, {
+                        method: "POST",
+                        body: { position: Number(payload.position ?? 0) },
+                    }) as Record<string, unknown>,
+                };
+            case "focuser.position":
+                return {
+                    ok: true,
+                    payload: await httpJson(`${env.daemonApiBase}/focuser/position`) as Record<string, unknown>,
+                };
+            case "focuser.abort":
+                return {
+                    ok: true,
+                    payload: await httpJson(`${env.daemonApiBase}/focuser/abort`, {
+                        method: "POST",
+                    }) as Record<string, unknown>,
+                };
             default:
                 throw new Error(`Unsupported local daemon action: ${action}`);
         }

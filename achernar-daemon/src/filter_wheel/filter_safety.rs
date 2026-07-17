@@ -28,7 +28,13 @@ impl FilterWheelSafetyGuard {
         Self { config }
     }
 
-    pub fn validate_switch(&self, _is_exposing: bool) -> Result<(), String> {
-        todo!("Implement filter switch safety validation")
+    pub fn validate_switch(&self, is_exposing: bool) -> Result<(), String> {
+        if self.config.max_switch_timeout_ms == 0 {
+            return Err("Filter switch timeout must be greater than zero".to_string());
+        }
+        if self.config.block_during_exposure && is_exposing {
+            return Err("Filter switch blocked during active exposure".to_string());
+        }
+        Ok(())
     }
 }

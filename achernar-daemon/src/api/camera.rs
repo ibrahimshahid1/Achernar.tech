@@ -1,4 +1,5 @@
 use axum::{extract::Query, extract::State, http::StatusCode, Json};
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -219,6 +220,27 @@ pub async fn abort(State(state): State<AppState>) -> Result<StatusCode, StatusCo
     Ok(StatusCode::OK)
 }
 
+/// POST /camera/snapshot — return the latest preview frame as a JPEG payload
+/// for the Django relay/browser path.
+pub async fn snapshot(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let frame = state.latest_frame.lock().unwrap().clone();
+    let frame = frame.ok_or(StatusCode::NOT_FOUND)?;
+    let jpeg = encode_frame_jpeg(&frame).ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "format": "JPEG",
+        "mime_type": "image/jpeg",
+        "width": frame.width,
+        "height": frame.height,
+        "frame_counter": frame.frame_counter,
+        "timestamp": frame.unix_timestamp,
+        "data_base64": base64::engine::general_purpose::STANDARD.encode(jpeg),
+    })))
+}
+
 /// MJPEG Stream placeholder
 pub async fn stream_mjpeg() -> Result<String, StatusCode> {
     tracing::info!("MJPEG stream requested");
@@ -379,7 +401,7 @@ pub fn encode_frame_jpeg(f: &FrameData) -> Option<Vec<u8>> {
 }
 
 /// snake_case key for each option id (stable contract with the UI).
-fn option_name(id: OlsCamOptionId) -> &'static str {
+pub(crate) fn option_name(id: OlsCamOptionId) -> &'static str {
     use OlsCamOptionId::*;
     match id {
         AutoExp => "auto_exposure",
@@ -416,7 +438,7 @@ fn option_name(id: OlsCamOptionId) -> &'static str {
     }
 }
 
-fn parse_option(name: &str) -> Option<OlsCamOptionId> {
+pub(crate) fn parse_option(name: &str) -> Option<OlsCamOptionId> {
     use OlsCamOptionId::*;
     Some(match name {
         "auto_exposure" => AutoExp,
@@ -454,7 +476,7 @@ fn parse_option(name: &str) -> Option<OlsCamOptionId> {
     })
 }
 
-fn option_type_name(t: OlsCamOptionType) -> &'static str {
+pub(crate) fn option_type_name(t: OlsCamOptionType) -> &'static str {
     use OlsCamOptionType::*;
     match t {
         Bool => "bool",

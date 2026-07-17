@@ -54,6 +54,7 @@ yarn-error.log
 target/
 Cargo.lock
 *.rs.bk
+achernar-daemon/achernar.db*
 
 # Tauri/Desktop
 achernar-desktop/target/

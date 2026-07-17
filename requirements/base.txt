@@ -13,7 +13,7 @@ celery>=5.3
 redis>=5.0
 
 # Database
-psycopg2-binary>=2.9
+psycopg[binary]>=3.1,<4
 
 # Storage
 django-storages>=1.14

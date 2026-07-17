@@ -12,7 +12,7 @@ celery==5.3.4
 redis==5.0.1
 
 # Database
-psycopg2-binary==2.9.9
+psycopg[binary]>=3.1,<4
 
 # Astronomy
 astropy==5.3.4

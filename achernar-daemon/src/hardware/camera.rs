@@ -154,7 +154,10 @@ impl OlsCameraDriver {
         let c_dir = CString::new(watch_dir)?;
         let mut handle = std::ptr::null_mut();
         unsafe {
-            check(ols_ffi::ols_wdir_camera_driver_create(c_dir.as_ptr(), &mut handle))?;
+            check(ols_ffi::ols_wdir_camera_driver_create(
+                c_dir.as_ptr(),
+                &mut handle,
+            ))?;
         }
         Ok(Self { handle })
     }

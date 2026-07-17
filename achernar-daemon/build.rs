@@ -178,9 +178,16 @@ fn main() {
     link_optional_indi();
 
     // INDIGO library
-    for inc in ["/opt/homebrew/include", "/usr/local/include", "/usr/include"] {
+    for inc in [
+        "/opt/homebrew/include",
+        "/usr/local/include",
+        "/usr/include",
+    ] {
         if std::path::Path::new(&format!("{inc}/indigo/indigo_bus.h")).exists() {
-            println!("cargo:rustc-link-search=native={}", inc.replace("/include", "/lib"));
+            println!(
+                "cargo:rustc-link-search=native={}",
+                inc.replace("/include", "/lib")
+            );
             println!("cargo:rustc-link-lib=dylib=indigo");
             break;
         }

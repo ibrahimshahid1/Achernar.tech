@@ -36,16 +36,46 @@ impl MountController {
         self.state
     }
 
-    pub async fn slew(&mut self, _target: SlewTarget) -> crate::error::Result<()> {
-        todo!("Implement slew with safety enforcement — Section 8.3")
+    pub async fn slew(&mut self, target: SlewTarget) -> crate::error::Result<()> {
+        if !(0.0..24.0).contains(&target.ra_hours) || !(-90.0..=90.0).contains(&target.dec_degrees)
+        {
+            return Err(crate::error::ControlError::SafetyBlocked(format!(
+                "Unsafe slew target ra={}h dec={}deg",
+                target.ra_hours, target.dec_degrees
+            ))
+            .into());
+        }
+        if matches!(self.state, MountState::Parking | MountState::Parked) {
+            return Err(crate::error::ControlError::ModeNotAllowed(
+                "Cannot slew while mount is parking or parked".to_string(),
+            )
+            .into());
+        }
+
+        self.state = MountState::Slewing;
+        tracing::info!(
+            "Mount controller accepted slew target: {}h {}deg",
+            target.ra_hours,
+            target.dec_degrees
+        );
+        self.state = MountState::Tracking;
+        Ok(())
     }
 
     pub async fn park(&mut self) -> crate::error::Result<()> {
-        todo!("Implement park")
+        self.state = MountState::Parking;
+        tracing::info!("Mount controller park requested");
+        self.state = MountState::Parked;
+        Ok(())
     }
 
     pub async fn unpark(&mut self) -> crate::error::Result<()> {
-        todo!("Implement unpark")
+        if !matches!(self.state, MountState::Parked | MountState::Parking) {
+            return Ok(());
+        }
+        tracing::info!("Mount controller unpark requested");
+        self.state = MountState::Idle;
+        Ok(())
     }
 
     pub fn abort_slew(&mut self) {

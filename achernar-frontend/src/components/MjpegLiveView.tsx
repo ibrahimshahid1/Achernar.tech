@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { cloudApi } from "../api/cloud";
 import { daemonApi } from "../api/daemon";
+import { env } from "../env";
 import { getHardwareTransport } from "../lib/runtime";
 
 type StreamState = "idle" | "connecting" | "waiting" | "live" | "error";
@@ -12,13 +13,64 @@ export default function MjpegLiveView() {
     const [connectionKey, setConnectionKey] = useState(0);
     const imageUrlRef = useRef<string | null>(null);
     const hardwareTransport = getHardwareTransport();
+    const useDirectDaemon = hardwareTransport === "daemon" || env.enableBrowserDirectDaemon;
 
     useEffect(() => {
-        // The live view always connects straight to the daemon's frame socket
-        // (it is CORS-permissive on :3030), in both browser and desktop modes.
         let disposed = false;
         setStreamState("connecting");
-        setMessage("Connecting to daemon stream...");
+        setMessage(useDirectDaemon ? "Connecting to daemon stream..." : "Connecting to relayed preview...");
+
+        const setPreviewImage = (bytes: BlobPart, mimeType: string, width: number, height: number) => {
+            const nextUrl = URL.createObjectURL(new Blob([bytes], { type: mimeType }));
+            const previousUrl = imageUrlRef.current;
+            imageUrlRef.current = nextUrl;
+            setImageUrl(nextUrl);
+            setStreamState("live");
+            setMessage(`${width} x ${height} live frame`);
+
+            if (previousUrl) {
+                URL.revokeObjectURL(previousUrl);
+            }
+        };
+
+        if (!useDirectDaemon) {
+            setStreamState("waiting");
+            setMessage("Waiting for relayed preview frames.");
+
+            const pollSnapshot = async () => {
+                try {
+                    const snapshot = await cloudApi.cameraSnapshot();
+                    if (disposed || !snapshot.data_base64) return;
+                    const raw = window.atob(snapshot.data_base64);
+                    const bytes = new Uint8Array(raw.length);
+                    for (let i = 0; i < raw.length; i += 1) {
+                        bytes[i] = raw.charCodeAt(i);
+                    }
+                    setPreviewImage(
+                        bytes,
+                        snapshot.mime_type || "image/jpeg",
+                        snapshot.width,
+                        snapshot.height,
+                    );
+                } catch {
+                    if (disposed) return;
+                    setStreamState("waiting");
+                    setMessage("Waiting for relayed preview frames.");
+                }
+            };
+
+            void pollSnapshot();
+            const timer = window.setInterval(pollSnapshot, 750);
+
+            return () => {
+                disposed = true;
+                window.clearInterval(timer);
+                if (imageUrlRef.current) {
+                    URL.revokeObjectURL(imageUrlRef.current);
+                    imageUrlRef.current = null;
+                }
+            };
+        }
 
         const ws = new WebSocket(daemonApi.cameraStreamWsUrl());
         ws.binaryType = "arraybuffer";
@@ -58,16 +110,7 @@ export default function MjpegLiveView() {
             }
 
             const frame = event.data.slice(20);
-            const nextUrl = URL.createObjectURL(new Blob([frame], { type: "image/jpeg" }));
-            const previousUrl = imageUrlRef.current;
-            imageUrlRef.current = nextUrl;
-            setImageUrl(nextUrl);
-            setStreamState("live");
-            setMessage(`${width} x ${height} live frame`);
-
-            if (previousUrl) {
-                URL.revokeObjectURL(previousUrl);
-            }
+            setPreviewImage(frame, "image/jpeg", width, height);
         };
 
         return () => {
@@ -78,18 +121,19 @@ export default function MjpegLiveView() {
                 imageUrlRef.current = null;
             }
         };
-    }, [connectionKey, hardwareTransport]);
+    }, [connectionKey, useDirectDaemon]);
 
     const startStream = async () => {
         setStreamState("connecting");
         setMessage("Starting camera stream...");
         try {
-            const result = hardwareTransport === "django"
-                ? await cloudApi.startCameraStream()
-                : await daemonApi.startCameraStream();
+            const result =
+                hardwareTransport === "django" && !env.enableBrowserDirectDaemon
+                    ? await cloudApi.startCameraStream()
+                    : await daemonApi.startCameraStream();
             setMessage(`Stream started: ${result.width} x ${result.height} ${result.format}`);
             setStreamState("waiting");
-            if (hardwareTransport === "daemon") {
+            if (useDirectDaemon) {
                 setConnectionKey((key) => key + 1);
             }
         } catch (error) {

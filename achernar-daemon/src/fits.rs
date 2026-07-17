@@ -58,7 +58,11 @@ fn frame_to_pixels(frame: &FrameData) -> Result<(i32, Vec<i64>, Vec<u8>)> {
         OlsStreamType::Mono8 | OlsStreamType::Raw8 => {
             let expected = w * h;
             if frame.data.len() < expected {
-                return Err(anyhow!("8-bit buffer too small: {} < {}", frame.data.len(), expected));
+                return Err(anyhow!(
+                    "8-bit buffer too small: {} < {}",
+                    frame.data.len(),
+                    expected
+                ));
             }
             let mut out = frame.data[..expected].to_vec();
             pad(&mut out, 0);
@@ -67,7 +71,11 @@ fn frame_to_pixels(frame: &FrameData) -> Result<(i32, Vec<i64>, Vec<u8>)> {
         OlsStreamType::Mono16 | OlsStreamType::Raw16 => {
             let expected = w * h * 2;
             if frame.data.len() < expected {
-                return Err(anyhow!("16-bit buffer too small: {} < {}", frame.data.len(), expected));
+                return Err(anyhow!(
+                    "16-bit buffer too small: {} < {}",
+                    frame.data.len(),
+                    expected
+                ));
             }
             // Camera samples are little-endian unsigned 16-bit. FITS BITPIX=16 is
             // signed big-endian, so we store (value - 32768) and set BZERO=32768.
@@ -83,15 +91,27 @@ fn frame_to_pixels(frame: &FrameData) -> Result<(i32, Vec<i64>, Vec<u8>)> {
         OlsStreamType::Rgb24 => {
             let expected = w * h * 3;
             if frame.data.len() < expected {
-                return Err(anyhow!("rgb buffer too small: {} < {}", frame.data.len(), expected));
+                return Err(anyhow!(
+                    "rgb buffer too small: {} < {}",
+                    frame.data.len(),
+                    expected
+                ));
             }
-            Ok((8, vec![w as i64, h as i64, 3], interleaved_rgb_to_planar(&frame.data, w, h)))
+            Ok((
+                8,
+                vec![w as i64, h as i64, 3],
+                interleaved_rgb_to_planar(&frame.data, w, h),
+            ))
         }
         OlsStreamType::Mjpeg => {
             // Decode the JPEG preview to RGB8, then store planar.
             let img = image::load_from_memory(&frame.data)?.to_rgb8();
             let (iw, ih) = (img.width() as usize, img.height() as usize);
-            Ok((8, vec![iw as i64, ih as i64, 3], interleaved_rgb_to_planar(img.as_raw(), iw, ih)))
+            Ok((
+                8,
+                vec![iw as i64, ih as i64, 3],
+                interleaved_rgb_to_planar(img.as_raw(), iw, ih),
+            ))
         }
         other => Err(anyhow!("unsupported capture format {:?}", other)),
     }
@@ -143,12 +163,28 @@ fn build_header(bitpix: i32, naxes: &[i64], meta: &FitsMeta, bayer: Option<&str>
     cards.push(card_float("EXPTIME", meta.exposure_s, "[s] exposure time"));
     cards.push(card_int("GAIN", meta.gain as i64, "sensor gain"));
     if meta.temperature_c.is_finite() {
-        cards.push(card_float("CCD-TEMP", meta.temperature_c, "[degC] sensor temperature"));
+        cards.push(card_float(
+            "CCD-TEMP",
+            meta.temperature_c,
+            "[degC] sensor temperature",
+        ));
     }
-    cards.push(card_int("XBINNING", meta.binning as i64, "binning factor, X axis"));
-    cards.push(card_int("YBINNING", meta.binning as i64, "binning factor, Y axis"));
+    cards.push(card_int(
+        "XBINNING",
+        meta.binning as i64,
+        "binning factor, X axis",
+    ));
+    cards.push(card_int(
+        "YBINNING",
+        meta.binning as i64,
+        "binning factor, Y axis",
+    ));
     cards.push(card_string("INSTRUME", &meta.instrument, "camera"));
-    cards.push(card_string("DATE-OBS", &meta.date_obs, "UTC start of exposure"));
+    cards.push(card_string(
+        "DATE-OBS",
+        &meta.date_obs,
+        "UTC start of exposure",
+    ));
     if let Some(b) = bayer {
         cards.push(card_string("BAYERPAT", b, "colour filter array pattern"));
     }

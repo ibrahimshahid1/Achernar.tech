@@ -28,14 +28,39 @@ impl PlateSolveTrigger {
         }
     }
 
-    pub fn should_solve(&self, _pointing_error_arcmin: f64) -> bool {
-        todo!("Implement plate solve trigger logic — Section 8.3 M-3")
+    pub fn should_solve(&self, pointing_error_arcmin: f64) -> bool {
+        if pointing_error_arcmin >= self.max_pointing_error_arcmin {
+            return self.cooldown_elapsed();
+        }
+        false
     }
 
     pub async fn trigger_solve(
         &mut self,
-        _image_data: &[u8],
+        image_data: &[u8],
     ) -> crate::error::Result<PlateSolveResult> {
-        todo!("Call plate solver and return result")
+        if image_data.is_empty() {
+            return Err(crate::error::HardwareError::Unsupported(
+                "Plate solve requires a non-empty image frame".to_string(),
+            )
+            .into());
+        }
+
+        self.last_solve = Some(chrono::Utc::now());
+        Err(crate::error::HardwareError::Unsupported(
+            "No local plate solver backend is configured yet".to_string(),
+        )
+        .into())
+    }
+
+    fn cooldown_elapsed(&self) -> bool {
+        let Some(last_solve) = self.last_solve else {
+            return true;
+        };
+        let elapsed = chrono::Utc::now()
+            .signed_duration_since(last_solve)
+            .num_milliseconds() as f64
+            / 1000.0;
+        elapsed >= self.cooldown_seconds
     }
 }

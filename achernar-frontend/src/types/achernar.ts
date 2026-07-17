@@ -35,12 +35,32 @@ export interface EquipmentState {
         exposing?: boolean;
         streaming?: boolean;
         progress?: number; // 0..1
+        gain?: number;
+        exposure_s?: number;
+        latest_frame?: {
+            frame_counter?: number;
+            width?: number;
+            height?: number;
+            format?: string;
+        };
     };
     focuser?: {
         name?: string;
         connected?: boolean;
         position: number;
         moving: boolean;
+        absolute?: boolean;
+        max_range?: number;
+        hfr?: number;
+        temperature?: number;
+    };
+    filter_wheel?: {
+        name?: string;
+        connected?: boolean;
+        filter?: string;
+        slot?: number;
+        moving?: boolean;
+        offset?: number;
     };
 }
 

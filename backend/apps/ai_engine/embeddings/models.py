@@ -3,7 +3,6 @@ AstroM3 embedding models.
 
 Stores the 512-D shared embedding vectors produced by AstroM3 / AstroM3Edge.
 """
-from django.contrib.postgres.fields import ArrayField
 from django.db import models
 import uuid
 
@@ -61,8 +60,10 @@ class ObjectEmbedding(models.Model):
     catalog_id = models.CharField(max_length=100, blank=True)
     object_type = models.CharField(max_length=100, blank=True)
     
-    # Embedding vector (512-D for AstroM3 / AstroM3Edge)
-    embedding = ArrayField(models.FloatField(), size=ASTROM3_EMBEDDING_DIM)
+    # Embedding vector (512-D for AstroM3 / AstroM3Edge). Stored as JSON for
+    # local SQLite compatibility; PostgreSQL deployments additionally enable
+    # pgvector via migrations for indexed vector search.
+    embedding = models.JSONField(default=list)
     
     # Source modality
     modality = models.CharField(max_length=20, choices=ASTROM3_MODALITY_CHOICES)

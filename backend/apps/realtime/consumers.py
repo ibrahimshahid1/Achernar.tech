@@ -265,7 +265,9 @@ class TelemetryConsumer(AsyncWebsocketConsumer):
         await self.accept()
         
         # Send latest telemetry snapshot immediately
-        await self.send_latest_telemetry()
+        telemetry_data = await self.get_latest_telemetry()
+        if telemetry_data:
+            await self.send(text_data=json.dumps(telemetry_data))
         
         logger.info(f"Client connected to daemon {self.daemon_id} telemetry")
     
@@ -318,8 +320,8 @@ class TelemetryConsumer(AsyncWebsocketConsumer):
         await self.send(text_data=json.dumps(event['data']))
     
     @database_sync_to_async
-    def send_latest_telemetry(self):
-        """Send latest telemetry snapshot to newly connected client"""
+    def get_latest_telemetry(self):
+        """Return latest telemetry snapshot for a newly connected client."""
         from .models import DaemonConnection, TelemetrySnapshot
         try:
             daemon = DaemonConnection.objects.get(id=self.daemon_id)
@@ -337,11 +339,8 @@ class TelemetryConsumer(AsyncWebsocketConsumer):
                         'ai': snapshot.ai_metrics,
                     }
                 }
-                # Use async send
-                import asyncio
-                asyncio.create_task(
-                    self.send(text_data=json.dumps(telemetry_data))
-                )
+                return telemetry_data
         
         except DaemonConnection.DoesNotExist:
             pass
+        return None

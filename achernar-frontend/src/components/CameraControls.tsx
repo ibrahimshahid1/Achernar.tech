@@ -1,20 +1,22 @@
 import { useCallback, useEffect, useState } from "react";
+import { cloudApi } from "../api/cloud";
 import { daemonApi, type CamParam, type CamFormat, type DriverCapability } from "../api/daemon";
+import { getHardwareTransport } from "../lib/runtime";
 
 /**
  * Manual camera control panel.
  *
  * Philosophy: the operator always has direct, NINA/SharpCap-style control over
- * every supported camera parameter. AI/autonomy is an opt-in layer on top — in
- * "Autonomous" mode the same controls are shown read-only while a model drives
- * them, and the operator can reclaim manual control at any time.
+ * every supported camera parameter. AI/autonomy can layer on later, but this
+ * panel stays manual while the hardware/control spine is being proven.
  *
- * Talks to the local daemon directly (CORS-permissive on :3030).
+ * Transport-aware: browser mode uses Django relay, desktop mode talks to the
+ * local daemon directly.
  */
 
-type Mode = "manual" | "auto";
-
 const DRIVERS: DriverCapability[] = [
+    { id: "sim", label: "Simulator", compiled: true, enabled: true },
+    { id: "alpaca", label: "Alpaca", compiled: true, enabled: true },
     { id: "svb", label: "SVBony", compiled: true, enabled: true },
     { id: "asi", label: "ZWO ASI", compiled: true, enabled: true },
     { id: "toup", label: "ToupTek", compiled: true, enabled: true },
@@ -22,9 +24,7 @@ const DRIVERS: DriverCapability[] = [
     { id: "gphoto2", label: "DSLR (gphoto2)", compiled: true, enabled: true },
     { id: "indi", label: "INDI", compiled: true, enabled: true },
     { id: "indigo", label: "INDIGO", compiled: true, enabled: true },
-    { id: "alpaca", label: "Alpaca", compiled: true, enabled: true },
     { id: "wdir", label: "Watch Folder", compiled: true, enabled: true },
-    { id: "sim", label: "Simulator", compiled: true, enabled: true },
 ];
 
 function humanize(name: string): string {
@@ -35,13 +35,18 @@ function fmtVal(v: number): string {
     return Number.isInteger(v) ? String(v) : String(Number(v.toFixed(2)));
 }
 
+function capabilityReason(driver: DriverCapability): string {
+    return driver.reason ?? (driver.enabled ? "Available in this daemon build." : "Unavailable in this daemon build.");
+}
+
 export default function CameraControls() {
-    const [mode, setMode] = useState<Mode>("manual");
+    const hardwareTransport = getHardwareTransport();
+    const cameraApi = hardwareTransport === "django" ? cloudApi : daemonApi;
     const [params, setParams] = useState<CamParam[]>([]);
     const [formats, setFormats] = useState<CamFormat[]>([]);
     const [selectedFormat, setSelectedFormat] = useState(0);
     const [connected, setConnected] = useState(false);
-    const [driver, setDriver] = useState("svb");
+    const [driver, setDriver] = useState("sim");
     const [driverCapabilities, setDriverCapabilities] = useState<DriverCapability[] | null>(null);
     const [streaming, setStreaming] = useState(false);
     const [message, setMessage] = useState("No camera connected.");
@@ -52,8 +57,8 @@ export default function CameraControls() {
     const refresh = useCallback(async () => {
         try {
             const [p, f] = await Promise.all([
-                daemonApi.getCameraParameters(),
-                daemonApi.getCameraFormats(),
+                cameraApi.getCameraParameters(),
+                cameraApi.getCameraFormats(),
             ]);
             setParams(p);
             setFormats(f);
@@ -65,7 +70,7 @@ export default function CameraControls() {
             setFormats([]);
             setMessage("No camera connected.");
         }
-    }, []);
+    }, [cameraApi]);
 
     useEffect(() => {
         refresh();
@@ -74,7 +79,7 @@ export default function CameraControls() {
     useEffect(() => {
         let cancelled = false;
 
-        daemonApi
+        cameraApi
             .getDriverCapabilities()
             .then((report) => {
                 if (!cancelled) {
@@ -90,11 +95,12 @@ export default function CameraControls() {
         return () => {
             cancelled = true;
         };
-    }, []);
+    }, [cameraApi]);
 
     const driverOptions = driverCapabilities ?? DRIVERS;
     const selectedDriver = driverOptions.find((d) => d.id === driver);
-    const selectedDriverEnabled = selectedDriver?.enabled ?? true;
+    const selectedDriverEnabled = selectedDriver?.enabled ?? false;
+    const unavailableDrivers = driverOptions.filter((d) => !d.enabled);
 
     useEffect(() => {
         if (!driverCapabilities) {
@@ -119,7 +125,7 @@ export default function CameraControls() {
         setBusy(true);
         setMessage(`Connecting ${driver}...`);
         try {
-            const res = await daemonApi.connectCamera(driver);
+            const res = await cameraApi.connectCamera(driver);
             setMessage(`Connected: ${res.camera ?? driver}`);
             await refresh();
         } catch (e) {
@@ -133,7 +139,7 @@ export default function CameraControls() {
         // Optimistic update, then reconcile with the value the hardware applied.
         setParams((prev) => prev.map((p) => (p.name === name ? { ...p, current: value } : p)));
         try {
-            const res = await daemonApi.setCameraParameter(name, value);
+            const res = await cameraApi.setCameraParameter(name, value);
             setParams((prev) => prev.map((p) => (p.name === name ? { ...p, current: res.value } : p)));
         } catch {
             setMessage(`Failed to set ${name}.`);
@@ -143,7 +149,7 @@ export default function CameraControls() {
     const startStream = async () => {
         setBusy(true);
         try {
-            const res = await daemonApi.startCameraStream(selectedFormat);
+            const res = await cameraApi.startCameraStream(selectedFormat);
             setStreaming(true);
             setMessage(`Streaming ${res.width}x${res.height} ${res.format}`);
         } catch (e) {
@@ -156,7 +162,7 @@ export default function CameraControls() {
     const stopStream = async () => {
         setBusy(true);
         try {
-            await daemonApi.stopCameraStream();
+            await cameraApi.stopCameraStream();
             setStreaming(false);
             setMessage("Stream stopped.");
         } catch (e) {
@@ -172,13 +178,13 @@ export default function CameraControls() {
         try {
             // Capture reads from the active stream, so ensure it's running.
             if (!streaming) {
-                await daemonApi.startCameraStream(selectedFormat);
+                await cameraApi.startCameraStream(selectedFormat);
                 setStreaming(true);
             }
             const gainParam = params.find((p) => p.name === "gain");
             const gain = gainParam ? Math.round(gainParam.current) : 0;
             const bin = formats[selectedFormat]?.bin ?? 1;
-            const res = await daemonApi.capture({ exposure, gain, binning: bin });
+            const res = await cameraApi.capture({ exposure, gain, binning: bin });
             setLastCapture(res.path ?? res.id);
             setMessage(`Saved ${res.width}×${res.height} → ${res.path ?? res.id}`);
         } catch (e) {
@@ -188,35 +194,14 @@ export default function CameraControls() {
         }
     };
 
-    const locked = mode === "auto" || busy;
+    const locked = busy;
 
     return (
         <div className="cam-panel">
             <div className="cam-head">
                 <div className="cam-title">Camera Control</div>
-                <div className="cam-mode" role="group" aria-label="Control mode">
-                    <button
-                        type="button"
-                        className={`cam-mode-btn ${mode === "manual" ? "active" : ""}`}
-                        onClick={() => setMode("manual")}
-                    >
-                        Manual
-                    </button>
-                    <button
-                        type="button"
-                        className={`cam-mode-btn ${mode === "auto" ? "active" : ""}`}
-                        onClick={() => setMode("auto")}
-                    >
-                        Autonomous
-                    </button>
-                </div>
+                <div className="cam-transport">{hardwareTransport === "django" ? "Django relay" : "Direct daemon"}</div>
             </div>
-
-            {mode === "auto" && (
-                <div className="cam-note">
-                    AI is driving the camera. Switch to Manual to take direct control at any time.
-                </div>
-            )}
 
             {!connected ? (
                 <div className="cam-connect">
@@ -224,13 +209,23 @@ export default function CameraControls() {
                         {driverOptions.map((d) => (
                             <option key={d.id} value={d.id} disabled={!d.enabled} title={d.reason}>
                                 {d.label}
-                                {d.enabled ? "" : " (not compiled)"}
+                                {d.enabled ? "" : " - unavailable"}
                             </option>
                         ))}
                     </select>
                     <button type="button" className="cam-btn primary" onClick={connect} disabled={busy || !selectedDriverEnabled}>
                         Connect
                     </button>
+                    {unavailableDrivers.length > 0 && (
+                        <div className="cam-driver-reasons" aria-label="Unavailable camera drivers">
+                            {unavailableDrivers.map((d) => (
+                                <div key={d.id} className="cam-driver-reason" title={capabilityReason(d)}>
+                                    <span className="cam-driver-name">{d.label}</span>
+                                    <span className="cam-driver-detail">{capabilityReason(d)}</span>
+                                </div>
+                            ))}
+                        </div>
+                    )}
                 </div>
             ) : (
                 <>
@@ -300,7 +295,7 @@ export default function CameraControls() {
                 </>
             )}
 
-            <div className="cam-status">{message}</div>
+            <div className="cam-status">{message} Control path: {hardwareTransport === "django" ? "Django relay" : "direct daemon"}.</div>
         </div>
     );
 }

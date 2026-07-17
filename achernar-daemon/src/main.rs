@@ -60,9 +60,12 @@ async fn main() -> anyhow::Result<()> {
         config.mount.max_slew_rate
     );
 
-    // Create shared application state
-    let app_state = AppState::new();
+    // Create shared application state and local offline store.
+    let local_store = storage::local_store::LocalStore::open(&config.storage.database_path).await?;
+    info!("Local SQLite store ready: {}", config.storage.database_path);
+    let app_state = AppState::new(config.focus.clone(), local_store);
     cloud_client::spawn_if_configured(app_state.clone());
+    vision::vision_loop::spawn(app_state.clone(), 1.0);
 
     // Build API routes
     let api_v1 = Router::new()
@@ -72,7 +75,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/disconnect", post(api::disconnect_equipment))
         .nest("/camera", camera_routes())
         .nest("/mount", mount_routes())
-        .nest("/focuser", focuser_routes());
+        .nest("/focuser", focuser_routes())
+        .nest("/focus", focus_routes());
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -106,6 +110,7 @@ fn camera_routes() -> Router<AppState> {
     Router::new()
         .route("/capture", post(api::camera::capture))
         .route("/abort", post(api::camera::abort))
+        .route("/snapshot", post(api::camera::snapshot))
         .route(
             "/parameters",
             get(api::camera::get_parameters).post(api::camera::set_parameter),
@@ -135,6 +140,15 @@ fn focuser_routes() -> Router<AppState> {
         .route("/abort", post(api::focuser::abort))
 }
 
+fn focus_routes() -> Router<AppState> {
+    Router::new()
+        .route("/run", post(api::focus::start_focus_run))
+        .route("/abort", post(api::focus::abort_focus_run))
+        .route("/status", get(api::focus::get_focus_status))
+        .route("/history", get(api::focus::get_focus_history))
+        .route("/drift", get(api::focus::get_drift_prediction))
+}
+
 /// WebSocket handler for telemetry — now sends real hardware state
 async fn telemetry_ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     ws.on_upgrade(move |socket| handle_telemetry_socket(socket, state))
@@ -143,15 +157,36 @@ async fn telemetry_ws_handler(ws: WebSocketUpgrade, State(state): State<AppState
 async fn handle_telemetry_socket(mut socket: WebSocket, state: AppState) {
     info!("Telemetry stream started");
     let mut ticker = interval(Duration::from_millis(1000));
+    let mut vision_rx = state.vision_updates.subscribe();
 
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {
+                let telemetry_str = crate::telemetry::telemetry_event(&state).to_string();
 
-        let telemetry_str = crate::telemetry::telemetry_event(&state).to_string();
-
-        if let Err(e) = socket.send(Message::Text(telemetry_str)).await {
-            info!("Telemetry socket closed: {}", e);
-            break;
+                if let Err(e) = socket.send(Message::Text(telemetry_str)).await {
+                    info!("Telemetry socket closed: {}", e);
+                    break;
+                }
+            }
+            vision_result = vision_rx.recv() => {
+                match vision_result {
+                    Ok(observation) => {
+                        let event = serde_json::json!({
+                            "type": "VISION_UPDATE",
+                            "observation": observation,
+                        });
+                        if let Err(e) = socket.send(Message::Text(event.to_string())).await {
+                            info!("Telemetry socket closed: {}", e);
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!("Telemetry socket skipped {skipped} vision updates");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
         }
     }
 }

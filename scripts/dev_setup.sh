@@ -12,12 +12,22 @@ echo ""
 
 # ── Python backend ──
 echo "▶ Setting up Python backend..."
-if [ ! -d "$ROOT_DIR/backend/.venv" ]; then
-    python3 -m venv "$ROOT_DIR/backend/.venv"
+PYTHON_BIN="${PYTHON_BIN:-python3.11}"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "  ⚠ $PYTHON_BIN not found; falling back to python3"
+    PYTHON_BIN="python3"
 fi
-source "$ROOT_DIR/backend/.venv/bin/activate"
+if [ ! -d "$ROOT_DIR/venv" ]; then
+    "$PYTHON_BIN" -m venv "$ROOT_DIR/venv"
+fi
+source "$ROOT_DIR/venv/bin/activate"
 pip install --quiet --upgrade pip
 pip install --quiet -r "$ROOT_DIR/requirements.txt"
+python - <<'PY'
+import sys
+if sys.version_info[:2] != (3, 11):
+    print(f"  ⚠ Active venv is Python {sys.version.split()[0]}; Python 3.11 is the supported backend dev target.")
+PY
 echo "  ✓ Python environment ready"
 
 # ── Frontend ──

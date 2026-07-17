@@ -1,11 +1,16 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::time::{Duration, Instant};
 
+use crate::api::camera::{option_name, option_type_name, parse_option, CamParamInfo, FormatInfo};
+use crate::fits::FitsMeta;
 use crate::hardware::{
     camera::OlsCameraDriver,
-    focuser::{Focuser, FocuserDriver},
+    capabilities::driver_capability_report,
+    focuser::{ConnectedFocuser, Focuser, FocuserDriver, SimFocuser},
     mount::{EqCoord, Mount, MountDriver},
+    ols_ffi::OlsCamOptionId,
 };
 use crate::state::AppState;
 
@@ -51,8 +56,13 @@ pub async fn execute(state: AppState, command: &RelayCommand) -> Result<Value, S
     match command.action.as_str() {
         "equipment.connect" => connect_equipment(state, &command.payload).await,
         "equipment.status" => Ok(crate::telemetry::equipment_status(&state)),
+        "drivers.capabilities" => Ok(json!(driver_capability_report())),
+        "camera.parameters" => camera_parameters(state),
+        "camera.formats" => camera_formats(state),
+        "camera.set_parameter" => camera_set_parameter(state, &command.payload),
         "camera.start_stream" => start_camera_stream(state, &command.payload),
         "camera.abort" => abort_camera(state),
+        "camera.capture" => camera_capture(state, &command.payload).await,
         "camera.snapshot" => camera_snapshot(state),
         "mount.slew" => mount_slew(state, &command.payload),
         "mount.sync" => mount_sync(state, &command.payload),
@@ -64,6 +74,172 @@ pub async fn execute(state: AppState, command: &RelayCommand) -> Result<Value, S
         "focuser.abort" => focuser_abort(state),
         other => Err(format!("Unsupported relay action: {other}")),
     }
+}
+
+fn camera_parameters(state: AppState) -> Result<Value, String> {
+    let cam_lock = state.camera.lock().unwrap();
+    let camera = cam_lock
+        .as_ref()
+        .ok_or_else(|| "No camera connected".to_string())?;
+    let options = camera.supported_options().map_err(|e| e.to_string())?;
+    let mut params = Vec::with_capacity(options.len());
+
+    for id in options {
+        if let Ok(p) = camera.get_parameter(id) {
+            params.push(CamParamInfo {
+                name: option_name(id).to_string(),
+                kind: option_type_name(p.option_type).to_string(),
+                read_only: p.read_only,
+                min: p.min_val,
+                max: p.max_val,
+                step: p.step_size,
+                default: p.def_val,
+                current: p.cur_val,
+            });
+        }
+    }
+
+    Ok(json!(params))
+}
+
+fn camera_formats(state: AppState) -> Result<Value, String> {
+    let cam_lock = state.camera.lock().unwrap();
+    let camera = cam_lock
+        .as_ref()
+        .ok_or_else(|| "No camera connected".to_string())?;
+    let formats = camera.formats().map_err(|e| e.to_string())?;
+    let list: Vec<FormatInfo> = formats
+        .iter()
+        .enumerate()
+        .map(|(i, f)| FormatInfo {
+            index: i,
+            format: format!("{:?}", f.format),
+            width: f.width,
+            height: f.height,
+            bin: f.bin,
+            framerate: f.framerate,
+        })
+        .collect();
+
+    Ok(json!(list))
+}
+
+fn camera_set_parameter(state: AppState, payload: &Value) -> Result<Value, String> {
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "payload.name is required".to_string())?;
+    let value = payload_f64(payload, "value")?;
+    let id = parse_option(name).ok_or_else(|| format!("Unknown camera parameter: {name}"))?;
+
+    let cam_lock = state.camera.lock().unwrap();
+    let camera = cam_lock
+        .as_ref()
+        .ok_or_else(|| "No camera connected".to_string())?;
+    camera.set_parameter(id, value).map_err(|e| e.to_string())?;
+    let current = camera.get_parameter(id).map(|p| p.cur_val).unwrap_or(value);
+
+    Ok(json!({
+        "status": "ok",
+        "name": name,
+        "value": current,
+    }))
+}
+
+async fn camera_capture(state: AppState, payload: &Value) -> Result<Value, String> {
+    let params: crate::api::camera::CaptureParams =
+        serde_json::from_value(payload.clone()).map_err(|e| e.to_string())?;
+
+    {
+        let cam_lock = state.camera.lock().unwrap();
+        let camera = cam_lock
+            .as_ref()
+            .ok_or_else(|| "No camera connected".to_string())?;
+        let _ = camera.set_parameter(OlsCamOptionId::Exp, params.exposure * 1000.0);
+        if let Some(gain) = params.gain {
+            let _ = camera.set_parameter(OlsCamOptionId::Gain, gain as f64);
+        }
+        if let Some(temp) = params.temperature {
+            let _ = camera.set_parameter(OlsCamOptionId::CoolerTarget, temp);
+        }
+    }
+
+    if !*state.streaming.lock().unwrap() {
+        return Err("Capture requires an active camera stream".to_string());
+    }
+
+    let settle = Duration::from_secs_f64(params.exposure.clamp(0.0, 120.0));
+    tokio::time::sleep(settle).await;
+
+    let baseline = state
+        .latest_frame
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|f| f.frame_counter);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let frame = loop {
+        {
+            let guard = state.latest_frame.lock().unwrap();
+            if let Some(frame) = guard.as_ref() {
+                if Some(frame.frame_counter) != baseline {
+                    break frame.clone();
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            let guard = state.latest_frame.lock().unwrap();
+            match guard.as_ref() {
+                Some(frame) => break frame.clone(),
+                None => return Err("No camera frame is available yet".to_string()),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+
+    let (temperature, gain_val) = {
+        let cam_lock = state.camera.lock().unwrap();
+        let camera = cam_lock.as_ref();
+        let temperature = camera
+            .and_then(|c| c.get_parameter(OlsCamOptionId::Temperature).ok())
+            .map(|p| p.cur_val)
+            .unwrap_or(f64::NAN);
+        let gain_val = camera
+            .and_then(|c| c.get_parameter(OlsCamOptionId::Gain).ok())
+            .map(|p| p.cur_val as u32)
+            .unwrap_or_else(|| params.gain.unwrap_or(0));
+        (temperature, gain_val)
+    };
+
+    let id = uuid::Uuid::new_v4().to_string();
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let meta = FitsMeta {
+        exposure_s: params.exposure,
+        gain: gain_val,
+        temperature_c: temperature,
+        binning: params.binning.unwrap_or(1),
+        instrument: state
+            .camera_name
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "Achernar".to_string()),
+        date_obs: timestamp.clone(),
+    };
+    let path = crate::fits::write_capture(&frame, &meta, &id).map_err(|e| e.to_string())?;
+
+    Ok(json!({
+        "id": id,
+        "width": frame.width,
+        "height": frame.height,
+        "path": path,
+        "metadata": {
+            "exposure": params.exposure,
+            "gain": gain_val,
+            "temperature": temperature,
+            "timestamp": timestamp,
+        }
+    }))
 }
 
 async fn connect_equipment(state: AppState, payload: &Value) -> Result<Value, String> {
@@ -149,12 +325,29 @@ fn connect_mount(state: AppState, driver: &str, option: Option<String>) -> Resul
 }
 
 fn connect_focuser(state: AppState, driver: &str, option: Option<String>) -> Result<Value, String> {
+    if matches!(driver, "sim" | "simulator") {
+        let position = option
+            .as_deref()
+            .and_then(|value| value.parse::<i32>().ok())
+            .unwrap_or(10000);
+        *state.focuser_name.lock().unwrap() = Some("Simulator focuser".to_string());
+        *state.focuser.lock().unwrap() =
+            Some(ConnectedFocuser::Simulator(SimFocuser::new(position)));
+
+        return Ok(json!({
+            "status": "connected",
+            "equipment_type": "focuser",
+            "driver": driver,
+            "position": position,
+            "available_drivers": [{"name": "sim", "option": "initial_position"}],
+        }));
+    }
+
     let driver_type = match driver {
         "alpaca" => FocuserDriver::Alpaca,
         "indi" => FocuserDriver::Indi,
         "moonlite" => FocuserDriver::Moonlite,
         "usb" | "serial" => FocuserDriver::UsbSerial,
-        "sim" | "simulator" => FocuserDriver::Simulator,
         other => return Err(format!("Unsupported focuser driver: {other}")),
     };
     let option = option.unwrap_or_else(|| "auto".to_string());
@@ -165,7 +358,7 @@ fn connect_focuser(state: AppState, driver: &str, option: Option<String>) -> Res
     let drivers = focuser.list_drivers().unwrap_or_default();
 
     *state.focuser_name.lock().unwrap() = Some(format!("{driver_type:?} focuser"));
-    *state.focuser.lock().unwrap() = Some(focuser);
+    *state.focuser.lock().unwrap() = Some(ConnectedFocuser::Hardware(focuser));
 
     Ok(json!({
         "status": "connected",
@@ -218,14 +411,17 @@ fn abort_camera(state: AppState) -> Result<Value, String> {
 fn camera_snapshot(state: AppState) -> Result<Value, String> {
     let frame = state.latest_frame.lock().unwrap().clone();
     let frame = frame.ok_or_else(|| "No camera frame is available yet".to_string())?;
+    let jpeg = crate::api::camera::encode_frame_jpeg(&frame)
+        .ok_or_else(|| "Latest frame cannot be encoded as a browser preview".to_string())?;
     Ok(json!({
         "status": "ok",
-        "format": format!("{:?}", frame.format),
+        "format": "JPEG",
+        "mime_type": "image/jpeg",
         "width": frame.width,
         "height": frame.height,
         "frame_counter": frame.frame_counter,
         "timestamp": frame.unix_timestamp,
-        "data_base64": general_purpose::STANDARD.encode(frame.data),
+        "data_base64": general_purpose::STANDARD.encode(jpeg),
     }))
 }
 

@@ -1,3 +1,4 @@
+import type { DragEvent } from "react";
 import type { EquipmentCardModel } from "../types/achernar";
 
 const TYPE_LABELS: Record<EquipmentCardModel["type"], string> = {
@@ -11,15 +12,30 @@ const TYPE_LABELS: Record<EquipmentCardModel["type"], string> = {
 export default function EquipmentCard({
     model,
     onAction,
+    selected = false,
+    draggable = false,
+    onSelect,
+    onDragStart,
 }: {
     model: EquipmentCardModel;
     onAction?: (action: string, payload?: Record<string, unknown>) => void;
+    selected?: boolean;
+    draggable?: boolean;
+    onSelect?: (model: EquipmentCardModel) => void;
+    onDragStart?: (model: EquipmentCardModel, event: DragEvent<HTMLElement>) => void;
 }) {
     const metrics: NonNullable<EquipmentCardModel["metrics"]> = model.metrics
         ?? Object.entries(model.meta ?? {}).map(([label, value]) => ({ label, value }));
 
     return (
-        <article className={`card status-${model.status}`} data-type={model.type}>
+        <article
+            className={`card status-${model.status} ${selected ? "selected" : ""} ${onSelect ? "selectable" : ""}`}
+            data-type={model.type}
+            data-equipment-id={model.id}
+            draggable={draggable}
+            onClick={() => onSelect?.(model)}
+            onDragStart={(event) => onDragStart?.(model, event)}
+        >
             <div className="card-header">
                 <div className="card-identity">
                     <div className="card-type">{TYPE_LABELS[model.type]}</div>
@@ -57,26 +73,41 @@ export default function EquipmentCard({
             {onAction && (
                 <div className="card-actions">
                     {model.type === "camera" && (
-                        <button className="btn" type="button" onClick={() => onAction("camera.start_stream")}>
-                            Start Stream
-                        </button>
-                    )}
-                    {model.type === "mount" && (
-                        <>
-                            <button className="btn" type="button" onClick={() => onAction("mount.set_tracking", { enabled: true })}>
+                            <button className="btn" type="button" onClick={(event) => {
+                                event.stopPropagation();
+                                onAction("camera.start_stream");
+                            }}>
+                                Start Stream
+                            </button>
+                        )}
+                        {model.type === "mount" && (
+                            <>
+                            <button className="btn" type="button" onClick={(event) => {
+                                event.stopPropagation();
+                                onAction("mount.set_tracking", { enabled: true });
+                            }}>
                                 Track
                             </button>
-                            <button className="btn" type="button" onClick={() => onAction("mount.abort")}>
+                            <button className="btn" type="button" onClick={(event) => {
+                                event.stopPropagation();
+                                onAction("mount.abort");
+                            }}>
                                 Stop
                             </button>
                         </>
                     )}
                     {model.type === "focuser" && (
                         <>
-                            <button className="btn" type="button" onClick={() => onAction("focuser.move_relative", { steps: -10 })}>
+                            <button className="btn" type="button" onClick={(event) => {
+                                event.stopPropagation();
+                                onAction("focuser.move_relative", { steps: -10 });
+                            }}>
                                 -10
                             </button>
-                            <button className="btn" type="button" onClick={() => onAction("focuser.move_relative", { steps: 10 })}>
+                            <button className="btn" type="button" onClick={(event) => {
+                                event.stopPropagation();
+                                onAction("focuser.move_relative", { steps: 10 });
+                            }}>
                                 +10
                             </button>
                         </>

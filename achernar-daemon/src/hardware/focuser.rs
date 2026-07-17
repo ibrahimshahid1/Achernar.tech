@@ -25,13 +25,13 @@ pub enum FocuserDriver {
 
 impl FocuserDriver {
     /// Name string used by OLS driver loading.
-    pub fn ols_name(&self) -> &str {
+    pub fn ols_name(&self) -> Option<&str> {
         match self {
-            FocuserDriver::Alpaca => "alpaca:remote",
-            FocuserDriver::Indi => "indi:focuser",
-            FocuserDriver::Moonlite => "moonlite",
-            FocuserDriver::UsbSerial => "usb",
-            FocuserDriver::Simulator => "alpaca:remote",
+            FocuserDriver::Alpaca => Some("alpaca:remote"),
+            FocuserDriver::Indi => Some("indi:focuser"),
+            FocuserDriver::Moonlite => Some("moonlite"),
+            FocuserDriver::UsbSerial => Some("usb"),
+            FocuserDriver::Simulator => None,
         }
     }
 }
@@ -51,8 +51,133 @@ pub struct FocuserStatus {
     pub max_range: Option<i32>,
 }
 
+/// Focuser connected to daemon state. The simulator keeps the no-hardware
+/// control spine testable without an Alpaca/INDI focuser service.
+pub enum ConnectedFocuser {
+    Hardware(Focuser),
+    Simulator(SimFocuser),
+}
+
+impl ConnectedFocuser {
+    pub fn position(&self) -> crate::error::Result<i32> {
+        match self {
+            Self::Hardware(focuser) => focuser.position(),
+            Self::Simulator(focuser) => focuser.position(),
+        }
+    }
+
+    pub fn is_moving(&self) -> crate::error::Result<bool> {
+        match self {
+            Self::Hardware(focuser) => focuser.is_moving(),
+            Self::Simulator(focuser) => focuser.is_moving(),
+        }
+    }
+
+    pub fn is_absolute(&self) -> crate::error::Result<bool> {
+        match self {
+            Self::Hardware(focuser) => focuser.is_absolute(),
+            Self::Simulator(focuser) => focuser.is_absolute(),
+        }
+    }
+
+    pub fn max_range(&self) -> crate::error::Result<i32> {
+        match self {
+            Self::Hardware(focuser) => focuser.max_range(),
+            Self::Simulator(focuser) => focuser.max_range(),
+        }
+    }
+
+    pub fn move_absolute(&mut self, position: i32) -> crate::error::Result<()> {
+        match self {
+            Self::Hardware(focuser) => focuser.move_absolute(position),
+            Self::Simulator(focuser) => focuser.move_absolute(position),
+        }
+    }
+
+    pub fn move_relative(&mut self, steps: i32) -> crate::error::Result<()> {
+        match self {
+            Self::Hardware(focuser) => focuser.move_relative(steps),
+            Self::Simulator(focuser) => focuser.move_relative(steps),
+        }
+    }
+
+    pub fn abort(&mut self) -> crate::error::Result<()> {
+        match self {
+            Self::Hardware(focuser) => focuser.abort(),
+            Self::Simulator(focuser) => focuser.abort(),
+        }
+    }
+
+    pub fn status(&self) -> FocuserStatus {
+        match self {
+            Self::Hardware(focuser) => focuser.status(),
+            Self::Simulator(focuser) => focuser.status(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SimFocuser {
+    position: i32,
+    max_range: i32,
+    moving: bool,
+}
+
+impl SimFocuser {
+    pub fn new(position: i32) -> Self {
+        let max_range = 50000;
+        Self {
+            position: position.clamp(0, max_range),
+            max_range,
+            moving: false,
+        }
+    }
+
+    pub fn position(&self) -> crate::error::Result<i32> {
+        Ok(self.position)
+    }
+
+    pub fn is_moving(&self) -> crate::error::Result<bool> {
+        Ok(self.moving)
+    }
+
+    pub fn is_absolute(&self) -> crate::error::Result<bool> {
+        Ok(true)
+    }
+
+    pub fn max_range(&self) -> crate::error::Result<i32> {
+        Ok(self.max_range)
+    }
+
+    pub fn move_absolute(&mut self, position: i32) -> crate::error::Result<()> {
+        self.moving = true;
+        self.position = position.clamp(0, self.max_range);
+        self.moving = false;
+        Ok(())
+    }
+
+    pub fn move_relative(&mut self, steps: i32) -> crate::error::Result<()> {
+        self.move_absolute(self.position + steps)
+    }
+
+    pub fn abort(&mut self) -> crate::error::Result<()> {
+        self.moving = false;
+        Ok(())
+    }
+
+    pub fn status(&self) -> FocuserStatus {
+        FocuserStatus {
+            connected: true,
+            position: Some(self.position),
+            is_moving: self.moving,
+            is_absolute: true,
+            max_range: Some(self.max_range),
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
-//  Focuser Implementation
+//  Hardware Focuser Implementation
 // ═══════════════════════════════════════════════════════════════════
 
 /// Hardware focuser interface backed by the OLS bridge.
@@ -130,7 +255,12 @@ impl Focuser {
 
     /// Connect to the focuser with a specific option (e.g., Alpaca URL).
     pub fn connect_with_option(&mut self, option: &str) -> crate::error::Result<()> {
-        let driver_name = CString::new(self.driver_type.ols_name()).map_err(|_| {
+        let driver_name = self.driver_type.ols_name().ok_or_else(|| {
+            crate::error::HardwareError::Communication(
+                "Simulator focuser is daemon-local and cannot be loaded through OLS".into(),
+            )
+        })?;
+        let driver_name = CString::new(driver_name).map_err(|_| {
             crate::error::HardwareError::Communication("Invalid driver name".into())
         })?;
         let option_c = CString::new(option).map_err(|_| {

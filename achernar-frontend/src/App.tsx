@@ -5,6 +5,7 @@ import Equipment from "./pages/Equipment";
 import Queue from "./pages/Queue";
 import DataLab from "./pages/DataLab";
 import Logs from "./pages/Logs";
+import RunRoom from "./pages/RunRoom";
 
 export default function App() {
   return (
@@ -16,6 +17,7 @@ export default function App() {
       <Routes>
         <Route path="/" element={<Navigate to="/dashboard" replace />} />
         <Route path="/dashboard" element={<Dashboard />} />
+        <Route path="/run" element={<RunRoom />} />
         <Route path="/equipment" element={<Equipment />} />
         <Route path="/queue" element={<Queue />} />
         <Route path="/data-lab" element={<DataLab />} />

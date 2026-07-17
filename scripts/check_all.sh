@@ -45,7 +45,11 @@ fi
 
 # ── Django ──
 echo "▶ Django Backend"
-source "$ROOT_DIR/backend/.venv/bin/activate" 2>/dev/null || true
+if [ -f "$ROOT_DIR/venv/bin/activate" ]; then
+    source "$ROOT_DIR/venv/bin/activate"
+elif [ -f "$ROOT_DIR/backend/.venv/bin/activate" ]; then
+    source "$ROOT_DIR/backend/.venv/bin/activate"
+fi
 check "manage.py check" bash -c "cd '$ROOT_DIR' && USE_SQLITE=1 python manage.py check 2>&1"
 
 # ── Frontend ──

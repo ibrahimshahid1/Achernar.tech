@@ -11,4 +11,10 @@ export const env = {
             ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws`
             : 'ws://localhost:8000/ws'
     ),
+
+    // Browser escape hatch for rigs where the web client is on the same LAN as
+    // the daemon. Default browser mode stays on the Django relay path.
+    enableBrowserDirectDaemon: ["1", "true", "yes"].includes(
+        String(import.meta.env.VITE_ENABLE_BROWSER_DIRECT_DAEMON || "").toLowerCase()
+    ),
 };

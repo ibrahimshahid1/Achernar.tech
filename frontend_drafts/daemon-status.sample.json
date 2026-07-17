@@ -1,0 +1,50 @@
+{
+  "connected": true,
+  "daemon_id": "d9217a90-bdc8-48c2-bd97-cb78a7941b09",
+  "hardware_id": "achernar-local-daemon",
+  "last_heartbeat": "2026-07-07T20:28:16Z",
+  "camera": {
+    "name": "ASI2600MM Pro",
+    "connected": true,
+    "cooling": true,
+    "temperature": -10.1,
+    "exposing": true,
+    "streaming": true,
+    "gain": 100,
+    "exposure_s": 2,
+    "latest_frame": {
+      "frame_counter": 1842,
+      "width": 1304,
+      "height": 976,
+      "format": "Mjpeg"
+    }
+  },
+  "mount": {
+    "name": "AP 1100GTO",
+    "connected": true,
+    "tracking": true,
+    "ra": 5.5753,
+    "dec": 22.0144,
+    "parked": false,
+    "pier_side": "East",
+    "guide_rms": 0.48
+  },
+  "focuser": {
+    "name": "Optec Gemini",
+    "connected": true,
+    "position": 9900,
+    "moving": false,
+    "absolute": true,
+    "max_range": 50000,
+    "hfr": 3.61,
+    "temperature": 4.8
+  },
+  "filter_wheel": {
+    "name": "EFW 7 x 36 mm",
+    "connected": true,
+    "filter": "L",
+    "slot": 1,
+    "moving": false,
+    "offset": 0
+  }
+}

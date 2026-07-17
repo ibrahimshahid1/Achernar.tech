@@ -1,6 +1,7 @@
 import { env } from "../env";
 import { httpJson } from "./http";
-import type { EquipmentState, ImagingSession, RelayCommandResult, DaemonSummary } from "../types/achernar";
+import type { EquipmentState, ImagingSession, RelayCommandResult, DaemonSummary, CaptureParams } from "../types/achernar";
+import type { CamFormat, CamParam, CaptureResult, DriverCapabilityReport } from "./daemon";
 
 /**
  * Cloud API (Django Apps)
@@ -41,8 +42,24 @@ export const cloudApi = {
         return httpJson<EquipmentState>(`${env.cloudApiBase}/equipment/daemon-status/`);
     },
 
-    async startCameraStream(): Promise<{ status: string; format: string; width: number; height: number }> {
+    async startCameraStream(formatIndex?: number): Promise<{ status: string; format: string; width: number; height: number; bin?: number }> {
         return httpJson(`${env.cloudApiBase}/equipment/camera/start-stream/`, {
+            method: "POST",
+            body: typeof formatIndex === "number" ? { payload: { format_index: formatIndex } } : {},
+        });
+    },
+
+    async cameraSnapshot(): Promise<{
+        status: string;
+        format: string;
+        mime_type?: string;
+        width: number;
+        height: number;
+        frame_counter?: number;
+        timestamp?: number;
+        data_base64: string;
+    }> {
+        return httpJson(`${env.cloudApiBase}/equipment/camera/snapshot/`, {
             method: "POST",
         });
     },
@@ -60,6 +77,53 @@ export const cloudApi = {
                 daemon_id: daemonId,
             },
         });
+    },
+
+    async relayPayload<T>(
+        action: string,
+        payload: Record<string, unknown> = {},
+        daemonId?: string,
+    ): Promise<T> {
+        const result = await this.relayCommand(action, payload, daemonId);
+        if (result.pending) {
+            throw new Error(`${action} is still pending on the daemon.`);
+        }
+        if (result.ok === false) {
+            throw new Error(result.error ?? `${action} failed.`);
+        }
+        return (result.payload ?? {}) as T;
+    },
+
+    async getDriverCapabilities(): Promise<DriverCapabilityReport> {
+        return this.relayPayload<DriverCapabilityReport>("drivers.capabilities");
+    },
+
+    async connectCamera(driver: string, option?: string): Promise<{ status: string; camera?: string; cameras_found?: string[] }> {
+        return this.relayPayload("equipment.connect", {
+            equipment_type: "camera",
+            driver,
+            option,
+        });
+    },
+
+    async stopCameraStream(): Promise<void> {
+        await this.relayPayload("camera.abort");
+    },
+
+    async getCameraParameters(): Promise<CamParam[]> {
+        return this.relayPayload<CamParam[]>("camera.parameters");
+    },
+
+    async setCameraParameter(name: string, value: number): Promise<{ status: string; name: string; value: number }> {
+        return this.relayPayload("camera.set_parameter", { name, value });
+    },
+
+    async getCameraFormats(): Promise<CamFormat[]> {
+        return this.relayPayload<CamFormat[]>("camera.formats");
+    },
+
+    async capture(payload: CaptureParams): Promise<CaptureResult> {
+        return this.relayPayload<CaptureResult>("camera.capture", payload as unknown as Record<string, unknown>);
     },
 
     /**

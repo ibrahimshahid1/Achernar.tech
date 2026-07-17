@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::hardware::{
     camera::OlsCameraDriver,
     capabilities::{driver_capability_report, DriverCapabilityReport},
-    focuser::{Focuser, FocuserDriver},
+    focuser::{ConnectedFocuser, Focuser, FocuserDriver, SimFocuser},
     mount::{Mount, MountDriver},
 };
 use crate::state::AppState;
@@ -286,12 +286,30 @@ async fn connect_focuser(
     state: AppState,
     req: ConnectRequest,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    if matches!(req.driver.as_str(), "sim" | "simulator") {
+        let position = req
+            .option
+            .as_deref()
+            .and_then(|option| option.parse::<i32>().ok())
+            .unwrap_or(10000);
+        *state.focuser_name.lock().unwrap() = Some("Simulator focuser".to_string());
+        *state.focuser.lock().unwrap() =
+            Some(ConnectedFocuser::Simulator(SimFocuser::new(position)));
+
+        return Ok(Json(serde_json::json!({
+            "status": "connected",
+            "equipment_type": "focuser",
+            "driver": req.driver,
+            "position": position,
+            "available_drivers": [{"name": "sim", "option": "initial_position"}],
+        })));
+    }
+
     let driver_type = match req.driver.as_str() {
         "alpaca" => FocuserDriver::Alpaca,
         "indi" => FocuserDriver::Indi,
         "moonlite" => FocuserDriver::Moonlite,
         "usb" | "usb_serial" => FocuserDriver::UsbSerial,
-        "sim" | "simulator" => FocuserDriver::Simulator,
         _ => {
             tracing::warn!("Unsupported focuser driver: {}", req.driver);
             return Err(StatusCode::BAD_REQUEST);
@@ -310,7 +328,7 @@ async fn connect_focuser(
 
     let drivers = focuser.list_drivers().unwrap_or_default();
     *state.focuser_name.lock().unwrap() = Some(format!("{driver_type:?} focuser"));
-    *state.focuser.lock().unwrap() = Some(focuser);
+    *state.focuser.lock().unwrap() = Some(ConnectedFocuser::Hardware(focuser));
 
     Ok(Json(serde_json::json!({
         "status": "connected",

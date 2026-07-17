@@ -127,8 +127,8 @@ pub fn driver_capability_report() -> DriverCapabilityReport {
             available(
                 "sim",
                 "Simulator",
-                "Uses the Alpaca-compatible simulator path.",
-                Some("Alpaca simulator URL"),
+                "Daemon-local in-memory simulator for smoke tests and development.",
+                Some("initial position"),
             ),
             native_with_hint(
                 "indi",

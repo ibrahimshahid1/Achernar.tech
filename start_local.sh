@@ -20,6 +20,8 @@ cd "$ROOT"
 export ACHERNAR_RELAY_DEV_TOKEN="${ACHERNAR_RELAY_DEV_TOKEN:-achernar-dev-token}"
 # SQLite by default for friction-free local dev (see backend/settings/dev.py).
 export USE_SQLITE="${USE_SQLITE:-1}"
+export ACHERNAR_DJANGO_HOST="${ACHERNAR_DJANGO_HOST:-127.0.0.1}"
+export ACHERNAR_FRONTEND_HOST="${ACHERNAR_FRONTEND_HOST:-127.0.0.1}"
 
 wait_for() { # wait_for <url> <name> [timeout_s]
   local url="$1" name="$2" timeout="${3:-40}" i=0
@@ -38,7 +40,7 @@ elif [ -f backend/.venv/bin/activate ]; then source backend/.venv/bin/activate
 else echo "  (no virtualenv found; using system python)"; fi
 export PYTHONPATH="$ROOT/backend${PYTHONPATH:+:$PYTHONPATH}"
 python manage.py migrate --noinput
-python manage.py runserver 0.0.0.0:8000 &
+python manage.py runserver "${ACHERNAR_DJANGO_HOST}:8000" &
 wait_for "http://127.0.0.1:8000/api/sync/available-models/" "Django :8000"
 
 # ── 2. Rust daemon (registers a reverse tunnel with Django) ──────────────────
@@ -53,7 +55,14 @@ wait_for "http://127.0.0.1:3030/health" "daemon :3030" 120
 
 # ── 3. React frontend ────────────────────────────────────────────────────────
 echo "[3/3] React frontend…"
-( cd achernar-frontend && pnpm dev ) &
+(
+  cd achernar-frontend
+  if [ -x node_modules/.bin/vite ]; then
+    node_modules/.bin/vite --host "$ACHERNAR_FRONTEND_HOST"
+  else
+    pnpm dev --host "$ACHERNAR_FRONTEND_HOST"
+  fi
+) &
 wait_for "http://127.0.0.1:5173" "frontend :5173"
 
 cat <<EOF

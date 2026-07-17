@@ -85,6 +85,11 @@ pub fn equipment_status(state: &AppState) -> Value {
 
 pub fn telemetry_event(state: &AppState) -> Value {
     let status = equipment_status(state);
+    let observation = state
+        .vision_observation
+        .read()
+        .ok()
+        .and_then(|obs| obs.clone());
     json!({
         "type": "TELEMETRY_UPDATE",
         "timestamp": chrono::Utc::now().timestamp(),
@@ -98,8 +103,10 @@ pub fn telemetry_event(state: &AppState) -> Value {
                 "dy": 0.0,
             },
             "ai": {
-                "focus_hfr": 0.0,
-                "cloud_prob": 0.0,
+                "focus_hfr": observation.as_ref().map(|obs| obs.hfr).unwrap_or(0.0),
+                "cloud_prob": observation.as_ref().map(|obs| obs.cloud_probability).unwrap_or(0.0),
+                "star_count": observation.as_ref().map(|obs| obs.star_count).unwrap_or(0),
+                "frame_quality_score": observation.as_ref().map(|obs| obs.frame_quality_score).unwrap_or(0.0),
                 "recommended_exposure": 0.0,
             },
         }

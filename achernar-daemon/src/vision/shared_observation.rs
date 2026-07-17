@@ -3,57 +3,42 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Trailing axis classification.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum TrailingAxis {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CloudEvent {
     None,
-    Ra,
-    Dec,
-    Both,
-}
-
-/// Cloud condition classification from COC.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum CloudCondition {
-    Clear,
-    Thin,
-    Moderate,
-    Heavy,
-    Overcast,
+    CloudDetected,
+    ClearedUp,
 }
 
 /// The shared observation struct published by the vision loop at 1–5 Hz.
-/// All subsystems consume this as their view of the sky.
+/// All subsystem controllers consume this as their view of the sky.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedObservation {
     pub timestamp: chrono::DateTime<chrono::Utc>,
-    pub frame_id: uuid::Uuid,
-
-    // Focus quality (FQE)
-    pub focus_quality: f64,
-    pub focus_quality_confidence: f64,
-    pub hfr: f64,
-    pub fwhm: f64,
+    pub focus_quality: f32,
+    pub predicted_hfr: f32,
+    pub sharpness_score: f32,
+    pub quality_uncertainty: f32,
+    pub hfr: f32,
+    pub fwhm: f32,
+    pub seeing_estimate_arcsec: f32,
     pub star_count: u32,
-
-    // Cloud condition (COC)
-    pub cloud_condition: CloudCondition,
-    pub cloud_probability: f64,
-
-    // Trailing detection (TED)
-    pub trailing_detected: bool,
-    pub trailing_axis: TrailingAxis,
-    pub trailing_magnitude: f64,
-
-    // Background estimation (BGE)
-    pub background_adu: f64,
-    pub background_rms: f64,
-
-    // Environment
-    pub temperature: Option<f64>,
-    pub humidity: Option<f64>,
-    pub altitude: Option<f64>,
-    pub azimuth: Option<f64>,
+    pub cloud_probability: f32,
+    pub cloud_event: CloudEvent,
+    pub trailing_severity: f32,
+    pub trailing_axis: Option<String>,
+    pub trailing_direction_pa: Option<f32>,
+    pub background_adu: f32,
+    pub sky_background_adu: f32,
+    pub background_sigma: f32,
+    pub snr_proxy_median: f32,
+    pub saturation_fraction: f32,
+    pub pointing_error_arcmin: Option<f32>,
+    pub wcs_residual_arcsec: Option<f32>,
+    pub last_solve_confidence: Option<f32>,
+    pub last_solve_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub frame_quality_score: f32,
+    pub observation_valid: bool,
 }
 
 /// CloudEvent for publishing observations.

@@ -16,7 +16,22 @@ pub struct BackgroundEstimator;
 
 impl BackgroundEstimator {
     /// Estimate background from an image using SEP-like sigma-clipped statistics.
-    pub fn estimate(_image: &ndarray::Array2<f32>) -> BackgroundEstimate {
-        todo!("Implement background estimation with sigma-clipped stats — Section 8.1")
+    pub fn estimate(image: &ndarray::Array2<f32>) -> BackgroundEstimate {
+        let pixels: Vec<f32> = image.iter().copied().collect();
+        let max_adu = pixels
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .fold(0.0_f32, f32::max)
+            .max(65535.0);
+        let stats = super::background::estimate_background(&pixels, max_adu);
+
+        BackgroundEstimate {
+            mean_adu: stats.background_adu as f64,
+            rms_adu: stats.background_sigma as f64,
+            median_adu: stats.background_adu as f64,
+            gradient_x: 0.0,
+            gradient_y: 0.0,
+        }
     }
 }

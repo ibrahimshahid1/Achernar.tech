@@ -1,181 +1,255 @@
-import { useEffect, useMemo, useState } from "react";
-import SidePanel from "../components/SidePanel";
+import type { DragEvent } from "react";
+import { useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import EquipmentCard from "../components/EquipmentCard";
-import MjpegLiveView from "../components/MjpegLiveView";
-import CameraControls from "../components/CameraControls";
-import { cloudApi } from "../api/cloud";
-import { daemonApi as localDaemonApi } from "../api/daemon";
 import { useTelemetrySocket } from "../hooks/useTelemetrySocket";
 import { useConnectedEquipment } from "../hooks/useEquipment";
+import { useRunEquipmentSelection } from "../hooks/useRunEquipmentSelection";
 import { getHardwareTransport } from "../lib/runtime";
-import type { EquipmentCardModel, EquipmentType } from "../types/achernar";
+import type { EquipmentCardModel } from "../types/achernar";
 
-const PILL_TYPES: Array<{ key: "all" | EquipmentType; label: string; icon: string }> = [
-    { key: "all", label: "All", icon: "●" },
-    { key: "mount", label: "Mounts", icon: "🜨" },
-    { key: "focuser", label: "Focusers", icon: "⚙" },
-    { key: "camera", label: "Cameras", icon: "📷" },
-    { key: "filter-wheel", label: "Filter Wheels", icon: "⬤" },
-    { key: "dome", label: "Domes", icon: "🏛" },
+const QUEUE_ITEMS = [
+    { target: "M42 Core", recipe: "L / 24 x 120 s" },
+    { target: "Horsehead", recipe: "Ha / 18 x 300 s" },
+    { target: "Flats", recipe: "Auto panel / dusk" },
 ];
 
+const LOG_LINES = [
+    { time: "20:24:12", text: "Django relay ready for daemon status" },
+    { time: "20:25:51", text: "Camera stream control available" },
+    { time: "20:26:20", text: "Run context waiting for equipment selection" },
+];
+
+function statusText(card: EquipmentCardModel) {
+    if (card.status === "offline") {
+        return "offline";
+    }
+    return card.tags[0] ?? "ready";
+}
+
 export default function Dashboard() {
-    // Start telemetry as soon as Dashboard loads
     useTelemetrySocket();
 
-    const [active, setActive] = useState<"all" | EquipmentType>("all");
-    const [site, setSite] = useState<string>("all");
-    const [query, setQuery] = useState("");
-    const [relayMessage, setRelayMessage] = useState("");
+    const navigate = useNavigate();
     const hardwareTransport = getHardwareTransport();
+    const [dropActive, setDropActive] = useState(false);
+    const { data: equipment = [], isLoading, error } = useConnectedEquipment();
+    const {
+        selectedIds,
+        selectedCards,
+        addEquipment,
+        removeEquipment,
+        clearSelection,
+    } = useRunEquipmentSelection(equipment);
 
-    // Fetch connected equipment directly from the local daemon.
-    const { data: allCards = [], isLoading, error } = useConnectedEquipment();
+    const connectedCount = useMemo(
+        () => equipment.filter((card) => card.status !== "offline").length,
+        [equipment],
+    );
 
-    const cards = useMemo(() => {
-        return allCards
-            .filter((c) => (active === "all" ? true : c.type === active))
-            .filter((c) => (site === "all" ? true : c.site === site))
-            .filter((c) => {
-                const blob = `${c.name} ${c.site} ${c.tags.join(" ")}`.toLowerCase();
-                return blob.includes(query.toLowerCase());
-            });
-    }, [allCards, active, site, query]);
+    const camera = equipment.find((card) => card.type === "camera");
+    const mount = equipment.find((card) => card.type === "mount");
+    const focuser = equipment.find((card) => card.type === "focuser");
+    const filterWheel = equipment.find((card) => card.type === "filter-wheel");
 
-    const uniqueSites = useMemo(() => {
-        const s = new Set(allCards.map((c) => c.site));
-        return ["all", ...Array.from(s)];
-    }, [allCards]);
+    const handleDragStart = (card: EquipmentCardModel, event: DragEvent<HTMLElement>) => {
+        event.dataTransfer.setData("text/plain", card.id);
+        event.dataTransfer.effectAllowed = "copy";
+    };
 
-    useEffect(() => {
-        // Keep it "dashboard-like": no heavy logic in first template version.
-    }, []);
+    const handleDrop = (event: DragEvent<HTMLElement>) => {
+        event.preventDefault();
+        setDropActive(false);
+        addEquipment(event.dataTransfer.getData("text/plain"));
+    };
 
-    const handleEquipmentAction = async (action: string, payload: Record<string, unknown> = {}) => {
-        setRelayMessage(`Sending ${action}...`);
-        try {
-            const result = hardwareTransport === "django"
-                ? await cloudApi.relayCommand(action, payload)
-                : await localDaemonApi.relayCommand(action, payload);
-
-            if (result.pending) {
-                setRelayMessage(`${action} queued on daemon`);
-                return;
-            }
-            if (result.ok === false) {
-                setRelayMessage(result.error ?? `${action} failed`);
-                return;
-            }
-            setRelayMessage(`${action} accepted`);
-        } catch (error) {
-            setRelayMessage(error instanceof Error ? error.message : `${action} failed`);
+    const startRun = () => {
+        if (selectedCards.length === 0) {
+            return;
         }
+        navigate("/run");
     };
 
     return (
-        <main className="layout">
-            <section className="panel">
-                <div className="panel-header">
+        <main className="dashboard-layout">
+            <section className="dashboard-main panel">
+                <div className="dashboard-hero">
                     <div>
-                        <div className="panel-title">Instrument Deck</div>
+                        <div className="panel-title">Observatory Dashboard</div>
+                        <h1>Connected equipment and run readiness</h1>
                         <div className="panel-subtitle">
-                            Linked mounts, focusers, cameras, filter wheels & domes across your observatories.
+                            Browser mode reads hardware through Django; desktop mode can talk to the daemon directly.
                         </div>
                     </div>
+                    <div className="night-summary">
+                        <strong>{connectedCount > 0 ? "Ready" : "Waiting"}</strong>
+                        <span>{connectedCount} devices online</span>
+                        <small>{hardwareTransport === "django" ? "Django relay" : "Direct daemon"}</small>
+                    </div>
+                </div>
 
-                    <div className="panel-controls">
-                        {PILL_TYPES.map((p) => (
-                            <div
-                                key={p.key}
-                                className={`pill ${active === p.key ? "active" : ""}`}
-                                onClick={() => setActive(p.key)}
-                                role="button"
-                                tabIndex={0}
-                            >
-                                <span className="icon">{p.icon}</span> {p.label}
+                <section className="equipment-deck" aria-labelledby="equipmentTitle">
+                    <div className="section-row">
+                        <div>
+                            <h2 id="equipmentTitle">Equipment</h2>
+                            <p>Live daemon status, shaped for the current run context.</p>
+                        </div>
+                        <span className="source-chip">
+                            {hardwareTransport === "django" ? "Django to daemon status" : "Direct daemon status"}
+                        </span>
+                    </div>
+
+                    <div className="equipment-grid dashboard-equipment-grid">
+                        {isLoading && (
+                            <div className="loading-message">
+                                <div className="spinner" />
+                                <div>
+                                    {hardwareTransport === "django"
+                                        ? "Loading daemon state through Django..."
+                                        : "Loading equipment from local daemon..."}
+                                </div>
                             </div>
+                        )}
+                        {error && (
+                            <div className="error-message">
+                                <div>Error loading equipment</div>
+                                <div className="error-details">{(error as Error).message}</div>
+                                <div className="error-hint">
+                                    {hardwareTransport === "django"
+                                        ? "Make sure Django can reach the observatory daemon or its relay tunnel."
+                                        : "Make sure the Rust daemon is running on port 3030."}
+                                </div>
+                            </div>
+                        )}
+                        {!isLoading && !error && equipment.length === 0 && (
+                            <div className="empty-message">
+                                <div>No camera, mount, focuser, or filter wheel connected</div>
+                                <div className="empty-hint">
+                                    Connect hardware through the daemon, then this dashboard will populate from live status.
+                                </div>
+                            </div>
+                        )}
+                        {!isLoading && !error && equipment.map((card) => (
+                            <EquipmentCard
+                                key={card.id}
+                                model={card}
+                                selected={selectedIds.includes(card.id)}
+                                draggable={card.status !== "offline"}
+                                onSelect={() => addEquipment(card.id)}
+                                onDragStart={handleDragStart}
+                            />
                         ))}
                     </div>
-                </div>
+                </section>
 
-                <div className="panel-toolbar">
-                    <div className="toolbar-block">
-                        <div className="filter-label">Scope / node</div>
-                        <select className="filter-select" value={site} onChange={(e) => setSite(e.target.value)}>
-                            {uniqueSites.map((s) => (
-                                <option key={s} value={s}>
-                                    {s === "all" ? "All observatories" : s}
-                                </option>
+                <section className="dashboard-bands" aria-label="Operational overview">
+                    <article className="band-panel queue-panel">
+                        <div className="section-row compact">
+                            <h2>Observation Queue</h2>
+                            <span className="count-chip">{QUEUE_ITEMS.length} targets</span>
+                        </div>
+                        <ol className="queue-list">
+                            {QUEUE_ITEMS.map((item) => (
+                                <li key={item.target}>
+                                    <span>{item.target}</span>
+                                    <strong>{item.recipe}</strong>
+                                </li>
                             ))}
-                        </select>
-                    </div>
+                        </ol>
+                    </article>
 
-                    <div className="toolbar-block">
-                        <div className="filter-label">Search</div>
-                        <input
-                            className="filter-input"
-                            value={query}
-                            onChange={(e) => setQuery(e.target.value)}
-                            placeholder="AP 1100GTO, tags, sites…"
-                        />
-                    </div>
+                    <article className="band-panel logs-panel">
+                        <div className="section-row compact">
+                            <h2>Logs</h2>
+                            <span className="count-chip">Live</span>
+                        </div>
+                        <div className="log-stream">
+                            {LOG_LINES.map((line) => (
+                                <p key={`${line.time}-${line.text}`}>
+                                    <time>{line.time}</time> {line.text}
+                                </p>
+                            ))}
+                        </div>
+                    </article>
 
-                    {relayMessage && (
-                        <div className="toolbar-block">
-                            <div className="filter-label">Relay</div>
-                            <div className="relay-status">{relayMessage}</div>
+                    <article className="band-panel conditions-panel">
+                        <div className="section-row compact">
+                            <h2>Hardware Summary</h2>
+                            <span className="count-chip caution">Check</span>
                         </div>
-                    )}
-                </div>
-
-                <div className="camera-station">
-                    <MjpegLiveView />
-                    <CameraControls />
-                </div>
-
-                <div className="equipment-grid">
-                    {isLoading && (
-                        <div className="loading-message">
-                            <div className="spinner"></div>
-                            <div>
-                                {hardwareTransport === "django"
-                                    ? "Loading daemon state through Django..."
-                                    : "Loading equipment from local daemon..."}
-                            </div>
-                        </div>
-                    )}
-                    {error && (
-                        <div className="error-message">
-                            <div>⚠️ Error loading equipment</div>
-                            <div className="error-details">{(error as Error).message}</div>
-                            <div className="error-hint">
-                                {hardwareTransport === "django"
-                                    ? "Make sure Django is running on port 8000"
-                                    : "Make sure the Rust daemon is running on port 3030"}
-                            </div>
-                        </div>
-                    )}
-                    {!isLoading && !error && cards.length === 0 && (
-                        <div className="empty-message">
-                            <div>No camera, mount, or focuser connected</div>
-                            <div className="empty-hint">
-                                {hardwareTransport === "django"
-                                    ? "Django is relaying daemon state, but the daemon reports no connected hardware"
-                                    : "The local daemon is online, but no supported hardware is connected"}
-                            </div>
-                        </div>
-                    )}
-                    {!isLoading && cards.map((c: EquipmentCardModel) => (
-                        <EquipmentCard
-                            key={c.id}
-                            model={c}
-                            onAction={handleEquipmentAction}
-                        />
-                    ))}
-                </div>
+                        <div className="condition-row"><span>Camera</span><strong>{camera ? statusText(camera) : "missing"}</strong></div>
+                        <div className="condition-row"><span>Mount</span><strong>{mount ? statusText(mount) : "missing"}</strong></div>
+                        <div className="condition-row"><span>Focuser</span><strong>{focuser ? statusText(focuser) : "missing"}</strong></div>
+                        <div className="condition-row"><span>Filter Wheel</span><strong>{filterWheel ? statusText(filterWheel) : "missing"}</strong></div>
+                    </article>
+                </section>
             </section>
 
-            <SidePanel />
+            <aside className="run-context-panel" aria-labelledby="runContextTitle">
+                <div className="run-context-header">
+                    <div>
+                        <h2 id="runContextTitle">Run Context</h2>
+                        <p>Selected connected hardware for this imaging job.</p>
+                    </div>
+                    <span className={`context-valid ${selectedCards.length > 0 ? "good" : ""}`}>
+                        {selectedCards.length > 0 ? "Valid" : "Empty"}
+                    </span>
+                </div>
+
+                <div
+                    className={`run-drop-zone ${dropActive ? "active" : ""}`}
+                    onDragOver={(event) => {
+                        event.preventDefault();
+                        setDropActive(true);
+                    }}
+                    onDragLeave={() => setDropActive(false)}
+                    onDrop={handleDrop}
+                >
+                    {selectedCards.length === 0 ? (
+                        <div className="drop-hint">Drag connected equipment here or click a card.</div>
+                    ) : selectedCards.map((card) => (
+                        <div key={card.id} className="selected-equipment">
+                            <span className="card-type">{card.type.slice(0, 3).toUpperCase()}</span>
+                            <div>
+                                <strong>{card.name}</strong>
+                                <small>{card.summary ?? card.site}</small>
+                            </div>
+                            <button type="button" className="icon-button" onClick={() => removeEquipment(card.id)}>
+                                x
+                            </button>
+                        </div>
+                    ))}
+                </div>
+
+                <div className="run-fields">
+                    <label>
+                        Run name
+                        <input type="text" defaultValue="M42 luminance checkout" />
+                    </label>
+                    <label>
+                        Target
+                        <input type="text" defaultValue="M42 Core" />
+                    </label>
+                    <label>
+                        Capture recipe
+                        <select defaultValue="L / 24 x 120 s">
+                            <option>L / 24 x 120 s</option>
+                            <option>Ha / 18 x 300 s</option>
+                            <option>RGB / 12 x 180 s each</option>
+                        </select>
+                    </label>
+                </div>
+
+                <div className="run-context-actions">
+                    <button type="button" className="btn ghost" onClick={clearSelection}>
+                        Clear
+                    </button>
+                    <button type="button" className="btn primary start-run-btn" onClick={startRun} disabled={selectedCards.length === 0}>
+                        Start Run Job
+                    </button>
+                </div>
+            </aside>
         </main>
     );
 }
+

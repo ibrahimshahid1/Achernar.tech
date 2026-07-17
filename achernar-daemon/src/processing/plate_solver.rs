@@ -19,12 +19,22 @@ pub struct PlateSolver;
 impl PlateSolver {
     /// Solve a frame using a local astrometry solver.
     pub async fn solve(
-        _image_data: &[u8],
-        _width: u32,
-        _height: u32,
+        image_data: &[u8],
+        width: u32,
+        height: u32,
         _hint_ra: Option<f64>,
         _hint_dec: Option<f64>,
     ) -> crate::error::Result<PlateSolution> {
-        todo!("Implement local plate solving (astrometry.net or ASTAP)")
+        if image_data.is_empty() || width == 0 || height == 0 {
+            return Err(crate::error::HardwareError::Unsupported(
+                "Plate solving requires a non-empty image and valid dimensions".to_string(),
+            )
+            .into());
+        }
+
+        Err(crate::error::HardwareError::Unsupported(
+            "No local astrometry solver backend is configured yet".to_string(),
+        )
+        .into())
     }
 }

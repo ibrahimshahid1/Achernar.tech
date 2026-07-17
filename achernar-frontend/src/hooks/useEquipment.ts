@@ -47,6 +47,7 @@ function cardsFromDaemon(
 
     if (status.camera) {
         const temperature = Number(status.camera.temperature ?? 0);
+        const frame = status.camera.latest_frame;
         const cameraState = status.camera.streaming
             ? 'streaming'
             : status.camera.exposing
@@ -65,8 +66,8 @@ function cardsFromDaemon(
             metrics: [
                 { label: 'Mode', value: cameraState, tone: status.camera.streaming || status.camera.exposing ? 'good' : 'muted' },
                 { label: 'Temp', value: `${temperature.toFixed(1)} C` },
-                { label: 'Cooling', value: boolText(status.camera.cooling), tone: status.camera.cooling ? 'good' : 'muted' },
-                { label: 'Stream', value: boolText(status.camera.streaming), tone: status.camera.streaming ? 'good' : 'muted' },
+                { label: 'Exposure', value: status.camera.exposure_s == null ? '--' : `${Number(status.camera.exposure_s).toFixed(1)} s` },
+                { label: 'Frame', value: frame?.width && frame?.height ? `${frame.width} x ${frame.height}` : boolText(status.camera.streaming), tone: status.camera.streaming ? 'good' : 'muted' },
             ],
             meta: {
                 Temp: `${temperature.toFixed(1)} C`,
@@ -89,10 +90,37 @@ function cardsFromDaemon(
             metrics: [
                 { label: 'Position', value: status.focuser.position ?? 0 },
                 { label: 'Motion', value: status.focuser.moving ? 'moving' : 'idle', tone: status.focuser.moving ? 'warn' : 'good' },
+                { label: 'HFR', value: status.focuser.hfr ?? '--' },
+                { label: 'Range', value: status.focuser.max_range ?? '--' },
             ],
             meta: {
                 Position: status.focuser.position,
                 Moving: status.focuser.moving,
+            },
+        });
+    }
+
+    if (status.filter_wheel) {
+        const wheel = status.filter_wheel;
+        cards.push({
+            id: 'daemon-filter-wheel',
+            type: 'filter-wheel',
+            name: wheel.name ?? 'Filter Wheel',
+            site,
+            status: wheel.connected === false ? 'offline' : 'nominal',
+            summary: `Filter ${wheel.filter ?? '--'} / slot ${wheel.slot ?? '--'}`,
+            source,
+            tags: [wheel.moving ? 'moving' : 'ready', 'filters', 'Achernar daemon'],
+            metrics: [
+                { label: 'Slot', value: wheel.slot ?? '--' },
+                { label: 'Filter', value: wheel.filter ?? '--' },
+                { label: 'Offset', value: wheel.offset ?? 0 },
+                { label: 'Motion', value: wheel.moving ? 'moving' : 'stopped', tone: wheel.moving ? 'warn' : 'good' },
+            ],
+            meta: {
+                Slot: wheel.slot ?? '--',
+                Filter: wheel.filter ?? '--',
+                Moving: Boolean(wheel.moving),
             },
         });
     }

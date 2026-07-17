@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Achernar Run Room Draft</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="system-header" aria-label="System status">
+        <div class="brand-lockup">
+          <div class="brand-mark" aria-hidden="true"></div>
+          <div>
+            <div class="brand-name">Achernar</div>
+            <div class="site-line">Run job / camera workspace / daemon controls</div>
+          </div>
+        </div>
+        <div class="header-readouts">
+          <div class="readout good"><span></span> Daemon live</div>
+          <div class="readout">Camera stream active</div>
+          <div class="readout">Run context locked</div>
+        </div>
+      </header>
+
+      <main class="view view-active">
+        <section class="run-room">
+          <header class="run-room-header">
+            <button id="backToDashboard" type="button" class="secondary-action">Dashboard</button>
+            <div>
+              <h1>M42 luminance checkout</h1>
+              <p>Camera-centered acquisition workspace</p>
+            </div>
+            <div class="run-clock">
+              <strong>Running</strong>
+              <span>00:14:22 elapsed</span>
+            </div>
+          </header>
+
+          <div id="selectedRunStrip" class="selected-run-strip" aria-label="Selected run equipment"></div>
+
+          <div class="equipment-tabbar" role="tablist" aria-label="Equipment controls">
+            <button type="button" class="tab-button active" data-panel="cameraPanel">Camera</button>
+            <button type="button" class="tab-button" data-panel="mountPanel">Mount</button>
+            <button type="button" class="tab-button" data-panel="focusPanel">Focuser</button>
+            <button type="button" class="tab-button" data-panel="filterPanel">Filter Wheel</button>
+            <button type="button" class="tab-button" data-panel="logsPanel">Logs</button>
+          </div>
+
+          <section class="imaging-workspace">
+            <aside class="left-rail">
+              <div class="mini-window active" data-panel-shortcut="mountPanel">
+                <h3>Mount</h3>
+                <p>Tracking / RA 05:34:31 / Dec +22:00:52</p>
+              </div>
+              <div class="mini-window" data-panel-shortcut="focusPanel">
+                <h3>Focus</h3>
+                <p>Position 9900 / HFR 3.61</p>
+              </div>
+              <div class="mini-window" data-panel-shortcut="filterPanel">
+                <h3>Filter</h3>
+                <p>Luminance / slot 1</p>
+              </div>
+            </aside>
+
+            <section class="camera-stage" aria-labelledby="cameraStageTitle">
+              <div class="camera-toolbar">
+                <div>
+                  <h2 id="cameraStageTitle">Live Camera</h2>
+                  <span>1304 x 976 / MJPEG preview / relayed snapshot available</span>
+                </div>
+                <div class="toolbar-actions">
+                  <button type="button">Snapshot</button>
+                  <button type="button">Focus Run</button>
+                  <button type="button">Abort</button>
+                </div>
+              </div>
+              <div class="camera-frame">
+                <div class="star-field" aria-hidden="true">
+                  <span style="--x:12%;--y:22%;--s:2px"></span>
+                  <span style="--x:24%;--y:64%;--s:3px"></span>
+                  <span style="--x:35%;--y:31%;--s:2px"></span>
+                  <span style="--x:42%;--y:48%;--s:4px"></span>
+                  <span style="--x:55%;--y:21%;--s:2px"></span>
+                  <span style="--x:63%;--y:59%;--s:3px"></span>
+                  <span style="--x:72%;--y:38%;--s:2px"></span>
+                  <span style="--x:84%;--y:72%;--s:3px"></span>
+                  <span style="--x:91%;--y:28%;--s:2px"></span>
+                </div>
+                <div class="focus-reticle" aria-hidden="true"></div>
+                <div class="frame-hud">
+                  <span>Frame #1842</span>
+                  <span>HFR 3.61</span>
+                  <span>-10.1 C</span>
+                </div>
+              </div>
+            </section>
+
+            <aside class="control-pane">
+              <section id="cameraPanel" class="control-panel active">
+                <h2>Camera Controls</h2>
+                <label>Exposure <input type="range" min="1" max="300" value="120" /></label>
+                <label>Gain <input type="number" value="100" /></label>
+                <label>Cooler target <input type="number" value="-10" /></label>
+                <div class="button-row">
+                  <button type="button" class="primary-small">Start Stream</button>
+                  <button type="button">Capture</button>
+                </div>
+              </section>
+
+              <section id="mountPanel" class="control-panel">
+                <h2>Mount Controls</h2>
+                <div class="control-readout"><span>Tracking</span><strong>Sidereal</strong></div>
+                <div class="control-readout"><span>Guide RMS</span><strong>0.48"</strong></div>
+                <div class="button-row">
+                  <button type="button">Slew</button>
+                  <button type="button">Park</button>
+                  <button type="button">Stop</button>
+                </div>
+              </section>
+
+              <section id="focusPanel" class="control-panel">
+                <h2>Focuser Controls</h2>
+                <div class="control-readout"><span>Position</span><strong>9900</strong></div>
+                <div class="stepper-row">
+                  <button type="button">-100</button>
+                  <button type="button">-10</button>
+                  <button type="button">+10</button>
+                  <button type="button">+100</button>
+                </div>
+                <button type="button" class="primary-small">Run Autofocus</button>
+              </section>
+
+              <section id="filterPanel" class="control-panel">
+                <h2>Filter Wheel</h2>
+                <div class="filter-grid">
+                  <button type="button" class="active">L</button>
+                  <button type="button">R</button>
+                  <button type="button">G</button>
+                  <button type="button">B</button>
+                  <button type="button">Ha</button>
+                  <button type="button">OIII</button>
+                </div>
+              </section>
+
+              <section id="logsPanel" class="control-panel">
+                <h2>Run Logs</h2>
+                <div class="log-stream compact">
+                  <p><time>20:28:12</time> Capture started</p>
+                  <p><time>20:28:14</time> Frame saved locally</p>
+                  <p><time>20:28:16</time> Preview relayed to Django</p>
+                </div>
+              </section>
+            </aside>
+          </section>
+
+          <footer class="bottom-dock" aria-label="Acquisition status">
+            <div class="dock-card"><span>Queue</span><strong>M42 Core / 18 remaining</strong></div>
+            <div class="dock-card"><span>Guiding</span><strong>0.48" RMS</strong></div>
+            <div class="dock-card"><span>Storage</span><strong>184 GB local / sync idle</strong></div>
+            <div class="dock-card"><span>Weather</span><strong>Clear / wind 3 mph</strong></div>
+          </footer>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

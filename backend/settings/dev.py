@@ -6,6 +6,7 @@ Usage:
 """
 
 from .base import *  # noqa: F401, F403
+from urllib.parse import urlparse
 
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = 'django-insecure-j@p(&xu#@z4nrk#b(h#^na5$%3mw@7wdg$!+ow7v9t8@a!q!7a'
@@ -21,6 +22,18 @@ if os.getenv('USE_SQLITE'):
         'default': {
             'ENGINE': 'django.db.backends.sqlite3',
             'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
+elif os.getenv('DATABASE_URL'):
+    parsed = urlparse(os.environ['DATABASE_URL'])
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.postgresql',
+            'NAME': parsed.path.lstrip('/'),
+            'USER': parsed.username or '',
+            'PASSWORD': parsed.password or '',
+            'HOST': parsed.hostname or 'localhost',
+            'PORT': str(parsed.port or 5432),
         }
     }
 else:
