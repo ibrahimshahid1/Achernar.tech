@@ -1,34 +1,32 @@
 {
-  "model_name": "focus_quality_estimator",
+  "model_name": "focus_quality",
   "version": "1.0.0",
   "task": "focus_quality",
-  "description": "MobileNetV3-Small backbone for focus quality scoring. Predicts a [0,1] quality score from 64x64 grayscale star crops.",
-  "spec_section": "7.6.1",
-  "architecture": "MobileNetV3-Small",
-  "input_shape": [1, 1, 64, 64],
-  "input_dtype": "float32",
-  "output_shape": [1, 1],
-  "output_dtype": "float32",
-  "output_range": [0.0, 1.0],
-  "training": {
-    "framework": "PyTorch",
-    "optimizer": "AdamW",
-    "loss": "MSELoss",
-    "epochs": 50,
-    "batch_size": 64,
-    "learning_rate": 0.001,
-    "dataset_size": null,
-    "val_metric": "mae"
+  "framework": "onnx",
+  "input_format": {
+    "image": [
+      "batch",
+      1,
+      64,
+      64
+    ]
   },
-  "export": {
-    "format": "ONNX",
-    "opset_version": 17,
-    "dynamic_axes": {
-      "input": { "0": "batch" },
-      "output": { "0": "batch" }
-    }
+  "output_format": {
+    "mu_log_hfr": [
+      "batch"
+    ],
+    "log_var": [
+      "batch"
+    ]
   },
-  "sha256": null,
-  "created_at": null,
-  "deployed_at": null
+  "sha256": "4f8a555150d12d04fac348315a5683db1e6ec21458785ac8672636ffc993856b",
+  "created_at": "2026-07-23T00:07:30.379707Z",
+  "training_info": {
+    "status": "reference",
+    "trained": false,
+    "weights": "random",
+    "runtime_eligible": false,
+    "promotion_status": "never \u2014 integration placeholder only",
+    "notes": "Two-head heteroscedastic contract (mu = E[ln HFR_px], log_var = aleatoric log-variance). Reference weights are random \u2014 integration only, never inference."
+  }
 }

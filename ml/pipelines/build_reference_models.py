@@ -56,18 +56,33 @@ def _linear(prefix, x, in_dim, out_dim, inits, nodes, bias=True):
 
 
 def build_focus_quality(img=64):
-    """Grayscale star crop -> focus quality score in [0, 1]."""
+    """Grayscale star crop -> (mu_log_hfr, log_var), rank-1 [batch] outputs.
+
+    The reference graph MUST share the real FQE's contract (two heteroscedastic
+    heads, the exact names/shapes `fqe_runner.rs` extracts) — the old
+    sigmoid/`score` reference is what created the audit's "three incompatible
+    contracts" P1. Weights remain random; only the interface is meaningful.
+    """
     nodes, inits = [], []
     image = helper.make_tensor_value_info("image", TensorProto.FLOAT, ["batch", 1, img, img])
-    score = helper.make_tensor_value_info("score", TensorProto.FLOAT, ["batch", 1])
+    mu_out = helper.make_tensor_value_info("mu_log_hfr", TensorProto.FLOAT, ["batch"])
+    lv_out = helper.make_tensor_value_info("log_var", TensorProto.FLOAT, ["batch"])
     nodes.append(helper.make_node("Flatten", ["image"], ["flat"], axis=1))
-    logits = _linear("fq", "flat", img * img, 1, inits, nodes)
-    nodes.append(helper.make_node("Sigmoid", [logits], ["score"]))
-    graph = helper.make_graph(nodes, "focus_quality", [image], [score], inits)
+    mu_2d = _linear("fq_mu", "flat", img * img, 1, inits, nodes)
+    lv_2d = _linear("fq_lv", "flat", img * img, 1, inits, nodes)
+    # Squeeze [batch, 1] -> [batch] (opset 13+: axes as an input tensor).
+    inits.append(numpy_helper.from_array(np.array([1], dtype=np.int64), name="squeeze_axes"))
+    nodes.append(helper.make_node("Squeeze", [mu_2d, "squeeze_axes"], ["mu_log_hfr"]))
+    nodes.append(helper.make_node("Squeeze", [lv_2d, "squeeze_axes"], ["log_var"]))
+    graph = helper.make_graph(nodes, "focus_quality", [image], [mu_out, lv_out], inits)
     return _finish(graph), {
         "inputs": {"image": ["batch", 1, img, img]},
-        "outputs": {"score": ["batch", 1]},
-        "notes": "Higher score = better focus. Reference weights are random.",
+        "outputs": {"mu_log_hfr": ["batch"], "log_var": ["batch"]},
+        "notes": (
+            "Two-head heteroscedastic contract (mu = E[ln HFR_px], log_var = "
+            "aleatoric log-variance). Reference weights are random — integration "
+            "only, never inference."
+        ),
     }
 
 
@@ -105,16 +120,22 @@ def main():
         onnx.save(model, str(model_path))
         print(f"[{name} {version}] wrote {model_path.relative_to(ROOT)}")
         _verify(model_path, io)
-        # Preserve an existing curated metadata.json; otherwise write a fresh one.
-        meta_path = out_dir / "metadata.json"
-        if meta_path.exists():
-            print(f"    keeping existing {meta_path.relative_to(ROOT)} (curated)")
-        else:
-            write_metadata(
-                str(model_path), name, version, task,
-                framework="onnx", input_format=io["inputs"], output_format=io["outputs"],
-                training_info={"status": "reference", "trained": False, "weights": "random"},
-            )
+        # ALWAYS rewrite metadata for a reference build. The old "keep curated
+        # metadata" branch is exactly how a stale sigmoid/MSE description
+        # survived next to a graph it no longer matched (audit P1). metadata.json
+        # must describe the graph beside it, unconditionally.
+        write_metadata(
+            str(model_path), name, version, task,
+            framework="onnx", input_format=io["inputs"], output_format=io["outputs"],
+            training_info={
+                "status": "reference",
+                "trained": False,
+                "weights": "random",
+                "runtime_eligible": False,
+                "promotion_status": "never — integration placeholder only",
+                "notes": io.get("notes", ""),
+            },
+        )
     print("\nReference edge models ready under models/. Replace with trained exports when available.")
 
 

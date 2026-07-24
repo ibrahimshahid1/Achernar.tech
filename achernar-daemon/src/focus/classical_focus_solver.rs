@@ -24,56 +24,74 @@ pub enum CurveFitMethod {
 pub struct ClassicalFocusSolver;
 
 impl ClassicalFocusSolver {
-    /// Compute HFR (Half-Flux Radius) from a star image crop.
+    /// Compute HFR (Half-Flux Radius, px) from a star image crop.
+    ///
+    /// Two properties this guarantees (matching the corrected Python labeler in
+    /// `ml/labels/psf_measure.py`, and unlike the previous implementation):
+    ///
+    /// * **No noise pedestal.** The sky-subtracted flux is integrated *without*
+    ///   clipping negatives to zero, so background noise cancels in the mean. The
+    ///   old `(pixel - sky).max(0.0)` rectified every positive noise excursion
+    ///   into a pedestal that inflated HFR with the noise level.
+    /// * **Bounded aperture.** Integration is limited to a radius adapted to the
+    ///   star (~4x an initial estimate), so a larger crop cannot accumulate more
+    ///   noise-only annuli into the total.
+    ///
+    /// Returns `NaN` when no positive stellar flux is present.
     pub fn compute_hfr(image_data: &[f32], width: usize, height: usize) -> f64 {
         if width == 0 || height == 0 || image_data.len() != width * height {
             return f64::NAN;
         }
 
-        let background = percentile(image_data, 0.5);
-        let mut total_flux = 0.0_f64;
+        let background = percentile(image_data, 0.5) as f64;
+        let sky_sigma = robust_sigma(image_data, background);
+
+        // Centroid from the thresholded core only. Clipping is fine for
+        // *locating* the star; the bug was clipping when *integrating* its flux.
+        let threshold = 3.0 * sky_sigma.max(1e-6);
+        let mut core_total = 0.0_f64;
         let mut x_weighted = 0.0_f64;
         let mut y_weighted = 0.0_f64;
-
         for y in 0..height {
             for x in 0..width {
-                let flux = (image_data[y * width + x] - background).max(0.0) as f64;
-                total_flux += flux;
-                x_weighted += x as f64 * flux;
-                y_weighted += y as f64 * flux;
+                let core = (image_data[y * width + x] as f64 - background - threshold).max(0.0);
+                if core > 0.0 {
+                    core_total += core;
+                    x_weighted += x as f64 * core;
+                    y_weighted += y as f64 * core;
+                }
             }
         }
-
-        if total_flux <= f64::EPSILON {
+        if core_total <= f64::EPSILON {
             return f64::NAN;
         }
+        let cx = x_weighted / core_total;
+        let cy = y_weighted / core_total;
 
-        let cx = x_weighted / total_flux;
-        let cy = y_weighted / total_flux;
-        let mut radial_flux = Vec::with_capacity(image_data.len());
+        // (radius, UNCLIPPED residual) for every pixel, sorted by radius.
+        let mut radial: Vec<(f64, f64)> = Vec::with_capacity(image_data.len());
         for y in 0..height {
             for x in 0..width {
-                let flux = (image_data[y * width + x] - background).max(0.0) as f64;
-                if flux <= 0.0 {
-                    continue;
-                }
                 let dx = x as f64 - cx;
                 let dy = y as f64 - cy;
-                radial_flux.push(((dx * dx + dy * dy).sqrt(), flux));
+                let resid = image_data[y * width + x] as f64 - background;
+                radial.push(((dx * dx + dy * dy).sqrt(), resid));
             }
         }
+        radial.sort_by(|a, b| a.0.total_cmp(&b.0));
 
-        radial_flux.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let half_flux = total_flux * 0.5;
-        let mut cumulative = 0.0_f64;
-        for (radius, flux) in radial_flux {
-            cumulative += flux;
-            if cumulative >= half_flux {
-                return radius;
-            }
+        let hard_cap = (width.min(height) as f64) / 2.0 - 1.0;
+        // Pass 1: rough HFR within a modest cap. Pass 2: bound the aperture to
+        // ~4x that estimate so noise-only outer annuli stay out of the integral.
+        let est = match cog_half_radius(&radial, hard_cap.min(20.0)) {
+            Some((hfr, total)) if total > 0.0 => hfr,
+            _ => return f64::NAN,
+        };
+        let aperture = (4.0 * est).max(6.0).min(hard_cap);
+        match cog_half_radius(&radial, aperture) {
+            Some((hfr, _)) => hfr,
+            None => f64::NAN,
         }
-
-        f64::NAN
     }
 
     /// Compute HFD (Half-Flux Diameter) from a star image crop.
@@ -136,7 +154,10 @@ impl ClassicalFocusSolver {
             .iter()
             .map(|(x, _)| *x)
             .fold(f64::NEG_INFINITY, f64::max);
-        if optimal_position < min_position || optimal_position > max_position {
+        if optimal_position <= min_position
+            || optimal_position >= max_position
+            || !has_two_sided_support(&samples, optimal_position)
+        {
             return None;
         }
 
@@ -172,32 +193,131 @@ impl ClassicalFocusSolver {
 
     /// Fit a V-curve (two linear segments) to position-HFR samples.
     pub fn fit_v_curve(positions: &[i32], hfr_values: &[f64]) -> Option<CurveFitResult> {
-        let (idx, (_, hfr)) = positions
+        if positions.len() != hfr_values.len() || positions.len() < 4 {
+            return None;
+        }
+
+        let mut samples: Vec<(f64, f64)> = positions
             .iter()
             .zip(hfr_values.iter())
-            .enumerate()
-            .filter(|(_, (_, hfr))| hfr.is_finite())
-            .min_by(|(_, (_, a)), (_, (_, b))| a.total_cmp(b))?;
+            .filter_map(|(position, hfr)| hfr.is_finite().then_some((*position as f64, *hfr)))
+            .collect();
+        samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+        if samples.len() < 4
+            || samples
+                .windows(2)
+                .any(|pair| (pair[0].0 - pair[1].0).abs() <= f64::EPSILON)
+        {
+            return None;
+        }
 
-        Some(CurveFitResult {
-            optimal_position: positions[idx] as f64,
-            predicted_hfr: *hfr,
-            r_squared: 0.0,
-            coefficients: vec![],
-            method: CurveFitMethod::VCurve,
-        })
+        let mean_y = samples.iter().map(|(_, y)| *y).sum::<f64>() / samples.len() as f64;
+        let ss_tot = samples
+            .iter()
+            .map(|(_, y)| (y - mean_y).powi(2))
+            .sum::<f64>();
+        if ss_tot <= f64::EPSILON {
+            return None;
+        }
+
+        let mut best: Option<CurveFitResult> = None;
+        // The sample at `split` belongs to both arms. This anchors both lines at
+        // the measured valley while still requiring at least two points per arm.
+        for split in 1..samples.len() - 1 {
+            let Some((left_slope, left_intercept)) = fit_line(&samples[..=split]) else {
+                continue;
+            };
+            let Some((right_slope, right_intercept)) = fit_line(&samples[split..]) else {
+                continue;
+            };
+            if left_slope >= 0.0 || right_slope <= 0.0 {
+                continue;
+            }
+            let denominator = left_slope - right_slope;
+            if denominator.abs() <= f64::EPSILON {
+                continue;
+            }
+            let optimum = (right_intercept - left_intercept) / denominator;
+            let min_x = samples.first()?.0;
+            let max_x = samples.last()?.0;
+            if !optimum.is_finite() || optimum <= min_x || optimum >= max_x {
+                continue;
+            }
+            if !has_two_sided_support(&samples, optimum) {
+                continue;
+            }
+            let predicted_hfr = left_slope * optimum + left_intercept;
+            if !predicted_hfr.is_finite() || predicted_hfr <= 0.0 {
+                continue;
+            }
+
+            let ss_res = samples
+                .iter()
+                .map(|(x, y)| {
+                    let predicted = if *x <= optimum {
+                        left_slope * *x + left_intercept
+                    } else {
+                        right_slope * *x + right_intercept
+                    };
+                    (y - predicted).powi(2)
+                })
+                .sum::<f64>();
+            let r_squared = (1.0 - ss_res / ss_tot).clamp(0.0, 1.0);
+            let candidate = CurveFitResult {
+                optimal_position: optimum,
+                predicted_hfr,
+                r_squared,
+                coefficients: vec![left_slope, left_intercept, right_slope, right_intercept],
+                method: CurveFitMethod::VCurve,
+            };
+            if best
+                .as_ref()
+                .map(|current| candidate.r_squared > current.r_squared)
+                .unwrap_or(true)
+            {
+                best = Some(candidate);
+            }
+        }
+        best
     }
 
     /// Fit a hyperbola to position-HFR samples.
     pub fn fit_hyperbola(positions: &[i32], hfr_values: &[f64]) -> Option<CurveFitResult> {
-        // Hyperbolic fits are useful once we have more field data. For the MVP
-        // deterministic gate, a V-curve fallback gives bounded behavior without
-        // overfitting sparse autofocus sweeps.
-        Self::fit_v_curve(positions, hfr_values).map(|mut fit| {
-            fit.method = CurveFitMethod::Hyperbola;
-            fit
-        })
+        let _ = (positions, hfr_values);
+        // Do not relabel a different estimator as a hyperbola. A bounded nonlinear
+        // fit can be added once real sweeps justify its extra degrees of freedom.
+        None
     }
+}
+
+fn fit_line(samples: &[(f64, f64)]) -> Option<(f64, f64)> {
+    if samples.len() < 2 {
+        return None;
+    }
+    let n = samples.len() as f64;
+    let mean_x = samples.iter().map(|(x, _)| *x).sum::<f64>() / n;
+    let mean_y = samples.iter().map(|(_, y)| *y).sum::<f64>() / n;
+    let denominator = samples
+        .iter()
+        .map(|(x, _)| (x - mean_x).powi(2))
+        .sum::<f64>();
+    if denominator <= f64::EPSILON {
+        return None;
+    }
+    let slope = samples
+        .iter()
+        .map(|(x, y)| (x - mean_x) * (y - mean_y))
+        .sum::<f64>()
+        / denominator;
+    Some((slope, mean_y - slope * mean_x))
+}
+
+/// A focus minimum is actionable only when the sweep genuinely brackets it.
+/// Two distinct measurements on each side keep a noisy endpoint/shoulder from
+/// looking like a high-R2 minimum with no observed rising arm.
+fn has_two_sided_support(samples: &[(f64, f64)], optimum: f64) -> bool {
+    samples.iter().filter(|(x, _)| *x < optimum).count() >= 2
+        && samples.iter().filter(|(x, _)| *x > optimum).count() >= 2
 }
 
 fn percentile(values: &[f32], q: f64) -> f32 {
@@ -208,6 +328,61 @@ fn percentile(values: &[f32], q: f64) -> f32 {
     finite.sort_by(|a, b| a.total_cmp(b));
     let idx = ((finite.len() - 1) as f64 * q.clamp(0.0, 1.0)).round() as usize;
     finite[idx]
+}
+
+/// Robust sky sigma via the median absolute deviation (MAD x 1.4826). Used only
+/// to set the centroid detection threshold, so star pixels barely bias it.
+fn robust_sigma(values: &[f32], median: f64) -> f64 {
+    let mut deviations: Vec<f64> = values
+        .iter()
+        .filter(|v| v.is_finite())
+        .map(|v| (*v as f64 - median).abs())
+        .collect();
+    if deviations.is_empty() {
+        return 0.0;
+    }
+    deviations.sort_by(|a, b| a.total_cmp(b));
+    deviations[deviations.len() / 2] * 1.4826
+}
+
+/// One curve-of-growth pass within `max_radius`. `radial` is `(radius, residual)`
+/// sorted ascending by radius. Returns `(half_flux_radius, total_flux)` using an
+/// UNCLIPPED cumulative sum so zero-mean sky noise cancels instead of forming a
+/// positive pedestal. The half-flux crossing lies in the steeply-rising stellar
+/// core, so it is robust to noise wiggles in the wings.
+fn cog_half_radius(radial: &[(f64, f64)], max_radius: f64) -> Option<(f64, f64)> {
+    let mut radii: Vec<f64> = Vec::new();
+    let mut cumulative: Vec<f64> = Vec::new();
+    let mut running = 0.0_f64;
+    for &(r, v) in radial {
+        if r > max_radius {
+            break; // radial is sorted ascending, so nothing further qualifies
+        }
+        running += v;
+        radii.push(r);
+        cumulative.push(running);
+    }
+    if radii.len() < 4 {
+        return None;
+    }
+    let total = *cumulative.last().unwrap();
+    if total <= 0.0 {
+        return None;
+    }
+
+    let half = 0.5 * total;
+    let idx = cumulative.iter().position(|&c| c >= half)?;
+    if idx == 0 {
+        return Some((radii[0], total));
+    }
+    let (c0, c1) = (cumulative[idx - 1], cumulative[idx]);
+    let (r0, r1) = (radii[idx - 1], radii[idx]);
+    let hfr = if (c1 - c0).abs() < f64::EPSILON {
+        r1
+    } else {
+        r0 + (half - c0) / (c1 - c0) * (r1 - r0)
+    };
+    Some((hfr, total))
 }
 
 fn solve_3x3(mut matrix: [[f64; 3]; 3], mut rhs: [f64; 3]) -> Option<[f64; 3]> {
@@ -263,6 +438,62 @@ mod tests {
         assert!((0.0..=1.0).contains(&hfr));
     }
 
+    // Deterministic pseudo-noise (no rand dependency in tests).
+    fn lcg_noise(seed: &mut u64) -> f32 {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        // Map high bits to roughly [-1, 1).
+        ((*seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    }
+
+    fn gaussian_star(
+        size: usize,
+        hfr: f32,
+        sky: f32,
+        amp: f32,
+        read_noise: f32,
+        seed: u64,
+    ) -> Vec<f32> {
+        let sigma = hfr / (2.0 * std::f32::consts::LN_2).sqrt();
+        let c = size as f32 / 2.0 - 0.5;
+        let mut state = seed.max(1);
+        let mut pixels = vec![0.0_f32; size * size];
+        for y in 0..size {
+            for x in 0..size {
+                let dx = x as f32 - c;
+                let dy = y as f32 - c;
+                let star = amp * (-(dx * dx + dy * dy) / (2.0 * sigma * sigma)).exp();
+                pixels[y * size + x] = sky + star + read_noise * lcg_noise(&mut state);
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn hfr_is_stable_across_noise_and_crop_size() {
+        // A true 3 px HFR star must measure ~3 px regardless of noise level and
+        // crop size — the property the old clipped, whole-crop integrator broke
+        // (it drifted to 16 px at high noise and 21 px on a 128 px crop).
+        let truth = 3.0_f32;
+        for (amp, noise, seed) in [(6000.0, 0.0, 1), (3000.0, 25.0, 2), (1500.0, 60.0, 3)] {
+            let img = gaussian_star(64, truth, 100.0, amp, noise, seed);
+            let hfr = ClassicalFocusSolver::compute_hfr(&img, 64, 64) as f32;
+            assert!(
+                (hfr - truth).abs() < 0.6,
+                "noise={noise}: HFR {hfr} strayed from {truth}"
+            );
+        }
+        for size in [32usize, 64, 96, 128] {
+            let img = gaussian_star(size, truth, 100.0, 3000.0, 25.0, 7);
+            let hfr = ClassicalFocusSolver::compute_hfr(&img, size, size) as f32;
+            assert!(
+                (hfr - truth).abs() < 0.6,
+                "crop={size}: HFR {hfr} strayed from {truth}"
+            );
+        }
+    }
+
     #[test]
     fn parabola_fit_finds_known_minimum() {
         let positions = [900, 950, 1000, 1050, 1100];
@@ -280,12 +511,39 @@ mod tests {
     }
 
     #[test]
-    fn v_curve_uses_best_finite_sample() {
-        let fit =
-            ClassicalFocusSolver::fit_v_curve(&[100, 200, 300], &[4.0, f64::NAN, 3.0]).unwrap();
+    fn parabola_rejects_minimum_without_two_sided_support() {
+        // This is an exact upward parabola, but its vertex lies between the first
+        // two samples. The fit alone is excellent; the sweep did not bracket the
+        // minimum well enough to command a move.
+        let positions = [900, 950, 1000, 1050, 1100];
+        let hfr_values: Vec<f64> = positions
+            .iter()
+            .map(|position| 1.0 + ((*position - 925) as f64 / 100.0).powi(2))
+            .collect();
+
+        assert!(ClassicalFocusSolver::fit_parabola(&positions, &hfr_values).is_none());
+    }
+
+    #[test]
+    fn v_curve_fits_two_arms_and_intersection() {
+        let fit = ClassicalFocusSolver::fit_v_curve(
+            &[800, 900, 1000, 1100, 1200],
+            &[5.0, 3.0, 1.0, 3.0, 5.0],
+        )
+        .unwrap();
 
         assert!(matches!(fit.method, CurveFitMethod::VCurve));
-        assert_eq!(fit.optimal_position, 300.0);
-        assert_eq!(fit.predicted_hfr, 3.0);
+        assert!((fit.optimal_position - 1000.0).abs() < 1e-6);
+        assert!((fit.predicted_hfr - 1.0).abs() < 1e-6);
+        assert!(fit.r_squared > 0.999);
+    }
+
+    #[test]
+    fn v_curve_rejects_unbracketed_monotonic_sweep() {
+        assert!(ClassicalFocusSolver::fit_v_curve(
+            &[800, 900, 1000, 1100, 1200],
+            &[5.0, 4.0, 3.0, 2.0, 1.0],
+        )
+        .is_none());
     }
 }

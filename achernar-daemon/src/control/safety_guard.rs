@@ -3,7 +3,7 @@
 //! This module MUST sit between AI output and hardware calls.
 
 use crate::config::FocusSafetyConfig;
-use crate::error::{AchernarError, FocusError};
+use crate::error::AchernarError;
 use serde::{Deserialize, Serialize};
 
 /// Result of a safety validation check.
@@ -82,8 +82,8 @@ impl FocusSafetyGuard {
         }
 
         // Clamp single step size
-        let clamped_step =
-            proposed_step.clamp(-self.config.max_step_single, self.config.max_step_single);
+        let max_step = self.config.max_step_single.saturating_abs().max(1);
+        let clamped_step = proposed_step.clamp(-max_step, max_step);
 
         // Check target position bounds
         let target = current_position + clamped_step;
@@ -98,11 +98,12 @@ impl FocusSafetyGuard {
 
         // Check total travel budget
         let new_total = self.total_travel_this_run + clamped_step.abs();
-        if new_total > self.config.max_total_travel_per_run {
+        if new_total > self.config.max_total_travel_per_run.max(0) {
             return Ok(SafetyVerdict::Rejected {
                 reason: format!(
                     "Total travel {} would exceed run budget {}",
-                    new_total, self.config.max_total_travel_per_run
+                    new_total,
+                    self.config.max_total_travel_per_run.max(0)
                 ),
             });
         }
@@ -114,7 +115,7 @@ impl FocusSafetyGuard {
             Ok(SafetyVerdict::Modified {
                 original: proposed_step,
                 clamped: clamped_step,
-                reason: format!("Clamped to max step size {}", self.config.max_step_single),
+                reason: format!("Clamped to max step size {max_step}"),
             })
         } else {
             Ok(SafetyVerdict::Approved)

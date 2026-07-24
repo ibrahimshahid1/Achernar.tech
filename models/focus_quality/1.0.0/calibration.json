@@ -1,10 +1,5 @@
 {
-  "calibration_method": "temperature_scaling",
-  "temperature": 1.0,
-  "description": "Post-hoc calibration parameters for focus quality uncertainty estimates. Temperature scaling applied to logits before sigmoid.",
-  "spec_section": "7.7.3",
-  "calibration_dataset": null,
-  "ece_before": null,
-  "ece_after": null,
-  "calibrated_at": null
+  "calibration_method": null,
+  "description": "NOT CALIBRATED. Reference model with random weights; no per-star sigma_scale or post-pooling frame_sigma_scale is present, so fqe_runner.rs reports is_calibrated()=false. Real calibration is written by ml/pipelines/rebuild_fqe.py from validation groups and reported on held-out test groups.",
+  "spec_section": "7.7.3"
 }

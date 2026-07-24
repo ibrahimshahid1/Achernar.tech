@@ -1,81 +1,115 @@
 """
-focus_quality_cnn — Section 7.6.1.
+focus_quality_cnn — Focus Quality Estimator, Section 7.6.1.
 
-FocusQualityEstimator (FQE): scores how well-focused a star crop is, in [0, 1].
-The spec calls for a MobileNetV3-Small backbone; to keep the edge model tiny and
-dependency-light (no torchvision required), this is a compact depthwise-separable
-CNN with the same I/O contract. Swap in torchvision's MobileNetV3-Small later by
-keeping the (B,1,64,64) -> (B,1) signature unchanged.
+Two-head heteroscedastic FQE built on a grayscale-adapted MobileNetV3-Small.
 
-    Input  : (B, 1, 64, 64)  grayscale star crop, normalized to ~[0, 1]
-    Output : (B, 1)          focus quality score in [0, 1] (sigmoid)
+    Input  : (B, 1, H, W)   grayscale star crop, robust-normalized to ~[0, 1]
+    Output : mu (B,), log_var (B,)   where mu = predicted log(HFR_px)
+
+Design decisions that deviate from the spec's Listing 8, and why:
+
+  * **Per-star, not whole-frame.** The spec fed a 256x256 frame crop; we score
+    individual star crops and pool robustly (SEP/DAOPHOT idiom, Bosse 2018).
+  * **Predict log(HFR) in pixels**, not HFR in arc-seconds. HFR scatter is
+    roughly multiplicative across a sweep, so log-space homogenizes the
+    heteroscedasticity, and pixels avoid needing a pixel scale.
+  * **Pixels only — no focuser position.** The spec's metadata vector included
+    normalized focuser position. Within a run HFR is monotonic in
+    |position - focus|, so feeding position lets the net regress HFR from a
+    rig-specific shortcut instead of measuring PSF width (leakage; see
+    Oakden-Rayner 2020, Kaufman & Rosset 2012). Position/temperature/filter
+    history belong to the Focus Offset Predictor, not the FQE.
+
+The two-head output implements Gaussian mean/variance regression
+(Nix & Weigend 1994; Kendall & Gal 2017): mu is the predicted mean of
+log(HFR), log_var its aleatoric log-variance.
 """
 from __future__ import annotations
 
 try:
     import torch
     import torch.nn as nn
-except ModuleNotFoundError:
+    from torchvision.models import mobilenet_v3_small
+    from torchvision.models import MobileNet_V3_Small_Weights
+except ModuleNotFoundError:  # torch/torchvision are ML training extras
     torch = None  # type: ignore[assignment]
     nn = None  # type: ignore[assignment]
 
 
 def _missing_torch_error() -> ModuleNotFoundError:
     return ModuleNotFoundError(
-        "PyTorch is required to instantiate FocusQualityEstimator. "
+        "PyTorch + torchvision are required to instantiate FocusQualityEstimator. "
         "Install the ML training extras with `pip install -r ml/requirements.txt`."
     )
 
 
 if nn is None:
+
     class FocusQualityEstimator:  # type: ignore[no-redef]
         """Import-safe placeholder used when PyTorch is not installed."""
 
         def __init__(self, *args, **kwargs):
             raise _missing_torch_error()
+
 else:
-    class _DWSeparable(nn.Module):
-        """Depthwise-separable conv block (MobileNet-style)."""
-        def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
-            super().__init__()
-            self.dw = nn.Conv2d(in_ch, in_ch, 3, stride=stride, padding=1, groups=in_ch, bias=False)
-            self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=False)
-            self.bn = nn.BatchNorm2d(out_ch)
-            self.act = nn.Hardswish()
-
-        def forward(self, x):
-            return self.act(self.bn(self.pw(self.dw(x))))
-
 
     class FocusQualityEstimator(nn.Module):
-        """Compact CNN focus-quality estimator. Output is a scalar score in [0, 1]."""
+        """Grayscale MobileNetV3-Small with a heteroscedastic 2-value head.
 
-        def __init__(self, num_classes: int = 1, width: int = 16):
+        Args:
+            pretrained: load ImageNet weights (requires network). Defaults to
+                False so tests/CI are hermetic; production training should set
+                True and average the RGB stem into the grayscale stem.
+            dropout: dropout before the final linears.
+        """
+
+        def __init__(self, pretrained: bool = False, dropout: float = 0.20):
             super().__init__()
-            self.num_classes = num_classes
-            self.stem = nn.Sequential(
-                nn.Conv2d(1, width, 3, stride=2, padding=1, bias=False),  # 64 -> 32
-                nn.BatchNorm2d(width), nn.Hardswish(),
-            )
-            self.body = nn.Sequential(
-                _DWSeparable(width, width * 2, stride=2),       # 32 -> 16
-                _DWSeparable(width * 2, width * 4, stride=2),    # 16 -> 8
-                _DWSeparable(width * 4, width * 4, stride=2),    # 8  -> 4
-            )
-            self.pool = nn.AdaptiveAvgPool2d(1)
-            self.head = nn.Linear(width * 4, num_classes)
+            weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1 if pretrained else None
+            backbone = mobilenet_v3_small(weights=weights)
 
-        def forward(self, x: "torch.Tensor") -> "torch.Tensor":
-            x = self.stem(x)
-            x = self.body(x)
-            x = self.pool(x).flatten(1)
-            return torch.sigmoid(self.head(x))      # (B, num_classes) in [0, 1]
+            # Adapt the first conv from 3-channel to 1-channel by averaging the
+            # RGB filters — preserves pretrained low-level features on grayscale.
+            old_conv = backbone.features[0][0]
+            new_conv = nn.Conv2d(
+                1,
+                old_conv.out_channels,
+                kernel_size=old_conv.kernel_size,
+                stride=old_conv.stride,
+                padding=old_conv.padding,
+                bias=old_conv.bias is not None,
+            )
+            with torch.no_grad():
+                if weights is not None:
+                    new_conv.weight.copy_(old_conv.weight.mean(dim=1, keepdim=True))
+                else:
+                    # Averaging three randomly initialized RGB channels cuts the
+                    # stem variance by roughly 3x. Fresh grayscale training needs
+                    # a fresh fan-out-aware initialization instead.
+                    nn.init.kaiming_normal_(new_conv.weight, mode="fan_out")
+            backbone.features[0][0] = new_conv
+
+            self.features = backbone.features  # -> (B, 576, h', w')
+            self.pool = backbone.avgpool  # AdaptiveAvgPool2d(1) -> (B, 576, 1, 1)
+            self.head = nn.Sequential(
+                nn.Linear(576, 128),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(128, 2),  # [mu_log_hfr, log_var]
+            )
+
+        def forward(self, img: "torch.Tensor"):
+            x = self.pool(self.features(img)).flatten(1)
+            out = self.head(x)
+            mu = out[:, 0]
+            log_var = out[:, 1]
+            return mu, log_var
 
 
 if __name__ == "__main__":  # shape self-check (needs torch)
     if torch is None:
         raise _missing_torch_error()
     m = FocusQualityEstimator().eval()
-    out = m(torch.rand(4, 1, 64, 64))
-    assert out.shape == (4, 1), out.shape
-    print("FQE output:", tuple(out.shape), "range ok:", bool((0 <= out).all() and (out <= 1).all()))
+    mu, log_var = m(torch.rand(4, 1, 64, 64))
+    assert mu.shape == (4,) and log_var.shape == (4,), (mu.shape, log_var.shape)
+    print("FQE ok — mu:", tuple(mu.shape), "log_var:", tuple(log_var.shape))

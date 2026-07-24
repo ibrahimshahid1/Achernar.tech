@@ -5,6 +5,8 @@ pub mod background;
 pub mod background_estimator;
 pub mod coc_runner;
 pub mod fqe_runner;
+pub mod observed_frame;
+pub mod preprocess;
 pub mod quality;
 pub mod shared_observation;
 pub mod ted_runner;

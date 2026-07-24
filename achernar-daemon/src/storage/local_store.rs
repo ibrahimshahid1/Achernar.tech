@@ -6,7 +6,7 @@
 //! online during acquisition.
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use std::path::Path;
 
 #[derive(Clone)]
@@ -60,8 +60,38 @@ impl LocalStore {
                 .await
                 .map_err(storage_error("create local SQLite schema"))?;
         }
+        // `CREATE TABLE IF NOT EXISTS` does not evolve databases created by an
+        // older daemon. Keep additive provenance columns available without
+        // requiring users to delete an existing offline store.
+        ensure_column(&self.pool, "focus_samples", "frame_id", "TEXT").await?;
+        ensure_column(&self.pool, "focus_samples", "hfd", "REAL").await?;
+        ensure_column(&self.pool, "frames", "checksum_sha256", "TEXT").await?;
         Ok(())
     }
+}
+
+async fn ensure_column(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> crate::error::Result<()> {
+    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+        .fetch_all(pool)
+        .await
+        .map_err(storage_error("inspect local SQLite schema"))?;
+    let exists = rows
+        .iter()
+        .any(|row| row.try_get::<String, _>("name").ok().as_deref() == Some(column));
+    if !exists {
+        sqlx::query(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        ))
+        .execute(pool)
+        .await
+        .map_err(storage_error("upgrade local SQLite schema"))?;
+    }
+    Ok(())
 }
 
 fn storage_error(context: &'static str) -> impl Fn(sqlx::Error) -> crate::error::AchernarError {
@@ -90,6 +120,7 @@ const SCHEMA: &[&str] = &[
         run_id TEXT NOT NULL,
         position INTEGER NOT NULL,
         hfr REAL NOT NULL,
+        hfd REAL,
         fwhm REAL,
         star_count INTEGER NOT NULL DEFAULT 0,
         quality_score REAL,

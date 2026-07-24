@@ -237,6 +237,22 @@ impl Default for StorageConfig {
     }
 }
 
+impl StorageConfig {
+    /// Directory for preserved frame files. Defaults to a `frames` directory
+    /// beside the SQLite database when not explicitly configured.
+    pub fn frames_dir(&self) -> String {
+        if let Some(dir) = &self.frames_dir {
+            return dir.clone();
+        }
+        match std::path::Path::new(&self.database_path).parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                parent.join("frames").to_string_lossy().into_owned()
+            }
+            _ => "frames".to_string(),
+        }
+    }
+}
+
 /// Telemetry/logging configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryConfig {

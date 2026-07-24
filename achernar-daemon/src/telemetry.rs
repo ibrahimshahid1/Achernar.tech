@@ -103,10 +103,13 @@ pub fn telemetry_event(state: &AppState) -> Value {
                 "dy": 0.0,
             },
             "ai": {
-                "focus_hfr": observation.as_ref().map(|obs| obs.hfr).unwrap_or(0.0),
+                // Null (not 0.0) when there is no valid measurement — 0 HFR would
+                // read as perfect focus on a blank frame.
+                "focus_hfr": observation.as_ref().and_then(|obs| obs.hfr_px),
                 "cloud_prob": observation.as_ref().map(|obs| obs.cloud_probability).unwrap_or(0.0),
                 "star_count": observation.as_ref().map(|obs| obs.star_count).unwrap_or(0),
-                "frame_quality_score": observation.as_ref().map(|obs| obs.frame_quality_score).unwrap_or(0.0),
+                "star_count_used": observation.as_ref().map(|obs| obs.star_count_used).unwrap_or(0),
+                "observation_valid": observation.as_ref().map(|obs| obs.observation_valid).unwrap_or(false),
                 "recommended_exposure": 0.0,
             },
         }

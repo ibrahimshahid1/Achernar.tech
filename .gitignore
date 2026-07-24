@@ -90,3 +90,7 @@ sdks/
 # Downloaded model weights (artifacts, not source) — fetch with
 # scripts/download_astrom3.sh / ml/astrom3/download.py
 ml/checkpoints/
+OpenLiveStacker_Drivers/
+AstroM3-main/
+astronomy_texts/
+tmp/

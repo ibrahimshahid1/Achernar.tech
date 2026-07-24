@@ -63,7 +63,10 @@ async fn main() -> anyhow::Result<()> {
     // Create shared application state and local offline store.
     let local_store = storage::local_store::LocalStore::open(&config.storage.database_path).await?;
     info!("Local SQLite store ready: {}", config.storage.database_path);
-    let app_state = AppState::new(config.focus.clone(), local_store);
+    let frames_dir = config.storage.frames_dir();
+    let frame_store = storage::frames_repo::FrameStore::new(&frames_dir);
+    info!("Frame store ready: {}", frames_dir);
+    let app_state = AppState::new(config.focus.clone(), local_store, frame_store);
     cloud_client::spawn_if_configured(app_state.clone());
     vision::vision_loop::spawn(app_state.clone(), 1.0);
 

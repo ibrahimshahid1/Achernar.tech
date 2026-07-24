@@ -29,8 +29,10 @@ Trained **edge** models are published to the layout the daemon consumes
 
 ```
 models/<model_name>/<version>/
-    model.onnx        # the graph (loaded by achernar-daemon/src/models/onnx_runner.rs)
-    metadata.json     # schema below (read by achernar-daemon/src/models/model_registry.rs)
+    model.onnx         # two-head graph loaded by vision/fqe_runner.rs
+    metadata.json      # graph contract, provenance, hash, and promotion gates
+    calibration.json   # hash-bound per-star + post-pooling uncertainty scales
+    norm_params.json   # exact per-crop preprocessing contract
 ```
 
 `metadata.json` schema (matches the Rust `ModelMetadata` struct):
@@ -40,7 +42,7 @@ models/<model_name>/<version>/
   "model_name": "focus_quality", "version": "1.0.0", "task": "focus_quality",
   "framework": "onnx",
   "input_format":  { "image": ["batch",1,64,64] },
-  "output_format": { "score": ["batch",1] },
+  "output_format": { "mu_log_hfr": ["batch"], "log_var": ["batch"] },
   "sha256": "…", "created_at": "…Z", "training_info": { … }
 }
 ```
@@ -59,28 +61,21 @@ pip install -r ml/requirements.txt
 python ml/pipelines/build_reference_models.py
 #    -> models/focus_quality/1.0.0/model.onnx   (verified to load in onnxruntime)
 
-# 4. Train the real edge models, then export over the reference graphs.
-python ml/train/train_focus_quality.py
+# 4. Build a real labeled dataset from daemon autofocus provenance.
+python -m ml.datasets.build_focus_quality_dataset \
+  --db /path/to/achernar.db --output focus_quality_ds_v1.npz
+
+# 5. Train, calibrate, baseline, export, hash-bind, and publish one shadow model.
+cd ml
+../venv/bin/python -m pipelines.rebuild_fqe \
+  --dataset ../focus_quality_ds_v1.npz --epochs 50 --pretrained --version 1.1.0
 ```
 
-Export a trained **edge** model into the layout from your training script:
-
-```python
-import torch
-from ml.models.focus_quality_cnn import FocusQualityEstimator
-from ml.export.onnx_export import export_to_edge
-
-model = FocusQualityEstimator().eval()    # load trained weights first
-export_to_edge(
-    model,
-    sample_inputs=(torch.randn(1, 1, 64, 64),),
-    models_root="models", model_name="focus_quality", version="1.1.0",
-    task="focus_quality",
-    input_format={"image": ["batch", 1, 64, 64]},
-    output_format={"score": ["batch", 1]},
-    input_names=["image"], output_names=["score"],
-)
-```
+The checked-in `1.0.0` graph has random reference weights and
+`runtime_eligible=false`; it is useful for interface tests but the daemon will
+never auto-select it. `rebuild_fqe` also leaves synthetic-only artifacts
+explicit-path-only and stamps every trained artifact `shadow`. Promotion remains
+a separate decision after grouped real-data gates pass.
 
 ## AstroM3 — the tri-modal embedding (§7.6.9)
 
@@ -95,26 +90,11 @@ cloud = load_cloud("base")   # AstroM3 (planning / apps.ai_engine)
 edge  = build_edge()         # AstroM3Edge (daemon)
 ```
 
-## Daemon integration — the `/api/v1/ai/analyze` contract
+## Daemon integration
 
-The daemon loads edge models through `model_registry.rs` (scans
-`models/<name>/<version>/`) and runs them via `onnx_runner.rs` (ort). The agreed
-per-frame analysis endpoint the frontend/relay will call:
-
-```
-POST /api/v1/ai/analyze
-  request : { "frame_id": "<id>" }                # or an inline frame reference
-  response: {
-    "frame_id": "<id>",
-    "focus_score": 0.0-1.0,                        # focus_quality model
-    "background_adu": <float>, "snr": <float>,     # background/SNR model
-    "cloud_prob": 0.0-1.0,                          # cloud/obstruction model
-    "trailing": { "elongation": <float>, "angle_deg": <float> },
-    "embedding": [512 floats]                       # AstroM3Edge joint embedding (optional)
-  }
-```
-
-The frontend's previous dead `daemonApi.analyze()` helper was removed; implement
-this endpoint in the daemon (wire `vision/*_runner.rs` + `onnx_runner.rs`) and the
-frontend can call it through both transports (direct in desktop, relayed in browser).
-Until then, `build_reference_models.py` gives you valid graphs to develop against.
+The vision loop batches centered crops from classically gated stars through
+`vision/fqe_runner.rs`, robustly pools them, and publishes shadow-only fields on
+`SharedObservation`: `fqe_hfr_px`, `fqe_sigma_log_hfr`, `fqe_star_count`,
+`fqe_model_version`, and `fqe_calibrated`. Classical HFR remains the autofocus
+authority. Missing measurements stay `null`; there is deliberately no scalar
+`focus_score`, `sharpness_score`, or fabricated seeing value.

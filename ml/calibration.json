@@ -1,0 +1,75 @@
+{
+  "calibration_method": "quantile_interval_scaling",
+  "sigma_scale": 2.9607577361660624,
+  "fit_on": "val",
+  "n_val": 210,
+  "coverage_val_before": {
+    "0.5": 0.17142857142857143,
+    "0.8": 0.3142857142857143,
+    "0.9": 0.42857142857142855,
+    "0.95": 0.42857142857142855
+  },
+  "coverage_val_after": {
+    "0.5": 0.42857142857142855,
+    "0.8": 0.7142857142857143,
+    "0.9": 0.8857142857142857,
+    "0.95": 0.9476190476190476
+  },
+  "coverage_95_val_before": 0.42857142857142855,
+  "coverage_95_val_after": 0.9476190476190476,
+  "nll_val_before": 3.5611525398914625,
+  "nll_val_after": 0.4099515140715712,
+  "dataset": "synthetic(n_runs=48, seed=0)",
+  "calibrated_at": "2026-07-24T06:04:08.916535+00:00",
+  "description": "Per-star sigma = sigma_scale * exp(0.5*log_var). After robust star pooling, frame sigma is multiplied by frame_sigma_scale. Both scales are fit only on validation groups; test coverage is the honest generalization number. Consumed by fqe_runner.rs.",
+  "evaluated_on": "test",
+  "n_test": 210,
+  "coverage_95_test_before": 0.42857142857142855,
+  "coverage_95_test_after": 1.0,
+  "coverage_test_before": {
+    "0.5": 0.2,
+    "0.8": 0.42857142857142855,
+    "0.9": 0.42857142857142855,
+    "0.95": 0.42857142857142855
+  },
+  "coverage_test_after": {
+    "0.5": 0.42857142857142855,
+    "0.8": 0.7142857142857143,
+    "0.9": 0.9428571428571428,
+    "0.95": 1.0
+  },
+  "nll_test_before": 3.2080579893607863,
+  "nll_test_after": 0.3697046657564329,
+  "frame_sigma_scale": 2.4273351859701275,
+  "n_val_frames": 35,
+  "frame_coverage_val_before": {
+    "0.5": 0.2571428571428571,
+    "0.8": 0.3142857142857143,
+    "0.9": 0.42857142857142855,
+    "0.95": 0.5428571428571428
+  },
+  "frame_coverage_val_after": {
+    "0.5": 0.42857142857142855,
+    "0.8": 0.7142857142857143,
+    "0.9": 0.8857142857142857,
+    "0.95": 0.9428571428571428
+  },
+  "frame_coverage_95_val_after": 0.9428571428571428,
+  "n_test_frames": 35,
+  "frame_coverage_test_before": {
+    "0.5": 0.2,
+    "0.8": 0.42857142857142855,
+    "0.9": 0.42857142857142855,
+    "0.95": 0.42857142857142855
+  },
+  "frame_coverage_test_after": {
+    "0.5": 0.42857142857142855,
+    "0.8": 0.7142857142857143,
+    "0.9": 0.9428571428571428,
+    "0.95": 1.0
+  },
+  "frame_coverage_95_test_after": 1.0,
+  "frame_nll_test_after": 0.36988165979436244,
+  "model_state_sha256": "4b695f1d4ebfaa541ba0eb5fb29ffd5019f182e6bab8393f5bdbe89d09c2446a",
+  "dataset_sha256": null
+}
