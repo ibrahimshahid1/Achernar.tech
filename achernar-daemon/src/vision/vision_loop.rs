@@ -113,7 +113,7 @@ fn observation_from_frame_with_trends(
     fqe: Option<&FqeRunner>,
 ) -> crate::error::Result<SharedObservation> {
     let luma = quality::luma_from_frame(frame)?;
-    let background = background::estimate_background(&luma.pixels, luma.max_adu);
+    let background = background::estimate_background(&luma.pixels, luma.saturation_adu);
     let quality = quality::estimate_quality(&luma, &background);
     let trailing = trailing::estimate_trailing(&luma, &background);
 
@@ -197,6 +197,7 @@ fn observation_from_frame_with_trends(
         background_sigma: background.background_sigma,
         snr_proxy_median: background.snr_proxy_median,
         saturation_fraction: background.saturation_fraction,
+        saturation_gate: quality.saturation_gate,
         pointing_error_arcmin: previous.and_then(|obs| obs.pointing_error_arcmin),
         wcs_residual_arcsec: previous.and_then(|obs| obs.wcs_residual_arcsec),
         last_solve_confidence: previous.and_then(|obs| obs.last_solve_confidence),

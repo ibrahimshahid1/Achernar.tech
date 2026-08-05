@@ -33,6 +33,11 @@ pub const OLS_CAP_CAMERA_INDI: u32 = 1 << 5;
 pub const OLS_CAP_CAMERA_INDIGO: u32 = 1 << 6;
 pub const OLS_CAP_CAMERA_WDIR: u32 = 1 << 7;
 
+/// Bridge was built with LibRaw, so RAW containers can be decoded. Without it
+/// a gphoto2 body still connects, streams and captures — it just archives a
+/// container nothing downstream can read.
+pub const OLS_CAP_DECODE_LIBRAW: u32 = 1 << 16;
+
 // ═══════════════════════════════════════════════════════════════════
 //  Stream / Pixel Format Enums
 // ═══════════════════════════════════════════════════════════════════
@@ -72,6 +77,11 @@ pub struct OlsStreamFormat {
     pub width: i32,
     pub height: i32,
     pub bin: i32,
+    /// Region-of-interest fraction (`roi_num`/`roi_den`) the driver applies.
+    /// DSLR drivers enumerate several formats that share width/height/bin and
+    /// differ only here, so these are needed to identify a format uniquely.
+    pub roi_num: i32,
+    pub roi_den: i32,
     pub framerate: f32,
 }
 
@@ -86,6 +96,13 @@ pub struct OlsFrame {
     pub height: i32,
     pub data: *const u8,
     pub data_size: usize,
+    /// Unmodified bytes of the file the camera produced (CR2/CR3/RW2/JPEG),
+    /// or null. `data` above has already been black-level-corrected, scaled
+    /// and cropped by the RAW decoder; these bytes have not.
+    pub source_data: *const u8,
+    pub source_data_size: usize,
+    /// Lowercase extension without the dot ("cr3", "rw2", "jpg"), or null.
+    pub source_ext: *const c_char,
 }
 
 #[repr(C)]
@@ -150,6 +167,97 @@ pub struct OlsCamParam {
 }
 
 pub type OlsFrameCallback = unsafe extern "C" fn(frame: *const OlsFrame, user_data: *mut c_void);
+
+// ═══════════════════════════════════════════════════════════════════
+//  ABI Version
+// ═══════════════════════════════════════════════════════════════════
+
+/// Must match `OLS_BRIDGE_ABI_VERSION` in `ols-bridge/include/ols_bridge.h`.
+///
+/// These declarations are a hand-maintained copy of that header. A bridge and
+/// a daemon built from different revisions link fine and then read each
+/// other's structs at the wrong offsets, which shows up as corrupted frames
+/// rather than an error — so the versions are checked at startup instead.
+pub const OLS_BRIDGE_ABI_VERSION: u32 = 3;
+
+// ═══════════════════════════════════════════════════════════════════
+//  Single-Shot Still Capture
+// ═══════════════════════════════════════════════════════════════════
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OlsStillRequest {
+    pub exposure_seconds: c_double,
+    /// ISO / gain. `<= 0` leaves the body's current setting alone.
+    pub sensitivity: c_double,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OlsStillCaptureInfo {
+    /// Unix timestamps taken by the driver around the trigger. `started_at` is
+    /// the value for FITS `DATE-OBS`.
+    pub started_at: c_double,
+    pub completed_at: c_double,
+    /// Read back from the camera after being applied — not the request.
+    pub applied_exposure: c_double,
+    pub applied_sensitivity: c_double,
+    pub shutter_label: *const c_char,
+    pub iso_label: *const c_char,
+    pub asset_count: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OlsCapturedAsset {
+    pub camera_path: *const c_char,
+    pub extension: *const c_char,
+    pub bytes: *const u8,
+    pub byte_length: usize,
+}
+
+#[repr(C)]
+pub struct OlsStillCapture {
+    _private: [u8; 0],
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  RAW Decode (LibRaw)
+// ═══════════════════════════════════════════════════════════════════
+
+#[repr(C)]
+pub struct OlsRawImage {
+    _private: [u8; 0],
+}
+
+/// Everything the decode deliberately did *not* apply, so it can be applied
+/// downstream. See the header comment on `ols_decode_raw` for why the pixels
+/// are untouched sensor ADU.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OlsRawImageInfo {
+    pub width: i32,
+    pub height: i32,
+    pub bayer: OlsBayerType,
+    /// Storage depth per sample: always 16. The sensor's real depth is implied
+    /// by `white_level` (16383 → 14-bit), which is the value saturation tests
+    /// must use — the samples do not reach the top of the container.
+    pub bits_per_sample: i32,
+    /// Global black pedestal in ADU. NOT subtracted from the pixels.
+    pub black_level: i32,
+    /// Per-CFA-channel black offsets, added to `black_level`.
+    pub cblack: [i32; 4],
+    /// Dimensions of LibRaw's 2-D black table, `[0, 0]` when there is none.
+    /// Anything larger than 2x2 is not representable in `cblack`, so a
+    /// non-trivial value means the recorded black level is incomplete.
+    pub cblack_pattern: [i32; 2],
+    /// Saturation point in ADU. NOT normalised to.
+    pub white_level: i32,
+    /// As-shot white balance multipliers. Recorded, never applied.
+    pub cam_mul: [f32; 4],
+    pub make: *const c_char,
+    pub model: *const c_char,
+}
 
 // ═══════════════════════════════════════════════════════════════════
 //  Mount Types
@@ -256,6 +364,7 @@ extern "C" {
 
     // ─── Version ───
     pub fn ols_bridge_version() -> *const c_char;
+    pub fn ols_bridge_abi_version() -> c_uint;
 
     // ─── Build Capabilities ───
     pub fn ols_driver_capability_flags() -> c_uint;
@@ -343,7 +452,69 @@ extern "C" {
 
     pub fn ols_camera_set_param(cam: *mut OlsCamera, id: OlsCamOptionId, value: c_double) -> c_int;
 
+    /// Fetch the choice labels of a selection-type option (`iso`,
+    /// `shutterspeed`, `capturetarget`, …) as consecutive NUL-terminated
+    /// strings in choice-index order.
+    ///
+    /// Pass a null `buf` to learn `out_count` / `out_required` without writing.
+    pub fn ols_camera_param_choices(
+        cam: *mut OlsCamera,
+        id: OlsCamOptionId,
+        buf: *mut c_char,
+        buf_len: usize,
+        out_count: *mut i32,
+        out_required: *mut usize,
+    ) -> c_int;
+
+    // ─── Single-shot still capture ───
+    pub fn ols_camera_supports_still(cam: *mut OlsCamera, out_supported: *mut i32) -> c_int;
+
+    pub fn ols_camera_capture_still(
+        cam: *mut OlsCamera,
+        request: *const OlsStillRequest,
+        out_capture: *mut *mut OlsStillCapture,
+    ) -> c_int;
+
+    pub fn ols_capture_info(
+        capture: *const OlsStillCapture,
+        out_info: *mut OlsStillCaptureInfo,
+    ) -> c_int;
+
+    pub fn ols_capture_asset_count(capture: *const OlsStillCapture) -> i32;
+
+    pub fn ols_capture_asset_get(
+        capture: *const OlsStillCapture,
+        index: i32,
+        out_asset: *mut OlsCapturedAsset,
+    ) -> c_int;
+
+    pub fn ols_camera_delete_captured(
+        cam: *mut OlsCamera,
+        capture: *const OlsStillCapture,
+    ) -> c_int;
+
+    pub fn ols_capture_destroy(capture: *mut OlsStillCapture);
+
     pub fn ols_camera_destroy(cam: *mut OlsCamera);
+
+    // ─── RAW decode ───
+    //
+    // `data` is borrowed for the duration of the call only. Pass width/height
+    // of -1 for the full active area; `bin` must be 1.
+    pub fn ols_decode_raw(
+        data: *const u8,
+        len: usize,
+        width: i32,
+        height: i32,
+        bin: i32,
+        out_image: *mut *mut OlsRawImage,
+    ) -> c_int;
+
+    pub fn ols_rawimage_info(image: *const OlsRawImage, out_info: *mut OlsRawImageInfo) -> c_int;
+
+    pub fn ols_rawimage_pixels(image: *const OlsRawImage, out_len: *mut usize) -> *const u8;
+
+    pub fn ols_rawimage_destroy(image: *mut OlsRawImage);
 
     // ═══ Mount API ═══
     pub fn ols_mount_interface_create(out_mi: *mut *mut OlsMountInterface) -> c_int;

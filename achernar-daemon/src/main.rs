@@ -42,10 +42,34 @@ async fn main() -> anyhow::Result<()> {
 
     info!("Starting Achernar Daemon v{}", env!("CARGO_PKG_VERSION"));
 
-    // Report OLS bridge version
+    // Report OLS bridge version, and refuse to run against a bridge whose
+    // struct layouts do not match the FFI declarations this binary was built
+    // with. A mismatch links cleanly and then reads frames at the wrong
+    // offsets, which looks like a driver bug rather than a stale build.
     unsafe {
         let ver = std::ffi::CStr::from_ptr(hardware::ols_ffi::ols_bridge_version());
         info!("OLS Bridge version: {}", ver.to_string_lossy());
+    }
+    match hardware::camera::check_abi() {
+        Ok(v) => info!("OLS Bridge ABI: v{v}"),
+        Err(e) => {
+            tracing::error!("{e}");
+            return Err(e.into());
+        }
+    }
+
+    // Report RAW decode support at startup, not on the first failed capture.
+    // Without LibRaw a DSLR still connects, streams and fires the shutter — it
+    // just archives containers nothing downstream can read, which looks like a
+    // pipeline bug rather than a missing build dependency.
+    if hardware::raw_decode::libraw_available() {
+        info!("RAW decode: LibRaw available (CR2/CR3/RW2/NEF/ARW → FITS)");
+    } else {
+        tracing::warn!(
+            "RAW decode: LibRaw NOT compiled into the bridge. RAW captures will be \
+             archived but no FITS will be derived. macOS: `brew install libraw`, \
+             Debian/Ubuntu: `apt install libraw-dev`, then rebuild."
+        );
     }
 
     // Load achernar.toml configuration (falls back to defaults if absent).
@@ -66,7 +90,73 @@ async fn main() -> anyhow::Result<()> {
     let frames_dir = config.storage.frames_dir();
     let frame_store = storage::frames_repo::FrameStore::new(&frames_dir);
     info!("Frame store ready: {}", frames_dir);
-    let app_state = AppState::new(config.focus.clone(), local_store, frame_store);
+
+    // Captures live under <frames_dir>/captures, sharded rig/night/session/frame.
+    let capture_root = std::path::Path::new(&frames_dir).join("captures");
+    let capture_store = storage::capture_store::CaptureStore::new(&capture_root);
+    info!("Capture store ready: {}", capture_root.display());
+
+    // Clean up whatever the last run left behind before anything can read it:
+    // interrupted staging directories, committed rows whose files vanished,
+    // and capture attempts that never finished.
+    match capture_store.reconcile(local_store.pool()).await {
+        Ok(report) if report.is_clean() => info!("Capture store reconciled: clean"),
+        Ok(report) => tracing::warn!(
+            "Capture store reconciled: {} partial(s) removed, {} frame(s) marked corrupt, \
+             {} attempt(s) closed as failed",
+            report.partials_removed,
+            report.frames_marked_corrupt,
+            report.attempts_failed
+        ),
+        Err(e) => tracing::error!("Capture store reconciliation failed: {e}"),
+    }
+
+    let rig_id = std::env::var("ACHERNAR_RIG_ID").unwrap_or_else(|_| "local-rig".to_string());
+    info!("Rig id: {rig_id}");
+
+    match config.camera.saturation_adu {
+        Some(v) => info!("Sensor saturation: {v} ADU (from [camera] saturation_adu)"),
+        None => tracing::warn!(
+            "Sensor saturation unknown: [camera] saturation_adu is unset, so the star \
+             saturation gate cannot run on 16-bit streams and will report itself as not \
+             performed. A 14-bit body should set 16383."
+        ),
+    }
+
+    // Optics from the `rigs` row. Consulted before the operator is asked to
+    // restate focal ratio and pixel size in achernar.toml — those columns have
+    // been in the schema since migration 002, and a second place to type the
+    // same facts is the friction that keeps drift forecasting switched off.
+    let rig_optics = match storage::device_profiles_repo::load_rig_optics(
+        local_store.pool(),
+        &rig_id,
+    )
+    .await
+    {
+        Ok(Some(optics)) => {
+            info!("Rig optics: {optics:?}");
+            Some(optics)
+        }
+        Ok(None) => {
+            info!("No `rigs` row for {rig_id}; optics must come from achernar.toml");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Could not read rig optics: {e}");
+            None
+        }
+    };
+
+    let app_state = AppState::new(
+        config.focus.clone(),
+        config.camera.clone(),
+        local_store,
+        frame_store,
+        capture_store,
+        rig_id,
+        config.storage.data_dir(),
+        rig_optics,
+    );
     cloud_client::spawn_if_configured(app_state.clone());
     vision::vision_loop::spawn(app_state.clone(), 1.0);
 
@@ -74,6 +164,7 @@ async fn main() -> anyhow::Result<()> {
     let api_v1 = Router::new()
         .route("/status", get(api::get_status))
         .route("/drivers", get(api::get_driver_capabilities))
+        .route("/discover", post(api::discover_devices))
         .route("/connect", post(api::connect_equipment))
         .route("/disconnect", post(api::disconnect_equipment))
         .nest("/camera", camera_routes())
@@ -150,6 +241,7 @@ fn focus_routes() -> Router<AppState> {
         .route("/status", get(api::focus::get_focus_status))
         .route("/history", get(api::focus::get_focus_history))
         .route("/drift", get(api::focus::get_drift_prediction))
+        .route("/drift/history", get(api::focus::get_drift_history))
 }
 
 /// WebSocket handler for telemetry — now sends real hardware state

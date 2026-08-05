@@ -11,7 +11,28 @@ export interface CamParam {
     max: number;
     step: number;
     default: number;
+    /**
+     * The raw value the driver holds. For `kind === "selection"` this is an
+     * INDEX into `choices`, not a physical quantity — index 17 is not
+     * seventeen of anything.
+     */
     current: number;
+    /**
+     * Human-readable labels for a `selection` option, in index order, so the
+     * Nth entry is the value to send back for choice N. Empty for every other
+     * kind.
+     *
+     * A DSLR exposes shutter and ISO as enumerations whose labels carry the
+     * only physical meaning there is. Rendering the index instead gives the
+     * operator a control they cannot read, which is not manual control.
+     */
+    choices: string[];
+    /**
+     * The label parsed into physical units — seconds for shutter, ISO speed for
+     * ISO. Absent when the label does not parse ("bulb") or the option is not
+     * one of those two. Display only: send `current` (the index) when setting.
+     */
+    current_value?: number;
 }
 
 /** A selectable stream format / binning mode (from GET /camera/formats). */
@@ -22,6 +43,15 @@ export interface CamFormat {
     height: number;
     bin: number;
     framerate: number;
+    /**
+     * How the driver produces frames in this format.
+     *
+     * `still` means one shutter actuation per frame. Streaming it on a DSLR
+     * fires the mechanical shutter continuously — tens of thousands of
+     * actuations across a session against a shutter rated for a few hundred
+     * thousand. Prefer `liveview` for framing and focusing.
+     */
+    mode: "liveview" | "still";
 }
 
 export interface DriverCapability {
@@ -40,17 +70,94 @@ export interface DriverCapabilityReport {
     focuser: DriverCapability[];
 }
 
+/** A camera actually attached to a local bus, found by a discovery scan. */
+export interface DiscoveredCamera {
+    /** Driver id to pass to connectCamera (e.g. "svb"). */
+    driver_id: string;
+    driver_label: string;
+    /** Index within that driver's enumeration. */
+    index: number;
+    name: string;
+}
+
+/**
+ * Outcome of probing one driver. "empty" (no such camera attached) and
+ * "failed" (the probe itself errored) are reported separately on purpose —
+ * they mean very different things when troubleshooting in the dark.
+ */
+export interface DiscoveryProbe {
+    driver_id: string;
+    driver_label: string;
+    status: "found" | "empty" | "not_compiled" | "failed" | "timeout" | "skipped";
+    device_count: number;
+    detail?: string;
+}
+
+export interface DiscoveryReport {
+    cameras: DiscoveredCamera[];
+    probes: DiscoveryProbe[];
+    scanned_at: string;
+    /** Caveats — what was deliberately not scanned, and why. */
+    notes: string[];
+}
+
 /** Result of a single-shot capture (from POST /camera/capture). */
+/** One artifact of a committed capture. A body set to RAW+JPEG yields two
+ *  native assets plus a derived FITS — all belonging to the same exposure. */
+export interface CapturedAsset {
+    role:
+        | "native_raw"
+        | "camera_jpeg"
+        | "sensor_fits"
+        | "analysis_luma"
+        | "thumbnail"
+        | "calibrated_fits";
+    media_type: string;
+    /** Relative to the capture root, so the archive can be relocated. */
+    relative_path: string;
+    byte_length: number;
+    sha256: string;
+}
+
 export interface CaptureResult {
+    /** The capture attempt, allocated before the camera is commanded. */
+    capture_id: string;
+    /** The frames row; every asset below belongs to it. */
     id: string;
+    session_id?: string;
+    status: "committed";
     width: number;
     height: number;
+    /** Directory holding the bundle, relative to the capture root. */
+    relative_dir: string;
+    assets: CapturedAsset[];
+    /** @deprecated Single path cannot express a RAW+JPEG capture. Use `assets`. */
     path?: string;
     metadata: {
+        /** What the hardware actually delivered, read back from the camera. */
         exposure: number;
+        /** What was asked for. On a DSLR the two differ whenever the request
+         *  falls between two steps of the shutter ladder. */
+        requested_exposure: number;
+        /** Signed difference between the two, in stops. */
+        exposure_error_stops: number;
         gain: number;
+        /** Present on bodies whose gain control is an ISO enumeration. */
+        iso?: number;
+        /** The camera's own shutter label, e.g. "1/125". */
+        shutter?: string;
         temperature: number;
+        /** Whether `temperature` was measured, estimated, or absent. A DSLR has
+         *  no sensor thermometer, so it reports "missing" rather than a
+         *  plausible-looking number. */
+        temperature_state: "measured" | "estimated" | "missing";
+        /** Start of exposure, from the driver's clock read immediately before
+         *  the trigger — this is DATE-OBS, not a post-download timestamp. */
         timestamp: string;
+        completed_at: string;
+        /** Non-fatal problems worth showing the operator: an exposure the body
+         *  could not reach, a control it refused, files left on the card. */
+        warnings?: string[];
     };
 }
 
@@ -67,6 +174,19 @@ export const daemonApi = {
     // GET /api/v1/drivers — build-time native hardware support report
     async getDriverCapabilities(): Promise<DriverCapabilityReport> {
         return httpJson<DriverCapabilityReport>(`${env.daemonApiBase}/drivers`);
+    },
+
+    /**
+     * POST /api/v1/discover — scan local USB/SDK buses for attached cameras.
+     *
+     * Operator-initiated only (it instantiates vendor SDK drivers), and the
+     * daemon refuses to scan while a camera is connected. Network transports
+     * (Alpaca/INDI/INDIGO) are not scanned; they need an explicit address.
+     */
+    async discoverDevices(): Promise<DiscoveryReport> {
+        return httpJson<DiscoveryReport>(`${env.daemonApiBase}/discover`, {
+            method: "POST",
+        });
     },
 
     // POST /api/v1/mount/slew
@@ -116,11 +236,23 @@ export const daemonApi = {
         return httpJson<CamFormat[]>(`${env.daemonApiBase}/camera/formats`);
     },
 
-    // POST /api/v1/connect — connect a camera driver (e.g. "svb" for SVBony)
-    async connectCamera(driver: string, option?: string): Promise<{ status: string; camera?: string; cameras_found?: string[] }> {
+    /**
+     * POST /api/v1/connect — connect a camera driver (e.g. "svb" for SVBony).
+     *
+     * `index` selects which camera within that driver's enumeration, as
+     * returned by `discoverDevices()`. It matters as soon as two cameras are
+     * attached, which is the guiding + imaging configuration — without it the
+     * daemon always opens camera 0 and the guider and the imager are the same
+     * request.
+     */
+    async connectCamera(
+        driver: string,
+        option?: string,
+        index?: number,
+    ): Promise<{ status: string; camera?: string; cameras_found?: string[]; index?: number }> {
         return httpJson(`${env.daemonApiBase}/connect`, {
             method: "POST",
-            body: { equipment_type: "camera", driver, option },
+            body: { equipment_type: "camera", driver, option, index },
         });
     },
 

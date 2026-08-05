@@ -9,7 +9,7 @@ The central recommendation is to stop treating frame quality as one universal sc
 ## Executive findings
 
 1. The current `focus_quality` and `sharpness_score` are two reciprocal transforms of the same HFR value. They are not independent evidence and have no calibrated meaning.
-2. The current `fwhm` field is actually HFD, because it is assigned `2 * HFR`. HFD is twice HFR by definition; FWHM is a different PSF-width measurement.
+2. The current `fwhm` field is actually HFD, because it is assigned `2 * HFR`. HFD is twice HFR by definition; FWHM is omg PSF-width measurement.
 3. `seeing_estimate_arcsec = 2 * HFR` is invalid without pixel scale and is not a defensible seeing measurement even after converting pixels to arcseconds.
 4. Returning zero for unavailable HFR/FWHM/seeing is dangerous because zero is the mathematically best value for lower-is-better width metrics. Missing measurements should be `None`/JSON `null` with an explicit status and rejection reasons.
 5. `quality_uncertainty` is a unitless heuristic, not predictive uncertainty. FQE uncertainty should be reported in the same domain as its prediction, for example `sigma_log_hfr` or `sigma_hfr_px`.

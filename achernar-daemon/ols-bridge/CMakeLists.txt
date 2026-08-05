@@ -24,6 +24,36 @@ endif()
 
 # ─── Find required packages ───
 find_package(PkgConfig REQUIRED)
+
+# Homebrew's main `opencv` formula now tracks OpenCV 5, which ships opencv5.pc
+# and NOT opencv4.pc. OpenCV 4 is available only via the `opencv@4` formula,
+# which is keg-only (not symlinked into the brew prefix) precisely because the
+# unversioned formula occupies the same namespace — so its pkgconfig directory
+# is invisible to pkg-config unless it is added explicitly.
+#
+# Probe brew for the keg prefixes we depend on and prepend their pkgconfig dirs
+# before the REQUIRED checks below. Without this, a machine with a perfectly
+# good `brew install opencv@4` still fails configure with "Package 'opencv4'
+# not found", and every developer has to discover PKG_CONFIG_PATH themselves.
+# Non-macOS builds are untouched; a missing formula is skipped silently.
+if(APPLE)
+    find_program(BREW_EXECUTABLE brew)
+    if(BREW_EXECUTABLE)
+        foreach(KEG_FORMULA "opencv@4" "libtiff" "libraw" "libgphoto2")
+            execute_process(
+                COMMAND ${BREW_EXECUTABLE} --prefix ${KEG_FORMULA}
+                OUTPUT_VARIABLE KEG_PREFIX
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(KEG_PREFIX AND EXISTS "${KEG_PREFIX}/lib/pkgconfig")
+                set(ENV{PKG_CONFIG_PATH} "${KEG_PREFIX}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+                list(APPEND CMAKE_PREFIX_PATH "${KEG_PREFIX}")
+                message(STATUS "Using brew keg ${KEG_FORMULA} at ${KEG_PREFIX}")
+            endif()
+        endforeach()
+    endif()
+endif()
+
 pkg_check_modules(OPENCV REQUIRED opencv4)
 pkg_check_modules(TIFF REQUIRED libtiff-4)
 
@@ -243,7 +273,56 @@ else()
 endif()
 
 # ═══════════════════════════════════════════════════════════════════
-#  GPhoto2 (DSLR support, optional)
+#  LibRaw (RAW decoding — REQUIRED for any RAW-shooting DSLR/mirrorless)
+# ═══════════════════════════════════════════════════════════════════
+#
+# This is not merely "optional" the way a vendor SDK is. Canon bodies set to
+# RAW (CR2 on the T3i/600D and T6s/760D, CR3 on the R50/M50) and Panasonic
+# bodies set to RW2 emit *only* a raw file per shutter actuation. Without a
+# decoder, `GPFile::to_mat()` throws "built without libraw support", so
+# `formats()` enumerates nothing for those bodies and the camera appears to
+# work right up until it produces zero usable frames. Compiling gphoto2 while
+# leaving LibRaw out is therefore the single most misleading build state we
+# can ship, and it is what the tree did before this block existed.
+#
+# Probe pkg-config first (LibRaw installs libraw.pc), then fall back to a
+# header search so source builds and non-pkg-config installs still work.
+pkg_check_modules(LIBRAW QUIET libraw)
+
+if(NOT LIBRAW_FOUND)
+    find_file(LIBRAW_HEADER libraw/libraw.h
+        PATHS "/opt/homebrew/include" "/usr/local/include" "/usr/include" "/opt/local/include"
+    )
+    find_library(LIBRAW_LIBRARY
+        NAMES raw raw_r libraw libraw_r
+        PATHS "/opt/homebrew/lib" "/usr/local/lib" "/usr/lib" "/opt/local/lib"
+    )
+endif()
+
+if(LIBRAW_FOUND OR (LIBRAW_HEADER AND LIBRAW_LIBRARY))
+    if(LIBRAW_FOUND)
+        message(STATUS "✅ LibRaw found via pkg-config ${LIBRAW_VERSION} — RAW decoding enabled")
+        list(APPEND EXTRA_INCLUDE_DIRS ${LIBRAW_INCLUDE_DIRS})
+        list(APPEND EXTRA_LINK_DIRS ${LIBRAW_LIBRARY_DIRS})
+        list(APPEND EXTRA_LIBS ${LIBRAW_LIBRARIES})
+    else()
+        # LIBRAW_HEADER is .../include/libraw/libraw.h; `#include <libraw/libraw.h>`
+        # needs the grandparent ("include/") on the search path.
+        get_filename_component(LIBRAW_INC_DIR "${LIBRAW_HEADER}" DIRECTORY)  # .../libraw/
+        get_filename_component(LIBRAW_INC_DIR "${LIBRAW_INC_DIR}" DIRECTORY) # .../include/
+        message(STATUS "✅ LibRaw found at ${LIBRAW_LIBRARY} — RAW decoding enabled")
+        list(APPEND EXTRA_INCLUDE_DIRS ${LIBRAW_INC_DIR})
+        list(APPEND EXTRA_LIBS ${LIBRAW_LIBRARY})
+    endif()
+    add_definitions(-DWITH_LIBRAW)
+    set(OLS_HAVE_LIBRAW TRUE)
+else()
+    set(OLS_HAVE_LIBRAW FALSE)
+    message(STATUS "ℹ️  LibRaw not found — RAW (CR2/CR3/RW2/NEF/ARW) decoding disabled")
+endif()
+
+# ═══════════════════════════════════════════════════════════════════
+#  GPhoto2 (DSLR / mirrorless support, optional)
 # ═══════════════════════════════════════════════════════════════════
 find_file(GPHOTO2_HEADER gphoto2/gphoto2.h
     PATHS "/opt/homebrew/include" "/usr/local/include" "/usr/include"
@@ -258,6 +337,17 @@ if(GPHOTO2_HEADER)
     list(APPEND EXTRA_INCLUDE_DIRS ${GPHOTO2_INC_DIR})
     add_definitions(-DWITH_GPHOTO2)
     list(APPEND EXTRA_LIBS gphoto2 gphoto2_port)
+
+    # Loud, actionable warning rather than a silent half-capable build: the
+    # driver will connect to the body, report a name, and then fail to produce
+    # a single frame if the camera is not set to JPEG.
+    if(NOT OLS_HAVE_LIBRAW)
+        message(WARNING
+            "GPhoto2 is enabled but LibRaw is NOT. RAW-only capture will fail at "
+            "runtime — only cameras set to JPEG will stream. Install LibRaw "
+            "(macOS: `brew install libraw`, Debian/Ubuntu: `apt install libraw-dev`) "
+            "and re-run cmake.")
+    endif()
 else()
     message(STATUS "ℹ️  GPhoto2 not found — DSLR camera driver disabled")
 endif()
@@ -320,7 +410,12 @@ if("WITH_UVC" IN_LIST COMPILE_DEFS)
     message(STATUS "  Camera:   ✅ UVC (USB video)")
 endif()
 if("WITH_GPHOTO2" IN_LIST COMPILE_DEFS)
-    message(STATUS "  Camera:   ✅ GPhoto2 (DSLR)")
+    message(STATUS "  Camera:   ✅ GPhoto2 (DSLR / mirrorless)")
+endif()
+if("WITH_LIBRAW" IN_LIST COMPILE_DEFS)
+    message(STATUS "  Decode:   ✅ LibRaw (CR2/CR3/RW2/NEF/ARW)")
+else()
+    message(STATUS "  Decode:   ❌ LibRaw missing — RAW capture unavailable")
 endif()
 if("WITH_INDI" IN_LIST COMPILE_DEFS)
     message(STATUS "  Protocol: ✅ INDI (camera + mount)")

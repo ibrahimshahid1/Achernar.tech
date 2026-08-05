@@ -10,7 +10,7 @@ use std::os::raw::c_void;
 use std::sync::{Arc, Mutex};
 
 /// Get the last error message from the OLS bridge.
-fn last_error() -> String {
+pub(crate) fn last_error() -> String {
     unsafe {
         let ptr = ols_ffi::ols_last_error();
         if ptr.is_null() {
@@ -21,8 +21,19 @@ fn last_error() -> String {
     }
 }
 
+/// Borrow a C string, or an empty String when the pointer is null.
+/// The bridge promises non-null for its label fields; this is belt-and-braces
+/// so a driver bug degrades to "no label" rather than a segfault.
+fn cstr_or_default(ptr: *const std::os::raw::c_char) -> String {
+    if ptr.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(ptr).to_string_lossy().into_owned() }
+    }
+}
+
 /// Check an OLS error code and convert to Result.
-fn check(code: i32) -> Result<()> {
+pub(crate) fn check(code: i32) -> Result<()> {
     if code == ols_ffi::OLS_OK {
         Ok(())
     } else {
@@ -37,7 +48,21 @@ pub struct StreamFormat {
     pub width: i32,
     pub height: i32,
     pub bin: i32,
+    pub roi_num: i32,
+    pub roi_den: i32,
     pub framerate: f32,
+}
+
+impl StreamFormat {
+    /// True when this looks like a driver-provided live-view feed rather than
+    /// a full-resolution still: an MJPEG format advertising a real framerate.
+    ///
+    /// The gphoto2 driver enumerates live view first precisely so that callers
+    /// which do not choose a format never actuate the shutter; this predicate
+    /// lets the daemon label the mode in API responses.
+    pub fn is_liveview(&self) -> bool {
+        self.format == ols_ffi::OlsStreamType::Mjpeg && self.framerate > 0.0
+    }
 }
 
 impl From<ols_ffi::OlsStreamFormat> for StreamFormat {
@@ -47,6 +72,8 @@ impl From<ols_ffi::OlsStreamFormat> for StreamFormat {
             width: f.width,
             height: f.height,
             bin: f.bin,
+            roi_num: f.roi_num,
+            roi_den: f.roi_den,
             framerate: f.framerate,
         }
     }
@@ -59,6 +86,8 @@ impl From<&StreamFormat> for ols_ffi::OlsStreamFormat {
             width: f.width,
             height: f.height,
             bin: f.bin,
+            roi_num: f.roi_num,
+            roi_den: f.roi_den,
             framerate: f.framerate,
         }
     }
@@ -77,6 +106,23 @@ pub struct CamParam {
     pub cur_val: f64,
 }
 
+/// The camera-authored original a frame was decoded from.
+///
+/// For a DSLR or mirrorless body this is the CR2/CR3/RW2/NEF exactly as the
+/// camera wrote it. It matters because `FrameData::data` is already a lossy
+/// interpretation: LibRaw has subtracted the black level, applied a scale
+/// factor, cropped to the active area and dropped the maker notes. A training
+/// set built only from decoded pixels is permanently welded to whatever decode
+/// path was current the night it was captured — you can never re-derive it
+/// with a better demosaic, a different calibration, or corrected black points.
+#[derive(Debug, Clone)]
+pub struct SourceImage {
+    /// Lowercase extension without the dot: "cr3", "cr2", "rw2", "jpg".
+    pub ext: String,
+    /// The file's bytes, verbatim.
+    pub bytes: Vec<u8>,
+}
+
 /// A captured frame with owned data
 #[derive(Debug, Clone)]
 pub struct FrameData {
@@ -87,6 +133,138 @@ pub struct FrameData {
     pub width: i32,
     pub height: i32,
     pub data: Vec<u8>,
+    /// The original file the pixels came from, when the driver supplied one.
+    /// `None` for sensor drivers that DMA pixels straight out of hardware, and
+    /// for live-view preview frames (which are not science data).
+    pub source: Option<SourceImage>,
+    /// Linear saturation point of the sensor, in this frame's own ADU.
+    ///
+    /// Per-frame and not global, because a rig with a guider and an imaging
+    /// camera has two different answers at the same time. `None` means unknown,
+    /// and unknown must stay distinguishable from "does not saturate": a
+    /// saturation gate computed from the container depth sits at 64224 on a
+    /// 14-bit body whose data tops out at 16383, so it never fires and every
+    /// clipped star passes.
+    ///
+    /// Sourced from `[camera] saturation_adu` in `achernar.toml` for streams,
+    /// and from the RAW decoder's `white_level` on the capture path. No driver
+    /// reports it today; when one can, this is the field it fills.
+    pub saturation_adu: Option<f32>,
+}
+
+/// One file a single exposure produced, copied out of the bridge.
+#[derive(Debug, Clone)]
+pub struct CapturedAsset {
+    /// Path on the camera's storage, kept so the file can be deleted after the
+    /// bytes are durably persisted.
+    pub camera_path: String,
+    /// Lowercase extension without the dot: "cr3", "cr2", "rw2", "jpg".
+    pub extension: String,
+    pub bytes: Vec<u8>,
+}
+
+impl CapturedAsset {
+    /// Asset role, from the container the camera wrote.
+    pub fn role(&self) -> &'static str {
+        match self.extension.as_str() {
+            "jpg" | "jpeg" => "camera_jpeg",
+            _ => "native_raw",
+        }
+    }
+
+    /// IANA media type, as specific as we can be. Recorded per asset so a
+    /// consumer never has to re-sniff the bytes to know what it has.
+    pub fn media_type(&self) -> &'static str {
+        match self.extension.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "cr2" => "image/x-canon-cr2",
+            "cr3" => "image/x-canon-cr3",
+            "rw2" => "image/x-panasonic-rw2",
+            "nef" => "image/x-nikon-nef",
+            "arw" => "image/x-sony-arw",
+            "dng" => "image/x-adobe-dng",
+            _ => "application/octet-stream",
+        }
+    }
+}
+
+/// The complete result of one shutter actuation.
+///
+/// Everything here describes that single exposure and nothing else. It never
+/// passes through the streaming frame callback, so there is no window in which
+/// the pixels and the metadata can drift apart.
+#[derive(Debug, Clone)]
+pub struct StillCapture {
+    /// Unix timestamp taken immediately before the trigger — the value for
+    /// FITS `DATE-OBS`. A clock read after the call returns is late by the
+    /// exposure plus however long the download took.
+    pub started_at: f64,
+    pub completed_at: f64,
+    /// Settings read back from the camera after being applied.
+    pub applied_exposure_s: f64,
+    /// ISO / gain as read back; `<= 0` when the body reports nothing numeric.
+    pub applied_sensitivity: f64,
+    /// The camera's own labels ("1/125", "800"). Empty when not applicable.
+    pub shutter_label: String,
+    pub iso_label: String,
+    /// Every file the exposure produced — two on a RAW+JPEG body.
+    pub assets: Vec<CapturedAsset>,
+}
+
+impl StillCapture {
+    /// The asset a science pipeline should treat as canonical: the native RAW
+    /// when there is one, otherwise the camera JPEG.
+    pub fn primary(&self) -> Option<&CapturedAsset> {
+        self.assets
+            .iter()
+            .find(|a| a.role() == "native_raw")
+            .or_else(|| self.assets.first())
+    }
+
+    pub fn exposure_duration_s(&self) -> f64 {
+        (self.completed_at - self.started_at).max(0.0)
+    }
+}
+
+/// Live handle to a completed capture inside the bridge.
+///
+/// Held only long enough to copy the bytes out and, later, to delete the files
+/// from the camera. `Drop` releases the bridge-side buffers, so forgetting to
+/// clean up leaks nothing.
+pub struct StillCaptureHandle {
+    handle: *mut ols_ffi::OlsStillCapture,
+}
+
+// Safety: the handle is an owned, immutable snapshot; the bridge does not
+// touch it again until destroy.
+unsafe impl Send for StillCaptureHandle {}
+
+impl Drop for StillCaptureHandle {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            unsafe { ols_ffi::ols_capture_destroy(self.handle) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
+/// Verify the compiled bridge matches the FFI declarations this binary was
+/// built against.
+///
+/// Layout drift between the two does not fail to link — it silently reads
+/// structs at the wrong offsets, which surfaces as corrupt frames or a crash
+/// deep in a driver. Call once at startup.
+pub fn check_abi() -> Result<u32> {
+    let actual = unsafe { ols_ffi::ols_bridge_abi_version() };
+    if actual != ols_ffi::OLS_BRIDGE_ABI_VERSION {
+        return Err(anyhow!(
+            "OLS bridge ABI mismatch: daemon expects v{}, linked bridge is v{}. \
+             Rebuild the bridge (`cargo clean -p achernar-daemon && cargo build`).",
+            ols_ffi::OLS_BRIDGE_ABI_VERSION,
+            actual
+        ));
+    }
+    Ok(actual)
 }
 
 /// OLS Camera Driver - manages driver lifecycle and camera enumeration
@@ -262,6 +440,10 @@ unsafe impl Send for OlsCamera {}
 
 struct CallbackData {
     latest_frame: Arc<Mutex<Option<FrameData>>>,
+    /// Stamped onto every frame this stream produces. Held per-stream rather
+    /// than read from a global so two cameras on one rig can carry different
+    /// values. See `FrameData::saturation_adu`.
+    saturation_adu: Option<f32>,
 }
 
 impl OlsCamera {
@@ -298,6 +480,8 @@ impl OlsCamera {
                 width: 0,
                 height: 0,
                 bin: 0,
+                roi_num: 1,
+                roi_den: 1,
                 framerate: 0.0,
             };
             unsafe {
@@ -314,13 +498,20 @@ impl OlsCamera {
     }
 
     /// Start streaming, storing frames into the provided Arc<Mutex<Option<FrameData>>>
+    ///
+    /// `saturation_adu` is the sensor's linear saturation point in this
+    /// stream's ADU, stamped onto every frame. Pass `None` when it is not
+    /// known — the quality gate then reports itself as not performed instead of
+    /// silently passing every star. See `FrameData::saturation_adu`.
     pub fn start_stream(
         &mut self,
         format: &StreamFormat,
         frame_store: Arc<Mutex<Option<FrameData>>>,
+        saturation_adu: Option<f32>,
     ) -> Result<()> {
         let cb_data = Box::new(CallbackData {
             latest_frame: frame_store,
+            saturation_adu,
         });
         let user_data = &*cb_data as *const CallbackData as *mut c_void;
 
@@ -391,6 +582,180 @@ impl OlsCamera {
         }
     }
 
+    /// Human-readable labels for a selection-type option, in choice-index
+    /// order — so `labels[n]` is what the camera does when you
+    /// `set_parameter(id, n as f64)`.
+    ///
+    /// DSLR bodies expose exposure and gain only as enumerations
+    /// (`shutterspeed` = ["30", "25", …, "1/4000", "bulb"], `iso` = ["Auto",
+    /// "100", "200", …]). The numeric index carries no physical meaning; the
+    /// label is the value. Without these the daemon can change the exposure
+    /// but cannot report what exposure it made.
+    ///
+    /// Returns an empty vector for continuous options — not an error.
+    pub fn parameter_choices(&self, id: ols_ffi::OlsCamOptionId) -> Result<Vec<String>> {
+        let mut count: i32 = 0;
+        let mut required: usize = 0;
+
+        // First call sizes the buffer, second fills it. The choice list is
+        // fixed per body, but it is cheap enough to re-read and this avoids
+        // caching stale values after a mode-dial change.
+        unsafe {
+            check(ols_ffi::ols_camera_param_choices(
+                self.handle as *mut _,
+                id,
+                std::ptr::null_mut(),
+                0,
+                &mut count,
+                &mut required,
+            ))?;
+        }
+        if count <= 0 || required == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut buf = vec![0u8; required];
+        unsafe {
+            check(ols_ffi::ols_camera_param_choices(
+                self.handle as *mut _,
+                id,
+                buf.as_mut_ptr() as *mut std::os::raw::c_char,
+                buf.len(),
+                &mut count,
+                &mut required,
+            ))?;
+        }
+
+        // The buffer holds `count` consecutive NUL-terminated strings. Split on
+        // NUL and drop the trailing empty produced by the final terminator.
+        let labels: Vec<String> = buf
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect();
+
+        if labels.len() != count as usize {
+            tracing::warn!(
+                "Option {:?}: driver reported {} choices, parsed {}",
+                id,
+                count,
+                labels.len()
+            );
+        }
+        Ok(labels)
+    }
+
+    /// Whether this camera implements single-shot still capture.
+    pub fn supports_still_capture(&self) -> bool {
+        let mut supported: i32 = 0;
+        unsafe {
+            if ols_ffi::ols_camera_supports_still(self.handle as *mut _, &mut supported)
+                != ols_ffi::OLS_OK
+            {
+                return false;
+            }
+        }
+        supported != 0
+    }
+
+    /// Take exactly one exposure and return its files.
+    ///
+    /// Blocking — libgphoto2 is synchronous and a full-frame download over USB
+    /// 2.0 takes seconds. Call this from `spawn_blocking`, never on an async
+    /// runtime thread.
+    ///
+    /// The returned handle is kept alive alongside the copied data so the
+    /// caller can pass it to `delete_captured` after the bytes are safely on
+    /// disk. Dropping it without deleting simply leaves the files on the card,
+    /// which is the safe direction to fail.
+    pub fn capture_still(
+        &self,
+        exposure_seconds: f64,
+        sensitivity: Option<f64>,
+    ) -> Result<(StillCapture, StillCaptureHandle)> {
+        let request = ols_ffi::OlsStillRequest {
+            exposure_seconds,
+            // <= 0 tells the driver to leave the body's current ISO alone,
+            // so a capture without an explicit gain never overrides what the
+            // operator dialled in.
+            sensitivity: sensitivity.unwrap_or(-1.0),
+        };
+
+        let mut raw: *mut ols_ffi::OlsStillCapture = std::ptr::null_mut();
+        unsafe {
+            check(ols_ffi::ols_camera_capture_still(
+                self.handle,
+                &request,
+                &mut raw,
+            ))?;
+        }
+        if raw.is_null() {
+            return Err(anyhow!("Bridge returned a null capture handle"));
+        }
+        // Own it immediately: every early return below must still release it.
+        let handle = StillCaptureHandle { handle: raw };
+
+        let mut info = ols_ffi::OlsStillCaptureInfo {
+            started_at: 0.0,
+            completed_at: 0.0,
+            applied_exposure: 0.0,
+            applied_sensitivity: 0.0,
+            shutter_label: std::ptr::null(),
+            iso_label: std::ptr::null(),
+            asset_count: 0,
+        };
+        unsafe { check(ols_ffi::ols_capture_info(handle.handle, &mut info))? };
+
+        let mut assets = Vec::with_capacity(info.asset_count.max(0) as usize);
+        for i in 0..info.asset_count {
+            let mut a = ols_ffi::OlsCapturedAsset {
+                camera_path: std::ptr::null(),
+                extension: std::ptr::null(),
+                bytes: std::ptr::null(),
+                byte_length: 0,
+            };
+            unsafe { check(ols_ffi::ols_capture_asset_get(handle.handle, i, &mut a))? };
+            if a.bytes.is_null() || a.byte_length == 0 {
+                tracing::warn!("Capture asset {} came back empty; skipping", i);
+                continue;
+            }
+            assets.push(CapturedAsset {
+                camera_path: cstr_or_default(a.camera_path),
+                extension: cstr_or_default(a.extension).to_lowercase(),
+                bytes: unsafe { std::slice::from_raw_parts(a.bytes, a.byte_length).to_vec() },
+            });
+        }
+
+        if assets.is_empty() {
+            return Err(anyhow!("Capture produced no readable assets"));
+        }
+
+        let capture = StillCapture {
+            started_at: info.started_at,
+            completed_at: info.completed_at,
+            applied_exposure_s: info.applied_exposure,
+            applied_sensitivity: info.applied_sensitivity,
+            shutter_label: cstr_or_default(info.shutter_label),
+            iso_label: cstr_or_default(info.iso_label),
+            assets,
+        };
+        Ok((capture, handle))
+    }
+
+    /// Delete a capture's files from the camera.
+    ///
+    /// Call only after the bytes are durably persisted. Failure here is not
+    /// fatal — it wastes card space, whereas deleting too early destroys the
+    /// exposure.
+    pub fn delete_captured(&self, handle: &StillCaptureHandle) -> Result<()> {
+        unsafe {
+            check(ols_ffi::ols_camera_delete_captured(
+                self.handle,
+                handle.handle,
+            ))
+        }
+    }
+
     /// Get supported option IDs
     pub fn supported_options(&self) -> Result<Vec<ols_ffi::OlsCamOptionId>> {
         let mut count: i32 = 0;
@@ -450,6 +815,24 @@ unsafe extern "C" fn frame_callback_trampoline(
     // Copy frame data into owned Vec
     let data_slice = std::slice::from_raw_parts(frame_ref.data, frame_ref.data_size);
 
+    // Copy the camera-authored original too, while it is still alive. Both
+    // pointers are only valid for the duration of this callback, so there is
+    // no deferring this: either we copy here or the CR3 is gone forever.
+    let source = if !frame_ref.source_data.is_null() && frame_ref.source_data_size > 0 {
+        let ext = if frame_ref.source_ext.is_null() {
+            "raw".to_string()
+        } else {
+            CStr::from_ptr(frame_ref.source_ext)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let bytes =
+            std::slice::from_raw_parts(frame_ref.source_data, frame_ref.source_data_size).to_vec();
+        Some(SourceImage { ext, bytes })
+    } else {
+        None
+    };
+
     let frame_data = FrameData {
         format: frame_ref.format,
         bayer: frame_ref.bayer,
@@ -458,6 +841,8 @@ unsafe extern "C" fn frame_callback_trampoline(
         width: frame_ref.width,
         height: frame_ref.height,
         data: data_slice.to_vec(),
+        source,
+        saturation_adu: cb_data.saturation_adu,
     };
 
     if let Ok(mut store) = cb_data.latest_frame.lock() {

@@ -174,10 +174,95 @@ namespace ols {
         int height; /// image height
         void const *data; /// data - pointer becomes invalid when callback ends, points to null terminamted char const * for \a stream_error format to indicate caputre error
         size_t data_size; /// size of data in bytes
+
+        /// ─── Optional original-file passthrough ───
+        ///
+        /// When a driver obtains its pixels by decoding a container the camera
+        /// itself produced (a DSLR writing CR2/CR3/RW2/NEF, or a JPEG), these
+        /// point at the *undecoded, unmodified* bytes of that file.
+        ///
+        /// This exists because `data` above is already lossy with respect to
+        /// the original: LibRaw applies black-level subtraction and a scale
+        /// factor, crops to the active area, and discards the maker notes that
+        /// carry per-shot metadata. A frame archive built only from `data` can
+        /// never be re-processed with a different demosaic or calibration, so
+        /// any model trained from it is permanently locked to today's decode
+        /// path. Consumers that want a canonical archive copy should persist
+        /// these bytes verbatim.
+        ///
+        /// Lifetime matches `data`: valid only for the duration of the
+        /// callback. `nullptr` when the driver has no meaningful original
+        /// (sensor drivers that DMA pixels straight out of hardware).
+        void const *source_data = nullptr;
+        /// Size of \a source_data in bytes; 0 when absent.
+        size_t source_data_size = 0;
+        /// Lowercase file extension without the dot ("cr3", "cr2", "rw2",
+        /// "nef", "arw", "jpg"), or nullptr. Tells the consumer what container
+        /// \a source_data actually is so it can be written with a truthful name.
+        char const *source_ext = nullptr;
     };
 
     /// callback to pass to camera - called from separate thread when frame is ready
     typedef std::function<void(CamFrame const &)> frame_callback_type;
+
+    /// ═══════════════════════════════════════════════════════════════════
+    ///  Single-shot still capture
+    /// ═══════════════════════════════════════════════════════════════════
+    ///
+    /// Deliberately separate from the streaming path. A stream is a
+    /// free-running producer: frames arrive when they arrive, the consumer
+    /// sees only the most recent one, and settings written mid-stream may or
+    /// may not have taken effect by the time the next frame appears. That is
+    /// fine for a preview and unusable for a science exposure, where the
+    /// pixels and the metadata describing them must come from the same
+    /// shutter actuation.
+    ///
+    /// capture_still() therefore owns its exposure end to end: it applies and
+    /// reads back the settings, triggers exactly one exposure, collects every
+    /// file that exposure produced, and returns them to the caller directly.
+    /// Nothing passes through frame_callback_type.
+
+    /// One file the camera itself wrote for a single exposure. A body set to
+    /// RAW+JPEG produces two of these per actuation.
+    struct CapturedAsset {
+        /// Path on the camera's storage, e.g.
+        /// "/store_00020001/DCIM/100CANON/IMG_0042.CR3". Retained so the file
+        /// can be deleted later — after the bytes are durably persisted, not
+        /// before.
+        std::string camera_path;
+        /// Lowercase extension without the dot: "cr3", "cr2", "rw2", "jpg".
+        std::string extension;
+        /// The file's bytes, verbatim.
+        std::vector<unsigned char> bytes;
+    };
+
+    struct StillCaptureRequest {
+        /// Requested exposure. Bodies with an enumerated shutter ladder select
+        /// the nearest available step and report it back in
+        /// StillCaptureResult::applied_exposure.
+        double exposure_seconds = 1.0;
+        /// Requested ISO / gain. <= 0 means "leave whatever the body is set
+        /// to", so the operator's manual setting is never silently overridden.
+        double sensitivity = 0.0;
+    };
+
+    struct StillCaptureResult {
+        /// Unix timestamps bracketing the actual exposure, taken by the driver
+        /// immediately before the trigger and after the last file arrives.
+        /// `started_at` is what belongs in FITS DATE-OBS — not the wall clock
+        /// read after the capture returns.
+        double started_at = 0.0;
+        double completed_at = 0.0;
+        /// Settings as read back from the camera after being applied, never
+        /// the requested values.
+        double applied_exposure = 0.0;
+        double applied_sensitivity = 0.0;
+        /// The camera's own labels for those settings ("1/125", "800").
+        std::string shutter_label;
+        std::string iso_label;
+        /// Every file this one exposure produced.
+        std::vector<CapturedAsset> assets;
+    };
 
 
     ///
@@ -209,6 +294,41 @@ namespace ols {
 
         /// stop the stream - once function ends callback will not be called any more
         virtual void stop_stream(CamErrorCode &e) = 0;
+
+        /// True when this driver implements capture_still(). Callers should
+        /// check rather than relying on the error, so a UI can offer a real
+        /// still-capture button only where it means something.
+        virtual bool supports_still_capture() const { return false; }
+
+        /// Take exactly one exposure and return its files.
+        ///
+        /// Blocking, and safe to call while a stream is running: an
+        /// implementation must suspend its own stream for the duration rather
+        /// than interleaving preview traffic with the capture, which is what
+        /// provokes "camera busy" on PTP bodies.
+        ///
+        /// Default: unsupported. Sensor drivers that DMA pixels out of
+        /// hardware have no separate still path and keep using the stream.
+        virtual StillCaptureResult capture_still(StillCaptureRequest const &request,
+                                                 CamErrorCode &e)
+        {
+            (void)request;
+            e = "This camera driver does not implement single-shot still capture";
+            return StillCaptureResult();
+        }
+
+        /// Delete the given files from the camera's storage.
+        ///
+        /// Separate from capture_still() on purpose. The caller deletes only
+        /// after the bytes are durably persisted; deleting inside the capture
+        /// would mean a crash between download and commit destroys the only
+        /// copy of the exposure.
+        virtual void delete_captured(std::vector<CapturedAsset> const &assets,
+                                     CamErrorCode &e)
+        {
+            (void)assets;
+            e = "This camera driver does not implement captured-file deletion";
+        }
 
         /// list of camera controls that the camera supports
         virtual std::vector<CamOptionId> supported_options(CamErrorCode &e) = 0;

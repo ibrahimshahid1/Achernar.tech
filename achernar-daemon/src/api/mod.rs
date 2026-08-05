@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::hardware::{
     camera::OlsCameraDriver,
     capabilities::{driver_capability_report, DriverCapabilityReport},
+    discovery::{discover_cameras, DiscoveryReport},
     focuser::{ConnectedFocuser, Focuser, FocuserDriver, SimFocuser},
     mount::{Mount, MountDriver},
 };
@@ -57,42 +58,55 @@ pub struct ConnectRequest {
     pub driver: String,
     /// Driver-specific option (e.g., sim data directory path)
     pub option: Option<String>,
+    /// Which camera within this driver's enumeration, as reported by
+    /// `/discover`. Defaults to 0.
+    ///
+    /// `/discover` has always returned indexes and this handler has always
+    /// ignored them, so with two cameras attached both "connect" requests
+    /// opened the same device. That is exactly the guiding + imaging setup, and
+    /// the failure is silent — you get a working camera, just not the one you
+    /// picked.
+    pub index: Option<i32>,
 }
 
 pub async fn get_status(
     State(state): State<AppState>,
 ) -> Result<Json<EquipmentStatus>, StatusCode> {
     let camera_status = {
-        let cam_name = state.camera_name.lock().unwrap();
-        let streaming = state.streaming.lock().unwrap();
-        cam_name.as_ref().map(|name| {
-            // Read real sensor temperature and cooler state from the camera.
-            let (temperature, cooling) = {
-                let cam = state.camera.lock().unwrap();
-                let temperature = cam
-                    .as_ref()
-                    .and_then(|c| {
-                        c.get_parameter(crate::hardware::ols_ffi::OlsCamOptionId::Temperature)
-                            .ok()
-                    })
+        // Take the locks in the order documented on AppState — camera, then
+        // camera_name, then streaming — and hold no two of them at once.
+        //
+        // This used to hold `camera_name` and `streaming` while reaching for
+        // `camera`, while `start_stream` held `camera` while reaching for
+        // `streaming`. Opposite orders, so a status poll arriving during a
+        // stream start deadlocked both tasks and, with them, the daemon.
+        // Copying each value out and dropping the guard removes the nesting
+        // entirely rather than relying on everyone remembering the order.
+        let camera_readings = {
+            let cam = state.camera.lock().unwrap();
+            cam.as_ref().map(|c| {
+                let temperature = c
+                    .get_parameter(crate::hardware::ols_ffi::OlsCamOptionId::Temperature)
                     .map(|p| p.cur_val)
                     .unwrap_or(-10.0);
-                let cooling = cam
-                    .as_ref()
-                    .and_then(|c| {
-                        c.get_parameter(crate::hardware::ols_ffi::OlsCamOptionId::CoolerOn)
-                            .ok()
-                    })
+                let cooling = c
+                    .get_parameter(crate::hardware::ols_ffi::OlsCamOptionId::CoolerOn)
                     .map(|p| p.cur_val > 0.5)
                     .unwrap_or(false);
                 (temperature, cooling)
-            };
+            })
+        };
+        let cam_name = state.camera_name.lock().unwrap().clone();
+        let streaming = *state.streaming.lock().unwrap();
+
+        cam_name.map(|name| {
+            let (temperature, cooling) = camera_readings.unwrap_or((-10.0, false));
             CameraStatus {
-                name: name.clone(),
+                name,
                 temperature,
                 cooling,
-                exposing: *streaming,
-                streaming: *streaming,
+                exposing: streaming,
+                streaming,
             }
         })
     };
@@ -143,6 +157,25 @@ pub async fn get_status(
 
 pub async fn get_driver_capabilities() -> Json<DriverCapabilityReport> {
     Json(driver_capability_report())
+}
+
+/// Scan locally-attached buses for cameras — the "Scan for devices" button.
+///
+/// POST rather than GET: this instantiates vendor SDK drivers and touches real
+/// hardware, so it must never be prefetched, cached, or retried automatically
+/// by a browser. It is an operator-initiated action with side effects.
+///
+/// Returns every device found plus a per-driver outcome, so the UI can
+/// distinguish "no ZWO camera attached" from "the ZWO probe failed".
+pub async fn discover_devices(State(state): State<AppState>) -> Json<DiscoveryReport> {
+    tracing::info!("Device discovery scan requested");
+    let report = discover_cameras(&state).await;
+    tracing::info!(
+        "Device discovery complete: {} camera(s) across {} probe(s)",
+        report.cameras.len(),
+        report.probes.len()
+    );
+    Json(report)
 }
 
 pub async fn connect_equipment(
@@ -218,9 +251,22 @@ async fn connect_camera(
                 return Err(StatusCode::NOT_FOUND);
             }
 
-            // Open first camera
-            let camera = driver.open_camera(0).map_err(|e| {
-                tracing::error!("Failed to open camera: {}", e);
+            // Open the requested camera. An out-of-range index is rejected
+            // rather than clamped to 0: silently opening a different camera
+            // than the operator selected is how a guider ends up taking the
+            // light frames.
+            let index = req.index.unwrap_or(0);
+            if index < 0 || index as usize >= cameras.len() {
+                tracing::warn!(
+                    "Camera index {index} out of range; driver {} enumerated {} camera(s)",
+                    req.driver,
+                    cameras.len()
+                );
+                return Err(StatusCode::BAD_REQUEST);
+            }
+
+            let camera = driver.open_camera(index).map_err(|e| {
+                tracing::error!("Failed to open camera {index}: {}", e);
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
@@ -235,6 +281,7 @@ async fn connect_camera(
                 "status": "connected",
                 "driver": req.driver,
                 "camera": cam_name,
+                "index": index,
                 "cameras_found": cameras,
             })))
         }

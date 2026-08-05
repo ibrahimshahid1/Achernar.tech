@@ -6,7 +6,7 @@
 //! online during acquisition.
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::SqlitePool;
 use std::path::Path;
 
 #[derive(Clone)]
@@ -53,166 +53,165 @@ impl LocalStore {
         &self.pool
     }
 
+    /// Apply every migration that has not run yet.
+    ///
+    /// `migrations/*.sql` is the single source of truth for the schema. It did
+    /// not used to be: the files sat unexecuted while a `const SCHEMA` in this
+    /// module created a *different* set of tables, so the two definitions of
+    /// `frames` disagreed and reading the migrations told you nothing about
+    /// the database you actually had. The embedded copy is gone.
+    ///
+    /// The runner is deliberately small rather than pulling in `sqlx::migrate!`
+    /// — it needs one behaviour that generic runners do not have, described at
+    /// `is_benign` below.
     async fn create_schema(&self) -> crate::error::Result<()> {
-        for statement in SCHEMA {
-            sqlx::query(statement)
+        sqlx::query(
+            r#"CREATE TABLE IF NOT EXISTS schema_migrations (
+                   version     INTEGER PRIMARY KEY,
+                   name        TEXT NOT NULL,
+                   applied_at  TEXT NOT NULL DEFAULT (datetime('now'))
+               )"#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(storage_error("create schema_migrations"))?;
+
+        for (version, name, sql) in MIGRATIONS {
+            let already: Option<(i64,)> =
+                sqlx::query_as("SELECT version FROM schema_migrations WHERE version = ?")
+                    .bind(*version)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(storage_error("read schema_migrations"))?;
+            if already.is_some() {
+                continue;
+            }
+
+            tracing::info!("Applying migration {:03}_{}", version, name);
+            for statement in split_statements(sql) {
+                match sqlx::query(&statement).execute(&self.pool).await {
+                    Ok(_) => {}
+                    Err(err) if is_benign(&err) => {
+                        // Databases created before this runner existed already
+                        // carry some of these columns, added at startup by the
+                        // old `ensure_column` calls. `ALTER TABLE ADD COLUMN`
+                        // is not idempotent the way `CREATE TABLE IF NOT
+                        // EXISTS` is, so a first run of the ledger against an
+                        // existing store would otherwise abort on a column
+                        // that is already correct.
+                        tracing::debug!(
+                            "migration {:03}: skipping already-applied statement ({err})",
+                            version
+                        );
+                    }
+                    Err(err) => {
+                        return Err(crate::error::StorageError::Database(format!(
+                            "migration {version:03}_{name} failed on statement `{}`: {err}",
+                            statement.chars().take(120).collect::<String>()
+                        ))
+                        .into())
+                    }
+                }
+            }
+
+            sqlx::query("INSERT INTO schema_migrations (version, name) VALUES (?, ?)")
+                .bind(*version)
+                .bind(*name)
                 .execute(&self.pool)
                 .await
-                .map_err(storage_error("create local SQLite schema"))?;
+                .map_err(storage_error("record schema migration"))?;
         }
-        // `CREATE TABLE IF NOT EXISTS` does not evolve databases created by an
-        // older daemon. Keep additive provenance columns available without
-        // requiring users to delete an existing offline store.
-        ensure_column(&self.pool, "focus_samples", "frame_id", "TEXT").await?;
-        ensure_column(&self.pool, "focus_samples", "hfd", "REAL").await?;
-        ensure_column(&self.pool, "frames", "checksum_sha256", "TEXT").await?;
         Ok(())
     }
 }
 
-async fn ensure_column(
-    pool: &SqlitePool,
-    table: &str,
-    column: &str,
-    definition: &str,
-) -> crate::error::Result<()> {
-    let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
-        .fetch_all(pool)
-        .await
-        .map_err(storage_error("inspect local SQLite schema"))?;
-    let exists = rows
-        .iter()
-        .any(|row| row.try_get::<String, _>("name").ok().as_deref() == Some(column));
-    if !exists {
-        sqlx::query(&format!(
-            "ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        ))
-        .execute(pool)
-        .await
-        .map_err(storage_error("upgrade local SQLite schema"))?;
+/// Migrations, embedded at compile time so a deployed binary carries its own
+/// schema and cannot be run against a stale checkout of `migrations/`.
+const MIGRATIONS: &[(i64, &str, &str)] = &[
+    (
+        1,
+        "initial_schema",
+        include_str!("../../migrations/001_initial_schema.sql"),
+    ),
+    (
+        2,
+        "focus_schema",
+        include_str!("../../migrations/002_focus_schema.sql"),
+    ),
+    (
+        3,
+        "filter_mount_schema",
+        include_str!("../../migrations/003_filter_mount_schema.sql"),
+    ),
+    (
+        4,
+        "frame_assets",
+        include_str!("../../migrations/004_frame_assets.sql"),
+    ),
+    (
+        5,
+        "focuser_scale",
+        include_str!("../../migrations/005_focuser_scale.sql"),
+    ),
+];
+
+/// True for errors that mean "this statement's effect is already present".
+///
+/// Narrow on purpose: only the two SQLite messages that indicate an additive
+/// change already exists. Anything else is a real failure and aborts startup,
+/// because a half-applied schema is worse than refusing to start.
+fn is_benign(err: &sqlx::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("duplicate column name") || msg.contains("already exists")
+}
+
+/// Split a migration file into statements on `;` at end of line.
+///
+/// Sufficient for this schema — it contains no triggers, no `BEGIN…END`
+/// blocks, and no semicolons inside string literals. Line comments are
+/// stripped so a `--` containing a semicolon cannot split a statement.
+fn split_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    for line in sql.lines() {
+        let code = match line.find("--") {
+            Some(idx) => &line[..idx],
+            None => line,
+        };
+        if code.trim().is_empty() {
+            continue;
+        }
+        current.push_str(code);
+        current.push('\n');
+        if code.trim_end().ends_with(';') {
+            let trimmed = current.trim().trim_end_matches(';').trim().to_string();
+            if !trimmed.is_empty() {
+                statements.push(trimmed);
+            }
+            current.clear();
+        }
     }
-    Ok(())
+    let tail = current.trim().trim_end_matches(';').trim().to_string();
+    if !tail.is_empty() {
+        statements.push(tail);
+    }
+    statements
+}
+
+/// Migration list for tests that need a schema in an in-memory database.
+/// Exposed so other modules' tests build their fixture from the *same*
+/// migrations the daemon runs, rather than a hand-copied CREATE TABLE that
+/// silently drifts (which is how the schema split in the first place).
+#[cfg(test)]
+pub(crate) fn migrations_for_test() -> &'static [(i64, &'static str, &'static str)] {
+    MIGRATIONS
+}
+
+#[cfg(test)]
+pub(crate) fn split_statements_for_test(sql: &str) -> Vec<String> {
+    split_statements(sql)
 }
 
 fn storage_error(context: &'static str) -> impl Fn(sqlx::Error) -> crate::error::AchernarError {
     move |err| crate::error::StorageError::Database(format!("{context}: {err}")).into()
 }
-
-const SCHEMA: &[&str] = &[
-    r#"
-    CREATE TABLE IF NOT EXISTS focus_runs (
-        id TEXT PRIMARY KEY,
-        rig_id TEXT NOT NULL,
-        filter_name TEXT,
-        start_position INTEGER NOT NULL,
-        best_position INTEGER,
-        best_hfr REAL,
-        state TEXT NOT NULL,
-        temperature REAL,
-        started_at TEXT NOT NULL,
-        completed_at TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS focus_samples (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id TEXT NOT NULL,
-        position INTEGER NOT NULL,
-        hfr REAL NOT NULL,
-        hfd REAL,
-        fwhm REAL,
-        star_count INTEGER NOT NULL DEFAULT 0,
-        quality_score REAL,
-        temperature REAL,
-        captured_at TEXT NOT NULL,
-        frame_id TEXT,
-        FOREIGN KEY (run_id) REFERENCES focus_runs(id) ON DELETE CASCADE
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS focus_actions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id TEXT,
-        action TEXT NOT NULL,
-        from_position INTEGER,
-        to_position INTEGER,
-        steps INTEGER,
-        reason TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        FOREIGN KEY (run_id) REFERENCES focus_runs(id) ON DELETE SET NULL
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS focus_predictions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        run_id TEXT,
-        model_name TEXT,
-        model_version TEXT,
-        predicted_offset INTEGER,
-        confidence REAL,
-        payload_json TEXT NOT NULL DEFAULT '{}',
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        FOREIGN KEY (run_id) REFERENCES focus_runs(id) ON DELETE SET NULL
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS frames (
-        id TEXT PRIMARY KEY,
-        session_id TEXT,
-        local_path TEXT NOT NULL,
-        object_key TEXT,
-        checksum_sha256 TEXT,
-        width INTEGER,
-        height INTEGER,
-        exposure_s REAL,
-        gain REAL,
-        filter_name TEXT,
-        temperature REAL,
-        wcs_json TEXT NOT NULL DEFAULT '{}',
-        quality_json TEXT NOT NULL DEFAULT '{}',
-        captured_at TEXT NOT NULL,
-        synced_at TEXT
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS equipment_profiles (
-        id TEXT PRIMARY KEY,
-        equipment_type TEXT NOT NULL,
-        name TEXT NOT NULL,
-        driver TEXT NOT NULL,
-        options_json TEXT NOT NULL DEFAULT '{}',
-        last_seen_at TEXT,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS sync_queue (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        entity_type TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
-        operation TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        attempts INTEGER NOT NULL DEFAULT 0,
-        last_error TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now')),
-        synced_at TEXT
-    )
-    "#,
-    r#"
-    CREATE TABLE IF NOT EXISTS control_audit_logs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        actor TEXT NOT NULL DEFAULT 'local',
-        action TEXT NOT NULL,
-        target TEXT,
-        payload_json TEXT NOT NULL DEFAULT '{}',
-        accepted INTEGER NOT NULL DEFAULT 1,
-        reason TEXT,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    )
-    "#,
-    "CREATE INDEX IF NOT EXISTS focus_samples_run_idx ON focus_samples(run_id)",
-    "CREATE INDEX IF NOT EXISTS frames_session_idx ON frames(session_id, captured_at)",
-    "CREATE INDEX IF NOT EXISTS sync_queue_pending_idx ON sync_queue(synced_at, created_at)",
-    "CREATE INDEX IF NOT EXISTS control_audit_logs_created_idx ON control_audit_logs(created_at)",
-];

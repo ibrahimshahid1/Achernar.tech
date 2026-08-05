@@ -67,10 +67,16 @@ pub enum WsEvent {
         run_id: String,
         error: String,
     },
+    /// Never emitted yet — no publisher constructs this. Kept in the schema,
+    /// but shaped to match `DriftPrediction`: a drift prediction always has a
+    /// magnitude, and has a confidence and a recommendation only when a refocus
+    /// threshold is known. A `bool` here would force a publisher to invent
+    /// `false` for a rig whose optics were never declared, which reads as "we
+    /// checked and it is fine".
     FocusDriftAlert {
         predicted_drift: f64,
-        confidence: f64,
-        refocus_recommended: bool,
+        confidence: Option<f64>,
+        refocus_recommended: Option<bool>,
     },
 
     // Vision events — Section 8.1

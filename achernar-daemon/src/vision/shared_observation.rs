@@ -95,6 +95,16 @@ pub struct SharedObservation {
     pub background_sigma: f32,
     pub snr_proxy_median: f32,
     pub saturation_fraction: f32,
+    /// Whether the star-saturation gate could run on this frame.
+    ///
+    /// Without it, `saturation_fraction: 0.0` and `star_rejections.saturated: 0`
+    /// are ambiguous — they read as "clean frame" whether the gate found nothing
+    /// or was never able to test. On a 14-bit body with no declared saturation
+    /// point it is always the second. `#[serde(default)]` so observations
+    /// persisted before this field deserialize as `NotPerformed`, which is the
+    /// truthful reading of them.
+    #[serde(default)]
+    pub saturation_gate: crate::vision::quality::SaturationGate,
 
     // --- From PlateSolver (lower cadence) ---
     pub pointing_error_arcmin: Option<f32>,

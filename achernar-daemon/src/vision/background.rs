@@ -8,7 +8,16 @@ pub struct BackgroundStats {
     pub saturation_fraction: f32,
 }
 
-pub fn estimate_background(pixels: &[f32], max_adu: f32) -> BackgroundStats {
+/// Robust sky statistics.
+///
+/// `saturation_adu` is the sensor's linear saturation point, or `None` when it
+/// is unknown — see [`crate::vision::quality::LumaFrame::saturation_adu`].
+/// Unknown means no pixel is excluded and `saturation_fraction` reports 0,
+/// which is safe here in a way it is not for the star gate: the background is a
+/// median/MAD estimate and is robust to a handful of clipped pixels, whereas
+/// HFR is measured *on* the clipped star. Read `saturation_fraction == 0.0`
+/// together with the frame's `SaturationGate` before treating it as evidence.
+pub fn estimate_background(pixels: &[f32], saturation_adu: Option<f32>) -> BackgroundStats {
     let mut finite: Vec<f32> = pixels.iter().copied().filter(|v| v.is_finite()).collect();
     if finite.is_empty() {
         return BackgroundStats {
@@ -58,7 +67,7 @@ pub fn estimate_background(pixels: &[f32], max_adu: f32) -> BackgroundStats {
         stddev(&clipped, mean(&clipped))
     };
 
-    let saturation_threshold = saturation_threshold(max_adu);
+    let saturation_threshold = saturation_threshold(saturation_adu);
     let saturated = finite
         .iter()
         .filter(|value| **value >= saturation_threshold)
@@ -115,15 +124,20 @@ fn percentile_sorted(sorted_values: &[f32], quantile: f32) -> f32 {
     sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
 }
 
-fn saturation_threshold(max_adu: f32) -> f32 {
-    if max_adu <= 0.0 {
-        f32::INFINITY
-    } else {
-        // Conservative fallback until a camera profile supplies its measured
-        // linearity limit. The previous `max(..., max_adu - 1)` accidentally
-        // turned this into an almost-100% threshold and missed clipped/nonlinear
-        // stellar cores between 98% and full scale.
-        max_adu * 0.98
+fn saturation_threshold(saturation_adu: Option<f32>) -> f32 {
+    match saturation_adu {
+        // Unknown: exclude nothing. An infinite threshold is the honest
+        // encoding of "we cannot test this" — the alternative, deriving one
+        // from the container depth, produces a finite-looking threshold that
+        // no sample on a 14-bit body can ever reach.
+        Some(sat) if sat > 0.0 => {
+            // 0.98 rather than full scale: sensor response goes non-linear
+            // below the hard clip, and the previous `max(..., max_adu - 1)`
+            // accidentally made this an almost-100% threshold that missed
+            // clipped cores between 98% and full scale.
+            sat * 0.98
+        }
+        _ => f32::INFINITY,
     }
 }
 
@@ -161,7 +175,7 @@ mod tests {
         let mut pixels = vec![100.0_f32; 100];
         pixels.extend([102.0, 98.0, 65535.0, 65534.0]);
 
-        let stats = estimate_background(&pixels, 65535.0);
+        let stats = estimate_background(&pixels, Some(65535.0));
 
         assert!((98.0..=102.0).contains(&stats.background_adu));
         assert!(stats.background_sigma < 10.0);
@@ -173,7 +187,7 @@ mod tests {
         let mut pixels = vec![100.0_f32; 90];
         pixels.extend(vec![10_000.0_f32; 10]);
 
-        let stats = estimate_background(&pixels, 65_535.0);
+        let stats = estimate_background(&pixels, Some(65_535.0));
 
         assert_eq!(stats.background_adu, 100.0);
         assert_eq!(stats.background_sigma, 0.0);

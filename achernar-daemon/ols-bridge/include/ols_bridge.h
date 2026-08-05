@@ -46,6 +46,41 @@ const char* ols_last_error(void);
 #define OLS_CAP_CAMERA_INDIGO   (1u << 6)
 #define OLS_CAP_CAMERA_WDIR     (1u << 7)
 
+/* Decoder capabilities. Bit 16 onwards so the camera-driver block above stays
+ * free to grow. Without LibRaw a gphoto2 body still connects, streams and
+ * captures — it just returns a container nothing downstream can read, which is
+ * a far more confusing failure than a missing driver. Report it at startup. */
+#define OLS_CAP_DECODE_LIBRAW   (1u << 16)
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  ABI Version
+ * ═══════════════════════════════════════════════════════════════════ */
+
+/**
+ * Binary compatibility version of the structs and calls in this header.
+ *
+ * Bump this on ANY layout change to a struct crossing the boundary, or any
+ * change to an existing function's signature. The Rust side compiles against
+ * a copy of these declarations, so a bridge built from one revision and a
+ * daemon built from another will not fail to link — they will silently read
+ * each other's structs at the wrong offsets and produce garbage frames.
+ *
+ * History:
+ *   1 — initial
+ *   2 — OlsStreamFormat gained roi_num/roi_den; OlsFrame gained
+ *       source_data/source_data_size/source_ext; added ols_camera_param_choices
+ *       and the single-shot still capture API.
+ *   3 — added the LibRaw decode API (OlsRawImage / OlsRawImageInfo,
+ *       ols_decode_raw and friends). No existing struct or signature changed,
+ *       but a v2 bridge does not export the new symbols, so the daemon must
+ *       still refuse to run against one.
+ */
+#define OLS_BRIDGE_ABI_VERSION 3u
+
+/** Runtime ABI version of the compiled bridge. Compare against
+ *  OLS_BRIDGE_ABI_VERSION at startup and refuse to run on a mismatch. */
+uint32_t ols_bridge_abi_version(void);
+
 /** Get the OLS bridge version string. */
 const char* ols_bridge_version(void);
 
@@ -85,6 +120,13 @@ typedef struct {
     int32_t width;
     int32_t height;
     int32_t bin;
+    /* Region-of-interest fraction (roi_num/roi_den) applied by the driver.
+     * These are part of OLS's CamStreamFormat and identify a format uniquely:
+     * a DSLR enumerates several entries that share width/height/bin and differ
+     * only here. Dropping them meant a format selected by index could not be
+     * matched back to its driver-side entry. */
+    int32_t roi_num;
+    int32_t roi_den;
     float framerate;
 } OlsStreamFormat;
 
@@ -97,6 +139,17 @@ typedef struct {
     int32_t height;
     const uint8_t* data;
     size_t data_size;
+    /* Optional: the unmodified bytes of the file the camera itself produced
+     * (CR2/CR3/RW2/NEF/JPEG), when the driver has them. NULL otherwise.
+     * `data` above has already been black-level-corrected, scaled and cropped
+     * by the RAW decoder, so it cannot be reprocessed later with a different
+     * pipeline — these bytes can. Valid only for the duration of the callback;
+     * copy before returning if you intend to keep them. */
+    const uint8_t* source_data;
+    size_t source_data_size;
+    /* Lowercase extension without the dot ("cr3", "cr2", "rw2", "jpg"), or
+     * NULL. Identifies the container so it can be written with a true name. */
+    const char* source_ext;
 } OlsFrame;
 
 typedef enum {
@@ -220,7 +273,240 @@ OlsError ols_camera_option_count(OlsCamera* cam, int32_t* out_count);
 OlsError ols_camera_option_id(OlsCamera* cam, int32_t index, OlsCamOptionId* out_id);
 OlsError ols_camera_get_param(OlsCamera* cam, OlsCamOptionId id, OlsCamParam* out_param);
 OlsError ols_camera_set_param(OlsCamera* cam, OlsCamOptionId id, double value);
+
+/**
+ * Fetch the human-readable choice labels of a OLS_TYPE_SELECTION option.
+ *
+ * DSLR and mirrorless bodies do not expose exposure and gain as continuous
+ * numbers. They expose `shutterspeed` and `iso` as enumerations whose *labels*
+ * carry the only physical meaning: index 17 means nothing, "1/125" means an
+ * eight-millisecond exposure. OlsCamParam reports min/max/cur as bare indices,
+ * so without this call the daemon can set an exposure but cannot know what
+ * exposure it set — and any metadata it records is a guess.
+ *
+ * Labels are written into `buf` as consecutive NUL-terminated strings
+ * ("100\0" "200\0" "400\0"), in choice-index order, so the Nth string is the
+ * value to pass to ols_camera_set_param for choice N.
+ *
+ * `*out_count` always receives the number of choices, and `*out_required` the
+ * total buffer size needed, even when `buf` is NULL or too small — call once
+ * with buf=NULL to size the allocation, then again to fill it. Returns
+ * OLS_ERR_INVALID (without writing) when `buf` is non-NULL but too small.
+ *
+ * A non-selection option is not an error: it reports zero choices.
+ */
+OlsError ols_camera_param_choices(OlsCamera* cam, OlsCamOptionId id,
+                                  char* buf, size_t buf_len,
+                                  int32_t* out_count, size_t* out_required);
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  Single-Shot Still Capture
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Separate from the streaming API on purpose. A stream is free-running: the
+ * consumer sees whatever frame happened to arrive most recently, and a setting
+ * written mid-stream may not have reached the sensor before the next frame
+ * appears. Fine for a preview, unusable for a science exposure, where the
+ * pixels and the metadata describing them must come from one shutter
+ * actuation.
+ *
+ * ols_camera_capture_still() applies and reads back the settings, triggers
+ * exactly one exposure, and returns every file that exposure produced. None of
+ * it passes through the frame callback.
+ *
+ * Ownership: the returned OlsStillCapture owns its byte buffers. Copy what you
+ * need, then call ols_capture_destroy(). Delete the files from the camera with
+ * ols_camera_delete_captured() only AFTER the bytes are durably persisted. */
+
+typedef struct {
+    /** Requested exposure. A body with an enumerated shutter ladder selects
+     *  the nearest step and reports it back in OlsStillCaptureInfo. */
+    double exposure_seconds;
+    /** Requested ISO / gain. <= 0 leaves the body's current setting alone. */
+    double sensitivity;
+} OlsStillRequest;
+
+typedef struct {
+    /** Unix timestamps bracketing the exposure, taken by the driver around the
+     *  trigger. `started_at` is what belongs in FITS DATE-OBS — a clock read
+     *  after the call returns is late by the exposure plus the download. */
+    double started_at;
+    double completed_at;
+    /** Settings read back from the camera after being applied. */
+    double applied_exposure;
+    double applied_sensitivity;
+    /** The camera's own labels, e.g. "1/125" and "800". Owned by the capture;
+     *  valid until ols_capture_destroy(). Never NULL — empty string instead. */
+    const char* shutter_label;
+    const char* iso_label;
+    int32_t asset_count;
+} OlsStillCaptureInfo;
+
+typedef struct {
+    /** Path on the camera's storage, retained so the file can be deleted after
+     *  persistence. Owned by the capture. */
+    const char* camera_path;
+    /** Lowercase extension without the dot: "cr3", "cr2", "rw2", "jpg". */
+    const char* extension;
+    const uint8_t* bytes;
+    size_t byte_length;
+} OlsCapturedAsset;
+
+typedef struct OlsStillCapture_t OlsStillCapture;
+
+/** Whether this camera implements single-shot still capture. */
+OlsError ols_camera_supports_still(OlsCamera* cam, int32_t* out_supported);
+
+/** Take one exposure. Blocking; suspends any running stream for the duration.
+ *  On success `*out_capture` must be released with ols_capture_destroy(). */
+OlsError ols_camera_capture_still(OlsCamera* cam, const OlsStillRequest* request,
+                                  OlsStillCapture** out_capture);
+
+/** Timestamps, applied settings and asset count for a completed capture. */
+OlsError ols_capture_info(const OlsStillCapture* capture, OlsStillCaptureInfo* out_info);
+
+/** Number of files the exposure produced (2 on a RAW+JPEG body). */
+int32_t ols_capture_asset_count(const OlsStillCapture* capture);
+
+/** Borrow one asset. Pointers are owned by the capture and are valid until
+ *  ols_capture_destroy(); copy before releasing. */
+OlsError ols_capture_asset_get(const OlsStillCapture* capture, int32_t index,
+                               OlsCapturedAsset* out_asset);
+
+/** Delete this capture's files from the camera. Call only after the bytes are
+ *  durably persisted. */
+OlsError ols_camera_delete_captured(OlsCamera* cam, const OlsStillCapture* capture);
+
+/** Release a capture and its byte buffers. */
+void ols_capture_destroy(OlsStillCapture* capture);
+
 void ols_camera_destroy(OlsCamera* cam);
+
+/* ═══════════════════════════════════════════════════════════════════
+ *  RAW Decode (LibRaw)
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * Turns the bytes of a camera-authored RAW container (CR2/CR3/RW2/NEF/ARW)
+ * into a plain 16-bit Bayer plane. Not a camera method: the input is a byte
+ * buffer, so a file downloaded hours ago on another machine decodes exactly
+ * like one that just came off the shutter.
+ *
+ * ── What comes out: raw sensor ADU ──
+ *
+ * The pixels are the sensor's own numbers. No black-level subtraction, no
+ * scaling, no white balance, no left-shift to "fill" 16 bits. Everything
+ * needed to calibrate them later is reported in OlsRawImageInfo instead.
+ *
+ * This is deliberately NOT what ols::load_libraw() in libraw_wrapper.h does.
+ * That function subtracts black and multiplies by `65535 / (maximum - black)`
+ * — computed in *integer* arithmetic, so a 14-bit Canon gets 4 where the exact
+ * factor is 4.572 and an eighth of the range is discarded. Three reasons that
+ * is wrong for science frames, all of which survive fixing the truncation:
+ *
+ *   1. It buys nothing. A monotonic linear map changes no SNR and resolves no
+ *      detail. It produces a coarser lattice — 14336 distinct levels spread
+ *      over 0…57340 with stride 4 — in exchange for nothing.
+ *   2. It severs ADU from electrons. Gain (e-/ADU) is a sensor property at a
+ *      given ISO, and shot-noise variance in ADU² is signal/gain. Multiply by
+ *      k and the signal scales by k while its variance scales by k², so any
+ *      gain fitted from the frame is wrong by k. k is body-dependent (4 here,
+ *      17 on a 12-bit body), so two cameras' frames stop being comparable.
+ *   3. It breaks calibration arithmetic. Black level moves with ISO and
+ *      temperature, so darks and bias land on different integer k than the
+ *      lights, and master-frame subtraction is off by a varying constant.
+ *
+ * Black is not subtracted either. Subtracting into an unsigned type clips the
+ * negative half of the noise distribution around the bias pedestal, biasing
+ * the background mean upward and making read noise unrecoverable — σ cannot be
+ * fitted from a one-sided distribution. Black is also per-channel and
+ * temperature-dependent, and is better measured from bias frames than trusted
+ * from LibRaw's table. Calibration is a downstream step producing a new asset.
+ *
+ * load_libraw() is left untouched: the preview stream wants a stretched,
+ * ready-to-look-at image and is welcome to it.
+ *
+ * ── Ownership ──
+ *
+ * `data` is BORROWED for the duration of ols_decode_raw() only. The caller
+ * keeps owning the container bytes and may free them the moment it returns.
+ *
+ * The returned OlsRawImage owns one tightly-packed pixel buffer and the
+ * strings in its info. Release it with ols_rawimage_destroy(). LibRaw's own
+ * (larger, margin-inclusive) buffers are freed before the call returns.
+ */
+
+typedef struct OlsRawImage_t OlsRawImage;
+
+typedef struct {
+    /** Post-crop dimensions of the returned plane. */
+    int32_t       width;
+    int32_t       height;
+    /** Bayer phase at pixel (0,0) OF THE RETURNED PLANE, not of the sensor. */
+    OlsBayerType  bayer;
+    /** Storage depth of each sample: always 16. The sensor's actual depth is
+     *  implied by white_level (16383 → 14-bit), which is what you want for
+     *  saturation tests — the samples do not use the top of the container. */
+    int32_t       bits_per_sample;
+
+    /* ── Provenance: what the decode did NOT do, so it can be done later ── */
+
+    /** Global black pedestal in ADU. NOT subtracted from the pixels. */
+    int32_t       black_level;
+    /** Per-CFA-channel black offsets, added to black_level. Zero on bodies
+     *  that use a single pedestal. Recorded because a black level that omits
+     *  them is wrong by a few ADU per channel — small, but it is exactly the
+     *  systematic that shows up as a colour cast in a stacked background. */
+    int32_t       cblack[4];
+    /** Dimensions of LibRaw's 2-D black-level table, when the body has one
+     *  ({0,0} otherwise). A table larger than 2x2 is NOT representable in
+     *  cblack[] above, so a non-trivial value here means the recorded black
+     *  level is incomplete and calibration should be driven from bias frames.
+     *  Reported rather than dropped: an archive that quietly omits this cannot
+     *  be told apart later from one that had nothing to omit. */
+    int32_t       cblack_pattern[2];
+    /** Saturation point in ADU. NOT normalised to. */
+    int32_t       white_level;
+    /** As-shot white balance multipliers. Recorded, never applied. */
+    float         cam_mul[4];
+    /** Borrowed from the image; valid until ols_rawimage_destroy(). Never
+     *  NULL — empty string instead. */
+    const char   *make;
+    const char   *model;
+} OlsRawImageInfo;
+
+/**
+ * Decode `len` bytes of a RAW container.
+ *
+ * Pass width=-1, height=-1 for the full active area. A positive width/height
+ * selects a centred sub-region; the offset is forced even so the Bayer phase
+ * of the returned plane still matches `bayer`.
+ *
+ * `bin` must be 1. The parameter exists so binning can be added without
+ * another ABI break, but binning here would be a lossy pre-calibration step of
+ * exactly the kind this API refuses to take: a 2x2 sum saturates at 4x
+ * white_level, so the returned plane would need saturation semantics that
+ * OlsRawImageInfo cannot currently express. Bin after calibration.
+ *
+ * Returns OLS_ERR_NOT_FOUND when the bridge was built without LibRaw, and
+ * OLS_ERR_INVALID for a container LibRaw parses but that has no 16-bit Bayer
+ * plane (Foveon, sRAW, and float DNG all land here).
+ */
+OlsError ols_decode_raw(const uint8_t* data, size_t len,
+                        int32_t width, int32_t height, int32_t bin,
+                        OlsRawImage** out_image);
+
+/** Dimensions, Bayer phase and calibration provenance. */
+OlsError ols_rawimage_info(const OlsRawImage* image, OlsRawImageInfo* out_info);
+
+/**
+ * Borrow the pixel plane: `width * height * 2` bytes, row-major, tightly
+ * packed, native-endian uint16. Valid until ols_rawimage_destroy().
+ * Returns NULL on a null handle.
+ */
+const uint8_t* ols_rawimage_pixels(const OlsRawImage* image, size_t* out_len);
+
+/** Release an image and its pixel buffer. */
+void ols_rawimage_destroy(OlsRawImage* image);
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Mount Types & Structures

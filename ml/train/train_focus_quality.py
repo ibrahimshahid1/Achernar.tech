@@ -173,6 +173,12 @@ def train(config: dict) -> dict:
                 loss = loss + lambda_rank * ranknet_within_run(mu, yb, rb.numpy())
             opt.zero_grad()
             loss.backward()
+            # Guard the warmup->NLL transition: once the variance head switches on,
+            # inv_var = exp(-log_var) (up to exp(8) ~ 3000x) amplifies the mean-head
+            # gradient and can transiently diverge (the epoch-3 MAE ~7e10 spike).
+            # heteroscedastic_nll clamps log_var's *value* but not the gradient, so
+            # clip the global grad norm — standard, and cheap insurance on noisy data.
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
         sched.step()
 

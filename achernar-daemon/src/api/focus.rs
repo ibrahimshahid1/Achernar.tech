@@ -157,6 +157,12 @@ pub async fn start_focus_run(
         {
             tracing::error!("Focused successfully but failed to persist focus action: {err}");
         }
+
+        // Fold the converged position into the drift filter. Only here, after
+        // the move succeeded: this is the one moment the daemon knows, by
+        // measurement rather than by model, where best focus is.
+        let (temperature, _, _) = crate::api::camera::read_temperature(&state);
+        record_drift_measurement(&state, best_position, temperature, &run.samples).await;
     }
 
     Ok(Json(response_from_run(&run)))
@@ -206,14 +212,321 @@ pub async fn get_focus_history(
     ))
 }
 
-/// GET /api/v1/focus/drift — get current drift prediction
+#[derive(Debug, Deserialize)]
+pub struct DriftQuery {
+    /// How far ahead to forecast, in seconds. Ten minutes by default — roughly
+    /// a sub-exposure, which is the interval over which "will focus still be
+    /// good?" is a question worth asking.
+    pub horizon_s: Option<f64>,
+}
+
+/// GET /api/v1/focus/drift — current drift prediction.
+///
+/// Three distinct outcomes, kept distinct on purpose:
+///
+/// * `disabled` — `[focus.drift]` is off or misconfigured. The operator has to
+///   do something.
+/// * `uninitialized` — configured, but the filter has not seen enough measured
+///   focus positions to say anything. Nothing to do but observe.
+/// * `ok` — a real prediction with its uncertainty.
+///
+/// Collapsing these into one "unavailable" (which is what this endpoint used to
+/// return unconditionally) tells the operator nothing about which of the three
+/// they are in, and they call for different responses.
 pub async fn get_drift_prediction(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<DriftQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    Ok(Json(serde_json::json!({
-        "status": "unavailable",
-        "detail": "Deterministic autofocus is enabled; drift prediction model is not active.",
-    })))
+    let Some(forecaster) = state.focus_drift.clone() else {
+        return Ok(Json(serde_json::json!({
+            "status": "disabled",
+            "detail": "Focus drift forecasting is off. Set [focus.drift] enabled = true in \
+                       achernar.toml. It will start estimating immediately — optics are \
+                       needed only to turn its estimate into refocus advice.",
+        })));
+    };
+
+    let horizon_s = query.horizon_s.filter(|h| h.is_finite() && *h >= 0.0).unwrap_or(600.0);
+
+    // Temperature drives the forecast, so its provenance travels with the
+    // answer. A DSLR has no sensor thermometer: `missing` is reported as
+    // missing rather than substituted, because a prediction built on an
+    // invented temperature is indistinguishable from one built on a real
+    // reading once it has been written down.
+    let (temperature, temperature_state, temperature_source) =
+        crate::api::camera::read_temperature(&state);
+
+    let Some(temperature_c) = temperature else {
+        let guard = forecaster.lock().await;
+        let update_count = guard.update_count();
+        drop(guard);
+        return Ok(Json(serde_json::json!({
+            "status": "unavailable",
+            "detail": "No temperature reading, and drift is predicted from temperature. \
+                       Attach a focuser or environment sensor that reports one.",
+            "temperature_state": temperature_state,
+            "update_count": update_count,
+        })));
+    };
+
+    // Lock, predict, copy out, release — the SQLite write below must not hold
+    // the filter (see the lock-order note on AppState).
+    let (prediction, update_count, coefficient, drift_rate, threshold) = {
+        let guard = forecaster.lock().await;
+        (
+            guard.predict(temperature_c, horizon_s),
+            guard.update_count(),
+            guard.temperature_coefficient(),
+            guard.drift_rate(),
+            guard.threshold(),
+        )
+    };
+
+    if !prediction.initialized {
+        return Ok(Json(serde_json::json!({
+            "status": "uninitialized",
+            "detail": "The filter has not seen enough measured focus positions yet. It learns \
+                       from converged autofocus runs; run one or two more.",
+            "update_count": update_count,
+            "temperature_c": temperature_c,
+            "temperature_state": temperature_state,
+            "refocus_threshold_steps": threshold.map(|(steps, _)| steps),
+        })));
+    }
+
+    // Audit the evaluation. A failed write must not fail the request: the
+    // operator asked what focus is doing, not to write a row.
+    if let Err(err) = crate::storage::focus_drift_repo::record_event(
+        state.local_store.pool(),
+        None,
+        &prediction,
+        Some(temperature_c),
+    )
+    .await
+    {
+        tracing::warn!("Failed to record focus_drift_event: {err}");
+    }
+
+    let (k, k_sigma) = coefficient;
+    let mut body = serde_json::json!({
+        "status": "ok",
+
+        // ── Estimation. Always present once the filter has data; none of it
+        //    needs to know anything about the optics. ────────────────────────
+        "predicted_drift_steps": prediction.predicted_drift_steps,
+        // Half-width of the 95% interval. Published beside the point estimate
+        // because a drift of 40 +/- 200 steps and one of 40 +/- 5 justify very
+        // different actions, and a bare point estimate hides which you have.
+        "confidence_interval_steps": prediction.confidence_interval,
+        "temperature_coefficient_steps_per_c": k,
+        "temperature_coefficient_sigma": k_sigma,
+        "drift_rate_steps_per_s": drift_rate,
+        "update_count": update_count,
+        "horizon_s": horizon_s,
+        "temperature_c": temperature_c,
+        "temperature_state": temperature_state,
+        "temperature_source": temperature_source,
+
+        // ── Decision. Null when no refocus threshold is known. ─────────────
+        "exceed_probability": prediction.exceed_probability,
+        "refocus_recommended": prediction.refocus_recommended,
+        "time_to_refocus_s": prediction.time_to_refocus_s,
+        "refocus_threshold_steps": threshold.map(|(steps, _)| steps),
+        "threshold_source": threshold.map(|(_, source)| source),
+        "advice": prediction.advice,
+    });
+
+    // When advice is unavailable, say what to do about it — next to the
+    // estimate, which is the evidence that doing it is worth the trouble.
+    // Silence would be a weaker prompt than "here is what I already know".
+    if matches!(
+        prediction.advice,
+        crate::focus::focus_drift::AdviceStatus::ThresholdUnknown
+    ) {
+        body["advice_detail"] = serde_json::json!(
+            "Refocus advice unavailable: no refocus threshold. Estimation is unaffected — \
+             the drift and coefficient above are real. Supply [focus.drift] \
+             steps_per_micron (with f_ratio here or focal_ratio on the rigs row), or set \
+             rigs.pixel_size_um and let the next autofocus V-curve measure the focuser \
+             scale for you."
+        );
+    }
+
+    Ok(Json(body))
+}
+
+/// Measure the focuser's steps-per-micron from the run that just finished, and
+/// adopt the refocus threshold that falls out of it.
+///
+/// `steps_per_micron` is mechanical — turns of a knob against a drawtube. It is
+/// printed on nothing, few operators know it for their own focuser, and
+/// requiring it by hand is what kept the refocus threshold unset. The sweep the
+/// daemon has just run measured it: the slope of a V-curve wing, against the
+/// focal ratio and the sensor pixel pitch, gives it directly. See
+/// [`crate::focus::focus_drift::steps_per_micron_from_vcurve`] for the
+/// derivation and the error terms it neglects.
+///
+/// Everything here is best-effort. A rig that has not filled in
+/// `rigs.pixel_size_um` simply gets no measurement, and the forecaster carries
+/// on estimating without a threshold — which is the whole point of the split.
+async fn measure_focuser_scale(
+    state: &AppState,
+    forecaster: &Arc<tokio::sync::Mutex<crate::focus::focus_drift::FocusDriftForecaster>>,
+    samples: &[FocusSample],
+) {
+    use crate::focus::classical_focus_solver::ClassicalFocusSolver;
+    use crate::focus::focus_drift::{steps_per_micron_from_vcurve, DriftConfig};
+
+    // A configured threshold outranks any measurement, so do not spend the
+    // fit — but do keep measuring if the only threshold we have is a previous
+    // measurement, since a later sweep is a better one.
+    {
+        let guard = forecaster.lock().await;
+        if let Some((_, source)) = guard.threshold() {
+            if source != crate::focus::focus_drift::ThresholdSource::MeasuredVCurve {
+                return;
+            }
+        }
+    }
+
+    let Some((f_ratio, pixel_size_um)) = state
+        .focus_config
+        .drift
+        .vcurve_inputs(state.rig_optics.as_ref())
+    else {
+        tracing::debug!(
+            "Focuser scale not measured: needs a focal ratio ([focus.drift] f_ratio or \
+             rigs.focal_ratio) and rigs.pixel_size_um"
+        );
+        return;
+    };
+
+    // Samples come from the run that just finished, passed in directly rather
+    // than re-read from `agent.history()` — that would depend on whether the
+    // agent has pushed the run yet, which is not this function's business.
+    if samples.len() < 5 {
+        return;
+    }
+    let (positions, hfrs): (Vec<i32>, Vec<f64>) =
+        samples.iter().map(|s| (s.position, s.hfr)).unzip();
+
+    // The V fit gives both wing slopes. Average their magnitudes: they measure
+    // the same mechanical scale from opposite sides, and averaging halves the
+    // effect of an asymmetric sweep or a little backlash on one side.
+    let Some(fit) = ClassicalFocusSolver::fit_v_curve(&positions, &hfrs) else {
+        return;
+    };
+    let (Some(left), Some(right)) = (fit.coefficients.first(), fit.coefficients.get(2)) else {
+        return;
+    };
+    let slope = 0.5 * (left.abs() + right.abs());
+
+    let Some(steps_per_micron) = steps_per_micron_from_vcurve(slope, f_ratio, pixel_size_um) else {
+        return;
+    };
+
+    let threshold = DriftConfig::threshold_from_optics(
+        f_ratio,
+        state.focus_config.drift.wavelength_nm_or_default(),
+        steps_per_micron,
+    );
+
+    let adopted = {
+        let mut guard = forecaster.lock().await;
+        guard.adopt_measured_threshold(threshold)
+    };
+    if !adopted {
+        return;
+    }
+
+    tracing::info!(
+        "Focuser scale measured from the V-curve: {steps_per_micron:.3} steps/µm \
+         (wing slope {slope:.6} px/step, f/{f_ratio}, {pixel_size_um} µm pixels) \
+         → refocus threshold {threshold:.1} steps. An estimate; a value in \
+         [focus.drift] would override it."
+    );
+
+    // Persist it against the focuser, so a restart does not re-measure and the
+    // operator never has to enter it.
+    let focuser_name = state
+        .focuser_name
+        .lock()
+        .ok()
+        .and_then(|n| n.clone())
+        .unwrap_or_else(|| "unknown".to_string());
+    if let Err(err) = crate::storage::device_profiles_repo::record_focuser_scale(
+        state.local_store.pool(),
+        &state.rig_id,
+        &focuser_name,
+        steps_per_micron,
+    )
+    .await
+    {
+        tracing::warn!("Failed to persist measured focuser scale: {err}");
+    }
+}
+
+/// GET /api/v1/focus/drift/history — recent forecaster evaluations.
+pub async fn get_drift_history(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    match crate::storage::focus_drift_repo::recent_events(state.local_store.pool(), 100).await {
+        Ok(rows) => Ok(Json(serde_json::json!({ "events": rows }))),
+        Err(err) => {
+            tracing::error!("Failed to read focus_drift_events: {err}");
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Fold a converged autofocus result into the drift filter and snapshot it.
+///
+/// Called only on success: the filter models where best focus *is*, so feeding
+/// it the endpoint of a run that never converged would teach it that best focus
+/// is wherever the sweep gave up.
+///
+/// Every failure here is logged and swallowed. The forecaster is advisory; an
+/// autofocus run that physically converged has succeeded whether or not a
+/// prediction model got updated.
+async fn record_drift_measurement(
+    state: &AppState,
+    position: i32,
+    temperature: Option<f64>,
+    samples: &[FocusSample],
+) {
+    let Some(forecaster) = state.focus_drift.clone() else {
+        return;
+    };
+
+    // Independent of the temperature check below: the V-curve measures the
+    // focuser's mechanical scale, which has nothing to do with thermometers.
+    // A run that converged in a rig with no thermometer can still teach the
+    // system what a focuser step is worth.
+    measure_focuser_scale(state, &forecaster, samples).await;
+
+    let Some(temperature_c) = temperature else {
+        tracing::debug!(
+            "Focus drift: autofocus converged at {position} but no temperature was available; \
+             not folding it in (a position without its temperature teaches the filter nothing \
+             about thermal drift)"
+        );
+        return;
+    };
+
+    let snapshot = {
+        let mut guard = forecaster.lock().await;
+        guard.update(position as f64, temperature_c, chrono::Utc::now());
+        guard.to_state()
+    };
+
+    if let Some(path) = state.focus_drift_state_path.as_ref() {
+        if let Err(err) = crate::storage::focus_drift_repo::save_state(path, &snapshot) {
+            tracing::warn!(
+                "Failed to snapshot focus drift state to {}: {err}",
+                path.display()
+            );
+        }
+    }
 }
 
 fn response_from_run(run: &FocusRunContext) -> FocusRunResponse {
@@ -242,7 +555,11 @@ async fn ensure_streaming(state: &AppState) -> crate::error::Result<()> {
         HardwareError::Unsupported("Camera reports no stream formats".to_string())
     })?;
     camera
-        .start_stream(format, state.latest_frame.clone())
+        .start_stream(
+            format,
+            state.latest_frame.clone(),
+            state.camera_config.saturation_adu,
+        )
         .map_err(|err| HardwareError::Communication(err.to_string()))?;
     *state.streaming.lock().unwrap() = true;
     Ok(())
@@ -281,10 +598,15 @@ async fn measure_at_position(
         let observed = wait_for_fresh_frame(state).await?;
         let frame_id =
             persist_observed_frame(state, position, rig_id, filter_name, &observed).await;
+        // Read the temperature next to the frame it belongs to, not once per
+        // run: a sweep takes minutes and a tube cooling through it is the very
+        // effect the drift filter is trying to learn.
+        let (temperature, _, _) = crate::api::camera::read_temperature(state);
         samples.push(sample_from_observation(
             position,
             &observed.observation,
             frame_id,
+            temperature,
         )?);
     }
 
@@ -323,10 +645,17 @@ async fn persist_observed_frame(
         None
     }
     .unwrap_or(observation.timestamp);
+    // Temperature, with its provenance. The drift forecaster is trained from
+    // these rows, and it cannot tell a measured reading from an invented one
+    // once both are just a number in a column — so a body with no thermometer
+    // records NULL and says why, rather than a plausible-looking value.
+    let (temperature, temperature_state, temperature_source) =
+        crate::api::camera::read_temperature(state);
+
     let meta = crate::storage::frames_repo::FrameMeta {
         captured_at: Some(captured_at),
         filter_name: filter_name.map(str::to_string),
-        temperature: None,
+        temperature,
         quality_json: serde_json::json!({
             "source": "autofocus",
             "rig_id": rig_id,
@@ -351,6 +680,18 @@ async fn persist_observed_frame(
             "background_sigma": observation.background_sigma,
             "saturation_fraction": observation.saturation_fraction,
             "max_adu": luma.max_adu,
+            // Saturation provenance, written so the dataset builder can filter
+            // on it. `saturation_fraction: 0.0` and `saturated: 0` mean "clean
+            // frame" only when the gate actually ran; on a body with no declared
+            // saturation point they mean nothing was tested, and every clipped
+            // core is in the HFR this row labels.
+            "saturation_adu": luma.saturation_adu,
+            "saturation_gate_applied": observation.saturation_gate.was_applied(),
+            // Provenance for the temperature in the column beside this blob.
+            // `measured` / `estimated` / `missing` — a drift model trained on a
+            // mixture of the three, unable to tell them apart, is learning noise.
+            "temperature_state": temperature_state,
+            "temperature_source": temperature_source,
             "observation_valid": observation.observation_valid,
         }),
         ..Default::default()
@@ -493,10 +834,15 @@ fn abort_if_requested(state: &AppState) -> crate::error::Result<()> {
     }
 }
 
+/// `temperature` is `None` when nothing could measure one. Left NULL rather
+/// than filled with a default: `focus_samples.temperature` feeds the drift
+/// forecaster, and a column that mixes readings with stand-ins is worse than a
+/// column with holes in it — the holes are at least visible.
 fn sample_from_observation(
     position: i32,
     observation: &SharedObservation,
     frame_id: Option<String>,
+    temperature: Option<f64>,
 ) -> crate::error::Result<FocusSample> {
     let hfr = match observation.hfr_px {
         Some(hfr) if observation.observation_valid && (hfr as f64).is_finite() && hfr > 0.0 => {
@@ -519,7 +865,7 @@ fn sample_from_observation(
         // The reciprocal focus score is gone: the curve fit uses raw HFR, not a
         // display score, so we no longer fabricate a per-sample quality_score.
         quality_score: None,
-        temperature: None,
+        temperature,
         timestamp: observation.timestamp,
         frame_id,
     })

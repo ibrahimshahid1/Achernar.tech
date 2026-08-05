@@ -98,11 +98,18 @@ export const cloudApi = {
         return this.relayPayload<DriverCapabilityReport>("drivers.capabilities");
     },
 
-    async connectCamera(driver: string, option?: string): Promise<{ status: string; camera?: string; cameras_found?: string[] }> {
+    /** `index` selects which camera within the driver's enumeration; see the
+     *  daemon-transport version of this method. */
+    async connectCamera(
+        driver: string,
+        option?: string,
+        index?: number,
+    ): Promise<{ status: string; camera?: string; cameras_found?: string[]; index?: number }> {
         return this.relayPayload("equipment.connect", {
             equipment_type: "camera",
             driver,
             option,
+            index,
         });
     },
 

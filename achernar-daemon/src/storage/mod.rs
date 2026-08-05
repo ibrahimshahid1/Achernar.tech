@@ -1,6 +1,7 @@
 //! Storage layer — Sections 5.2, 7.4, 8.4.
 //! SQLite repository modules for all persistent data.
 
+pub mod capture_store;
 pub mod device_profiles_repo;
 pub mod filter_switch_repo;
 pub mod focus_actions_repo;

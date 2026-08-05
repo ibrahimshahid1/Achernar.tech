@@ -54,7 +54,26 @@ yarn-error.log
 target/
 Cargo.lock
 *.rs.bk
-achernar-daemon/achernar.db*
+
+# SQLite offline store, wherever it lands.
+# This used to be `achernar-daemon/achernar.db*` only, so a daemon started from
+# the repo root wrote achernar.db / -wal / -shm beside the .gitignore and they
+# were committed. A WAL file changes on every capture, so the working tree was
+# permanently dirty and running the daemon produced a diff.
+achernar.db
+achernar.db-shm
+achernar.db-wal
+**/achernar.db
+**/achernar.db-shm
+**/achernar.db-wal
+*.sqlite
+*.sqlite3
+
+# Capture archive: RAW/FITS bundles are large, immutable, and belong in the
+# frame store, never in git.
+frames/
+**/frames/captures/
+dslr-bench/
 
 # Tauri/Desktop
 achernar-desktop/target/
@@ -94,3 +113,5 @@ OpenLiveStacker_Drivers/
 AstroM3-main/
 astronomy_texts/
 tmp/
+# Learned focus-drift filter state — per-rig, changes nightly, never committed.
+**/focus_drift_state.json

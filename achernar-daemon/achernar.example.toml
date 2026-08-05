@@ -40,7 +40,70 @@ compensation_steps = 0
 [focus.models]               # Edge ONNX models (Section 7.6.10 layout)
 # quality_model_path = "../models/focus_quality/1.0.0/model.onnx"
 # offset_model_path  = "../models/focus_offset/0.3.0/model.onnx"
-# drift_model_path   = "../models/focus_drift/0.1.0/model.onnx"
+#
+# There is deliberately no drift_model_path. The focus-drift forecaster is a
+# 3-state Kalman filter, not a neural network — there is no ONNX file to point
+# at and there should not be. Its tuning lives in [focus.drift] below.
+
+[focus.drift]                # Focus-drift forecaster (Section 7.6.3)
+# Advisory only: it publishes a prediction on /focus/drift, it never moves the
+# focuser.
+#
+# Turning this on is enough. The forecaster does two separable jobs, and only
+# the second needs to know anything about your optics:
+#
+#   Estimation — learn this rig's focus drift rate and temperature coefficient
+#                from converged autofocus runs. Needs NO optical constants.
+#   Decision   — turn a predicted drift into "refocus now?". Needs a threshold,
+#                which is half the critical focus zone, which needs the optics.
+#
+# So with nothing below filled in you still get a drift estimate and its
+# uncertainty; /focus/drift reports the refocus advice as unavailable and says
+# what to enter. Estimation is the expensive half — the temperature coefficient
+# is only identifiable across varied thermal conditions over several sessions —
+# so it starts learning tonight rather than waiting for you.
+enabled = false
+
+# ── Refocus threshold ───────────────────────────────────────────────────────
+# Half the critical focus zone, CFZ = 4*lambda*N^2. There is no default: a fixed
+# step count is several times the CFZ on a fast scope and a fraction of it on a
+# slow one, so any placeholder produces advice nobody can interpret.
+#
+# Resolved in this order, first hit wins:
+#   1. refocus_threshold_steps below
+#   2. f_ratio + steps_per_micron below
+#   3. rigs.focal_ratio (already in your database) + steps_per_micron below
+#   4. measured from an autofocus V-curve — see below
+#
+# f_ratio         = 5.6      # falls back to rigs.focal_ratio
+# steps_per_micron = 2.5     # your focuser's mechanical resolution
+# wavelength_nm   = 550      # default: 550 (visual peak)
+# refocus_threshold_steps = 86   # direct override, skips the CFZ calculation
+
+# ── Measuring steps_per_micron instead of looking it up ─────────────────────
+# Few people know their focuser's steps-per-micron, and requiring it by hand is
+# what keeps this feature switched off. Every autofocus run already measures it:
+# the slope of a V-curve wing, against the focal ratio and the sensor pixel
+# pitch, gives it directly.
+#
+# To enable that, set `pixel_size_um` (and ideally `focal_ratio`) on your row in
+# the `rigs` table. The next converged autofocus run then measures the scale,
+# derives a threshold, records it against your focuser, and starts giving
+# advice — with `threshold_source: "measured_v_curve"` so you can see it was
+# inferred rather than declared. Anything you set above always overrides it.
+
+# min_confidence_to_act = 0.7    # P(|drift| > threshold) before recommending
+
+# Process/measurement noise. Defaults are in focus_drift.rs::DriftConfig, whose
+# doc comments carry the physical justification for each — in particular why the
+# prior on the temperature coefficient is sigma = 20 steps/degC and not ~0.
+# sigma_accel_steps_per_s2 = 1e-4
+# sigma_temp_coeff         = 1e-3
+# sigma_measurement_steps  = 10.0
+
+# Learned filter state, relative to the data directory. This is per-rig and
+# changes every night — it is NOT a model artefact and must not be committed.
+state_path = "focus_drift_state.json"
 
 [mount]                       # Mount control (Section 8.3)
 guide_rate = 0.5
@@ -60,6 +123,20 @@ focus_offsets = [0, 12, 8, 15, 120, 118, 122]
 # default_gain = 100
 # default_offset = 30
 # cooling_target = -10.0
+
+# Linear saturation point of your sensor, in the ADU of the stream it produces.
+# This is the SENSOR's depth, not the container's: a 14-bit body sends 16-bit
+# samples that top out at 16383.
+#
+#   14-bit (most Canon/Nikon/Sony bodies) -> 16383
+#   12-bit (older bodies, many in silent/electronic shutter modes) -> 4095
+#   16-bit (cooled astro cameras) -> 65535
+#
+# Leave it commented if you do not know it. The saturation gate is then reported
+# as "not performed" rather than quietly passing every star, and any dataset
+# exported from those frames can be filtered on that. Setting a wrong value is
+# worse than setting none.
+# saturation_adu = 16383
 
 [storage]
 database_path = "achernar.db"

@@ -32,6 +32,14 @@
 
 #include <opencv2/imgcodecs.hpp>
 
+// LibRaw is optional. Included directly rather than via
+// OpenLiveStacker/include/libraw_wrapper.h on purpose: that header's
+// load_libraw() black-subtracts and rescales, which is right for the preview
+// stream and wrong for a science frame. See ols_decode_raw() below.
+#ifdef WITH_LIBRAW
+#include <libraw/libraw.h>
+#endif
+
 // ─── Thread-local error message ───
 static thread_local std::string g_last_error;
 
@@ -375,7 +383,9 @@ extern "C" {
 
 const char *ols_last_error(void) { return g_last_error.c_str(); }
 
-const char *ols_bridge_version(void) { return "0.2.0"; }
+uint32_t ols_bridge_abi_version(void) { return OLS_BRIDGE_ABI_VERSION; }
+
+const char *ols_bridge_version(void) { return "0.3.0"; }
 
 uint32_t ols_driver_capability_flags(void) {
   uint32_t flags = 0;
@@ -402,6 +412,9 @@ uint32_t ols_driver_capability_flags(void) {
 #endif
 #ifdef __linux__
   flags |= OLS_CAP_CAMERA_WDIR;
+#endif
+#ifdef WITH_LIBRAW
+  flags |= OLS_CAP_DECODE_LIBRAW;
 #endif
   return flags;
 }
@@ -729,6 +742,8 @@ OlsError ols_camera_format_get(OlsCamera *cam, int32_t index,
   out_fmt->width = f.width;
   out_fmt->height = f.height;
   out_fmt->bin = f.bin;
+  out_fmt->roi_num = f.roi_num;
+  out_fmt->roi_den = f.roi_den;
   out_fmt->framerate = f.framerate;
   return OLS_OK;
 }
@@ -741,6 +756,12 @@ OlsError ols_camera_start_stream(OlsCamera *cam, const OlsStreamFormat *fmt,
     ols_fmt.width = fmt->width;
     ols_fmt.height = fmt->height;
     ols_fmt.bin = fmt->bin;
+    // roi_num/roi_den default to 1/1 in CamStreamFormat; a caller that echoes
+    // back a format from ols_camera_format_get() will carry the driver's real
+    // values, but a hand-built struct may leave them zero. Zero is not a legal
+    // ROI fraction, so fall back to the identity rather than propagating it.
+    ols_fmt.roi_num = fmt->roi_num > 0 ? fmt->roi_num : 1;
+    ols_fmt.roi_den = fmt->roi_den > 0 ? fmt->roi_den : 1;
     ols_fmt.framerate = fmt->framerate;
 
     cam->trampoline.reset(
@@ -760,6 +781,11 @@ OlsError ols_camera_start_stream(OlsCamera *cam, const OlsStreamFormat *fmt,
           f.height = frame.height;
           f.data = (const uint8_t *)frame.data;
           f.data_size = frame.data_size;
+          // Pass the camera-authored original through untouched. Drivers that
+          // have no such original leave these null, which is the common case.
+          f.source_data = (const uint8_t *)frame.source_data;
+          f.source_data_size = frame.source_data_size;
+          f.source_ext = frame.source_ext;
           tramp->callback(&f, tramp->user_data);
         },
         e);
@@ -826,7 +852,366 @@ OlsError ols_camera_set_param(OlsCamera *cam, OlsCamOptionId id, double value) {
   }
 }
 
+OlsError ols_camera_param_choices(OlsCamera *cam, OlsCamOptionId id,
+                                  char *buf, size_t buf_len,
+                                  int32_t *out_count, size_t *out_required) {
+  try {
+    if (!cam || !out_count || !out_required)
+      return set_error(OLS_ERR_INVALID, "Null argument");
+    *out_count = 0;
+    *out_required = 0;
+
+    ols::CamErrorCode e;
+    // `current_only == false` asks the driver for the full descriptor,
+    // including the choice list. Passing true would return only cur_val and
+    // the names vector would come back empty.
+    auto p = cam->camera->get_parameter((ols::CamOptionId)id, false, e);
+    if (e)
+      return set_error(OLS_ERR_IO, e.message());
+
+    size_t required = 0;
+    for (const auto &name : p.names)
+      required += name.size() + 1; // + NUL
+
+    *out_count = (int32_t)p.names.size();
+    *out_required = required;
+
+    if (!buf)
+      return OLS_OK; // sizing call
+    if (buf_len < required)
+      return set_error(OLS_ERR_INVALID,
+                       "Choice buffer too small: need " +
+                           std::to_string(required) + " bytes, got " +
+                           std::to_string(buf_len));
+
+    size_t off = 0;
+    for (const auto &name : p.names) {
+      std::memcpy(buf + off, name.c_str(), name.size() + 1);
+      off += name.size() + 1;
+    }
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Single-Shot Still Capture
+// ═══════════════════════════════════════════════════════════════════
+
+struct OlsStillCapture_t {
+  ols::StillCaptureResult result;
+};
+
+OlsError ols_camera_supports_still(OlsCamera *cam, int32_t *out_supported) {
+  if (!cam || !out_supported)
+    return set_error(OLS_ERR_INVALID, "Null argument");
+  *out_supported = cam->camera->supports_still_capture() ? 1 : 0;
+  return OLS_OK;
+}
+
+OlsError ols_camera_capture_still(OlsCamera *cam, const OlsStillRequest *request,
+                                  OlsStillCapture **out_capture) {
+  try {
+    if (!cam || !request || !out_capture)
+      return set_error(OLS_ERR_INVALID, "Null argument");
+    *out_capture = nullptr;
+
+    if (!cam->camera->supports_still_capture())
+      return set_error(OLS_ERR_NOT_FOUND,
+                       "This camera does not support single-shot still capture");
+
+    ols::StillCaptureRequest req;
+    req.exposure_seconds = request->exposure_seconds;
+    req.sensitivity = request->sensitivity;
+
+    ols::CamErrorCode e;
+    auto result = cam->camera->capture_still(req, e);
+    if (e)
+      return set_error(OLS_ERR_IO, e.message());
+    if (result.assets.empty())
+      return set_error(OLS_ERR_IO, "Capture produced no assets");
+
+    auto *handle = new OlsStillCapture_t();
+    handle->result = std::move(result);
+    *out_capture = handle;
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+}
+
+OlsError ols_capture_info(const OlsStillCapture *capture,
+                          OlsStillCaptureInfo *out_info) {
+  if (!capture || !out_info)
+    return set_error(OLS_ERR_INVALID, "Null argument");
+  const auto &r = capture->result;
+  out_info->started_at = r.started_at;
+  out_info->completed_at = r.completed_at;
+  out_info->applied_exposure = r.applied_exposure;
+  out_info->applied_sensitivity = r.applied_sensitivity;
+  // Borrowed from the owning std::strings — never NULL, so the Rust side does
+  // not have to distinguish "absent" from "empty".
+  out_info->shutter_label = r.shutter_label.c_str();
+  out_info->iso_label = r.iso_label.c_str();
+  out_info->asset_count = (int32_t)r.assets.size();
+  return OLS_OK;
+}
+
+int32_t ols_capture_asset_count(const OlsStillCapture *capture) {
+  return capture ? (int32_t)capture->result.assets.size() : 0;
+}
+
+OlsError ols_capture_asset_get(const OlsStillCapture *capture, int32_t index,
+                               OlsCapturedAsset *out_asset) {
+  if (!capture || !out_asset)
+    return set_error(OLS_ERR_INVALID, "Null argument");
+  if (index < 0 || (size_t)index >= capture->result.assets.size())
+    return set_error(OLS_ERR_NOT_FOUND, "Asset index out of range");
+  const auto &a = capture->result.assets[(size_t)index];
+  out_asset->camera_path = a.camera_path.c_str();
+  out_asset->extension = a.extension.c_str();
+  out_asset->bytes = a.bytes.data();
+  out_asset->byte_length = a.bytes.size();
+  return OLS_OK;
+}
+
+OlsError ols_camera_delete_captured(OlsCamera *cam,
+                                    const OlsStillCapture *capture) {
+  try {
+    if (!cam || !capture)
+      return set_error(OLS_ERR_INVALID, "Null argument");
+    ols::CamErrorCode e;
+    cam->camera->delete_captured(capture->result.assets, e);
+    if (e)
+      return set_error(OLS_ERR_IO, e.message());
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+}
+
+void ols_capture_destroy(OlsStillCapture *capture) { delete capture; }
+
 void ols_camera_destroy(OlsCamera *cam) { delete cam; }
+
+// ═══════════════════════════════════════════════════════════════════
+//  RAW Decode (LibRaw)
+// ═══════════════════════════════════════════════════════════════════
+//
+// See the long comment in ols_bridge.h for why this does not call
+// ols::load_libraw() from libraw_wrapper.h. Short version: that function
+// black-subtracts and multiplies by an integer scale factor, both of which are
+// irreversible and both of which corrupt the ADU↔electron relationship every
+// downstream noise estimate depends on. The preview stream still uses it.
+
+struct OlsRawImage_t {
+  std::vector<uint8_t> pixels;
+  // Backing store for info.make / info.model. Set before the info pointers.
+  std::string make;
+  std::string model;
+  OlsRawImageInfo info;
+};
+
+#ifdef WITH_LIBRAW
+
+/// dcraw's CFA lookup, evaluated in RAW-ARRAY coordinates.
+///
+/// Deliberately not `raw.COLOR()`. Whether COLOR() indexes from the raw-array
+/// origin or the visible-image origin has moved between LibRaw releases, and
+/// choosing wrong rotates RGGB→GRBG only on bodies whose top/left margin is
+/// odd — a bug that reproduces on one camera and not another and looks like a
+/// colour-balance problem rather than an indexing one. `idata.filters` is
+/// unambiguously the pattern of the raw array, and the pixel copy below indexes
+/// the raw array too, so the two agree by construction.
+static inline int ols_fc_raw(unsigned filters, int row, int col) {
+  return (filters >> ((((row) << 1 & 14) | ((col) & 1)) << 1)) & 3;
+}
+
+/// Bayer phase at raw-array coordinate (row0, col0) — i.e. at the top-left of
+/// the plane we are about to return, not of the sensor.
+static OlsBayerType ols_bayer_from_filters(unsigned filters, int row0, int col0) {
+  if (filters == 0)
+    return OLS_BAYER_NA; // no CFA: monochrome body, or already demosaiced
+
+  // LibRaw colour indices are 0=R 1=G 2=B 3=G(second green).
+  static const char lut[] = "RGBG";
+  char pat[5] = {0};
+  pat[0] = lut[ols_fc_raw(filters, row0, col0)];
+  pat[1] = lut[ols_fc_raw(filters, row0, col0 + 1)];
+  pat[2] = lut[ols_fc_raw(filters, row0 + 1, col0)];
+  pat[3] = lut[ols_fc_raw(filters, row0 + 1, col0 + 1)];
+
+  if (!strcmp(pat, "RGGB")) return OLS_BAYER_RG;
+  if (!strcmp(pat, "BGGR")) return OLS_BAYER_BG;
+  if (!strcmp(pat, "GRBG")) return OLS_BAYER_GR;
+  if (!strcmp(pat, "GBRG")) return OLS_BAYER_GB;
+  return OLS_BAYER_NA;
+}
+
+#endif // WITH_LIBRAW
+
+OlsError ols_decode_raw(const uint8_t *data, size_t len, int32_t width,
+                        int32_t height, int32_t bin, OlsRawImage **out_image) {
+#ifndef WITH_LIBRAW
+  (void)data; (void)len; (void)width; (void)height; (void)bin;
+  if (out_image)
+    *out_image = nullptr;
+  return set_error(OLS_ERR_NOT_FOUND,
+                   "This bridge was built without LibRaw, so RAW containers "
+                   "cannot be decoded (macOS: `brew install libraw`, "
+                   "Debian/Ubuntu: `apt install libraw-dev`, then rebuild)");
+#else
+  try {
+    if (!data || !out_image || len == 0)
+      return set_error(OLS_ERR_INVALID, "Null argument");
+    *out_image = nullptr;
+
+    if (bin != 1)
+      return set_error(OLS_ERR_INVALID,
+                       "ols_decode_raw supports bin=1 only. Binning here would "
+                       "be a lossy pre-calibration step: a 2x2 sum saturates at "
+                       "4x white_level, which OlsRawImageInfo cannot express. "
+                       "Bin after calibration.");
+
+    LibRaw raw;
+    // open_buffer takes char* on some LibRaw versions and void* on others;
+    // char* converts implicitly to void* but not the reverse, so cast to char*.
+    int code = raw.open_buffer(
+        const_cast<char *>(reinterpret_cast<const char *>(data)), len);
+    if (code != LIBRAW_SUCCESS)
+      return set_error(OLS_ERR_INVALID,
+                       std::string("LibRaw could not parse the container: ") +
+                           libraw_strerror(code));
+
+    if ((code = raw.unpack()) != LIBRAW_SUCCESS)
+      return set_error(OLS_ERR_IO, std::string("LibRaw unpack failed: ") +
+                                       libraw_strerror(code));
+
+    if (!raw.imgdata.rawdata.raw_image)
+      return set_error(OLS_ERR_INVALID,
+                       "File has no 16-bit Bayer plane (Foveon, sRAW and float "
+                       "DNG decode to other layouts and are not supported)");
+
+    if (raw.imgdata.idata.filters == 9)
+      return set_error(OLS_ERR_INVALID,
+                       "X-Trans (6x6 CFA) sensors are not supported by this "
+                       "decoder");
+
+    const libraw_image_sizes_t &sz = raw.imgdata.sizes;
+
+    // Crop geometry, mirroring load_libraw() so a frame decoded here lines up
+    // with the same frame decoded for preview.
+    //
+    // `sz.width`/`sz.height` are the VISIBLE dimensions; the raw array is
+    // `raw_width` x `raw_height` and the visible area starts at
+    // (top_margin, left_margin). Offsets are forced even (`/4*2`) so that a
+    // sub-region request cannot rotate the CFA phase relative to a full-frame
+    // request of the same file.
+    int w = 0, h = 0, dw = 0, dh = 0;
+    if (width > 0 && height > 0) {
+      w = width;
+      h = height;
+      dw = (sz.width - w) / 4 * 2;
+      dh = (sz.height - h) / 4 * 2;
+    } else {
+      w = sz.width / 2 * 2;
+      h = sz.height / 2 * 2;
+    }
+
+    const long x0 = (long)sz.left_margin + dw;
+    const long y0 = (long)sz.top_margin + dh;
+
+    if (w <= 0 || h <= 0 || (w & 1) || (h & 1) || dw < 0 || dh < 0 ||
+        x0 + w > (long)sz.raw_width || y0 + h > (long)sz.raw_height) {
+      char buf[320];
+      // LibRaw's size fields are ushort; cast so the format specifiers match
+      // after integral promotion.
+      snprintf(buf, sizeof(buf),
+               "Requested %dx%d does not fit: visible %ux%u, raw %ux%u, "
+               "margins l=%u t=%u, offset %dx%d",
+               w, h, (unsigned)sz.width, (unsigned)sz.height,
+               (unsigned)sz.raw_width, (unsigned)sz.raw_height,
+               (unsigned)sz.left_margin, (unsigned)sz.top_margin, dw, dh);
+      return set_error(OLS_ERR_INVALID, buf);
+    }
+
+    // raw_pitch is in BYTES and is not always tight — some unpackers pad rows.
+    // Older LibRaw builds leave it zero, in which case rows are tight.
+    const size_t pitch =
+        sz.raw_pitch ? (size_t)sz.raw_pitch : (size_t)sz.raw_width * 2;
+    if (pitch < (size_t)sz.raw_width * 2)
+      return set_error(OLS_ERR_GENERIC,
+                       "LibRaw reported a raw_pitch narrower than raw_width");
+
+    std::unique_ptr<OlsRawImage_t> image(new OlsRawImage_t());
+
+    // One copy, into a tightly-packed buffer, so `ols_rawimage_pixels` can
+    // honestly promise `width * height * 2` contiguous bytes and the Rust side
+    // never has to reason about stride. The alternative — keeping this LibRaw
+    // instance alive and handing out a pointer into its margin-inclusive
+    // buffer — saves this copy but holds LibRaw's larger allocation for the
+    // whole life of the handle, and makes every consumer stride-aware.
+    const size_t row_bytes = (size_t)w * 2;
+    image->pixels.resize(row_bytes * (size_t)h);
+    const uint8_t *src =
+        reinterpret_cast<const uint8_t *>(raw.imgdata.rawdata.raw_image);
+    for (int y = 0; y < h; ++y) {
+      memcpy(image->pixels.data() + (size_t)y * row_bytes,
+             src + ((size_t)y0 + (size_t)y) * pitch + (size_t)x0 * 2,
+             row_bytes);
+    }
+
+    image->make = raw.imgdata.idata.make;
+    image->model = raw.imgdata.idata.model;
+
+    OlsRawImageInfo &info = image->info;
+    info.width = w;
+    info.height = h;
+    info.bayer =
+        ols_bayer_from_filters(raw.imgdata.idata.filters, (int)y0, (int)x0);
+    info.bits_per_sample = 16;
+    info.black_level = (int32_t)raw.imgdata.color.black;
+    for (int i = 0; i < 4; ++i)
+      info.cblack[i] = (int32_t)raw.imgdata.color.cblack[i];
+    // cblack[4] and cblack[5] are the dimensions of a 2-D black table stored
+    // from cblack[6] onward — not black values themselves.
+    info.cblack_pattern[0] = (int32_t)raw.imgdata.color.cblack[4];
+    info.cblack_pattern[1] = (int32_t)raw.imgdata.color.cblack[5];
+    info.white_level = (int32_t)raw.imgdata.color.maximum;
+    for (int i = 0; i < 4; ++i)
+      info.cam_mul[i] = raw.imgdata.color.cam_mul[i];
+    // Set last: these borrow from the strings above, which must be final.
+    info.make = image->make.c_str();
+    info.model = image->model.c_str();
+
+    *out_image = image.release();
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_GENERIC, ex);
+  }
+#endif // WITH_LIBRAW
+}
+
+OlsError ols_rawimage_info(const OlsRawImage *image, OlsRawImageInfo *out_info) {
+  if (!image || !out_info)
+    return set_error(OLS_ERR_INVALID, "Null argument");
+  *out_info = image->info;
+  return OLS_OK;
+}
+
+const uint8_t *ols_rawimage_pixels(const OlsRawImage *image, size_t *out_len) {
+  if (!image) {
+    if (out_len)
+      *out_len = 0;
+    return nullptr;
+  }
+  if (out_len)
+    *out_len = image->pixels.size();
+  return image->pixels.data();
+}
+
+void ols_rawimage_destroy(OlsRawImage *image) { delete image; }
 
 // ═══════════════════════════════════════════════════════════════════
 //  Mount API Implementation

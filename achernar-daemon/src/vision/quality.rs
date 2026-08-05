@@ -13,7 +13,52 @@ pub struct LumaFrame {
     pub pixels: Vec<f32>,
     pub width: usize,
     pub height: usize,
+    /// Full scale of the *container* the samples arrived in: 255 for an 8-bit
+    /// stream, 65535 for a 16-bit one. Not the sensor's saturation point, and
+    /// using it as one is the bug [`LumaFrame::saturation_adu`] exists to fix.
     pub max_adu: f32,
+    /// Linear saturation point of the sensor in these units, when known.
+    ///
+    /// For 8-bit streams this is the container full scale, because an 8-bit
+    /// sample physically cannot exceed 255 and one that reads 255 is clipped.
+    /// For 16-bit streams it must be declared (`[camera] saturation_adu`) or
+    /// come from the RAW decoder, because a 14-bit body sends 16-bit samples
+    /// that stop at 16383 and nothing in the pixels reveals that.
+    ///
+    /// `None` means unknown, and the saturation gate is then reported as not
+    /// performed rather than passed. Those are very different claims: the
+    /// second one silently blessed every clipped star in the FQE training set.
+    pub saturation_adu: Option<f32>,
+}
+
+/// Whether the star-saturation gate could be applied to a frame.
+///
+/// Published so a consumer — the FQE labeler above all — can tell "no stars
+/// were saturated" from "we never checked". Only the first is evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum SaturationGate {
+    /// Applied at this ADU threshold (`SATURATION_FRACTION_OF_MAX` of the
+    /// sensor's saturation point).
+    Applied { threshold_adu: f32 },
+    /// Not applied: the sensor's saturation point is unknown for this frame.
+    /// Measurements are still produced, but any star with a clipped, flat core
+    /// is in them, biasing HFR low exactly where the V-curve needs resolution.
+    NotPerformed,
+}
+
+impl SaturationGate {
+    pub fn was_applied(&self) -> bool {
+        matches!(self, SaturationGate::Applied { .. })
+    }
+}
+
+impl Default for SaturationGate {
+    /// `NotPerformed`. Chosen so that an observation persisted before this
+    /// field existed deserializes to the truth about itself — no gate ran on
+    /// those frames either.
+    fn default() -> Self {
+        SaturationGate::NotPerformed
+    }
 }
 
 /// Why a frame did (not) yield a usable focus measurement. `Valid` means at
@@ -75,6 +120,11 @@ pub struct QualityMetrics {
     /// The gate-surviving stars (centroid + HFR) the frame median was built
     /// from. Consumed by the FQE shadow path; not serialized onto the bus.
     pub used_stars: Vec<UsedStar>,
+    /// Whether the saturation gate ran at all. `star_rejections.saturated == 0`
+    /// is only meaningful when this is `Applied`; under `NotPerformed` it means
+    /// nothing was checked, and a training label built from the frame inherits
+    /// whatever clipped cores were present.
+    pub saturation_gate: SaturationGate,
 }
 
 impl QualityMetrics {
@@ -250,16 +300,57 @@ pub fn luma_from_frame(frame: &FrameData) -> crate::error::Result<LumaFrame> {
         width,
         height,
         max_adu,
+        saturation_adu: resolve_saturation_adu(frame.format, max_adu, frame.saturation_adu),
     })
 }
 
+/// Decide the linear saturation point for a frame.
+///
+/// Two regimes, and conflating them is the original bug:
+///
+/// * **8-bit containers** (MJPEG, YUV, RGB24, Mono8, Raw8). The sample cannot
+///   exceed 255, so 255 *is* the clip point and no declaration is needed. These
+///   pixels have also been through a non-linear transform, so a sensor-domain
+///   saturation value would not apply to them even if we had one — which is why
+///   a declared value is ignored here rather than trusted.
+/// * **16-bit containers** (Mono16, Raw16, RGB48). The container says 65535 and
+///   the sensor says 16383 on a 14-bit body. Nothing in the pixels distinguishes
+///   them, so the value has to be declared. Absent a declaration the answer is
+///   `None` — not 65535, which produces a gate that can never fire.
+///
+/// A declared value above the container full scale is a configuration error
+/// (someone wrote 65535 for a body streaming 8-bit); it is clamped rather than
+/// trusted, because a threshold above full scale is the never-fires case again.
+fn resolve_saturation_adu(
+    format: OlsStreamType,
+    max_adu: f32,
+    declared: Option<f32>,
+) -> Option<f32> {
+    match format {
+        // 8-bit paths: the container is the clip point.
+        OlsStreamType::Mjpeg
+        | OlsStreamType::Rgb24
+        | OlsStreamType::Yuv2
+        | OlsStreamType::Mono8
+        | OlsStreamType::Raw8 => Some(max_adu),
+        // 16-bit linear paths: only a declared value will do.
+        OlsStreamType::Mono16 | OlsStreamType::Raw16 | OlsStreamType::Rgb48 => {
+            declared.filter(|v| *v > 0.0).map(|v| v.min(max_adu))
+        }
+        OlsStreamType::Error => None,
+    }
+}
+
 pub fn estimate_quality(frame: &LumaFrame, background: &BackgroundStats) -> QualityMetrics {
+    let gate = saturation_gate(frame);
+
     if frame.pixels.is_empty() || frame.width == 0 || frame.height == 0 {
         return invalid_metrics(
             QualityStatus::EmptyFrame,
             QualityRejectionReason::NoFinitePixels,
             0,
             StarRejectionTallies::default(),
+            gate,
         );
     }
 
@@ -278,6 +369,7 @@ pub fn estimate_quality(frame: &LumaFrame, background: &BackgroundStats) -> Qual
             QualityRejectionReason::NoStellarSources,
             0,
             StarRejectionTallies::default(),
+            gate,
         );
     }
 
@@ -306,6 +398,7 @@ pub fn estimate_quality(frame: &LumaFrame, background: &BackgroundStats) -> Qual
                 hfr_log_sigma,
                 star_rejections,
                 used_stars,
+                saturation_gate: gate,
             }
         }
         // Stars were detected but none survived the validity gates with a usable
@@ -316,6 +409,7 @@ pub fn estimate_quality(frame: &LumaFrame, background: &BackgroundStats) -> Qual
             QualityRejectionReason::NoValidHfr,
             star_count_detected,
             star_rejections,
+            gate,
         ),
     }
 }
@@ -325,6 +419,7 @@ fn invalid_metrics(
     reason: QualityRejectionReason,
     star_count_detected: u32,
     star_rejections: StarRejectionTallies,
+    saturation_gate: SaturationGate,
 ) -> QualityMetrics {
     QualityMetrics {
         status,
@@ -338,6 +433,7 @@ fn invalid_metrics(
         hfr_log_sigma: None,
         star_rejections,
         used_stars: Vec::new(),
+        saturation_gate,
     }
 }
 
@@ -475,7 +571,10 @@ fn measure_stars(
     frame: &LumaFrame,
     stars: &[StarCandidate],
 ) -> (Vec<UsedStar>, StarRejectionTallies) {
-    let saturation_adu = saturation_threshold_adu(frame.max_adu);
+    let saturation_adu = match saturation_gate(frame) {
+        SaturationGate::Applied { threshold_adu } => Some(threshold_adu),
+        SaturationGate::NotPerformed => None,
+    };
     let mut used = Vec::new();
     let mut tallies = StarRejectionTallies::default();
 
@@ -487,9 +586,17 @@ fn measure_stars(
         let mut rejected = false;
 
         // Gate 1 — saturation, from the component peak (no crop needed).
-        if star.peak >= saturation_adu {
-            tallies.saturated += 1;
-            rejected = true;
+        //
+        // Skipped when the sensor's saturation point is unknown. It is not
+        // replaced by a container-derived threshold: on a 14-bit body that
+        // threshold sits above anything the ADC can produce, so it would pass
+        // every star while looking like a gate that ran. `QualityMetrics::
+        // saturation_gate` carries the distinction to consumers.
+        if let Some(threshold) = saturation_adu {
+            if star.peak >= threshold {
+                tallies.saturated += 1;
+                rejected = true;
+            }
         }
 
         // Gate 2 — edge truncation: above-threshold pixels reach the border.
@@ -585,12 +692,18 @@ fn measure_stars(
     (used, tallies)
 }
 
-/// Saturation threshold in ADU (mirrors `background::saturation_threshold`).
-fn saturation_threshold_adu(max_adu: f32) -> f32 {
-    if max_adu <= 0.0 {
-        f32::INFINITY
-    } else {
-        max_adu * SATURATION_FRACTION_OF_MAX
+/// Resolve the star-saturation gate for a frame.
+///
+/// Returns [`SaturationGate::NotPerformed`] rather than an unreachable
+/// threshold when the sensor's saturation point is unknown, so "no stars were
+/// saturated" and "we never checked" stay distinguishable all the way out to
+/// the dataset. Mirrors `background::saturation_threshold`.
+fn saturation_gate(frame: &LumaFrame) -> SaturationGate {
+    match frame.saturation_adu {
+        Some(sat) if sat > 0.0 => SaturationGate::Applied {
+            threshold_adu: sat * SATURATION_FRACTION_OF_MAX,
+        },
+        _ => SaturationGate::NotPerformed,
     }
 }
 
@@ -773,8 +886,9 @@ mod tests {
             width,
             height,
             max_adu: 65535.0,
+            saturation_adu: Some(65535.0),
         };
-        let background = estimate_background(&frame.pixels, frame.max_adu);
+        let background = estimate_background(&frame.pixels, frame.saturation_adu);
         let quality = estimate_quality(&frame, &background);
 
         assert!(quality.observation_valid());
@@ -837,8 +951,9 @@ mod tests {
             width,
             height,
             max_adu: 65_535.0,
+            saturation_adu: Some(65_535.0),
         };
-        let background = estimate_background(&frame.pixels, frame.max_adu);
+        let background = estimate_background(&frame.pixels, frame.saturation_adu);
         let quality = estimate_quality(&frame, &background);
 
         assert_eq!(quality.star_count_detected, 1);
@@ -849,6 +964,111 @@ mod tests {
             "saturated star must not yield a width"
         );
         assert_eq!(quality.star_rejections.saturated, 1);
+        assert!(quality.saturation_gate.was_applied());
+    }
+
+    /// A 14-bit body clipped at 16383 inside a 16-bit container.
+    ///
+    /// This is the frame the old code got wrong: the gate was computed from the
+    /// container (0.98 * 65535 = 64224), the star peaks at 16383, so it sailed
+    /// through as a clean measurement and its flat core biased HFR low. The two
+    /// halves below feed byte-identical pixels and differ only in whether the
+    /// sensor's saturation point is known.
+    fn clipped_14bit_star_frame(saturation_adu: Option<f32>) -> LumaFrame {
+        let width = 64;
+        let height = 64;
+        let mut pixels = vec![100.0_f32; width * height];
+        for dy in -4_i32..=4 {
+            for dx in -4_i32..=4 {
+                let d = ((dx * dx + dy * dy) as f32).sqrt();
+                let idx = ((32 + dy) as usize) * width + (32 + dx) as usize;
+                // Flat, clipped core at the 14-bit ceiling, falling off outside.
+                pixels[idx] = (16_383.0 - (d - 1.5).max(0.0) * 3_000.0).max(pixels[idx]);
+            }
+        }
+        LumaFrame {
+            pixels,
+            width,
+            height,
+            max_adu: 65_535.0,
+            saturation_adu,
+        }
+    }
+
+    #[test]
+    fn clipped_14bit_star_is_rejected_when_saturation_is_declared() {
+        let frame = clipped_14bit_star_frame(Some(16_383.0));
+        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let quality = estimate_quality(&frame, &background);
+
+        assert!(quality.saturation_gate.was_applied());
+        assert_eq!(
+            quality.star_rejections.saturated, 1,
+            "a core clipped at the 14-bit ceiling must be caught once the ceiling is known"
+        );
+    }
+
+    #[test]
+    fn unknown_saturation_reports_not_performed_rather_than_passing() {
+        let frame = clipped_14bit_star_frame(None);
+        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let quality = estimate_quality(&frame, &background);
+
+        // The star is NOT rejected — we cannot tell it is clipped. That is the
+        // honest outcome, and the point of the change is that it is now
+        // *labelled* as such instead of being indistinguishable from a clean
+        // frame.
+        assert_eq!(quality.star_rejections.saturated, 0);
+        assert!(
+            !quality.saturation_gate.was_applied(),
+            "gate must report NotPerformed so a dataset builder can exclude this frame"
+        );
+        assert_eq!(quality.saturation_gate, super::SaturationGate::NotPerformed);
+        assert_eq!(
+            background.saturation_fraction, 0.0,
+            "unknown saturation must exclude no pixels from the background"
+        );
+    }
+
+    #[test]
+    fn saturation_resolution_by_stream_format() {
+        use super::resolve_saturation_adu;
+        use crate::hardware::ols_ffi::OlsStreamType;
+
+        // 8-bit containers: the container is the clip point, and a declared
+        // sensor-domain value does not apply to non-linear pixels.
+        assert_eq!(
+            resolve_saturation_adu(OlsStreamType::Mjpeg, 255.0, Some(16_383.0)),
+            Some(255.0)
+        );
+        assert_eq!(
+            resolve_saturation_adu(OlsStreamType::Mono8, 255.0, None),
+            Some(255.0)
+        );
+
+        // 16-bit containers: only a declaration will do.
+        assert_eq!(
+            resolve_saturation_adu(OlsStreamType::Raw16, 65_535.0, None),
+            None,
+            "16-bit with no declaration must be unknown, never 65535"
+        );
+        assert_eq!(
+            resolve_saturation_adu(OlsStreamType::Raw16, 65_535.0, Some(16_383.0)),
+            Some(16_383.0)
+        );
+
+        // A value above full scale is a config error; clamping keeps the
+        // threshold reachable instead of silently disabling the gate.
+        assert_eq!(
+            resolve_saturation_adu(OlsStreamType::Mono16, 65_535.0, Some(999_999.0)),
+            Some(65_535.0)
+        );
+        // Nonsense values fall back to unknown rather than to a zero threshold
+        // that would reject every star.
+        assert_eq!(
+            resolve_saturation_adu(OlsStreamType::Mono16, 65_535.0, Some(0.0)),
+            None
+        );
     }
 
     #[test]
@@ -862,8 +1082,9 @@ mod tests {
             width,
             height,
             max_adu: 65_535.0,
+            saturation_adu: Some(65_535.0),
         };
-        let background = estimate_background(&frame.pixels, frame.max_adu);
+        let background = estimate_background(&frame.pixels, frame.saturation_adu);
         let quality = estimate_quality(&frame, &background);
 
         assert_eq!(quality.star_count_used, 0);
@@ -885,8 +1106,9 @@ mod tests {
             width,
             height,
             max_adu: 65_535.0,
+            saturation_adu: Some(65_535.0),
         };
-        let background = estimate_background(&frame.pixels, frame.max_adu);
+        let background = estimate_background(&frame.pixels, frame.saturation_adu);
         let quality = estimate_quality(&frame, &background);
 
         assert_eq!(quality.star_count_used, 0);
@@ -914,8 +1136,9 @@ mod tests {
             width,
             height,
             max_adu: 65_535.0,
+            saturation_adu: Some(65_535.0),
         };
-        let background = estimate_background(&frame.pixels, frame.max_adu);
+        let background = estimate_background(&frame.pixels, frame.saturation_adu);
         let quality = estimate_quality(&frame, &background);
 
         // Trailed sources are measured by vision::trailing; they must not
@@ -948,8 +1171,9 @@ mod tests {
             width,
             height,
             max_adu: 65_535.0,
+            saturation_adu: Some(65_535.0),
         };
-        let background = estimate_background(&frame.pixels, frame.max_adu);
+        let background = estimate_background(&frame.pixels, frame.saturation_adu);
         let quality = estimate_quality(&frame, &background);
 
         assert!(quality.observation_valid());
@@ -967,8 +1191,9 @@ mod tests {
             width: 64,
             height: 64,
             max_adu: 65535.0,
+            saturation_adu: Some(65535.0),
         };
-        let background = estimate_background(&frame.pixels, frame.max_adu);
+        let background = estimate_background(&frame.pixels, frame.saturation_adu);
         let quality = estimate_quality(&frame, &background);
 
         assert!(!quality.observation_valid());
@@ -1008,8 +1233,9 @@ mod tests {
             width,
             height,
             max_adu: 65535.0,
+            saturation_adu: Some(65535.0),
         };
-        let background = estimate_background(&frame.pixels, frame.max_adu);
+        let background = estimate_background(&frame.pixels, frame.saturation_adu);
         let quality = estimate_quality(&frame, &background);
 
         assert!(quality.observation_valid());

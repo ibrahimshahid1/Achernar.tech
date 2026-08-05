@@ -141,6 +141,7 @@ mod tests {
             width,
             height,
             max_adu: 65_535.0,
+            saturation_adu: Some(65_535.0),
         };
 
         let crop = fqe_input_from_frame(&frame, 100.0, 100.0).unwrap();
@@ -156,6 +157,7 @@ mod tests {
             width: 200,
             height: 200,
             max_adu: 65_535.0,
+            saturation_adu: Some(65_535.0),
         };
 
         assert!(fqe_input_from_frame(&frame, 31.0, 100.0).is_none());

@@ -57,8 +57,14 @@ impl TedRunner {
             width: shape[1],
             height: shape[0],
             max_adu,
+            // TED receives a bare ndarray with no camera provenance attached, so
+            // the sensor's saturation point is genuinely unknown here. `max_adu`
+            // above is the observed peak, which is not a saturation point:
+            // deriving one from it would make the threshold depend on how bright
+            // the brightest star in this particular frame happened to be.
+            saturation_adu: None,
         };
-        let background = super::background::estimate_background(&frame.pixels, frame.max_adu);
+        let background = super::background::estimate_background(&frame.pixels, frame.saturation_adu);
         let estimate = super::trailing::estimate_trailing(&frame, &background);
         let trailing_detected = estimate.severity >= self.elongation_threshold_to_severity();
         let axis = match estimate.axis.as_deref() {

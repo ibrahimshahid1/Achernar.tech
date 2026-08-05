@@ -114,7 +114,13 @@ export interface EquipmentCardModel {
 
 export interface CaptureParams {
     exposure: number;
-    gain: number;
+    /**
+     * Optional on purpose. The daemon treats `<= 0` as "leave the operator's
+     * setting alone", so sending 0 for a body that has no numeric gain control
+     * is not neutral — it overrides the ISO they set on the camera. Omit the
+     * field instead.
+     */
+    gain?: number;
     count?: number;
     filter?: string;
     binning?: number;

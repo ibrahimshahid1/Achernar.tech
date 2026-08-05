@@ -176,6 +176,7 @@ fn main() {
     link_optional_pkg("libgphoto2");
     link_optional_pkg("libuvc");
     link_optional_indi();
+    link_optional_libraw();
 
     // INDIGO library
     for inc in [
@@ -222,6 +223,8 @@ fn main() {
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/indigo_camera.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/camera.h",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/alpaca_client.h",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/include/libraw_wrapper.h",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/include/sw_bin.h",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
@@ -250,10 +253,69 @@ fn find_pkg_config_optional() -> Option<String> {
     None
 }
 
+/// PKG_CONFIG_PATH augmented with Homebrew keg-only prefixes.
+///
+/// Homebrew's unversioned `opencv` formula now tracks OpenCV 5, which ships
+/// `opencv5.pc`. OpenCV 4 is available only through the `opencv@4` formula,
+/// which is keg-only — not symlinked into the brew prefix — so `opencv4.pc` is
+/// invisible to pkg-config unless its directory is named explicitly.
+///
+/// `ols-bridge/CMakeLists.txt` performs the same probe, but that only fixes the
+/// CMake process: `set(ENV{...})` there does not propagate back to this build
+/// script, which runs its own `pkg-config` to emit link flags. Both layers must
+/// resolve it independently, otherwise the bridge compiles and then linking
+/// fails — which is exactly what happened.
+///
+/// Computed once; a missing formula or a missing `brew` is skipped silently so
+/// Linux and non-Homebrew macOS builds are unaffected.
+fn pkg_config_path() -> Option<&'static str> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let brew = ["brew", "/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+                .into_iter()
+                .find(|candidate| {
+                    Command::new(candidate)
+                        .arg("--version")
+                        .output()
+                        .map(|out| out.status.success())
+                        .unwrap_or(false)
+                })?;
+
+            let mut dirs = Vec::new();
+            for formula in ["opencv@4", "libtiff", "libraw", "libgphoto2"] {
+                let Ok(output) = Command::new(brew).args(["--prefix", formula]).output() else {
+                    continue;
+                };
+                if !output.status.success() {
+                    continue;
+                }
+                let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let pkgconfig = format!("{prefix}/lib/pkgconfig");
+                if std::path::Path::new(&pkgconfig).is_dir() {
+                    dirs.push(pkgconfig);
+                }
+            }
+            // Anything the developer already exported wins as a later entry,
+            // so an explicit PKG_CONFIG_PATH is respected, never discarded.
+            if let Ok(existing) = env::var("PKG_CONFIG_PATH") {
+                if !existing.is_empty() {
+                    dirs.push(existing);
+                }
+            }
+            (!dirs.is_empty()).then(|| dirs.join(":"))
+        })
+        .as_deref()
+}
+
 fn pkg_config_libs(name: &str) -> PkgConfigResult {
     let pkg_config = find_pkg_config();
-    let output = Command::new(&pkg_config)
-        .args(["--libs", name])
+    let mut command = Command::new(&pkg_config);
+    command.args(["--libs", name]);
+    if let Some(path) = pkg_config_path() {
+        command.env("PKG_CONFIG_PATH", path);
+    }
+    let output = command
         .output()
         .unwrap_or_else(|_| panic!("pkg-config not found, cannot locate {}", name));
 
@@ -287,7 +349,12 @@ fn link_optional_pkg(name: &str) -> bool {
     let Some(pkg_config) = find_pkg_config_optional() else {
         return false;
     };
-    let output = match Command::new(&pkg_config).args(["--libs", name]).output() {
+    let mut command = Command::new(&pkg_config);
+    command.args(["--libs", name]);
+    if let Some(path) = pkg_config_path() {
+        command.env("PKG_CONFIG_PATH", path);
+    }
+    let output = match command.output() {
         Ok(o) if o.status.success() => o,
         _ => return false,
     };
@@ -300,6 +367,39 @@ fn link_optional_pkg(name: &str) -> bool {
         }
     }
     true
+}
+
+/// Link LibRaw, the RAW decoder the gphoto2 driver needs for CR2/CR3/RW2.
+///
+/// `ols-bridge/CMakeLists.txt` compiles `libraw_wrapper.h` into the *static*
+/// bridge when it finds LibRaw, which leaves the actual symbols
+/// (`LibRaw::open_buffer`, `LibRaw::unpack`, …) undefined until the final Rust
+/// link stage — exactly like gphoto2 and libuvc above. Missing this call
+/// produces a wall of undefined-symbol errors that look like a bridge bug
+/// rather than a missing link flag.
+///
+/// pkg-config is preferred; the manual fallback covers source installs and
+/// distros that ship the library without a .pc file.
+fn link_optional_libraw() {
+    if link_optional_pkg("libraw") || link_optional_pkg("libraw_r") {
+        return;
+    }
+
+    for prefix in ["/opt/homebrew", "/usr/local", "/usr", "/opt/local"] {
+        let lib_dir = PathBuf::from(prefix).join("lib");
+        // Prefer the thread-safe variant when both are present; LibRaw
+        // instances are constructed per-frame on the capture thread.
+        for stem in ["raw_r", "raw"] {
+            let found = ["dylib", "so", "a"]
+                .iter()
+                .any(|ext| lib_dir.join(format!("lib{stem}.{ext}")).exists());
+            if found {
+                println!("cargo:rustc-link-search=native={}", lib_dir.display());
+                println!("cargo:rustc-link-lib=dylib={stem}");
+                return;
+            }
+        }
+    }
 }
 
 fn link_optional_indi() {

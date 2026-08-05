@@ -211,8 +211,9 @@ mod tests {
             width,
             height,
             max_adu: 65535.0,
+            saturation_adu: Some(65535.0),
         };
-        let background = estimate_background(&frame.pixels, frame.max_adu);
+        let background = estimate_background(&frame.pixels, frame.saturation_adu);
         let trailing = estimate_trailing(&frame, &background);
 
         assert!(trailing.severity > 0.15);

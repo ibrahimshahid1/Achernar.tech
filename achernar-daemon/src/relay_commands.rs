@@ -1,10 +1,8 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
 
 use crate::api::camera::{option_name, option_type_name, parse_option, CamParamInfo, FormatInfo};
-use crate::fits::FitsMeta;
 use crate::hardware::{
     camera::OlsCameraDriver,
     capabilities::driver_capability_report,
@@ -86,6 +84,24 @@ fn camera_parameters(state: AppState) -> Result<Value, String> {
 
     for id in options {
         if let Ok(p) = camera.get_parameter(id) {
+            // Selection options (iso, shutterspeed, capturetarget) are useless
+            // as bare indices; ship the camera's labels so a remote client can
+            // render "1/125" rather than "17".
+            let choices = if p.option_type
+                == crate::hardware::ols_ffi::OlsCamOptionType::Selection
+            {
+                camera.parameter_choices(id).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let current_value = choices.get(p.cur_val as usize).and_then(|label| match id {
+                OlsCamOptionId::Shutter => {
+                    crate::hardware::dslr_controls::parse_shutter_seconds(label)
+                }
+                OlsCamOptionId::Iso => crate::hardware::dslr_controls::parse_iso(label),
+                _ => None,
+            });
+
             params.push(CamParamInfo {
                 name: option_name(id).to_string(),
                 kind: option_type_name(p.option_type).to_string(),
@@ -95,6 +111,8 @@ fn camera_parameters(state: AppState) -> Result<Value, String> {
                 step: p.step_size,
                 default: p.def_val,
                 current: p.cur_val,
+                choices,
+                current_value,
             });
         }
     }
@@ -118,6 +136,7 @@ fn camera_formats(state: AppState) -> Result<Value, String> {
             height: f.height,
             bin: f.bin,
             framerate: f.framerate,
+            mode: if f.is_liveview() { "liveview" } else { "still" },
         })
         .collect();
 
@@ -146,100 +165,32 @@ fn camera_set_parameter(state: AppState, payload: &Value) -> Result<Value, Strin
     }))
 }
 
+/// Cloud-relay capture.
+///
+/// Delegates to the single shared implementation in `api::camera` rather than
+/// keeping a second copy. The duplicate that used to live here carried the
+/// same defects as the HTTP path — it wrote `Exp`/`Gain` to bodies that only
+/// understand `shutterspeed`/`iso`, discarded the resulting errors with
+/// `let _ =`, and then recorded the *requested* exposure in the FITS header —
+/// so a remote capture could disagree with the photograph it claimed to
+/// describe. One implementation means one place to be correct.
 async fn camera_capture(state: AppState, payload: &Value) -> Result<Value, String> {
     let params: crate::api::camera::CaptureParams =
         serde_json::from_value(payload.clone()).map_err(|e| e.to_string())?;
 
-    {
-        let cam_lock = state.camera.lock().unwrap();
-        let camera = cam_lock
-            .as_ref()
-            .ok_or_else(|| "No camera connected".to_string())?;
-        let _ = camera.set_parameter(OlsCamOptionId::Exp, params.exposure * 1000.0);
-        if let Some(gain) = params.gain {
-            let _ = camera.set_parameter(OlsCamOptionId::Gain, gain as f64);
-        }
-        if let Some(temp) = params.temperature {
-            let _ = camera.set_parameter(OlsCamOptionId::CoolerTarget, temp);
-        }
-    }
-
-    if !*state.streaming.lock().unwrap() {
-        return Err("Capture requires an active camera stream".to_string());
-    }
-
-    let settle = Duration::from_secs_f64(params.exposure.clamp(0.0, 120.0));
-    tokio::time::sleep(settle).await;
-
-    let baseline = state
-        .latest_frame
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|f| f.frame_counter);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let frame = loop {
-        {
-            let guard = state.latest_frame.lock().unwrap();
-            if let Some(frame) = guard.as_ref() {
-                if Some(frame.frame_counter) != baseline {
-                    break frame.clone();
-                }
+    let image = crate::api::camera::perform_capture(state, params)
+        .await
+        .map_err(|status| match status {
+            axum::http::StatusCode::PRECONDITION_FAILED => {
+                "Capture requires a connected camera and an active stream".to_string()
             }
-        }
-        if Instant::now() >= deadline {
-            let guard = state.latest_frame.lock().unwrap();
-            match guard.as_ref() {
-                Some(frame) => break frame.clone(),
-                None => return Err("No camera frame is available yet".to_string()),
+            axum::http::StatusCode::GATEWAY_TIMEOUT => {
+                "No camera frame is available yet".to_string()
             }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    };
+            other => format!("Capture failed: {other}"),
+        })?;
 
-    let (temperature, gain_val) = {
-        let cam_lock = state.camera.lock().unwrap();
-        let camera = cam_lock.as_ref();
-        let temperature = camera
-            .and_then(|c| c.get_parameter(OlsCamOptionId::Temperature).ok())
-            .map(|p| p.cur_val)
-            .unwrap_or(f64::NAN);
-        let gain_val = camera
-            .and_then(|c| c.get_parameter(OlsCamOptionId::Gain).ok())
-            .map(|p| p.cur_val as u32)
-            .unwrap_or_else(|| params.gain.unwrap_or(0));
-        (temperature, gain_val)
-    };
-
-    let id = uuid::Uuid::new_v4().to_string();
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let meta = FitsMeta {
-        exposure_s: params.exposure,
-        gain: gain_val,
-        temperature_c: temperature,
-        binning: params.binning.unwrap_or(1),
-        instrument: state
-            .camera_name
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| "Achernar".to_string()),
-        date_obs: timestamp.clone(),
-    };
-    let path = crate::fits::write_capture(&frame, &meta, &id).map_err(|e| e.to_string())?;
-
-    Ok(json!({
-        "id": id,
-        "width": frame.width,
-        "height": frame.height,
-        "path": path,
-        "metadata": {
-            "exposure": params.exposure,
-            "gain": gain_val,
-            "temperature": temperature,
-            "timestamp": timestamp,
-        }
-    }))
+    serde_json::to_value(image).map_err(|e| e.to_string())
 }
 
 async fn connect_equipment(state: AppState, payload: &Value) -> Result<Value, String> {
@@ -387,7 +338,11 @@ fn start_camera_stream(state: AppState, payload: &Value) -> Result<Value, String
         .ok_or_else(|| "Camera reports no stream formats".to_string())?;
 
     camera
-        .start_stream(fmt, state.latest_frame.clone())
+        .start_stream(
+            fmt,
+            state.latest_frame.clone(),
+            state.camera_config.saturation_adu,
+        )
         .map_err(|e| e.to_string())?;
     *state.streaming.lock().unwrap() = true;
 

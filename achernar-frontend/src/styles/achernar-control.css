@@ -964,6 +964,56 @@ body {
     overflow-wrap: anywhere;
 }
 
+/* Discovered devices — neutral/positive, unlike the red .cam-driver-reason
+   used for unavailable drivers and failed probes. */
+.cam-discovery {
+    flex: 0 0 100%;
+    display: grid;
+    gap: 6px;
+    margin-top: 2px;
+}
+
+.cam-discovered {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    align-items: baseline;
+    width: 100%;
+    text-align: left;
+    padding: 7px 9px;
+    border-radius: 10px;
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    background: rgba(148, 163, 184, 0.06);
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+}
+
+.cam-discovered:hover {
+    border-color: rgba(56, 189, 248, 0.45);
+    background: rgba(56, 189, 248, 0.08);
+}
+
+.cam-discovered.selected {
+    border-color: rgba(56, 189, 248, 0.65);
+    background: rgba(56, 189, 248, 0.12);
+}
+
+.cam-discovered .cam-driver-name {
+    color: #e2e8f0;
+}
+
+/* Informational scan caveats — must not read as an error. */
+.cam-note {
+    display: block;
+    padding: 6px 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    background: rgba(148, 163, 184, 0.05);
+    color: rgba(203, 213, 225, 0.82);
+    overflow-wrap: anywhere;
+}
+
 .cam-select,
 .cam-num {
     padding: 7px 9px;
@@ -1051,6 +1101,37 @@ body {
 .cam-saved code {
     font-family: var(--mono);
     color: rgba(167, 243, 208, 0.95);
+}
+
+/* Capture warnings. Amber, not red: these are conditions the operator needs to
+   know about on a capture that nonetheless succeeded — an exposure the body
+   quantised, files left on the card, a FITS that could not be derived. Styling
+   them as errors would teach people to ignore them. */
+.cam-warnings {
+    margin: 0;
+    padding: 8px 10px 8px 24px;
+    list-style: disc;
+    font-size: 0.70rem;
+    line-height: 1.45;
+    color: rgba(253, 224, 71, 0.92);
+    background: rgba(161, 98, 7, 0.12);
+    border: 1px solid rgba(253, 224, 71, 0.25);
+    border-radius: 10px;
+    overflow-wrap: anywhere;
+}
+
+div.cam-warnings {
+    padding-left: 10px;
+}
+
+.cam-warnings li + li {
+    margin-top: 4px;
+}
+
+/* Selection options render as a labelled dropdown, never a slider — the value
+   is an index and only the label means anything. */
+.cam-param-selection .cam-select {
+    width: 100%;
 }
 
 .cam-params {

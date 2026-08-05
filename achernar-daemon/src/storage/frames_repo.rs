@@ -172,6 +172,7 @@ mod tests {
             width: 8,
             height: 8,
             max_adu: 65535.0,
+            saturation_adu: Some(65535.0),
         };
         let meta = FrameMeta {
             quality_json: serde_json::json!({"focuser_position": 100, "hfr": 2.5}),
