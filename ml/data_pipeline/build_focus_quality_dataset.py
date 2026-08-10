@@ -40,13 +40,70 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def _saturation_level_from_quality(quality_json: str, default: float = 64000.0) -> float:
-    try:
-        q = json.loads(quality_json) if quality_json else {}
-        max_adu = q.get("max_adu")
-        return float(max_adu) * 0.98 if max_adu else default
-    except Exception:
-        return default
+# Matches `saturation_threshold` in achernar-daemon/src/vision/background.rs:
+# sensor response goes non-linear below the hard clip, so the gate sits at 98%.
+SATURATION_FRACTION = 0.98
+
+# A container ceiling at or below this is an 8-bit stream, where the container
+# *is* the clip point — mirroring the 8-bit arm of `resolve_saturation_adu` in
+# vision/quality.rs. Above it we are looking at a 16-bit container, whose
+# ceiling says nothing about where the sensor actually saturates.
+EIGHT_BIT_MAX_ADU = 255.0
+
+
+def saturation_level_from_quality(quality_json: str) -> float | None:
+    """SEP saturation threshold in ADU for this frame, or ``None`` if unknown.
+
+    The daemon already writes what we need. `api/focus.rs` puts both
+    ``saturation_adu`` and ``saturation_gate_applied`` into ``quality_json``,
+    with a comment stating they are there "so the dataset builder can filter on
+    it". This function is that filter.
+
+    The previous implementation read ``max_adu`` — the *container* ceiling — and
+    fell back to 64000. On a 14-bit body delivered in a 16-bit container the
+    sensor clips near 16383 while that rule put the gate at 64230, so no star
+    was ever rejected. Clipped cores have artificially flat profiles and
+    therefore measure *smaller* HFR than the truth, which biased the brightest,
+    highest-weight samples toward "sharper than reality".
+
+    Note the deliberate asymmetry with the daemon: at runtime an unknown
+    saturation point yields an infinite threshold (reject nothing, and report
+    the gate as not performed — the honest thing to do when you must keep
+    observing). At training time the honest thing is the opposite: drop the
+    frame, because an ungated label cannot be distinguished from a clean one
+    once it is in the dataset.
+    """
+    q = _quality_dict(quality_json)
+
+    # An explicit "the gate did not run" is decisive regardless of any value.
+    if q.get("saturation_gate_applied") is False:
+        return None
+
+    declared = q.get("saturation_adu")
+    if declared is not None:
+        try:
+            value = float(declared)
+        except (TypeError, ValueError):
+            return None
+        if value > 0.0:
+            return value * SATURATION_FRACTION
+        return None
+
+    # No declared value. Only an 8-bit container can supply one on its own.
+    max_adu = q.get("max_adu")
+    if max_adu is not None:
+        try:
+            ceiling = float(max_adu)
+        except (TypeError, ValueError):
+            return None
+        if 0.0 < ceiling <= EIGHT_BIT_MAX_ADU:
+            return ceiling * SATURATION_FRACTION
+
+    return None
+
+
+# Back-compat alias; the old private name is still referenced by older notebooks.
+_saturation_level_from_quality = saturation_level_from_quality
 
 
 def _quality_dict(raw: str) -> dict:
@@ -99,8 +156,15 @@ def build_dataset(
     crop_size: int = 64,
     min_snr: float = 5.0,
     max_stars_per_frame: int = 16,
+    allow_missing_saturation: bool = False,
 ) -> dict:
-    """Build the FQE dataset from a daemon SQLite DB + its frame PNGs."""
+    """Build the FQE dataset from a daemon SQLite DB + its frame PNGs.
+
+    Frames whose saturation point is unknown are dropped by default; see
+    :func:`saturation_level_from_quality`. ``allow_missing_saturation`` restores
+    the old permissive behaviour for synthetic fixtures only, and stamps the
+    manifest so a dataset built that way can never be mistaken for a clean one.
+    """
     from PIL import Image
 
     from labels.psf_measure import extract_centered_crop, measure_frame_sep
@@ -139,6 +203,7 @@ def build_dataset(
         )
     }
     frames_read = 0
+    frames_skipped_unknown_saturation = 0
     stars_kept = 0
     sources_detected = 0
     sources_valid = 0
@@ -161,12 +226,22 @@ def build_dataset(
                 f"expected {expected_checksum}, got {actual_checksum}"
             )
 
+        # Decide this before opening the image: a frame we cannot gate is a
+        # frame we cannot label, so there is no point measuring it.
+        sat = saturation_level_from_quality(row["quality_json"])
+        if sat is None:
+            if not allow_missing_saturation:
+                frames_skipped_unknown_saturation += 1
+                continue
+            # Permissive mode: no gate at all, matching the daemon's runtime
+            # behaviour of rejecting nothing rather than inventing a threshold.
+            sat = float("inf")
+
         with Image.open(path) as image:
             img = np.asarray(image).astype(np.float64)
         if img.ndim != 2:
             continue
         frames_read += 1
-        sat = _saturation_level_from_quality(row["quality_json"])
         sources, _frame_label = measure_frame_sep(
             img,
             saturation_level=sat,
@@ -227,10 +302,18 @@ def build_dataset(
             stars_kept += 1
 
     if not columns["crops"]:
-        raise RuntimeError(
-            f"No usable star crops found in {db_path}. "
-            "Has any real autofocus run been recorded yet?"
+        hint = (
+            f"Has any real autofocus run been recorded yet?"
+            if not frames_skipped_unknown_saturation
+            else (
+                f"{frames_skipped_unknown_saturation} frame(s) were dropped because "
+                "their sensor saturation point is unknown. Set `[camera] "
+                "saturation_adu` in the daemon config (measure it with "
+                "tools/photon_transfer.py) and re-capture, or pass "
+                "--allow-missing-saturation for synthetic fixtures only."
+            )
         )
+        raise RuntimeError(f"No usable star crops found in {db_path}. {hint}")
 
     dataset = {
         "crops": np.stack(columns["crops"]).astype(np.float32),
@@ -263,18 +346,29 @@ def build_dataset(
         "sha256": _sha256(output),
         "label_method": "SEP mesh background + deblending + aperture-normalized flux_radius",
         "frames_read": frames_read,
+        "frames_skipped_unknown_saturation": frames_skipped_unknown_saturation,
         "sources_detected": sources_detected,
         "sources_valid": sources_valid,
         "stars_kept": stars_kept,
         "runs": len(run_index),
         "crop_size": crop_size,
         "max_stars_per_frame": max_stars_per_frame,
+        # Load-bearing provenance: a permissive build has ungated labels in it
+        # and must never be promoted or compared against a gated one.
+        "saturation_gate": "permissive" if allow_missing_saturation else "enforced",
     }
     output.with_suffix(".manifest.json").write_text(json.dumps(manifest, indent=2))
     print(
         f"✓ {output_path}: {stars_kept} stars from {frames_read} frames "
         f"across {len(run_index)} runs"
     )
+    if frames_skipped_unknown_saturation:
+        print(
+            f"  ! {frames_skipped_unknown_saturation} frame(s) dropped: sensor "
+            "saturation point unknown (set [camera] saturation_adu)"
+        )
+    if allow_missing_saturation:
+        print("  ! PERMISSIVE saturation gate — synthetic fixtures only, never promote")
     return dataset
 
 
@@ -284,8 +378,23 @@ def main():
     parser.add_argument("--output", default="focus_quality_ds_v1.npz")
     parser.add_argument("--crop-size", type=int, default=64)
     parser.add_argument("--max-stars-per-frame", type=int, default=16)
+    parser.add_argument(
+        "--allow-missing-saturation",
+        action="store_true",
+        help=(
+            "Keep frames whose sensor saturation point is unknown. Synthetic "
+            "fixtures only — the resulting labels are ungated and the manifest "
+            "is stamped 'permissive'."
+        ),
+    )
     args = parser.parse_args()
-    build_dataset(args.db, args.output, args.crop_size, max_stars_per_frame=args.max_stars_per_frame)
+    build_dataset(
+        args.db,
+        args.output,
+        args.crop_size,
+        max_stars_per_frame=args.max_stars_per_frame,
+        allow_missing_saturation=args.allow_missing_saturation,
+    )
 
 
 if __name__ == "__main__":

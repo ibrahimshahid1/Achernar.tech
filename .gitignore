@@ -115,3 +115,10 @@ astronomy_texts/
 tmp/
 # Learned focus-drift filter state — per-rig, changes nightly, never committed.
 **/focus_drift_state.json
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz

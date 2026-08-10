@@ -1,0 +1,2703 @@
+\documentclass[11pt]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{textcomp}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{xcolor}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{tcolorbox}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage[hidelinks]{hyperref}
+\usepackage{xurl}
+
+% ---- palette (matches achernar_audit / achernar_commercial) ----
+\definecolor{acnavy}{HTML}{1F2A44}
+\definecolor{acblue}{HTML}{2D6CDF}
+\definecolor{acteal}{HTML}{0E7C7B}
+\definecolor{acgray}{HTML}{5B6472}
+\definecolor{aclight}{HTML}{EEF2F8}
+\definecolor{acred}{HTML}{C0392B}
+\definecolor{acamber}{HTML}{B9770E}
+\definecolor{acgreen}{HTML}{1E8449}
+\definecolor{accode}{HTML}{F4F6FB}
+
+\hypersetup{colorlinks=true,linkcolor=acblue,urlcolor=acblue}
+
+\pagestyle{fancy}
+\fancyhf{}
+\setlength{\headheight}{14pt}
+\addtolength{\topmargin}{-2pt}
+\renewcommand{\headrulewidth}{0.4pt}
+\lhead{\textcolor{acgray}{\small Achernar — Data Collection \& Ingestion Plan}}
+\rhead{\textcolor{acgray}{\small\thepage}}
+\lfoot{\textcolor{acgray}{\small Internal — working document}}
+
+\titleformat{\part}{\huge\bfseries\color{acnavy}}{Part \thepart}{0.6em}{}
+\titleformat{\section}{\Large\bfseries\color{acnavy}}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\large\bfseries\color{acblue}}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries\color{acteal}}{\thesubsubsection}{0.6em}{}
+
+\newtcolorbox{keybox}[1][]{colback=aclight,colframe=acblue,boxrule=0.8pt,
+  left=8pt,right=8pt,top=6pt,bottom=6pt,#1}
+\newtcolorbox{warnbox}[1][]{colback=white,colframe=acamber,boxrule=0.8pt,
+  left=8pt,right=8pt,top=6pt,bottom=6pt,#1}
+\newtcolorbox{redbox}[1][]{colback=white,colframe=acred,boxrule=0.8pt,
+  left=8pt,right=8pt,top=6pt,bottom=6pt,#1}
+\newtcolorbox{okbox}[1][]{colback=white,colframe=acgreen,boxrule=0.8pt,
+  left=8pt,right=8pt,top=6pt,bottom=6pt,#1}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  backgroundcolor=\color{accode},
+  breaklines=true, frame=single, rulecolor=\color{aclight},
+  framesep=6pt, xleftmargin=4pt, xrightmargin=4pt,
+  columns=fullflexible, keepspaces=true, showstringspaces=false,
+  literate={-}{-}1,
+}
+
+% shorthand for code identifiers in prose
+\newcommand{\co}[1]{\texttt{\small #1}}
+
+\setlist[itemize]{topsep=2pt,itemsep=1pt,parsep=0pt}
+\setlist[enumerate]{topsep=2pt,itemsep=2pt,parsep=0pt}
+
+% long monospaced paths should be allowed to break rather than overflow
+\sloppy
+\setlength{\emergencystretch}{3em}
+\hbadness=10000
+\hfuzz=6pt
+
+\begin{document}
+
+\begin{titlepage}
+\centering
+\vspace*{2.2cm}
+{\Huge\bfseries\color{acnavy} Achernar\par}
+\vspace{0.5cm}
+{\LARGE\color{acblue} Data Collection \& Ingestion Plan\par}
+\vspace{0.4cm}
+{\large\color{acgray} What has to happen outside, what has to happen in the code,\\
+and which of the nine models each night of data actually feeds\par}
+\vspace{1.6cm}
+
+\begin{minipage}{0.82\textwidth}
+\begin{keybox}
+\small
+This document is the bridge between \emph{achernar\_v4.pdf} \S7.6--\S7.7 (which
+says what the models are) and the repository as it exists on
+\today{} (which says what can actually be captured). It is organised so that
+Part~I tells you what is broken, Part~II tells you where bytes go, Part~III
+tells you what each model needs, and Part~IV tells you exactly what to do at
+the eyepiece.
+
+Nothing here assumes a model can be trained on data the current code cannot
+record. Where the code cannot record something, that is stated as a blocking
+defect with a named file, not as a wish.
+\end{keybox}
+\end{minipage}
+
+\vfill
+{\large\color{acnavy} Ibrahim Shahid\par}
+{\small\color{acgray}\today\par}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+% =====================================================================
+\part{Instrument and software readiness}
+% =====================================================================
+
+\section{Purpose, scope, and how to read this}
+
+\subsection{The question this document answers}
+
+Every model in \S7.6 of the specification is currently a stub, a reference graph
+with random weights, or a classical estimator with no fitted constants. The
+reason is not that the architectures are unwritten --- most are --- but that
+none of them has ever seen a photon collected by this system. The gap between
+``the code compiles'' and ``the model ships'' is entirely a data gap.
+
+This document specifies that data: what physically has to be photographed, with
+which instrument, under what conditions, how many times, what has to be written
+down at the time because it cannot be recovered afterwards, and what the
+software has to be able to do before any of it is worth collecting.
+
+\subsection{Reading order}
+
+\begin{itemize}
+\item \textbf{Part I} audits the daemon's real capture and sensor-control
+      capability, inventories the instruments available, and computes what each
+      optical combination can physically resolve. It ends with a list of defects
+      that must close before the first useful night.
+\item \textbf{Part II} traces the ingestion path that already exists in the
+      repository --- \co{capture\_attempts} $\rightarrow$ \co{frames}
+      $\rightarrow$ \co{frame\_assets} $\rightarrow$ \co{frame\_measurements}
+      --- and identifies where it does not yet reach.
+\item \textbf{Part III} takes each of the nine models in turn and states its
+      data contract: label source, required covariates, grouping key, sample
+      budget, which rig can produce it, and what blocks it today.
+\item \textbf{Part IV} is the field material. It is written to the same level of
+      detail as the specification chapters: numbered procedures, exact commands,
+      frame counts, abort criteria, and the log schema.
+\end{itemize}
+
+\subsection{Conventions and standing rules}
+
+\begin{keybox}
+\textbf{Rule 0 --- Citation convention.} A reference written ``spec \S7.6.4''
+points at \emph{achernar\_v4.pdf}. A bare ``\S7.4'' points at a section of
+\emph{this} document. Both documents happen to have a \S7, so the word
+\emph{spec} is load-bearing wherever it appears.
+\end{keybox}
+
+\begin{keybox}
+\textbf{Rule 1 --- Manual first.} Every procedure in Part~IV is executable by
+hand. Automation is an overlay, never a prerequisite. If the daemon is down you
+should still be able to complete the night and ingest afterwards.
+
+\textbf{Rule 2 --- Unknown is a value.} If a quantity was not measured, it is
+recorded as absent, never as a plausible default. The schema already models this
+(\co{frames.temperature\_state} $\in$ \{\co{measured}, \co{stale},
+\co{missing}\}); the field log must too. A guessed ambient temperature will
+silently corrupt the Focus Drift Forecaster and there is no way to detect it
+later.
+
+\textbf{Rule 3 --- Raw stays raw.} Nothing that is written to disk during a
+session is calibrated, stretched, debayered, or scaled. Calibration constants
+travel in the FITS header and the device profile. This is already how
+\co{ols\_decode\_raw} behaves and the field procedures must not undo it.
+
+\textbf{Rule 4 --- The group is the run, not the frame.} Splits are by focus run
+and by night, never by frame or by star. Two stars from the same frame are
+near-duplicates; a random split will produce a model that looks excellent and
+generalises to nothing.
+\end{keybox}
+
+\newpage
+\section{Capability audit: what the daemon can capture today}
+
+This section was written by reading the tree, not the previous handoff notes.
+File and line references are to the working tree as of \today.
+
+\subsection{The capture path, end to end}
+
+There are two distinct paths through the camera layer, and they have different
+maturity.
+
+\subsubsection*{Path A --- streaming / live view (\co{POST /camera/stream/start})}
+
+\co{OlsCamera::start\_stream} (\co{hardware/camera.rs}) opens a format, pushes
+frames into a store, and the vision loop (\co{vision/vision\_loop.rs}) converts
+each to a \co{LumaFrame}, estimates background, detects stars, and computes
+classical HFR in \co{vision/quality.rs}. This path is the one the autofocus
+routine uses. It is the most complete part of the system: 1254 lines of
+star-detection and quality code with an explicit saturation gate, an explicit
+``gate not performed'' state, and no fabricated scalars.
+
+\subsubsection*{Path B --- still capture (\co{POST /camera/capture})}
+
+\co{OlsCamera::capture\_still} (\co{hardware/camera.rs}, \S~line 671) drives a
+DSLR through gphoto2: pause live view, apply and \emph{read back} shutter and
+ISO, timestamp, trigger once, drain events to \co{CAPTURE\_COMPLETE}, download
+every companion asset, resume. The returned \co{StillCapture} carries every
+asset the body produced (native RAW, camera JPEG, and any sidecar), and
+\co{storage/capture\_store.rs} commits them with a stage-hash-manifest-fsync-
+transaction-rename protocol and a startup \co{reconcile()}.
+
+RAW decoding goes through \co{ols\_decode\_raw} into
+\co{hardware/raw\_decode.rs}, which produces \textbf{raw sensor ADU} --- no
+black subtraction, no white balance, no rescaling --- and \co{fits.rs} writes
+the calibration constants into the header (\co{BUNIT}, \co{BLKLEVEL},
+\co{CBLACK0..3}, \co{SATURATE}, \co{XBAYROFF}, \co{YBAYROFF}, \co{BAYERPAT}).
+
+\begin{warnbox}
+\textbf{Path B has never been compiled.} The RAW decode work and the
+\co{capture\_still} implementation were written in an environment with no Rust
+toolchain, no LibRaw and no OpenCV. \co{cargo build} on the Mac is the first
+real test of roughly 1,500 lines. Budget a full session for this before any
+observing is planned around it. See BP-0 in Part~IV.
+\end{warnbox}
+
+\subsection{Driver matrix}
+
+\co{hardware/capabilities.rs} reports, at runtime, which drivers were actually
+compiled into the bridge. The three-way distinction it makes --- \emph{compiled
+in}, \emph{compiled out}, \emph{exposed in Rust but never wired to the bridge}
+--- is exactly the distinction that matters for planning, so it is reproduced
+here.
+
+\begin{center}
+\scriptsize
+\begin{tabular}{@{}llp{0.32\textwidth}p{0.28\textwidth}@{}}
+\toprule
+\textbf{Subsystem} & \textbf{Driver} & \textbf{Status in code} & \textbf{Relevant to us?} \\
+\midrule
+Camera & \co{sim}      & always available & yes --- pipeline smoke tests \\
+Camera & \co{alpaca}   & always available & only via a bridge host \\
+Camera & \co{gphoto2}  & compiled if \co{libgphoto2} found & \textbf{yes --- all 5 DSLR/mirrorless} \\
+Camera & \co{uvc}      & compiled if \co{libuvc} found & \textbf{yes --- SV105} \\
+Camera & \co{asi}      & compiled if ASI SDK present & only if a loaner has one \\
+Camera & \co{svb}      & compiled if SVBony SDK present & \emph{not} the SV105 (see \S\ref{sec:owned}) \\
+Camera & \co{toup}     & compiled if ToupTek SDK present & unlikely \\
+Camera & \co{indi}     & compiled if \co{libindi} found & fallback for loaner gear \\
+Camera & \co{indigo}   & compiled if INDIGO found & unlikely \\
+Camera & \co{wdir}     & \textbf{Linux only} & see \S\ref{sec:defects} defect D3 \\
+\midrule
+Mount  & \co{alpaca}   & always available & loaner GoTo, via bridge \\
+Mount  & \co{sim}      & always available & testing \\
+Mount  & \co{indi}     & compiled if \co{libindi} found & loaner GoTo, native \\
+Mount  & serial/LX200  & \co{hardware/serial\_mount.rs} is a 12-line TODO & \textbf{absent} \\
+\midrule
+Focuser & \co{alpaca}  & always available & only via a bridge host \\
+Focuser & \co{sim}     & always available & testing \\
+Focuser & \co{indi}    & compiled if \co{libindi} found & \textbf{the realistic option} \\
+Focuser & \co{moonlite}& reported \co{disabled} --- Rust only, no bridge & absent \\
+Focuser & USB serial   & reported \co{disabled} --- Rust only, no bridge & absent \\
+\midrule
+Filter wheel & any     & \co{hardware/filter\_wheel.rs} is \co{todo!()} & \textbf{absent} \\
+Env.\ sensors & any    & \co{hardware/sensors.rs} is \co{todo!()} & \textbf{absent} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{What exists above the hardware layer}
+
+It is worth being precise about how much is \emph{not} the problem, because it
+changes where effort should go.
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.30\textwidth}p{0.62\textwidth}@{}}
+\toprule
+\textbf{Area} & \textbf{State} \\
+\midrule
+Star detection / HFR & Complete and careful. \co{vision/quality.rs}, 1254 lines. Explicit rejection accounting (saturated, edge, blended), an explicit \co{SaturationGate} state distinguishing ``no saturated stars'' from ``never checked''. \\
+Background estimation & \co{vision/background.rs} --- implemented, saturation-aware. \\
+Trailing (classical) & \co{vision/trailing.rs} --- 223 lines, implemented. \\
+FITS writer & \co{fits.rs} --- 507 lines, writes sensor-ADU Bayer frames with full calibration headers. \\
+Capture durability & \co{storage/capture\_store.rs} --- staging, hashing, manifest, fsync, transaction, atomic rename, startup reconcile. \\
+Schema & 5 migrations, single authority. \co{frame\_assets} models lineage; \co{frame\_measurements} is append-only and versioned by pipeline/model/preprocessing. \\
+ONNX serving & \co{vision/fqe\_runner.rs} loads a hash-bound model bundle and publishes shadow-only fields. \co{models/onnx\_runner.rs} generic path is still \co{todo!()}. \\
+Debayer / stacking / calibration application & 4-line TODO files. Not needed for training data. \\
+Plate solving & \co{processing/plate\_solver.rs} --- 40 lines. \textbf{Needed} (see \S\ref{m:tme}). \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Defects that block data collection}\label{sec:defects}
+
+These are ordered by how much data they spoil, not by how hard they are.
+
+\subsubsection*{D1 --- Sensor saturation point is not declared, and the ML side reads the wrong field}
+
+The daemon models this correctly. \co{vision/quality.rs} distinguishes
+\co{max\_adu} (the container ceiling: 255 for an 8-bit stream, 65535 for a
+16-bit one) from \co{saturation\_adu} (the sensor's linear saturation point,
+\co{Option<f32>}), and \co{resolve\_saturation\_adu} deliberately returns
+\co{None} for a 16-bit container rather than 65535, so that the gate reports
+``not performed'' instead of silently passing every star.
+
+Two things are still wrong:
+
+\begin{enumerate}
+\item \textbf{The value is never set.} \co{[camera] saturation\_adu} is
+      commented out in \co{achernar.example.toml}. Until it is measured per body
+      and written in, every DSLR frame you take will carry
+      \co{saturation\_gate = not\_performed}.
+\item \textbf{The dataset builder reads \co{max\_adu}, not \co{saturation\_adu}.}
+      \co{ml/data\_pipeline/build\_focus\_quality\_dataset.py} computes its
+      saturation level as \co{max\_adu * 0.98} with a default of 64000. On a
+      14-bit Canon delivered in a 16-bit container, real saturation is at
+      $\sim$16383 ADU; the builder will use 64230 and admit every clipped star
+      into the training set. Clipped stars have artificially flat cores and
+      therefore artificially \emph{small} measured HFR, so this biases the
+      brightest, highest-weight samples toward ``sharper than truth''.
+\end{enumerate}
+
+\begin{redbox}
+\textbf{Blocking.} Bench procedure BP-2 measures the per-body saturation point
+and read noise. The one-line change in the dataset builder --- prefer
+\co{saturation\_adu}, and drop frames where it is absent rather than defaulting
+--- must land before the first training run. This is the single highest-value
+half-hour of code in the document.
+\end{redbox}
+
+\subsubsection*{D2 --- \co{saturation\_adu} is plumbed into streaming but not into still capture}
+
+\co{api/camera.rs} passes \co{state.camera\_config.saturation\_adu} into
+\co{start\_stream} (line 159). No equivalent call appears on the still-capture
+path. That means Path~B frames --- the DSLR RAWs, which are precisely the frames
+that need it --- may reach the quality code without it even once D1 is fixed.
+Verify during BP-0 and wire it through.
+
+\subsubsection*{D3 --- No focuser with readable absolute position}
+
+The Zhumell Z114 has a manual rack-and-pinion focuser. There is no encoder, no
+motor, and no position readout. Consequently:
+
+\begin{itemize}
+\item The \textbf{Focus Offset Predictor} (\S7.6.2) cannot be trained --- its
+      label \emph{is} a signed step count.
+\item The \textbf{Focus Drift Forecaster} (\S7.6.3) cannot be fitted --- $\alpha$
+      is $\Delta p / \Delta T$ in steps per $^\circ$C.
+\item The \textbf{Focus Quality Estimator} can still be trained (it is
+      deliberately pixels-only and takes no position input), but the
+      \emph{provenance} of each run is degraded: without positions you cannot
+      order samples within a run or verify the sweep was monotonic.
+\end{itemize}
+
+Two remedies, in increasing cost, are given in \S\ref{sec:rigs} and RB-2. The cheap one ---
+a dial indicator clamped to the drawtube --- turns the manual focuser into a
+10\,\textmu m absolute encoder for about \$15 and makes FOP data collectable by
+hand.
+
+\subsubsection*{D4 --- No filter wheel, and the hardware layer for one is \co{todo!()}}
+
+\co{hardware/filter\_wheel.rs} is two \co{todo!()} calls. The control layer
+above it (\co{filter\_wheel/filter\_planner.rs}, \co{filter\_bandit.rs},
+\co{filter\_snr\_scorer.rs}, \co{filter\_safety.rs}) and the schema
+(\co{filter\_switch\_events}) both exist. The \textbf{Filter Order Recommender}
+(\S7.6.8) is a 7-class model over L/R/G/B/Ha/OIII/SII; you own none of those
+filters and no wheel. See \S\ref{m:for} --- the recommendation is to descope, not to
+buy.
+
+\subsubsection*{D5 --- No environment sensor}
+
+\co{hardware/sensors.rs} is \co{todo!()}. Temperature currently comes from
+\co{read\_temperature()}, i.e.\ whatever the camera reports, with an honest
+\co{temperature\_state} when it reports nothing. A DSLR's reported temperature
+is the sensor die, which self-heats during a session and is quantised to
+$1\,^\circ$C --- useful as a covariate, useless as ambient. FDF needs ambient.
+See \S\ref{m:fdf} and RB-4 for the manual-logging workaround, which is adequate for a
+first fit.
+
+\subsubsection*{D6 --- Plate solving is a stub}
+
+40 lines in \co{processing/plate\_solver.rs}. This blocks: verified pixel scale
+(BP-4), target identity on every frame (needed for the AstroM3 edge retrofit,
+\S\ref{m:tme}), airmass and moon-separation covariates computed from a \emph{solved}
+pointing rather than a claimed one, and the \co{plate\_solve\_events} table
+which already exists. The cheapest path is to shell out to a local
+\co{solve-field} (astrometry.net) install rather than implement a solver.
+
+\subsubsection*{D7 --- COC class count disagrees between spec and code}
+
+\S7.6.4 of the specification defines a \emph{binary} classifier:
+\co{Linear(1024,1) + Sigmoid}, focal loss with $\alpha=0.25$, $\gamma=2.0$,
+temperature scaling on a held-out set. \co{ml/models/cloud\_classifier.py}
+declares \co{num\_classes: int = 5} with classes
+\{clear, thin, moderate, heavy, overcast\}.
+
+This is not a code detail --- it determines what you write on the log card at
+2\,a.m., and relabelling afterwards is impossible because the sky is gone.
+
+\begin{keybox}
+\textbf{Resolution adopted in this document:} collect \textbf{5-class} labels in
+the field, and derive the binary label by thresholding
+(\{clear, thin\} $\rightarrow$ 0, \{moderate, heavy, overcast\} $\rightarrow$ 1).
+Five-class labels can always be collapsed to two; two can never be expanded to
+five. The model can then be trained either way from the same data. Whichever
+head ships, the field protocol is unchanged.
+\end{keybox}
+
+\newpage
+\section{Instrument inventory and what each rig can actually measure}
+
+\subsection{Owned}\label{sec:owned}
+
+\subsubsection*{SVBony SV105}
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+Sensor & Sony IMX307, 1920$\times$1080, 2.9\,\textmu m pixels, 1/2.8" \\
+Interface & USB 2.0, \textbf{UVC class} --- appears as a webcam, no vendor SDK \\
+Max exposure & \textbf{500\,ms} \\
+Output & 8-bit video (UVC YUY2/MJPEG); no 16-bit linear readout \\
+Form factor & 1.25" barrel, prime focus in the drawtube \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three consequences, all of which shape the plan:
+
+\begin{enumerate}
+\item \textbf{It is a UVC device, not an SVBony-SDK device.} The daemon's
+      \co{svb} driver (SVBony SDK) will not see it. It must come in through
+      \co{uvc} (libuvc). On macOS the OS claims UVC devices for AVFoundation,
+      which can prevent libuvc from opening them. \textbf{Verify in BP-1};
+      if it fails, the fallbacks are (a) capture with an AVFoundation-based
+      tool and ingest via a watch folder --- but \co{wdir} is compiled
+      \textbf{Linux-only} --- or (b) run the daemon in a Linux VM/container with
+      USB passthrough.
+\item \textbf{8-bit output makes the saturation gate load-bearing.} A star peaks
+      at 255 and clips. \co{resolve\_saturation\_adu} correctly returns
+      \co{Some(max\_adu)} for 8-bit containers, so the gate \emph{will} fire ---
+      but only if the frame is tagged as an 8-bit stream. Confirm during BP-1.
+\item \textbf{500\,ms ceiling rules out deep sky entirely.} It cannot contribute
+      to the exposure bandit, long-exposure FQE, or sky-background-vs-moon
+      campaigns. It \emph{is} excellent for high-cadence focus sweeps on bright
+      stars, where you want dozens of frames per focuser position in seconds.
+\end{enumerate}
+
+\subsubsection*{Zhumell Z114}
+
+114\,mm aperture, 450\,mm focal length, f/3.95, parabolic primary, tabletop
+alt-azimuth Dobsonian, 1.25" manual rack-and-pinion focuser, no tracking, no
+setting circles.
+
+\begin{keybox}
+\textbf{The absence of tracking is an asset, not only a limitation.} An
+untracked exposure trails by exactly $15.041\cos\delta$ arcseconds per second.
+That is a \emph{physically computed, exactly known} elongation label, available
+in unlimited quantity, on any clear night, with no rental. This makes the Z114
+the best trailing-detector instrument you have access to --- better than a
+tracked loaner rig, which can only produce negatives. See RB-6.
+\end{keybox}
+
+\subsection{Loanable camera bodies (UNCG)}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lllllc@{}}
+\toprule
+\textbf{Body} & \textbf{Sensor} & \textbf{Pixels} & \textbf{Pitch} & \textbf{RAW} & \textbf{ADC} \\
+\midrule
+Canon T3i (600D) & APS-C 22.3$\times$14.9 & 5184$\times$3456 & 4.30\,\textmu m & CR2 & 14-bit \\
+Canon T6S (760D) & APS-C 22.3$\times$14.9 & 6000$\times$4000 & 3.72\,\textmu m & CR2 & 14-bit \\
+Canon M50        & APS-C 22.3$\times$14.9 & 6000$\times$4000 & 3.72\,\textmu m & CR3 & 14-bit \\
+Canon R50        & APS-C 22.3$\times$14.8 & 6000$\times$4000 & 3.72\,\textmu m & CR3 & 14-bit \\
+Lumix G95        & MFT 17.3$\times$13.0   & 5184$\times$3888 & 3.34\,\textmu m & RW2 & 12-bit \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{warnbox}
+\textbf{The ADC column is a guess until BP-2 measures it, and it must not be
+guessed in the config.} The whole point of D1 is that a wrong
+\co{saturation\_adu} is worse than none. In particular the G95 is listed as
+12-bit here because Panasonic MFT bodies commonly are, but several shoot 12-bit
+in electronic shutter and 12-bit in mechanical too; some are 14. Measure it.
+\end{warnbox}
+
+\subsubsection*{Tethering risk, by body}
+
+The daemon drives DSLRs through \co{libgphoto2}. Support is per-body and
+per-operation, and the operation that matters is \emph{remote shutter release},
+not file download.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{0.62\textwidth}@{}}
+\toprule
+\textbf{Body} & \textbf{Expected gphoto2 status --- to be confirmed in BP-1} \\
+\midrule
+T3i, T6S & Mature Canon PTP support; remote capture and bulb are the
+           best-established case. \textbf{Treat as the primary tethered bodies.} \\
+M50      & Listed in the libgphoto2 supported-camera table; users have reported
+           intermittent capture failures on the M50 family. Medium risk. \\
+R50      & Not on the official supported list. Reports indicate the camera
+           connects and live view / file listing work, but
+           \co{--capture-image-and-download} may complete without taking a
+           frame; behaviour differs between macOS and Linux. \textbf{High risk
+           --- do not plan a rental night around it until BP-1 passes.} \\
+G95      & Panasonic tether support in gphoto2 is materially weaker than
+           Canon's. \textbf{High risk.} Plan for the fallback: shoot with an
+           intervalometer, ingest RW2 files afterwards as an offline import. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keybox}
+\textbf{Bodies that cannot be tethered are still useful.} A body driven by an
+intervalometer produces perfectly good frames for COC (\S\ref{m:coc}), sky background
+(\S\ref{m:bkg}) and trailing (\S\ref{m:ted}) --- none of which require the daemon to control the
+shutter. What they \emph{cannot} do is participate in a closed loop: no
+autofocus sweep, no exposure bandit. Assign untethered bodies to open-loop
+campaigns and do not waste rental nights on them.
+\end{keybox}
+
+\subsection{The loan-programme telescope}\label{sec:loaner}
+
+The rig arrives shipped, is picked up in Chapel Hill, and is available for a
+bounded window. That window is the scarcest resource in this entire plan, so it
+should be spent only on the campaigns that \emph{cannot} be run from the
+driveway with the Z114. Before booking, get answers to the following --- the
+answers change the plan materially, and two of them can make Part~III's Tier~2
+disappear entirely.
+
+\begin{enumerate}
+\item Aperture, focal length, and focal ratio (fixes pixel scale --- \S\ref{sec:sampling}).
+\item Mount model, and \textbf{does it have an ASCOM/Alpaca or INDI driver?}
+      The daemon speaks only Alpaca and INDI for mounts. A hand-controller-only
+      mount is manual-tracking-only from the daemon's point of view.
+\item \textbf{Is there an electronic focuser, and what protocol?} If yes ---
+      and it is INDI- or Alpaca-drivable --- then FOP and FDF become
+      collectable during the rental and you do not need to buy a focuser. This
+      is the single most consequential question on the list.
+\item Is there a filter wheel or filter drawer, and which filters?
+\item Is a guide camera / guide scope included? (Guiding RMS is a context
+      feature for the exposure bandit, \S\ref{m:bandit}.)
+\item Loan duration, shipping lead time, and whether the window can be chosen
+      to fall on a new moon.
+\item Power requirement --- mains, or 12\,V battery? This constrains site
+      choice more than people expect.
+\end{enumerate}
+
+\subsection{Sampling: what each combination can resolve}\label{sec:sampling}
+
+Plate scale in arcseconds per pixel is $s = 206.265\,p\,/\,f$ with $p$ in
+\textmu m and $f$ in mm. Typical Piedmont North Carolina seeing is
+$2.5$--$4''$; the table uses $3''$.
+
+\begin{center}
+\scriptsize
+\begin{longtable}{@{}llrrr@{}}
+\toprule
+\textbf{Optic ($f$)} & \textbf{Camera} & \textbf{"/px} & \textbf{FOV (arcmin)} & \textbf{FWHM @ 3" (px)} \\
+\midrule
+\endhead
+Z114 native (450\,mm)  & SV105  & 1.33 & 42.5 $\times$ 23.9 & 2.26 \\
+                       & T3i    & 1.97 & 170.4 $\times$ 113.6 & 1.52 \\
+                       & T6S / M50 / R50 & 1.70 & 170.4 $\times$ 113.6 & 1.76 \\
+                       & G95    & 1.53 & 132.2 $\times$ 99.1 & 1.96 \\
+\midrule
+Z114 + 2$\times$ Barlow (900\,mm) & SV105 & 0.66 & 21.3 $\times$ 12.0 & 4.51 \\
+                       & T3i    & 0.99 & 85.2 $\times$ 56.8 & 3.04 \\
+                       & T6S / M50 / R50 & 0.85 & 85.2 $\times$ 56.8 & 3.52 \\
+                       & G95    & 0.76 & 66.1 $\times$ 49.6 & 3.92 \\
+\midrule
+80\,mm f/6 refractor (480\,mm) & SV105 & 1.25 & 39.9 $\times$ 22.4 & 2.41 \\
+                       & T6S / M50 / R50 & 1.60 & 159.7 $\times$ 106.5 & 1.88 \\
+\midrule
+8" f/5 Newtonian (1000\,mm) & SV105 & 0.60 & 19.1 $\times$ 10.8 & 5.02 \\
+                       & T3i    & 0.89 & 76.7 $\times$ 51.1 & 3.38 \\
+                       & T6S / M50 / R50 & 0.77 & 76.7 $\times$ 51.1 & 3.91 \\
+                       & G95    & 0.69 & 59.5 $\times$ 44.6 & 4.36 \\
+\midrule
+8" f/10 SCT (2032\,mm) & SV105  & 0.29 & 9.4 $\times$ 5.3 & 10.19 \\
+                       & T6S / M50 / R50 & 0.38 & 37.7 $\times$ 25.2 & 7.95 \\
+\midrule
+11" f/10 SCT (2800\,mm) & SV105 & 0.21 & 6.8 $\times$ 3.8 & 14.04 \\
+                       & T6S / M50 / R50 & 0.27 & 27.4 $\times$ 18.3 & 10.96 \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\begin{redbox}
+\textbf{The Z114 at native focal length is undersampled at best focus for every
+camera you have.} Nyquist wants FWHM $\gtrsim 2$ px; the native combinations sit
+at 1.5--2.3\,px. The consequence is specific and important: \emph{the labels
+near the bottom of the V-curve are quantisation-limited}. The defocused wings
+are fine --- they are many pixels wide --- but the region the Focus Quality
+Estimator most needs to resolve is exactly the region the optics cannot deliver.
+
+\textbf{Remedy: a 2$\times$ Barlow (roughly \$40--60).} It moves every
+combination to 3--4.5\,px FWHM, which is properly sampled, and it doubles the
+defocus excursion per millimetre of focuser travel, which makes the dial-
+indicator scheme in RB-2 more precise in angular terms. For FQE and TED work on
+the Z114 the Barlow should be treated as mandatory equipment, not an option.
+\end{redbox}
+
+\begin{warnbox}
+\textbf{Unverified: whether a DSLR reaches prime focus on the Z114 at all.}
+Many tabletop Newtonians place the focal plane inside the drawtube, so a
+camera body with a 44--45\,mm flange distance cannot reach it. The SV105, being
+a 1.25" barrel that inserts deep into the tube, almost certainly will. Test this
+in daylight before planning anything around it --- BP-3.
+\end{warnbox}
+
+\subsection{Rig definitions used throughout this document}\label{sec:rigs}
+
+A ``rig'' is the grouping key that matters for generalisation testing: the
+\co{rigs} table exists in migration 002 and \co{focus\_runs.rig\_id} references
+it. Hold at least one rig out of training entirely.
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{0.42\textwidth}@{}}
+\toprule
+\textbf{ID} & \textbf{Configuration} & \textbf{What it can produce} \\
+\midrule
+R1 & Z114 + SV105, native & TED (untracked ladder), fast focus sweeps, planetary/lunar. No deep sky. \\
+R2 & Z114 + 2$\times$ Barlow + SV105 & As R1, properly sampled. \textbf{Primary FQE rig without rental.} \\
+R3 & Z114 + Barlow + T6S or T3i & Longer exposures, 14-bit, tethered focus sweeps. Untracked, so exposures $\lesssim 1$\,s. \\
+R4 & DSLR + kit lens, fixed tripod & COC, sky background, all-sky. No telescope needed. \textbf{Runs in parallel with everything else.} \\
+R5 & Loaner scope + loaner mount + DSLR & Tracked long exposure, exposure bandit, FOP/FDF if an electronic focuser is included. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keybox}
+R4 is free and independent. It uses a body, a lens, a tripod and an
+intervalometer, needs no telescope, no daemon and no rental, and it is the only
+rig that collects the Cloud/Obstruction Classifier's data. \textbf{It should be
+running on every single night you are outside, including nights whose primary
+purpose is something else, and including bad nights.}
+\end{keybox}
+
+% =====================================================================
+\part{The ingestion pipeline}
+% =====================================================================
+
+\section{The path bytes take, as built}
+
+\subsection{Table by table}
+
+The schema is the single authority (\co{achernar-daemon/migrations/}); the Rust
+repositories under \co{src/storage/} are its clients. A single exposure touches
+four tables.
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{0.66\textwidth}@{}}
+\toprule
+\textbf{Table} & \textbf{Role} \\
+\midrule
+\co{capture\_attempts} & Written \emph{before} the camera is commanded. Carries
+\co{capture\_id}, \co{requested\_json}, and a status of
+\co{started|committed|failed}. This is what makes ``the mount was slewing and
+the capture silently did nothing'' distinguishable from ``no capture was
+requested''. For a data campaign this is the row that lets you count what you
+\emph{attempted}, not just what succeeded --- which is the denominator in every
+yield calculation in Part~IV. \\
+\addlinespace
+\co{frames} & One row per exposure. Migration 004 widened it from a thin file
+record into a capture record: \co{rig\_id}, \co{camera\_name},
+\co{capture\_type} (\co{light|dark|flat|bias}), \co{capture\_status},
+\co{exposure\_started\_at} / \co{\_completed\_at}, \co{requested\_exposure\_s},
+\co{requested\_gain}, \co{iso}, \co{shutter\_label}, \co{focuser\_position},
+\co{temperature\_source}, \co{temperature\_state}, \co{software\_version},
+\co{driver\_name}, \co{acquisition\_json}. \\
+\addlinespace
+\co{frame\_assets} & The bytes. One row per artefact with an explicit
+\co{role}: \co{native\_raw}, \co{camera\_jpeg}, \co{sensor\_fits},
+\co{analysis\_luma}, \co{thumbnail}, \co{calibrated\_fits}. Carries
+\co{checksum\_sha256}, \co{byte\_length}, \co{bit\_depth}, and
+\co{derived\_from\_asset\_id} --- so the FITS knows it came from the RAW and the
+luma knows it came from the FITS. \co{variant} means a reprocessed asset is a
+new row, not an overwrite. Paths are \emph{relative} to the capture root, so the
+archive can be moved to an external drive without rewriting the database. \\
+\addlinespace
+\co{frame\_measurements} & Append-only, one row per (frame, measurement type).
+\co{hfr | fwhm | star\_count | fqe | cloud | trailing}, each stamped with
+\co{pipeline\_version}, \co{model\_version}, \co{preprocessing\_version}, plus
+\co{valid} and \co{rejection\_reason}. Measurements are opinions produced by a
+specific version of a specific pipeline; overwriting them inside \co{frames}
+would make it impossible to re-evaluate later without destroying what the
+previous model said. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{The commit protocol}
+
+\co{storage/capture\_store.rs} does the following, in order, and the order is
+the point:
+
+\begin{enumerate}
+\item Insert the \co{capture\_attempts} row with status \co{started}.
+\item Stage every downloaded asset to \co{<name>.partial}, hashing while
+      writing (one pass, not two).
+\item Write \co{manifest.v1.json} beside them.
+\item \co{fsync} the files and the directory.
+\item Open a SQLite transaction; insert \co{frames} + all \co{frame\_assets}.
+\item Atomically rename each \co{.partial} to its final name.
+\item Commit the transaction; set the attempt to \co{committed}.
+\item \emph{Only then} delete the originals from the camera's card.
+\end{enumerate}
+
+\co{reconcile()} runs at startup and repairs the two failure modes this leaves:
+committed rows whose files are missing, and staged files with no committed row.
+
+\begin{keybox}
+\textbf{Field consequence.} If the laptop dies mid-download, nothing is lost and
+nothing is half-recorded --- but the frame may still be on the camera card.
+\textbf{Do not format cards in the field.} The post-session checklist (Part~IV,
+\S D) has a card-retention step for exactly this reason.
+\end{keybox}
+
+\subsection{What the ML side reads}
+
+\co{ml/data\_pipeline/build\_focus\_quality\_dataset.py} joins
+\co{focus\_samples} to \co{frames} via \co{focus\_samples.frame\_id}, loads the
+16-bit PNG at \co{frames.local\_path}, detects stars, and labels each crop with
+a SEP/DAOPHOT-style HFR from \co{ml/labels/psf\_measure.py}. It emits an
+\co{.npz} keyed by \co{run\_key} (the split/grouping key), plus \co{rig\_id},
+\co{camera\_id}, \co{filter\_name}, \co{night\_id} as deployment strata.
+
+\co{ml/data\_pipeline/split\_registry.py} then performs grouped splitting ---
+all stars and all frames of one autofocus run stay on the same side --- and
+writes a JSON registry so a split is reproducible.
+
+\begin{warnbox}
+The builder's own docstring names the wall: ``this needs a populated
+\co{achernar.db} and a \co{frames/} directory produced by real autofocus runs on
+real rigs. Until that exists the builder has nothing to read.'' Everything in
+Part~IV exists to produce exactly that.
+\end{warnbox}
+
+\subsection{Gaps between the pipeline and the campaign}\label{sec:gaps}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lp{0.50\textwidth}l@{}}
+\toprule
+\textbf{Gap} & \textbf{Description} & \textbf{Blocks} \\
+\midrule
+G1 & Saturation level read from \co{max\_adu} not \co{saturation\_adu} (D1). & FQE labels \\
+G2 & No offline-import path for frames the daemon did not capture. Untethered bodies (G95, possibly R50) and intervalometer runs produce files with no DB row. & R4 entirely \\
+G3 & \co{wdir} watch-folder driver is Linux-only. & G2's obvious fix \\
+G4 & No ingestion for a manually recorded environment log (ambient temperature, sky condition label, wind). & FDF, COC \\
+G5 & \co{capture\_type} exists but nothing sets it to \co{bias|dark|flat}. & calibration library \\
+G6 & Plate solve stub, so \co{frames} has no verified pointing, no true pixel scale, no target identity. & TME bookkeeping, airmass covariates \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{G2 and G4 are the two that must close first}
+
+They share one solution: a \textbf{sidecar-import tool}. A small Python or Rust
+utility that takes (a) a directory of camera files and (b) a session log in the
+JSON schema of Part~IV \S C, and writes the corresponding \co{frames} /
+\co{frame\_assets} rows using the same hashing and manifest discipline as
+\co{capture\_store.rs}.
+
+This is worth building before the first night, because without it every frame
+that the daemon did not personally trigger is scientifically orphaned --- and
+that is the majority of what the plan collects. It should reuse
+\co{capture\_store.rs} rather than reimplement it, and should mark imported rows
+with \co{driver\_name = "offline\_import"} and an \co{acquisition\_json}
+recording which log file supplied the metadata, so imported and daemon-captured
+data can always be separated during analysis.
+
+\section{Grouping, leakage, and the things that cannot be recovered later}
+
+\subsection{The grouping hierarchy}
+
+\begin{center}
+\small
+\begin{tabular}{@{}llp{0.44\textwidth}@{}}
+\toprule
+\textbf{Level} & \textbf{Key} & \textbf{Why it is a group} \\
+\midrule
+Star & --- & Never a split unit. Stars in one frame share seeing, focus, tracking and sky. \\
+Frame & \co{frames.id} & Never a split unit. Frames in one run share the optical train and the night. \\
+Run & \co{focus\_runs.id} & \textbf{The FQE/FOP split unit.} \\
+Night & \co{night\_id} & \textbf{The COC/background/bandit split unit.} Seeing, transparency and sky brightness are night-level. \\
+Rig & \co{rigs.id} & Hold one out entirely --- this is the only test of whether the model learned optics or learned physics. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\S7.7.2 of the specification additionally requires a \emph{temporal} split
+(oldest 70\,\% train / next 15\,\% val / newest 15\,\% test), which the current
+\co{split\_registry.create\_group\_splits} does not implement --- it shuffles
+groups randomly with a seed. Both are defensible; random-group is a fair test of
+\emph{rig} generalisation, temporal is a fair test of \emph{drift}. Report both.
+
+\begin{redbox}
+\textbf{Practical consequence for the campaign:} a grouped split with a
+temporal component needs \emph{groups}, not \emph{frames}. Twenty thousand star
+crops from three focus runs is three data points. This is the single most common
+way an astro-ML dataset that looks large turns out to be worthless, and it
+drives every sample budget in Part~III.
+\end{redbox}
+
+\subsection{Irrecoverable metadata}
+
+The following cannot be reconstructed from the pixels afterwards. If it is not
+written down at the time, the frames that depend on it are unusable for the
+model that needs it.
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.34\textwidth}p{0.28\textwidth}p{0.30\textwidth}@{}}
+\toprule
+\textbf{Quantity} & \textbf{Needed by} & \textbf{Source} \\
+\midrule
+Sky-condition class (5-level) & COC & \textbf{You, at the time} \\
+Ambient temperature & FDF, FQE covariate & Probe or hand-logged thermometer \\
+Relative humidity, dew point & FOR, bandit, dew diagnosis & Probe or phone weather \\
+Focuser absolute position & FOP, FDF & Encoder / dial indicator \\
+Which direction the focuser was last moved & FOP (backlash) & Log, or daemon \\
+Wind (Beaufort estimate) & TED (distinguishes wind from tracking error) & \textbf{You, at the time} \\
+Whether tracking was on & TED & Log \\
+Moon altitude and illumination & bandit, FOR, background & Computable from time + site \\
+Transparency / naked-eye limiting magnitude & bandit, FOR & \textbf{You, at the time} \\
+Dew on the corrector or mirror & everything --- it invalidates the night & \textbf{You, at the time} \\
+Anything you touched mid-run & everything & \textbf{You, at the time} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keybox}
+The last row is the one that gets forgotten. If you bump the tripod, nudge the
+focuser to check something, swap an eyepiece, or a car's headlights sweep the
+field --- \textbf{write the timestamp}. One un-annotated disturbance in the
+middle of a focus run turns a clean V-curve into a bimodal one, and the fitter
+will silently converge on the wrong minimum. There is a dedicated
+\emph{Disturbances} block on the field card for this.
+\end{keybox}
+
+% =====================================================================
+\part{Per-model data requirements}
+% =====================================================================
+
+\section{How to read the model sections}
+
+Each subsection below follows the same eight-field template.
+
+\begin{center}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Field} & \textbf{Meaning} \\
+\midrule
+Predicts & The target, in its natural units. \\
+Label source & Where ground truth comes from --- and whether a human must supply it. \\
+Unit / group & The row of the dataset, and the key splits are made on. \\
+Covariates & What must accompany every row, and where it comes from. \\
+Rigs & Which of R1--R5 can produce it. \\
+Budget & v0 / v1 / v2 sample targets, in \emph{groups} first and rows second. \\
+Blocked by & Defects from \S\ref{sec:defects} that must close first. \\
+Runbook & The Part~IV procedure that collects it. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The three budget tiers mean:
+
+\begin{itemize}
+\item \textbf{v0 --- plumbing.} Enough to prove the dataset builder, the split
+      registry, the training loop and the ONNX export run end to end on real
+      bytes. Not enough to evaluate anything. Expect the model to be bad;
+      the deliverable is a green pipeline.
+\item \textbf{v1 --- shadow-eligible.} Enough to train something that beats the
+      classical baseline on a held-out group split and can run in shadow mode
+      alongside the classical authority. Not promotable.
+\item \textbf{v2 --- promotion candidate.} Enough groups, rigs, nights and
+      covariate span that a held-out \emph{rig} evaluation is meaningful.
+\end{itemize}
+
+\section{Model-by-model}
+
+\subsection{Model 1 --- Focus Quality Estimator (FQE), spec \S7.6.1}\label{m:fqe}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.16\textwidth}p{0.78\textwidth}@{}}
+\toprule
+Predicts & $\mu = \log(\mathrm{HFR}_{\mathrm{px}})$ and $\log\sigma^2$ per star crop, pooled robustly to a frame value. Note the repo deviates from the spec deliberately: per-star not per-frame, log-HFR in \emph{pixels} not arcseconds, and \textbf{pixels only, no focuser position} (position would let the network regress HFR from a rig-specific shortcut instead of measuring PSF width). \\
+Label source & Automatic --- SEP/DAOPHOT HFR from \co{ml/labels/psf\_measure.py}. \textbf{No human labelling.} \\
+Unit / group & Row = one star crop. Group = \co{focus\_runs.id}. \\
+Covariates & \co{rig\_id}, \co{camera\_id}, \co{night\_id}, \co{filter\_name}, \co{position}, \co{star\_snr}. Position is recorded as provenance, not fed to the net. \\
+Rigs & R2 (primary, no rental), R3, R5. \\
+Budget & \textbf{v0:} 20 runs, 1 rig, 2 nights. \textbf{v1:} 60 runs, $\geq$2 rigs, $\geq$4 nights. \textbf{v2:} 150 runs, $\geq$3 rigs, $\geq$8 nights, $\geq$10\,$^\circ$C ambient span, one rig fully held out. \\
+Blocked by & D1 (saturation), D2, and the Barlow (\S\ref{sec:sampling}). \\
+Runbook & RB-2 (manual focuser), RB-3 (motorised). \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{Why the budget is expressed in runs}
+
+A single 21-position sweep with 150 usable stars per frame yields
+$\sim$3,000 crops --- but they are one group. The binding constraint on a
+grouped split is the group count, not the row count. Thirty runs is the
+practical floor for a train/val/test split with any power at all; 150 runs
+across three rigs is what makes a held-out-rig evaluation interpretable.
+
+At 21 positions $\times$ 5 frames $\times$ $\sim$8\,s per position, one sweep is
+roughly 15 minutes including settling. Three sweeps per hour, four productive
+hours, gives \textbf{$\sim$10 runs per night} --- so v1 is four to six clear
+nights and v2 is fifteen to twenty. That is the real schedule.
+
+\subsubsection*{What makes a run usable}
+
+\begin{itemize}
+\item Monotonic on each side of the minimum, with the minimum interior to the
+      sweep --- not at an endpoint.
+\item $\geq$15 detected stars at every position (fewer at the extremes is
+      expected and acceptable down to 8).
+\item Saturation gate \emph{performed}, and $<5\,\%$ of stars rejected as
+      saturated.
+\item No disturbance logged during the run.
+\item Ambient temperature drift within the run $<0.5\,^\circ$C, otherwise the
+      run is a drift measurement rather than a clean V-curve.
+\end{itemize}
+
+\subsection{Model 2 --- Focus Offset Predictor (FOP), spec \S7.6.2}\label{m:fop}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.16\textwidth}p{0.78\textwidth}@{}}
+\toprule
+Predicts & Signed focuser steps from the current position to best focus, plus direction logits and an uncertainty. \\
+Label source & Automatic, but \emph{retrospective}: the label is $p_{\mathrm{best}} - p_i$, and $p_{\mathrm{best}}$ is only known once the run has converged. \textbf{An aborted run produces no labels at all.} \\
+Unit / group & Row = one focus \emph{sample} within a run. Group = run. \\
+Covariates & The 38-feature vector of \S7.6.2: 3 quality, 4 classical, 5 position, 4 temperature, 7 filter one-hot, 6 history, 3 direction, 3 rig params, 3 sky. \\
+Rigs & R5 with an electronic focuser; R3 with the dial-indicator scheme at reduced precision. \\
+Budget & \textbf{v0:} 40 runs. \textbf{v1:} 200 runs ($\sim$4,000 rows). \textbf{v2:} 500 runs ($\sim$10,000 rows), $\geq$3 rigs. \\
+Blocked by & \textbf{D3} (no position readout) --- hard blocker. D4 degenerates the 7 filter features to a constant. \\
+Runbook & RB-3, and passive harvesting (below). \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{redbox}
+\textbf{FOP needs an order of magnitude more runs than FQE, from the same
+nights.} Each run gives FQE thousands of crops but gives FOP only $\sim$20 rows,
+one per sampled position, and a LightGBM over 38 features wants $\gtrsim$10,000
+rows. Dedicated sweep nights will never get there.
+
+\textbf{The only viable strategy is passive harvesting}: instrument the daemon
+so that \emph{every} autofocus run --- during any session, for any purpose ---
+writes FOP rows. Then FOP data accumulates as a free byproduct of every other
+campaign in this document, and of ordinary use afterwards. The schema for this
+already exists (\co{focus\_runs}, \co{focus\_samples}, \co{focus\_actions}); the
+work is making sure nothing runs autofocus without logging.
+\end{redbox}
+
+\subsubsection*{Feature-group coverage, not just row count}
+
+The 38 features are grouped, and three groups will be degenerate in your data
+unless deliberately varied:
+
+\begin{itemize}
+\item \textbf{Filter (7 one-hot).} Constant-zero without a wheel. Train with the
+      block dropped and document it in \co{norm\_params.json}, or the model
+      will carry seven dead inputs into an ONNX graph that a future
+      filtered rig will silently misuse.
+\item \textbf{Temperature (4).} Needs real thermal span. A single 20-minute
+      session has none. Deliberately observe across a night's cooling curve ---
+      see RB-4.
+\item \textbf{History / direction (9).} \co{prev\_delta\_1/2/3},
+      \co{prev\_hfr\_delta\_1/2/3}, \co{dir\_changed\_recently},
+      \co{steps\_since\_flip}, \co{consec\_improvements}. These only vary if
+      runs actually reverse direction. A sweep that marches monotonically from
+      one end to the other never flips. \textbf{Include reversal runs}: start
+      inside the V, move the wrong way, detect it, reverse. Roughly one third of
+      runs should be reversal runs or the direction head has nothing to learn.
+\end{itemize}
+
+The specification's balanced sampler (\S7.6.2, Listing~12) buckets
+$|\delta|$ at $[0,5,15,40,120,\infty)$ steps. Sweeps that only ever start near
+focus leave the two largest buckets empty and resampling cannot invent them.
+\textbf{Deliberately start some runs far out} --- at $\pm$120 steps or more.
+
+\subsection{Model 3 --- Focus Drift Forecaster (FDF), spec \S7.6.3}\label{m:fdf}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.16\textwidth}p{0.78\textwidth}@{}}
+\toprule
+Predicts & Focus position at a future time, given temperature; and a refocus trigger when $|p_{\mathrm{forecast}} - p_{\mathrm{now}}| > 0.5\,\mathrm{CFZ}$. \\
+Label source & Automatic from consecutive converged runs: $\alpha_{\mathrm{new}} = (p_k - p_{k-1})/(T_k - T_{k-1})$, EWMA'd at $0.8/0.2$ into \co{focuser\_profiles.temp\_coefficient\_steps\_per\_c}. \\
+Unit / group & Row = consecutive run pair. Group = night $\times$ rig. \\
+Covariates & Ambient temperature (\textbf{not} sensor die temperature), timestamp, rig, focuser position. \\
+Rigs & R5, or R3 with dial indicator. \\
+Budget & \textbf{v0:} one night, 8 runs, $\geq$4\,$^\circ$C span. \textbf{v1:} 3 nights per rig, $\geq$6\,$^\circ$C each. \textbf{v2:} 3 rigs $\times$ 3 nights, spanning both a cooling and a warming night if possible. \\
+Blocked by & \textbf{D3} and \textbf{D5}. \\
+Runbook & RB-4. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{This is not really a learned model, and that changes the plan}
+
+FDF v1 is a two-state Kalman filter with hand-set noise parameters
+($\sigma_p = 2$ steps, $\sigma_{\dot p} = 0.5$ steps/min, $\sigma_z = 3$ steps)
+plus one fitted scalar per rig, $\alpha$. It needs \emph{few, well-separated,
+well-thermometered} measurements rather than many noisy ones. Eight clean
+autofocus runs spread over a 6\,$^\circ$C night beat two hundred runs at
+constant temperature.
+
+Note also that $\alpha$ is a property of the \emph{optical tube}, not of the
+camera --- an aluminium tube and a carbon one have different coefficients. A
+loaner scope's $\alpha$ does not transfer to the Z114. Each tube needs its own
+night.
+
+\begin{keybox}
+\textbf{Manual ambient logging is adequate for v1.} A \$10 outdoor
+thermometer read every 15 minutes and written on the card, ingested through the
+sidecar importer (\S G4), gives $\alpha$ to well within the precision the
+Kalman filter's $\sigma_z = 3$ steps assumes. Do not let D5 block this ---
+implement \co{hardware/sensors.rs} later, log by hand now.
+\end{keybox}
+
+\subsection{Model 4 --- Cloud / Obstruction Classifier (COC), spec \S7.6.4}\label{m:coc}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.16\textwidth}p{0.78\textwidth}@{}}
+\toprule
+Predicts & Sky condition. Spec says binary + sigmoid + focal loss; repo stub says 5 classes. \textbf{Collect 5, derive 2} (see D7). \\
+Label source & \textbf{Human, at the time of capture.} This is the only model in the system whose labels a person must supply, and they are irrecoverable. \\
+Unit / group & Row = one sky frame. Group = \textbf{night}, and within a night, contiguous 10-minute label blocks. \\
+Covariates & Timestamp, altitude/azimuth of the field, moon altitude and illumination, whether a light dome is in frame, humidity. \\
+Rigs & \textbf{R4} --- body + wide lens + tripod + intervalometer. No telescope, no daemon, no rental. \\
+Budget & \textbf{v0:} 2 nights, $\geq$500 labelled frames. \textbf{v1:} 8 nights, $\geq$2,000 frames per class for \{clear, thin\} and $\geq$800 for each of \{moderate, heavy, overcast\}. \textbf{v2:} 20 nights across $\geq$3 moon phases and $\geq$2 sites, with a full held-out night per class. \\
+Blocked by & G2 (offline import), G4 (label ingestion). \\
+Runbook & RB-5. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keybox}
+\textbf{The counterintuitive instruction: go outside when it is cloudy.} Clear
+nights are over-represented in any naturally collected set, and the spec already
+anticipates this with focal loss ($\alpha = 0.25$, $\gamma = 2.0$). But focal
+loss reweights a class that exists; it cannot create one. Broken, marginal,
+scudding-cumulus nights are the \emph{most} valuable nights for COC and the
+least valuable for everything else --- so they cost nothing to spend this way.
+
+Put R4 on the tripod on nights you would otherwise write off.
+\end{keybox}
+
+\subsubsection*{Hard negatives to collect deliberately}
+
+The spec calls for hard-negative mining. These are the ones this site will
+actually produce:
+
+\begin{itemize}
+\item Thin high cirrus that a photograph barely shows but which kills
+      transparency.
+\item Moon glow near a bright moon --- \emph{not} cloud, and easily confused
+      with it.
+\item The Durham / Chapel Hill light dome low in the sky --- a bright gradient
+      that is not cloud.
+\item Aircraft contrails, both fresh and spread.
+\item A tree branch, roof line, or power line intruding into frame --- this is
+      \emph{obstruction}, which the model is also named for and which is
+      trivially easy to collect and easy to forget.
+\item Dew or frost on the lens --- a whole-frame softening that resembles
+      overcast. Photograph it on purpose once before wiping it off.
+\item Passing car headlights and a neighbour's porch light.
+\end{itemize}
+
+\subsubsection*{Labelling discipline}
+
+Label on a fixed cadence (every 10 minutes) rather than per frame, and record
+transitions to the minute. Take a phone photo of the sky at each label as an
+independent cross-check --- when a label looks wrong during cleaning, the phone
+photo is what adjudicates. Photographs of the sky taken with the same body at a
+fixed exposure are also directly usable as a second view of the same label.
+
+\subsection{Model 5 --- Trailing / Elongation Detector (TED), spec \S7.6.5}\label{m:ted}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.16\textwidth}p{0.78\textwidth}@{}}
+\toprule
+Predicts & Classical: frame ellipticity $e = \tilde\mu_{0.2}\{1 - b_i/a_i\}$, trigger at $e > 0.15$ with $N \geq 10$, plus position angle. CNN: only for the ambiguous band $0.10 < e < 0.20$ or $N < 10$. \\
+Label source & \textbf{Physically computed.} An untracked exposure trails by $15.041\cos\delta$ arcsec per second, exactly. \\
+Unit / group & Row = one $32\times32$ star cutout. Group = (field, exposure step, night). \\
+Covariates & Exposure time, declination, plate scale (from BP-4), tracking on/off, wind estimate, position angle of the trail. \\
+Rigs & \textbf{R1/R2 for positives} (Z114 is untracked --- every frame is a labelled trail), R5 for negatives. \\
+Budget & \textbf{v0:} 1 night, 3 fields, 12 exposure steps. \textbf{v1:} 3 nights, 5 fields, 12 steps, 20 repeats --- $\sim$3,600 frames, $\gtrsim$100k cutouts. \textbf{v2:} add $\geq$2 tracked nights of negatives and $\geq$1 windy night. \\
+Blocked by & BP-4 (need a solved plate scale to convert arcsec to px). \\
+Runbook & RB-6. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection*{The exposure ladder gives a continuous label axis}
+
+At R2 (Z114 + Barlow + SV105, 0.66\,"/px), on the celestial equator:
+
+\begin{center}
+\small
+\begin{tabular}{@{}rrrl@{}}
+\toprule
+$t_{\mathrm{exp}}$ (s) & trail (arcsec) & trail (px) & regime \\
+\midrule
+0.017 (1/60) & 0.26 & 0.4 & indistinguishable from round \\
+0.05  & 0.75 & 1.1 & sub-seeing \\
+0.10  & 1.50 & 2.3 & marginal --- \textbf{the ambiguous band} \\
+0.20  & 3.01 & 4.6 & clearly elongated \\
+0.33  & 4.96 & 7.5 & \\
+0.50  & 7.52 & 11.4 & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keybox}
+The rows in bold are the ones the CNN exists for. The classical estimator
+already handles obvious trails; the model is only invoked at
+$0.10 < e < 0.20$. \textbf{Sample the ladder densely between 0.05\,s and
+0.25\,s} --- that band is where the training signal lives, and a linear sweep of
+exposure times will under-sample it.
+
+Declination is the second lever: $\cos\delta$ at $\delta = 70^\circ$ is 0.34, so
+a high-declination field at 0.30\,s trails the same as an equatorial field at
+0.10\,s. Shooting three declinations $\times$ a dense exposure ladder gives a
+well-covered 2-D label grid from a manual telescope in one evening.
+\end{keybox}
+
+\subsubsection*{Negatives and confounders}
+
+Perfectly round stars are as necessary as trailed ones, and the Z114 cannot make
+them. Sources: (a) the loaner tracked rig, (b) SV105 exposures short enough that
+the trail is well below a pixel, at $\leq$0.02\,s. Also collect the confounders
+that produce elongation \emph{other} than tracking error --- coma at the field
+edge of an f/3.95 Newtonian (which is severe and always present),
+astigmatism from a pinched mirror, and wind-shake, which produces a
+\emph{random-walk} smear rather than a linear one. The position-angle output
+is what distinguishes them: tracking error has a consistent PA across the frame,
+coma is radial from the optical axis, wind is incoherent.
+
+\subsection{Model 6 --- Background / SNR Estimator, spec \S7.6.6}\label{m:bkg}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.16\textwidth}p{0.78\textwidth}@{}}
+\toprule
+Predicts & \co{background\_adu}, \co{background\_sigma}, \co{snr\_proxy\_median}, \co{saturation\_fraction}. Classical (SEP), always active. Optional DnCNN-lite noise map is v2, GPU-only. \\
+Label source & \textbf{No labels --- it needs \emph{constants}}: \co{READNOISE} and \co{SENSOR\_SATURATION} appear literally in the spec's Listing~15. \\
+Unit / group & N/A for the classical path. \\
+Covariates & Per (body, ISO, temperature) --- gain in $e^-$/ADU, read noise in $e^-$, black level, saturation point. \\
+Rigs & \textbf{Bench. Indoors. No sky required.} \\
+Budget & 5 bodies $\times$ 4 ISOs $\times$ (20 bias + 12 flat pairs) $\approx$ 1,400 frames. One evening per body. \\
+Blocked by & Nothing. \textbf{This can be done tonight, in any weather.} \\
+Runbook & BP-2. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{okbox}
+\textbf{This is the highest-value work available right now.} It requires no
+clear sky, no rental, no focuser, and no working daemon. It produces the
+constants that D1 needs, which unblocks the FQE labels, which unblocks the
+entire focus stack. Every other model in this document consumes its output. If
+there is one thing to do before reading further, it is BP-2.
+\end{okbox}
+
+The photon-transfer method: for a pair of flats at the same illumination,
+\[
+g = \frac{(\bar{S}_1 + \bar{S}_2) - (\bar{B}_1 + \bar{B}_2)}
+         {\sigma^2_{(S_1 - S_2)} - \sigma^2_{(B_1 - B_2)}}
+\quad [e^-/\mathrm{ADU}], \qquad
+\sigma_{\mathrm{read}} = g\,\sigma_{\mathrm{bias}} \quad [e^-]
+\]
+The saturation point is the ADU at which the variance-versus-signal curve turns
+over --- \emph{not} the maximum value in the file, which is the container
+ceiling. Both go into the device profile; the saturation value additionally goes
+into \co{[camera] saturation\_adu}.
+
+\subsection{Model 7 --- Exposure / Gain Recommender (LinUCB), spec \S7.6.7}\label{m:bandit}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.16\textwidth}p{0.78\textwidth}@{}}
+\toprule
+Predicts & An arm from $\{10, 30, 60, 90, 120, 180, 300\}$\,s given a 17-dim context. \\
+Label source & The reward, computed after the fact from five components: sub accepted ($+1.0$), SNR in range ($+0.5$), sub rejected ($-0.5$), saturation $>5\%$ ($-0.3$), trailing ($-0.2$). \\
+Unit / group & Row = one (context, arm, reward) tuple. Group = night. \\
+Covariates & Sky background, moon illumination, moon--target separation, filter one-hot, target type one-hot, seeing, airmass, guiding RMS. \\
+Rigs & \textbf{R5 only.} 300-second exposures require tracking. The SV105 (500\,ms ceiling) cannot participate at all. \\
+Budget & \textbf{v0:} 200 tuples, uniformly randomised. \textbf{v1:} 1,500 tuples, $\geq$6 nights, $\geq$3 moon phases. \textbf{v2:} 5,000 tuples with $\geq$2 target types per session. \\
+Blocked by & Rental window; D6 (airmass/moon separation want a solved pointing); no guider means one context feature is permanently absent. \\
+Runbook & RB-8. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{redbox}
+\textbf{Log the propensity or the data is worthless for offline evaluation.}
+A contextual bandit is trained online, so it appears to need no dataset. But you
+cannot afford to let it explore on live rental nights, which means you need
+\emph{offline} policy evaluation --- and every offline estimator (IPS, doubly
+robust, self-normalised IPS) requires knowing the probability with which the
+logging policy chose each action.
+
+Concretely: run a deliberately randomised logging policy. The first 200 subs
+use a uniform policy ($\pi = 1/7$ for every arm); thereafter $\varepsilon$-greedy
+with $\varepsilon = 0.2$ recorded per decision. Write the sampled arm
+\emph{and} its probability into \co{focus\_predictions}-style provenance.
+Without that column, six nights of rental time produce a dataset on which no
+unbiased estimate of any alternative policy can be computed.
+\end{redbox}
+
+\subsubsection*{Store reward components, not the scalar}
+
+The five reward terms have different measurement provenance --- ``sub accepted''
+is a policy decision, ``saturation $>5\%$'' is a measurement, ``trailing'' is
+another model's output. Storing only the sum makes it impossible to re-weight the
+reward later without re-observing. Store all five in
+\co{frame\_measurements.payload\_json} and compute the scalar at training time.
+
+\subsection{Model 8 --- Filter Order Recommender (FOR), spec \S7.6.8}\label{m:for}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.16\textwidth}p{0.78\textwidth}@{}}
+\toprule
+Predicts & Next filter, 7-class over L/R/G/B/Ha/OIII/SII, LightGBM multiclass with SHAP explanations. \\
+Label source & The filter that was actually chosen, plus its realised SNR. \\
+Rigs & \textbf{None available.} \\
+Blocked by & \textbf{D4} --- no filter wheel, no filters, and \co{hardware/filter\_wheel.rs} is \co{todo!()}. \\
+Runbook & RB-9, documented but descoped. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keybox}
+\textbf{Recommendation: descope FOR. Do not buy hardware for it.}
+
+The reasoning is not just cost. FOR sits at the top of the dependency stack ---
+its feature set consumes ``historical rejection rate per filter'', ``mean HFR per
+filter'', ``sky background per filter'', ``seeing estimate'' and ``transparency
+score'', every one of which is an output of a model that does not exist yet.
+Building FOR before FQE, background and COC work means training a recommender on
+features that are currently constants.
+
+If a loaner rig arrives \emph{with} a wheel, log every filter change through
+\co{filter\_switch\_events} as free data and revisit later. If you specifically
+want a cheap partial path, a manual 1.25" filter drawer with L + UHC + Ha is
+around \$150 and yields a 3-class variant --- but that is a different model from
+the one in \S7.6.8 and should be documented as such, not silently substituted.
+\end{keybox}
+
+\subsection{Model 9 --- Tri-Modal Embedding (TME / AstroM3), spec \S7.6.9}\label{m:tme}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.16\textwidth}p{0.78\textwidth}@{}}
+\toprule
+Predicts & A shared embedding space; used for retrieval, target ranking, anomaly detection. \\
+Deployments & \textbf{(a) Cloud/planning:} AstroM3 as published --- light curve + spectrum + metadata. \textbf{Weights already trained and available} (\co{scripts/download\_astrom3.sh} $\rightarrow$ \co{ml/checkpoints/astrom3/}). \textbf{(b) Edge/daemon:} \co{AstroM3Edge} --- a retrofit with a \emph{new image encoder} over image crop + capture metadata + on-mount telemetry, reusing AstroM3's Informer, MetaModel and CLIPLoss. \\
+Field data needed & \textbf{Deployment (a): none.} It consumes archival survey data, not your photons. \\
+ & \textbf{Deployment (b): the new image encoder is the only untrained part}, and contrastive training from scratch is out of reach at your data scale --- AstroM3 was trained on $\sim$10$^5$ objects. \\
+Rigs & Any --- as a byproduct. \\
+Blocked by & \textbf{D6} (plate solving). \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keybox}
+\textbf{TME needs no dedicated observing at all --- it needs bookkeeping.}
+
+Two concrete asks, both cheap:
+
+\begin{enumerate}
+\item \textbf{Every frame must carry a resolved target identity.} That means
+      plate solving works (D6) and the solved centre is matched to a catalogue
+      object. This is free once \co{solve-field} is wired in, and it is
+      independently valuable for the bandit's airmass and moon-separation
+      features.
+\item \textbf{Train the edge image encoder by distillation, not contrastively
+      from scratch.} Freeze AstroM3's metadata encoder and its embedding space;
+      train only a small image adapter to map your crops into that existing
+      space, supervised by the frozen encoders' output for the same resolved
+      object. This needs thousands of frames, not $10^5$ objects, and every
+      other campaign in this document produces them for free.
+\end{enumerate}
+
+Set the threshold at \textbf{$\geq$10,000 plate-solved frames with resolved
+target identities} before attempting the adapter. You will cross it during the
+FQE and TED campaigns without shooting a single dedicated frame.
+\end{keybox}
+
+\section{Priority order and campaign schedule}
+
+\subsection{Dependency tiers}
+
+\begin{center}
+\scriptsize
+\begin{tabular}{@{}lp{0.30\textwidth}p{0.44\textwidth}@{}}
+\toprule
+\textbf{Tier} & \textbf{Precondition} & \textbf{Yields} \\
+\midrule
+\textbf{T0} & None --- indoors, any weather & Background/SNR constants; gphoto2 capability truth; saturation values; focus-reach answer. \textbf{Unblocks D1.} \\
+\textbf{T1} & One clear night, own gear + Barlow & TED (RB-6); FQE without positions (RB-2); COC in parallel (RB-5). \\
+\textbf{T1b} & Any night, even cloudy & COC alone (RB-5). \textbf{The cheapest data in the plan.} \\
+\textbf{T2} & An electronic focuser --- bought, or included with the loaner & FOP, FDF, FQE with full provenance. \\
+\textbf{T3} & Rental window & Exposure bandit; tracked negatives for TED; long-exposure FQE; plate-solved frames for TME. \\
+\textbf{T4} & Filter wheel & FOR. \textbf{Descoped.} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{The critical path}\label{sec:critical}
+
+\begin{enumerate}
+\item \textbf{BP-0} --- compile the daemon on the Mac. Nothing downstream is
+      real until this passes. Roughly 1,500 lines of Path~B have never been
+      through a compiler.
+\item \textbf{BP-2} --- photon transfer curves for all five bodies. Indoors,
+      one evening each, weather-independent.
+\item \textbf{Fix D1} --- dataset builder reads \co{saturation\_adu}; write the
+      measured values into config. Half an hour of code, and it gates every
+      focus label.
+\item \textbf{BP-1, BP-3} --- gphoto2 truth table and focus-reach test. These
+      determine which bodies can be planned around at all.
+\item \textbf{Build the sidecar importer} (G2/G4). Without it, R4 --- the
+      cheapest and most parallel rig --- produces orphaned files.
+\item \textbf{Decide the focuser question} before booking the rental. If the
+      loaner includes an INDI/Alpaca focuser, T2 and T3 merge into one window
+      and you save both the money and a month. If not, buy one --- FOP and FDF
+      are the models the entire \S7 control narrative rests on, and neither is
+      collectable without it.
+\item \textbf{Start RB-5 immediately} and never stop. It costs nothing, it runs
+      on nights that are useless for everything else, and COC needs more
+      distinct nights than any other model.
+\end{enumerate}
+
+\begin{keybox}
+\textbf{Sequencing note on the rental.} The rental window is the scarce
+resource, so it should be spent last, not first --- after BP-0/BP-2 have proven
+the software path, after the importer exists, and after RB-2/RB-6 have shaken
+out the field procedures on gear you can re-shoot for free. Arriving at a
+14-day loan with untested capture code is how the window gets spent on
+debugging. Aim to book it around a new moon, and pad for shipping.
+\end{keybox}
+
+\subsection{Risk register}
+
+\begin{center}
+\scriptsize
+\begin{tabular}{@{}p{0.30\textwidth}p{0.14\textwidth}p{0.46\textwidth}@{}}
+\toprule
+\textbf{Risk} & \textbf{Severity} & \textbf{Mitigation} \\
+\midrule
+Path~B does not compile or crashes on first RAW & High & BP-0 early; keep Path~A (streaming) as the fallback for all FQE work --- it is the mature path. \\
+libuvc cannot open the SV105 on macOS & High for R1/R2 & BP-1. Fallback: Linux VM with USB passthrough, or AVFoundation capture + sidecar import. \\
+DSLR will not reach prime focus on the Z114 & Medium & BP-3, daytime. Fallback: SV105 only for R1/R2; DSLRs go to R4 and R5. \\
+R50 / G95 cannot be tethered & Medium & BP-1. Fallback: assign them to open-loop campaigns (R4) where the shutter is on an intervalometer. \\
+Loaner has no electronic focuser & High for FOP/FDF & Ask before booking (\S\ref{sec:loaner}, question 3). Fallback: dial indicator (RB-2) or purchase. \\
+Weather --- Piedmont NC summer & High & T1b (COC) converts bad nights into data. T0 is weather-independent. Front-load both. \\
+Undersampling at native focal length & Medium & 2$\times$ Barlow, treated as mandatory for R2/R3. \\
+Focus runs contaminated by unlogged disturbances & Medium & Disturbance block on the field card; drop the run rather than clean it. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =====================================================================
+\part{Where the data comes from}
+% =====================================================================
+
+\section{Sourcing routes: the decision frame}
+
+\subsection{The rule that governs this whole part}
+
+\begin{redbox}
+\textbf{The own-gear track is the critical path. Everything else is optional
+upside, and nothing else may block it.}
+
+Every route in this part except the first has a response latency measured in
+weeks and an outcome outside your control --- an email that may not be answered,
+a loan programme that may not have a focuser, a rental window that may not fall
+on a clear moon. Plan the build and the observing campaign as though none of
+them will come through. If one does, it is a bonus track that runs in parallel.
+
+The failure mode this rule exists to prevent is spending September waiting for a
+reply instead of printing a bracket.
+\end{redbox}
+
+\subsection{What each route can and cannot supply}
+
+Rows are the nine models of Part~III. A tick means the route can produce
+training-grade data for that model; a tilde means partial or unverified; a cross
+means it structurally cannot.
+
+\begin{center}
+\scriptsize
+\begin{tabular}{@{}lccccccc@{}}
+\toprule
+\textbf{Model} & \textbf{Own gear} & \textbf{UNCG/TCO} & \textbf{LCO} & \textbf{Skynet} & \textbf{iTelescope} & \textbf{Seestar} & \textbf{GoTo mount} \\
+ & \scriptsize R1--R4 + DIY & \scriptsize free & \scriptsize free & \scriptsize \$65 & \scriptsize \$50/hr & \scriptsize \$349+ & \scriptsize \$200 \\
+\midrule
+FQE (7.6.1)      & \checkmark\checkmark & $\sim$ & $\times$ & $\times$ & $\times$ & $\sim$ & $\times$ \\
+FOP (7.6.2)      & \checkmark\checkmark & \checkmark\checkmark & $\times$ & $\times$ & $\times$ & \checkmark & $\times$ \\
+FDF (7.6.3)      & \checkmark\checkmark & \checkmark\checkmark & $\sim$ & $\sim$ & $\sim$ & \checkmark & $\times$ \\
+COC (7.6.4)      & \checkmark\checkmark & $\times$ & $\times$ & $\times$ & $\times\times$ & $\times$ & $\times$ \\
+TED (7.6.5)      & \checkmark\checkmark & $\sim$ & $\sim$ & $\sim$ & \checkmark\checkmark & \checkmark & $\times$ \\
+Background (7.6.6)& \checkmark\checkmark & \checkmark & \checkmark & \checkmark & \checkmark & \checkmark & $\times$ \\
+Bandit (7.6.7)   & $\times$ & $\sim$ & $\sim$ & $\sim$ & \checkmark\checkmark & \checkmark & \checkmark \\
+FOR (7.6.8)      & $\times$ & $\sim$ & \checkmark & \checkmark & \checkmark\checkmark & $\times$ & $\times$ \\
+TME (7.6.9)      & $\sim$ & \checkmark\checkmark & \checkmark & \checkmark & \checkmark & $\sim$ & $\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Three things fall out of that table immediately.
+
+\begin{enumerate}
+\item \textbf{Own gear is the only route that can produce COC data at all.}
+      Every remote and institutional option closes the dome when it is cloudy.
+      The Cloud/Obstruction Classifier is structurally uncollectable anywhere
+      except a camera you personally point at a bad sky.
+\item \textbf{Own gear plus a DIY focuser covers six of nine models.} It is not
+      a fallback. It is the main plan.
+\item \textbf{The paid routes buy exactly the two models that were already
+      descoped} --- the exposure bandit and the filter recommender --- because
+      both need hardware you do not have and neither is on the critical path.
+\end{enumerate}
+
+\subsection{Switching triggers}
+
+Rather than choosing a route now, define the condition under which each becomes
+worth activating.
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.26\textwidth}p{0.66\textwidth}@{}}
+\toprule
+\textbf{Route} & \textbf{Activate when} \\
+\midrule
+UNCG / TCO & Immediately --- it costs one email and runs in parallel. \\
+LCO archive & Immediately --- public data, no login, no application. \\
+LCO Global Sky Clubs & If the Durham club will sponsor an application. \\
+Skynet & If \$65 is affordable and you want a scriptable API to write a driver against. \\
+Seestar S30/S50 & If the DIY focuser build fails or slips past October, \emph{or} if you specifically want an end-to-end Alpaca integration rig. \\
+iTelescope & Only after FQE/FOP/FDF are done and you want FOR and the bandit. Not before. \\
+GoTo mount & Never, on this budget. See \S\ref{sec:mounts}. \\
+Raleigh loaner & Never. \$25 plus residency proof plus in-person pickup for gear worse than TCO's. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{The UNCG track}
+\label{sec:uncg}
+
+\subsection{Three College Observatory}
+
+TCO is operated jointly by UNCG, NC A\&T, and Guilford College. It holds a
+\textbf{0.81\,m (32") Ritchey-Chr\'etien on an equatorial mount} --- the largest
+telescope in North Carolina --- at a dark-sky site at 5106 Thompson Mill Road,
+Graham, roughly 33 miles and 45 minutes from Greensboro, and about midway
+between Greensboro and Chapel Hill.
+
+The instrument that matters is a \textbf{fibre-fed eShel \'echelle
+spectrograph}, $R \approx 12{,}000$, covering 3800--7900\,\AA{} continuously.
+
+Public nights run roughly monthly from late September to June; the observatory's
+own page notes that summer months are too cloudy to be worth scheduling. That
+sets the season boundary for anything involving the site.
+
+\begin{keybox}
+\textbf{Prof.\ Anatoly Miroshnichenko is the Director of TCO and of the UNCG
+Planetarium}, and has already replied to an initial enquiry saying there is data
+to work on. That single fact outranks every paid option in this part.
+\end{keybox}
+
+\subsection{What his group actually works on}
+
+Verified from published sources, not inferred:
+
+\begin{itemize}
+\item Hot stars with circumstellar material, the B[e] phenomenon, and binary
+      systems. Co-author on \emph{Galaxies} \textbf{13}, 67 (2025), affiliated
+      to UNCG Physics \& Astronomy.
+\item A \textbf{long-term binary spectroscopy programme at the TCO 0.81\,m
+      running since 2013}. One recent paper alone uses 71 TCO \'echelle spectra
+      spanning 2014--2025; TCO spectroscopy of Polaris\,Aa covers 2015--2024.
+\item Photometry used for \textbf{candidate selection}: the 2025 paper builds
+      criteria from optical and near-infrared colour indices, finds
+      $\sim$40 candidate B[e] objects, then uses spectroscopy to classify them.
+\end{itemize}
+
+\subsection{What to ask for, in order}
+
+\subsubsection*{Ask 1 --- the archive project (his benefit)}
+
+The select-then-confirm loop in the 2025 paper is precisely the setting where a
+cross-modal embedding helps: hand-built colour cuts are replaced by ranking
+against confirmed examples in a learned space over photometry, spectra and
+metadata. AstroM3's published weights already exist, so this is an application,
+not a training project.
+
+The reason this is a good proposal rather than a speculative one is that it is
+\textbf{falsifiable against work already done}: their existing candidate list
+and spectroscopic follow-ups form a ready-made validation set. If the method
+does not recover them, it does not work.
+
+\subsubsection*{Ask 2 --- the autofocus and engineering logs (your benefit)}
+
+Any observatory running ACP, MaxIm, NINA or TheSkyX writes
+(focuser position, HFD/FWHM, temperature) triples every night, plus bias, dark
+and flat libraries. These are treated as throwaway operational exhaust. They are
+\textbf{exactly the FOP and FDF training set}, and a decade of them may already
+exist on disk.
+
+This is the highest-value-per-effort request in the entire document: it costs
+the observatory one zip file and could supply, in a single transfer, the
+hundreds of focus runs that \S\ref{m:fop} says will otherwise take twenty
+nights to accumulate.
+
+Be honest that this serves your project, not theirs. Disguising it as
+collaboration is both wrong and transparent.
+
+\subsubsection*{Ask 3 --- engineering time (small, later)}
+
+Not ``may I observe'' but ``may I run a defocus sequence on a bright star during
+engineering time.'' Focus sweeps need fifteen minutes and a bright star --- not
+dark time, not photometric conditions. Offer explicitly to take the nights
+nobody else wants.
+
+\subsection{The second contact}
+
+Dr.\ Alicia Aarnio (UNCG Physics \& Astronomy) works on stellar magnetic fields
+and young stars using large datasets and computational methods, and runs an
+undergraduate research group. She is the more natural contact for the
+software and ML side specifically, and has an existing student pathway.
+
+\subsection{What the UNCG track does and does not unblock}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.30\textwidth}p{0.62\textwidth}@{}}
+\toprule
+\textbf{Unblocks} & FOP and FDF, \emph{if} the autofocus logs exist and are shared. TME, via the \'echelle archive. Background/SNR, via their calibration frames. \\
+\addlinespace
+\textbf{Does not unblock} & COC --- they do not observe through cloud. FQE --- unless engineering time is granted, and even then the runs are theirs, not repeatable on demand. \\
+\addlinespace
+\textbf{Does not replace} & The DIY focuser. Data you cannot re-collect at will is not a substitute for an instrument you control. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Remote networks and purchased hardware}
+
+\subsection{iTelescope}
+
+Commercial remote network. Control is by uploading an ACP plan text file; the
+complete directive set is \co{\#FILTER}, \co{\#COUNT}, \co{\#INTERVAL},
+\co{\#BINNING}, \co{\#SUBFRAME}, \co{\#DITHER}, \co{\#AUTOFOCUS},
+\co{\#AFINTERVAL}, \co{\#FILTEROFFSETS}, \co{\#DEFOCUS}, \co{\#PLATESOLVE},
+\co{\#TRACKON}/\co{\#TRACKOFF}, \co{\#DARK}, \co{\#BIAS}, \co{\#EXPRESS}.
+
+\begin{warnbox}
+\textbf{There is no directive that commands an absolute focuser position.}
+\co{\#DEFOCUS} is documented as ``defocus the image slightly'' with no
+parameter --- one binary step. No sweep is possible, so FQE and FOP get nothing.
+There is also no ASCOM/INDI/Alpaca surface exposed to the user, so the daemon
+cannot drive it at all.
+\end{warnbox}
+
+What it \emph{is} good for: \co{\#TRACKON} performs orbital tracking, which
+their documentation notes produces ``trailed stars and a stationary minor
+planet'' --- deliberate, rate-controlled trailing on a professional rig, which is
+excellent TED data. Real L/R/G/B/H$\alpha$/OIII/SII wheels make FOR collectable.
+Long tracked exposures with varied moon and airmass make the bandit collectable.
+And moon discounts make full-moon time cheap, which is exactly when
+sky-brightness data is wanted.
+
+Cost: 1 point $=$ US\$1. Their worked example is 104 points for two hours of
+session time on T21 at the Plan-40 tier, i.e.\ \textbf{$\sim$\$52/hour};
+rates fall on larger plans. Billing is per-session or per-exposure, with a
+typical ``system efficiency'' near 0.7 --- about 42 minutes of exposure per hour
+of session.
+
+Education accounts exist, but the application requires an institutional email
+address and explicitly rejects public domains such as Gmail. A UNCG address
+would be the lever.
+
+\subsection{Skynet (UNC Chapel Hill)}
+
+Roughly twenty optical telescopes across four continents plus the Green Bank
+radio telescope, operated from UNC-Chapel Hill. Access is normally restricted to
+contributing institutions, but is open to anyone taking the tuition-free,
+self-paced \emph{Astronomy with Skynet} courses, for which WebAssign charges
+about \$65.
+
+The reason it matters more than iTelescope: \textbf{Skynet has a public,
+token-authenticated API} for submitting observations. That is something a daemon
+driver could be written against, which makes it Achernar-shaped in a way a web
+form is not.
+
+\subsection{Las Cumbres Observatory}
+
+\begin{itemize}
+\item \textbf{Global Sky Partners} awards up to 1500 hours per year to
+      educational programmes; \textbf{Global Sky Clubs} gives 10 hours on the
+      0.4\,m network to school astronomy clubs.
+\item The \textbf{science archive is public} --- data without a proprietary
+      period is downloadable with no login, and proprietary data becomes public
+      after 12 months. Access is by web UI or a JSON API.
+\item Pipeline-processed data is available as little as 15 minutes after the
+      shutter closes.
+\end{itemize}
+
+\begin{okbox}
+The LCO public archive is the only route in this part that requires no
+application, no payment, no email, and no waiting. It is real FITS with real
+headers, available today, and it is enough to exercise the ingestion path, the
+background estimator, and the TME bookkeeping while the sky is cloudy.
+\end{okbox}
+
+\subsection{Smart telescopes}
+
+The ZWO Seestar S50 (\$499, discontinued early 2026) and S30 (\$349) expose
+\textbf{camera, mount and focuser over native Alpaca} in recent firmware; the
+open-source \co{seestar\_alp} project provides an alternative controller. An
+S50 Pro is expected mid-to-late 2026 at \$599--799.
+
+Because the daemon's \co{alpaca} driver is always compiled and needs no SDK,
+a Seestar is a genuine \textbf{drop-in end-to-end integration rig} --- tracking
+mount, camera, and absolute-position focuser, all reachable with no new code.
+
+Its limits are optical, not electrical: 50\,mm at f/5 (250\,mm focal length)
+gives roughly 2.4\,"/px, badly undersampled, and the optics are fixed. Treat it
+as an \emph{integration} instrument and a fallback if the DIY build slips ---
+not as an FQE rig.
+
+\subsection{Focusers}
+
+\begin{center}
+\small
+\begin{tabular}{@{}lrp{0.46\textwidth}@{}}
+\toprule
+\textbf{Option} & \textbf{Cost} & \textbf{Note} \\
+\midrule
+Dial indicator & $\sim$\$15 & Manual absolute position to 10\,\textmu m. No automation. \\
+\textbf{ESP32 + myFP2ESP32} & $\sim$\$40 & \textbf{Recommended.} Speaks Alpaca, ASCOM, INDI and TCP/IP natively. \\
+ZWO EAF & \$179 & \co{indi\_asi\_focuser}. No build risk. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keybox}
+\textbf{Why the DIY build must be ESP32 and not Arduino.}
+\co{OpenLiveStacker/src/focuser.cpp} is 46 lines and its driver list returns
+exactly one entry, \co{\{\{"alpaca:remote","auto"\}\}}. OLS implements no
+Moonlite driver, no USB-serial driver and no INDI focuser driver --- despite
+\co{hardware/focuser.rs} carrying \co{FocuserDriver} variants that map to
+\co{"moonlite"} and \co{"usb"}. Those names point at drivers that do not exist,
+which is what \co{capabilities.rs} reports as \co{disabled}.
+
+An Arduino speaking the Moonlite protocol therefore requires writing a new OLS
+C++ driver and threading it through the bridge ABI. An ESP32 speaking Alpaca
+connects to \co{alpaca\_focuser.cpp}, which is already written and already
+compiled, with \textbf{zero new C++ or Rust}.
+
+Secondary benefit: the Alpaca focuser interface carries \co{Temperature} and
+\co{TempComp} as standard properties, so a DS18B20 on the same board closes
+\textbf{D5} at the same time as \textbf{D3}.
+\end{keybox}
+
+\subsection{Mounts --- and why not to buy one}
+\label{sec:mounts}
+
+\begin{redbox}
+A \$200 GoTo mount solves tracking. \textbf{Tracking is not the blocker.}
+Consult the table in \S9.2: a mount unlocks the exposure bandit and nothing
+else, and the bandit was already descoped. A \$40 focuser unlocks FOP and FDF,
+which are the two models the entire \S7 control narrative rests on.
+
+Sub-\$300 GoTo mounts are additionally alt-azimuth, which introduces field
+rotation, and none ship with a drivable focuser. If tracked time is later
+needed, TCO has an equatorial 0.81\,m and LCO gives hours away.
+
+\textbf{Spend on the focuser. Do not buy a mount.}
+\end{redbox}
+
+\subsection{Standing recommendation}
+
+\begin{enumerate}
+\item Build the DIY focuser and observe on own gear. This is the plan.
+\item Email UNCG in parallel, expecting nothing on any particular timescale.
+\item Pull LCO archive data this week --- it is free and needs no permission.
+\item Consider Skynet's \$65 for API access worth writing a driver against.
+\item Hold iTelescope in reserve for FOR and the bandit, after the focus stack
+      is finished.
+\item Buy no mount.
+\end{enumerate}
+
+% =====================================================================
+\part{Field and bench procedures}
+% =====================================================================
+
+\begin{keybox}
+Every procedure below states, in order: \textbf{purpose}, \textbf{preconditions},
+\textbf{equipment}, \textbf{numbered steps}, \textbf{what is recorded},
+\textbf{abort criteria}, and \textbf{acceptance}. A procedure that is aborted
+still produces a log entry --- an aborted run is evidence, and the
+\co{capture\_attempts} table exists so that failures are counted rather than
+vanishing.
+
+\textbf{Nothing here requires the daemon to be working.} Where a step names a
+daemon endpoint, a manual equivalent is given.
+\end{keybox}
+
+\section*{Appendix A --- Bench procedures (indoors, weather-independent)}
+\addcontentsline{toc}{section}{Appendix A --- Bench procedures}
+
+\subsection*{BP-0 --- First compile and ABI verification}
+\addcontentsline{toc}{subsection}{BP-0 --- First compile}
+
+\textbf{Purpose.} Determine whether the still-capture and RAW-decode path
+(roughly 1,500 lines written but never compiled) actually builds and runs.
+
+\textbf{Preconditions.} Mac with Xcode command line tools, Homebrew, Rust
+toolchain.
+
+\begin{enumerate}
+\item Install the optional native libraries. Each one flips a capability bit
+      that \co{hardware/capabilities.rs} reports at runtime:
+\begin{lstlisting}[language=bash]
+brew install libraw libgphoto2 libusb opencv libtiff
+# optional, enables the INDI camera/mount/focuser drivers:
+brew install indi
+\end{lstlisting}
+
+\item Build, capturing the log --- the CMake summary lines matter as much as the
+      exit code:
+\begin{lstlisting}[language=bash]
+cd achernar-daemon
+cargo build 2>&1 | tee /tmp/build.log
+grep -Ei "libraw|gphoto|uvc|indi|Decode:" /tmp/build.log
+\end{lstlisting}
+
+\item Expect signature mismatches from the capture work. \textbf{Fix them
+      against a clean tree first} and do not tangle them with new features.
+
+\item Run and read the startup banner. It should print the OLS Bridge ABI
+      version and whether LibRaw was found.
+\begin{lstlisting}[language=bash]
+cargo run 2>&1 | head -40
+\end{lstlisting}
+
+\item Query the capability report and save it. This file is the ground truth
+      for every planning decision in Part~I, and it should be re-saved whenever
+      the build environment changes:
+\begin{lstlisting}[language=bash]
+curl -s localhost:8080/drivers | tee docs/capability-report-$(date +%F).json | python3 -m json.tool
+\end{lstlisting}
+
+\item Verify D2: confirm whether \co{camera\_config.saturation\_adu} reaches
+      the still-capture path, not only \co{start\_stream}. Search
+      \co{src/api/camera.rs} for the capture handler and check what it passes
+      into the quality code. If it does not, wire it through now.
+
+\item Run the test suite: \co{cargo test}. Then run the Python side:
+      \co{python -m pytest ml/tests/}, which exercises the dataset builder and
+      the FQE pipeline against synthetic fixtures.
+\end{enumerate}
+
+\textbf{Recorded.} \co{docs/capability-report-YYYY-MM-DD.json}; the build log;
+a note of every signature fix made.
+
+\textbf{Abort criteria.} None --- this must be completed.
+
+\textbf{Acceptance.} \co{cargo build} and \co{cargo test} pass; the capability
+report shows \co{gphoto2: compiled = true}; the startup banner confirms LibRaw.
+
+\subsection*{BP-1 --- Camera capability probe (per body)}
+\addcontentsline{toc}{subsection}{BP-1 --- Camera capability probe}
+
+\textbf{Purpose.} Establish, per body, whether gphoto2 can \emph{trigger} an
+exposure --- not merely list files --- and which exposure and ISO values are
+actually settable. This determines which bodies can be planned around.
+
+\textbf{Preconditions.} BP-0 passed. \textbf{Turn off the camera's Wi-Fi} and
+any companion-app pairing; on Canon bodies set USB connection mode to PC/PTP,
+not MTP or ``smartphone''.
+
+\textbf{Time.} 20--30 minutes per body. Repeat for all five.
+
+\begin{enumerate}
+\item Connect over USB. On macOS, quit Photos, Image Capture and any
+      auto-launching importer first --- they claim the device and gphoto2 will
+      report it as busy.
+
+\item Detect and dump abilities:
+\begin{lstlisting}[language=bash]
+gphoto2 --auto-detect
+gphoto2 --abilities
+gphoto2 --summary
+\end{lstlisting}
+      In \co{--abilities}, the decisive line is the capture operations list. If
+      it does not include image capture, the body is download-only.
+
+\item Enumerate the settable configuration tree and save it --- this is what
+      \co{hardware/dslr\_controls.rs} parses with \co{parse\_shutter\_seconds}
+      and \co{parse\_iso}:
+\begin{lstlisting}[language=bash]
+gphoto2 --list-config > docs/gphoto-config-<body>.txt
+gphoto2 --get-config /main/capturesettings/shutterspeed
+gphoto2 --get-config /main/imgsettings/iso
+gphoto2 --get-config /main/imgsettings/imageformat
+\end{lstlisting}
+      Record whether \co{bulb} appears among the shutter choices and whether
+      \co{/main/actions/eosremoterelease} exists (Canon) --- bulb is required
+      for exposures beyond 30\,s.
+
+\item Set RAW-only output, a known shutter and a known ISO, then read them back.
+      \emph{Reading back is the point} --- the daemon's capture path applies and
+      re-reads for exactly this reason, and a body that silently ignores a set
+      is worse than one that refuses it:
+\begin{lstlisting}[language=bash]
+gphoto2 --set-config imageformat=RAW
+gphoto2 --set-config shutterspeed=1/60 --set-config iso=800
+gphoto2 --get-config shutterspeed --get-config iso
+\end{lstlisting}
+
+\item \textbf{The decisive test.} Attempt three remote captures with download,
+      and confirm three \emph{new} files with three \emph{distinct} timestamps:
+\begin{lstlisting}[language=bash]
+for i in 1 2 3; do
+  gphoto2 --capture-image-and-download --filename "probe_${i}.%C"
+done
+ls -l probe_*
+\end{lstlisting}
+
+\item Time the round trip (trigger to file on disk). This sets the realistic
+      cadence for every sweep in Appendix~B --- a 6-second round trip turns a
+      21-position, 5-frame sweep into 10 minutes of pure transfer.
+
+\item Repeat steps 4--6 with \co{shutterspeed=bulb} if available, using a 5-second
+      bulb exposure, and confirm the resulting file's actual exposure in EXIF.
+
+\item Verify LibRaw can decode the result:
+\begin{lstlisting}[language=bash]
+# any LibRaw sample tool, or:
+python3 -c "import rawpy,sys; r=rawpy.imread(sys.argv[1]); print(r.raw_image.shape, r.raw_image.dtype, r.black_level_per_channel, r.white_level, r.raw_pattern)" probe_1.CR3
+\end{lstlisting}
+      Confirm the reported white level. \textbf{This number is a candidate for
+      \co{saturation\_adu}, but do not trust it} --- BP-2 measures it. The
+      metadata value is a manufacturer hint and is frequently wrong by a few
+      hundred ADU.
+
+\item For the SV105, the equivalent probe is a UVC one:
+\begin{lstlisting}[language=bash]
+# does the OS expose it, and can libuvc claim it?
+system_profiler SPCameraDataType
+# then attempt capture through the daemon's uvc driver and check
+# the reported stream format is 8-bit
+curl -s localhost:8080/camera/formats | python3 -m json.tool
+\end{lstlisting}
+      Confirm the reported container is 8-bit, so that
+      \co{resolve\_saturation\_adu} returns \co{Some(255)} and the saturation
+      gate can fire.
+\end{enumerate}
+
+\textbf{Recorded.} One row per body in the capability table below, plus the
+saved config dumps.
+
+\begin{center}
+\small
+\begin{tabular}{@{}llllllll@{}}
+\toprule
+Body & detect & set shutter & readback & capture & bulb & round trip & LibRaw \\
+\midrule
+T3i & & & & & & & \\
+T6S & & & & & & & \\
+M50 & & & & & & & \\
+R50 & & & & & & & \\
+G95 & & & & & & & \\
+SV105 & \multicolumn{7}{l}{UVC path: opens / 8-bit confirmed / max exposure confirmed} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Abort criteria.} If \co{--capture-image-and-download} fails 3 of 3, stop
+probing that body and mark it \textbf{open-loop only}. Do not spend more than
+30 minutes per body --- the fallback (intervalometer + sidecar import) is
+perfectly adequate for COC, background and trailing work.
+
+\textbf{Acceptance.} At least two bodies pass full remote capture. If none do,
+the entire closed-loop plan collapses to the SV105 and this must be discovered
+now, not on a rental night.
+
+\subsection*{BP-2 --- Photon transfer curve, read noise, and saturation}
+\addcontentsline{toc}{subsection}{BP-2 --- Photon transfer curve}
+
+\textbf{Purpose.} Measure, per (body, ISO), the conversion gain $g$ in
+$e^-$/ADU, the read noise $\sigma_{\mathrm{read}}$ in $e^-$, the black level,
+and the linear saturation point in ADU. These are the constants the
+Background/SNR estimator needs (\S\ref{m:bkg}) and the value D1 needs.
+
+\textbf{Preconditions.} BP-1 passed for this body. \textbf{Indoors. Any
+weather.}
+
+\textbf{Equipment.} Body; lens or body cap; a uniform light source --- a
+white laptop or tablet screen at fixed brightness, viewed slightly defocused,
+is more than good enough; a dark room; tripod or stable surface.
+
+\textbf{Time.} 45--60 minutes per body, per ISO. Do at least ISO 100, 400, 1600,
+3200.
+
+\begin{enumerate}
+\item \textbf{Bias frames.} Body cap on, lens off, in a dark room. Set the
+      shortest available shutter (1/4000\,s). Capture \textbf{20 frames}. Do
+      not let the sensor heat --- pause 5 seconds between frames.
+
+\item \textbf{Dark frames.} Same, but at each exposure you intend to use in the
+      field (1\,s, 10\,s, 30\,s, and bulb 120\,s if applicable), \textbf{10
+      frames each}. These also give you the dark-current rate, which is
+      strongly temperature dependent --- record the EXIF sensor temperature for
+      every frame.
+
+\item \textbf{Flat pairs.} Point at the uniform source. At each of
+      \textbf{12 illumination levels} spanning roughly 5\,\% to 105\,\% of full
+      scale (vary shutter speed, not screen brightness --- brightness controls
+      on screens are often non-linear and PWM-modulated), capture
+      \textbf{2 frames}. Twelve levels $\times$ 2 = 24 frames.
+
+      Use exposures $\geq$1/100\,s to avoid screen PWM banding, and check one
+      frame for banding before committing to the whole ladder.
+
+\item \textbf{Compute.} For each level, using the central 500$\times$500 region
+      of one Bayer channel only (do \emph{not} mix channels --- they have
+      different sensitivities):
+      \begin{itemize}
+      \item mean signal $\bar{S}$ and the variance of the \emph{difference}
+            of the pair, $\sigma^2_{(S_1-S_2)}$;
+      \item the same for the bias pair;
+      \item $g = \big[(\bar{S}_1 + \bar{S}_2) - (\bar{B}_1 + \bar{B}_2)\big] \big/ \big[\sigma^2_{(S_1-S_2)} - \sigma^2_{(B_1-B_2)}\big]$.
+      \end{itemize}
+      Differencing is what removes fixed-pattern non-uniformity, which would
+      otherwise dominate the variance and make $g$ come out far too small.
+
+\item \textbf{Plot} $\sigma^2$ against $\bar{S}$. The linear region has slope
+      $1/g$. \textbf{The saturation point is where it turns over}, not the
+      maximum value in the file.
+
+\item \textbf{Read noise.} $\sigma_{\mathrm{read}} = g \times \sigma_{\mathrm{bias}}$,
+      where $\sigma_{\mathrm{bias}}$ is the standard deviation of the bias
+      difference frame divided by $\sqrt{2}$.
+
+\item \textbf{Black level.} The mean of the bias frames. Canon bodies typically
+      carry an offset near 2048 ADU for 14-bit output. \textbf{Measure it, do
+      not assume it} --- it varies by body and sometimes by ISO.
+
+\item \textbf{Write the results} to \co{docs/device-profiles/<body>.json} and
+      set \co{[camera] saturation\_adu} in the daemon config for the body in
+      use. Follow the config file's own warning: a wrong value is worse than
+      none.
+\end{enumerate}
+
+\textbf{Recorded.} Per (body, ISO): $g$, $\sigma_{\mathrm{read}}$, black level,
+saturation ADU, full-well in $e^-$, dark current in $e^-$/px/s at the measured
+sensor temperature.
+
+\textbf{Abort criteria.} If the PTC is not linear over at least a decade of
+signal, something is applying a non-linear transform --- almost always a
+highlight-tone curve or the wrong RAW decode path. Stop and fix; the numbers are
+meaningless otherwise.
+
+\textbf{Acceptance.} $g$ within a factor of 2 of the manufacturer's published
+value where one exists; $\sigma^2$-vs-$\bar{S}$ linear ($R^2 > 0.99$) below
+saturation.
+
+\subsection*{BP-3 --- Prime-focus reach and backfocus (daytime)}
+\addcontentsline{toc}{subsection}{BP-3 --- Prime-focus reach}
+
+\textbf{Purpose.} Determine whether each camera can physically reach focus on
+the Z114, with and without the Barlow. Many tabletop Newtonians place the focal
+plane inside the drawtube, which no DSLR can reach.
+
+\textbf{Time.} 15 minutes. \textbf{Daylight. Do not point anywhere near the
+sun.}
+
+\begin{enumerate}
+\item Set up indoors, aimed through a window at a high-contrast object at least
+      1\,km away --- a distant roofline or antenna.
+\item Insert the SV105 at prime focus. Rack the focuser fully in, then out
+      slowly, watching the live stream. Record whether focus is achieved and,
+      if so, the drawtube extension in mm at focus.
+\item Repeat with each DSLR on a T-ring + 1.25" nosepiece.
+\item Repeat both with the 2$\times$ Barlow inserted --- a Barlow moves the
+      focal plane \emph{outward}, which usually rescues a body that could not
+      otherwise reach focus. This is a second, independent reason to own one.
+\item If a DSLR cannot reach focus even with the Barlow, record the shortfall in
+      mm. Remedies, in order of preference: use the Barlow permanently; fit a
+      low-profile focuser; move the primary mirror up the tube (last resort ---
+      it changes the optical alignment).
+\end{enumerate}
+
+\textbf{Recorded.} A 6-row table: camera $\times$ \{native, Barlow\}
+$\rightarrow$ \{reaches focus?, drawtube mm at focus, shortfall mm\}.
+
+\textbf{Acceptance.} At least one camera reaches focus in at least one
+configuration. If none do, R1--R3 are void and every telescope-based campaign
+depends on the rental.
+
+\subsection*{BP-4 --- Plate scale and orientation by solving}
+\addcontentsline{toc}{subsection}{BP-4 --- Plate scale by solving}
+
+\textbf{Purpose.} Measure the true arcsec/px and field rotation. \textbf{Do not
+trust the nominal focal length} --- a Barlow's true amplification depends on its
+spacing from the sensor and is routinely 10--20\,\% off its label, and the trail
+lengths in RB-6 are computed in arcseconds but labelled in pixels.
+
+\textbf{Preconditions.} One clear night, 20 minutes. Astrometry.net installed
+locally with the appropriate index files (4200-series for wide fields,
+4100-series for narrow).
+
+\begin{enumerate}
+\item Point at a moderately rich star field well away from the Milky Way plane
+      --- too many stars is as bad as too few.
+\item Capture 3 frames at the shortest exposure that shows $\geq$30 stars.
+\item Solve:
+\begin{lstlisting}[language=bash]
+solve-field --scale-units arcsecperpix --scale-low 0.2 --scale-high 3.0 \
+            --downsample 2 --no-plots --overwrite frame.fits
+\end{lstlisting}
+\item Record from the WCS: pixel scale, field rotation, and the solved centre.
+\item Repeat for every optical configuration you intend to use (native, Barlow,
+      each camera). \textbf{Each combination has its own scale.}
+\end{enumerate}
+
+\textbf{Recorded.} \co{docs/plate-scales.json}, keyed by rig ID.
+
+\textbf{Acceptance.} Solved scale within 15\,\% of the computed value in
+\S\ref{sec:sampling}. A larger discrepancy means the assumed focal length or pixel pitch is
+wrong --- find out which before collecting anything that depends on it.
+
+\subsection*{BP-5 --- Focuser step calibration (only if motorised)}
+\addcontentsline{toc}{subsection}{BP-5 --- Focuser step calibration}
+
+\textbf{Purpose.} Populate \co{focuser\_profiles.steps\_per\_micron} (migration
+005) and the critical focus zone, both of which the FDF trigger
+($0.5 \times \mathrm{CFZ}$) and the FOP normalisation depend on.
+
+\begin{enumerate}
+\item Command a known large move (e.g.\ 1000 steps) and measure the drawtube
+      displacement with a dial indicator. $\mathrm{steps/\mu m} = 1000 / \Delta x_{\mu m}$.
+\item Measure backlash: approach a position from each direction and record the
+      difference. Write it to \co{focuser\_profiles}; \co{focus/backlash.rs}
+      consumes it.
+\item Compute the CFZ from the focal ratio: $\mathrm{CFZ} \approx 4.88\,\lambda N^2$
+      in \textmu m, with $\lambda = 0.55\,\mathrm{\mu m}$ and $N$ the focal ratio.
+      For f/3.95 this is $\approx 42\,\mathrm{\mu m}$; for f/10, $\approx 268\,\mathrm{\mu m}$.
+      Convert to steps with the measured scale.
+\item \textbf{Sanity check.} The step size should be smaller than CFZ/5, or the
+      focuser cannot resolve best focus regardless of how good the model is.
+\end{enumerate}
+
+\textbf{Recorded.} steps/\textmu m, backlash in steps, CFZ in \textmu m and in
+steps, per rig.
+
+\section*{Appendix B --- Observing runbooks}
+\addcontentsline{toc}{section}{Appendix B --- Observing runbooks}
+
+\subsection*{RB-1 --- Calibration frame library}
+\addcontentsline{toc}{subsection}{RB-1 --- Calibration library}
+
+\textbf{Purpose.} Bias, dark and flat libraries per (body, ISO, exposure,
+temperature bin). Required for background estimation and any later calibration;
+also the substrate for BP-2.
+
+\textbf{When.} Refresh whenever the body changes, the ISO set changes, or
+ambient temperature moves by more than 5\,$^\circ$C from the library's bin.
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Type} & \textbf{Count} & \textbf{Conditions} & \co{capture\_type} \\
+\midrule
+Bias & 50 & shortest shutter, cap on, dark room & \co{bias} \\
+Dark & 20 per exposure & matched exposure, ISO, temperature bin & \co{dark} \\
+Flat & 20 per filter/config & even illumination, $\sim$50\,\% full scale & \co{flat} \\
+Flat-dark & 20 & matched to the flat exposure & \co{dark} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{enumerate}
+\item Shoot bias and dark at the end of the session, while the equipment is
+      still at ambient. Darks shot warm in the afternoon do not match lights
+      shot cold at 2\,a.m.
+\item Shoot flats at dusk against a twilight sky, or with a white t-shirt over
+      the aperture and an even light source. Target a mean around half of the
+      \emph{measured} saturation from BP-2 --- not half the container ceiling.
+\item Record the sensor temperature (EXIF) for every calibration frame.
+\item Set \co{frames.capture\_type} correctly on ingest (gap G5). If the daemon
+      does not yet set it, the sidecar importer must.
+\end{enumerate}
+
+\textbf{Abort criteria.} Any light leak visible in a bias frame --- reshoot in a
+darker room, and check the viewfinder eyepiece is covered on DSLRs.
+
+\textbf{Acceptance.} Bias frames have a flat histogram centred on the black
+level from BP-2 with no gradient; flats vary by $<20\,\%$ corner to centre
+beyond expected vignetting.
+
+\subsection*{RB-2 --- Focus sweep with a manual focuser (R2 / R3)}
+\addcontentsline{toc}{subsection}{RB-2 --- Manual focus sweep}
+
+\textbf{Purpose.} Produce FQE training runs --- and, with the dial-indicator
+modification, low-precision FOP runs --- without a motorised focuser.
+
+\textbf{Preconditions.} BP-2, BP-3, BP-4 complete. Clear sky, seeing not
+terrible, wind below about 10\,km/h.
+
+\textbf{Equipment.} Z114 + 2$\times$ Barlow + SV105 (or DSLR). A dial indicator
+(0.01\,mm) clamped so its plunger rides the drawtube, or failing that a printed
+paper mm scale taped along the drawtube. Red headlamp. Field card.
+
+\begin{keybox}
+\textbf{The dial-indicator modification.} A \$15 dial indicator clamped to the
+focuser body with its plunger against the drawtube gives absolute position to
+10\,\textmu m. At f/3.95 the CFZ is $\approx 42\,\mathrm{\mu m}$, so 10\,\textmu m
+resolves the focus zone into four steps --- coarse, but \emph{real absolute
+position}, which is the difference between an FQE-only run and an FOP-eligible
+one. Record the indicator reading in \co{frames.focuser\_position} in units of
+10\,\textmu m and document the unit in \co{acquisition\_json}.
+\end{keybox}
+
+\begin{enumerate}
+\item \textbf{Setup.} Level the table. Let the telescope reach ambient for
+      $\geq$30 minutes --- a warm mirror produces tube currents that ruin every
+      HFR measurement. Record the start time and ambient temperature.
+
+\item \textbf{Target.} A field with 20--60 stars of moderate brightness. Avoid
+      a single very bright star: it saturates while the field stars are still
+      undetected, and the saturation gate will reject exactly the star you were
+      aiming at. \textbf{A loose open cluster is ideal.}
+
+\item \textbf{Exposure.} Set so the brightest stars peak at 50--70\,\% of the
+      measured saturation \emph{when in focus} --- because they will be far
+      dimmer when defocused, and you must not clip at the centre of the sweep.
+      For the SV105 this will be in the 50--300\,ms range.
+
+\item \textbf{Find visual best focus} and record the indicator reading as
+      $x_0$.
+
+\item \textbf{Define the sweep.} 21 positions, symmetric about $x_0$, step size
+      $\approx \mathrm{CFZ}/3 \approx 14\,\mathrm{\mu m}$ --- so
+      $x_0 \pm 140\,\mathrm{\mu m}$ end to end. If the V-curve does not clearly
+      turn over at both ends, widen the range and redo.
+
+\item \textbf{At each position, in order:}
+      \begin{enumerate}[label=\alph*.]
+      \item Move the focuser \textbf{always in the same direction} --- start
+            fully at one end and march to the other. Never back up mid-sweep;
+            backlash will corrupt the position axis.
+      \item Wait 3 seconds for vibration to settle.
+      \item Record the indicator reading.
+      \item Capture \textbf{5 frames}.
+      \item Note star count from the live display if available.
+      \end{enumerate}
+
+\item \textbf{Log the run} on the field card: run ID, start/end time, $x_0$,
+      step size, direction, ambient temperature at start and end, target,
+      altitude, and anything you touched.
+
+\item \textbf{Repeat} 3 times per night minimum. Vary the target field between
+      runs --- three sweeps on the same field are more correlated than three on
+      different fields, and correlated groups do not help a grouped split.
+
+\item \textbf{One run in three should be a reversal run} (see \S\ref{m:fop}): start
+      70\,\textmu m inside the V on the wrong side, move away from focus for
+      four positions, then reverse and complete the sweep. This is the only
+      source of variation for the FOP direction and history features.
+\end{enumerate}
+
+\textbf{Recorded.} Per run: 21 positions $\times$ 5 frames $\approx$ 105 frames.
+Per position: indicator reading, timestamp, exposure, gain/ISO, star count.
+Per run: ambient temperature at start and end, target, altitude, seeing
+impression, disturbances.
+
+\textbf{Abort criteria.}
+\begin{itemize}
+\item Cloud crossing the field --- abort, log the run as \co{aborted}, restart.
+\item Star count $<8$ at the centre of the sweep --- the field is too sparse.
+\item Ambient temperature drifts $>0.5\,^\circ$C within the run --- keep the
+      data but flag it; it belongs to RB-4, not here.
+\item Wind gusts visibly shaking the image --- abort.
+\end{itemize}
+
+\textbf{Acceptance.} The HFR-vs-position curve is a clean V or U, monotonic on
+each side, minimum interior to the sweep, with $\geq$15 stars at the minimum and
+$\geq$8 at both ends.
+
+\textbf{Yield.} $\sim$15 min per run, $\sim$10 runs per productive night.
+\textbf{v1 (60 runs) is 6 clear nights; v2 (150 runs) is 15.}
+
+\subsection*{RB-3 --- Focus sweep with a motorised focuser (R5)}
+\addcontentsline{toc}{subsection}{RB-3 --- Motorised focus sweep}
+
+\textbf{Purpose.} Full-provenance FQE runs plus FOP rows and FDF pairs. This is
+the procedure that produces all three focus models at once and is therefore the
+best use of a rental night.
+
+\textbf{Preconditions.} BP-5 complete; focuser reachable through INDI or Alpaca;
+\co{POST /focus/run} works.
+
+\begin{enumerate}
+\item Setup and thermal equalisation as RB-2 steps 1--3.
+\item Verify the daemon can read and command position:
+\begin{lstlisting}[language=bash]
+curl -s localhost:8080/focuser/position
+curl -s -X POST localhost:8080/focuser/moveto -d '{"position": 12000}'
+\end{lstlisting}
+\item \textbf{25 positions}, step size $\mathrm{CFZ}/4$ in steps from BP-5,
+      \textbf{3 frames} per position, always approaching from the same
+      direction with backlash compensation enabled.
+\item After each run, record the fitted best position and the ambient
+      temperature --- this pair is one FDF observation.
+\item \textbf{Vary deliberately across runs:}
+      \begin{itemize}
+      \item \textbf{Field position:} centre, and two fields near the edge of the
+            usable field. Off-axis aberration changes the PSF shape and the
+            model must not learn that the centre crop is the only valid one.
+      \item \textbf{Airmass:} one field near zenith, one at $\sim$2 airmasses.
+      \item \textbf{Starting offset:} alternate between starting near focus and
+            starting at $\pm$150 steps, to populate the balanced-sampler buckets
+            of \S7.6.2.
+      \item \textbf{Direction:} alternate inward-first and outward-first.
+      \end{itemize}
+\item Log every run to \co{focus\_runs} with a correct \co{rig\_id}.
+\end{enumerate}
+
+\textbf{Yield.} $\sim$8 min per run with a motor. \textbf{$\sim$25 runs per
+night}, which is where the FOP budget becomes achievable --- 200 runs is 8
+nights rather than 20.
+
+\subsection*{RB-4 --- Thermal drift night (FDF)}
+\addcontentsline{toc}{subsection}{RB-4 --- Thermal drift night}
+
+\textbf{Purpose.} Fit the per-tube temperature coefficient
+$\alpha$ in steps/$^\circ$C, and the drift rate $\dot p$.
+
+\textbf{Preconditions.} A focuser with position readout. A thermometer.
+\textbf{Choose a night with a forecast temperature drop of $\geq$8\,$^\circ$C}
+--- clear, dry, post-frontal nights are ideal, which conveniently are also good
+seeing nights.
+
+\begin{enumerate}
+\item Start \textbf{at dusk}, while the air is still warm, and run until the
+      pre-dawn minimum. The span is the whole point; a 3-hour session in the
+      middle of the night has almost none.
+\item Do \textbf{not} let the telescope reach thermal equilibrium first --- for
+      once, you want the cooling transient.
+\item Run a full autofocus \textbf{every 30 minutes}, on the same field if
+      possible, and \textbf{do not touch the focuser between runs}.
+\item Record at every run: ambient temperature, sensor temperature, focuser
+      best position, time.
+\item Additionally log ambient temperature every 15 minutes regardless, so the
+      temperature series is denser than the focus series.
+\item Continue for $\geq$6 hours, giving $\geq$12 runs.
+\end{enumerate}
+
+\textbf{Recorded.} A table of (time, $T_{\mathrm{ambient}}$,
+$T_{\mathrm{sensor}}$, $p_{\mathrm{best}}$, run\_id). This is the entire FDF
+dataset for that tube.
+
+\textbf{Abort criteria.} Cloud for more than 30 minutes --- resume and note the
+gap; do not interpolate across it. If the focuser is bumped, the night is over
+for FDF purposes (though the individual runs remain valid FQE data).
+
+\textbf{Acceptance.} $\geq$10 successful runs spanning $\geq$6\,$^\circ$C,
+and $p_{\mathrm{best}}$ versus $T$ approximately linear. A scatter plot with no
+visible trend means either the temperature range was too small or the focuser
+has more backlash than drift --- check BP-5.
+
+\textbf{Repeat.} Three nights per tube. $\alpha$ is a property of the tube, not
+the camera; a loaner's $\alpha$ does not transfer to the Z114.
+
+\subsection*{RB-5 --- Cloud and obstruction campaign (R4)}
+\addcontentsline{toc}{subsection}{RB-5 --- Cloud campaign}
+
+\textbf{Purpose.} COC training data. \textbf{The cheapest and most parallelisable
+campaign in the plan.}
+
+\textbf{Preconditions.} None. No telescope, no daemon, no rental, no clear sky.
+
+\textbf{Equipment.} Any body + widest lens; tripod; intervalometer or the
+body's built-in interval timer; spare battery (this runs all night); a phone for
+cross-check photos; the field card.
+
+\begin{enumerate}
+\item Set up pointing at a fixed altitude/azimuth --- roughly 45$^\circ$
+      altitude, and choose the azimuth deliberately. Run some nights aimed at
+      the Durham/Chapel Hill light dome and some aimed away, so the model sees
+      both. Record which.
+\item Manual mode, fixed exposure, fixed ISO, fixed focus at infinity, fixed
+      white balance. \textbf{Nothing may auto-adjust} --- an auto-exposure
+      change looks exactly like a transparency change and will teach the model
+      the wrong thing. RAW + JPEG.
+\item Interval: \textbf{one frame every 30 seconds}, all night. At 8 hours
+      that is 960 frames per night.
+\item \textbf{Label every 10 minutes} on the 5-point scale below. Record
+      transitions to the minute.
+\item Take a phone photo of the sky at each label as an independent
+      adjudicator.
+\item Note obstructions explicitly: tree, roofline, power line, aircraft,
+      contrail, car headlights, dew on the lens.
+\item Leave it running when you go inside. This campaign does not need
+      supervision, only labels --- set a 10-minute timer and step out.
+\end{enumerate}
+
+\begin{center}
+\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+\textbf{Code} & \textbf{Class} & \textbf{Criterion} & \textbf{Binary} \\
+\midrule
+0 & clear     & no cloud visible; Milky Way structure visible if moonless & 0 \\
+1 & thin      & cirrus or haze; stars visible through it; halo around bright stars & 0 \\
+2 & moderate  & distinct cloud over $\sim$25--60\,\% of the frame; some stars hidden & 1 \\
+3 & heavy     & $>$60\,\% covered; only the brightest stars & 1 \\
+4 & overcast  & no stars visible & 1 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{Recorded.} Frames + a label timeline + moon altitude/illumination
+(computable) + azimuth + humidity + phone photos.
+
+\textbf{Abort criteria.} Rain --- bring the camera in. Dew on the lens ---
+photograph it once deliberately as a hard negative, then dry it and note the
+timestamp of the wipe.
+
+\textbf{Acceptance.} $\geq$500 labelled frames per night. Over the campaign,
+$\geq$800 frames in each of the three rarer classes.
+
+\textbf{Class balance strategy.} After each night, tally per class and pick the
+next night to fill the thinnest class. In this climate, class~1 (thin cirrus) is
+usually the hardest to get deliberately and class~4 (overcast) the easiest and
+least useful --- cap overcast at about 15\,\% of the set.
+
+\subsection*{RB-6 --- Trailing ladder (R1 / R2)}
+\addcontentsline{toc}{subsection}{RB-6 --- Trailing ladder}
+
+\textbf{Purpose.} TED training data with \textbf{exactly computed} elongation
+labels, exploiting the Z114's lack of tracking.
+
+\textbf{Preconditions.} BP-4 --- the plate scale must be solved, not assumed,
+because the label is computed in arcseconds and consumed in pixels.
+
+\textbf{The label.} For an untracked exposure of $t$ seconds at declination
+$\delta$, the trail length is
+\[
+\ell_{\mathrm{arcsec}} = 15.041 \, \cos\delta \, t ,
+\qquad
+\ell_{\mathrm{px}} = \ell_{\mathrm{arcsec}} / s ,
+\]
+with $s$ the solved plate scale. The expected ellipticity of a star of
+seeing-limited FWHM $w$ (in px) trailed by $\ell_{\mathrm{px}}$ is
+approximately $e = 1 - w/\sqrt{w^2 + \ell_{\mathrm{px}}^2}$, which is what the
+classical estimator will report and what the CNN must learn to agree with in
+the ambiguous band.
+
+\begin{enumerate}
+\item Choose \textbf{3 fields} at declinations near $0^\circ$, $+40^\circ$ and
+      $+70^\circ$. $\cos\delta$ is 1.00, 0.77 and 0.34 --- so the same exposure
+      gives three different trail lengths and the label grid is 2-D.
+\item At each field, run the exposure ladder below. \textbf{Sample densely
+      between 0.05 and 0.25\,s} --- that is where the CNN's ambiguous band
+      $0.10 < e < 0.20$ falls, and a linear ladder under-samples it badly.
+\begin{center}
+\small
+\begin{tabular}{@{}l@{}}
+\toprule
+$t$ (s) $\in \{0.017,\ 0.033,\ 0.05,\ 0.07,\ 0.10,\ 0.13,\ 0.17,\ 0.20,\ 0.25,\ 0.33,\ 0.50,\ 1.00\}$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+\item \textbf{20 frames} at each exposure step. 3 fields $\times$ 12 steps
+      $\times$ 20 = 720 frames per night.
+\item Record for every frame: exposure, field declination, timestamp, and
+      \textbf{tracking state = off}.
+\item \textbf{Position angle control.} The trail direction is along the
+      hour-angle axis, which for an alt-az tabletop mount rotates relative to
+      the sensor as the target moves. Shoot the same field early and late in the
+      evening to get two different position angles --- this prevents the model
+      from learning ``elongation means horizontal''.
+\item \textbf{Negatives.} Add either (a) $t \leq 0.02$\,s frames, where the trail
+      is under half a pixel, or (b) frames from the tracked loaner rig. At least
+      1,000 negative frames.
+\item \textbf{Confounders (one session, deliberately):}
+      \begin{itemize}
+      \item Frames using the \emph{edge} of the field, where an f/3.95
+            Newtonian's coma elongates stars radially --- a different position
+            angle signature from tracking error.
+      \item A windy night, which produces incoherent smear rather than a linear
+            trail.
+      \item A deliberate mid-exposure nudge (tap the tube), giving a double
+            image rather than a streak.
+      \end{itemize}
+\end{enumerate}
+
+\textbf{Recorded.} Frames + exposure + declination + tracking state + wind
+estimate + which confounder class, if any.
+
+\textbf{Abort criteria.} Cloud; star count $<10$ per frame.
+
+\textbf{Acceptance.} Measured ellipticity versus predicted
+$\ell_{\mathrm{px}}$ follows the expected curve within scatter. \textbf{If it
+does not, the plate scale from BP-4 is wrong} --- and finding that out here is
+much cheaper than finding it out during training.
+
+\subsection*{RB-7 --- Sky background and lunation ladder}
+\addcontentsline{toc}{subsection}{RB-7 --- Sky background ladder}
+
+\textbf{Purpose.} Populate the sky-brightness covariate that both the exposure
+bandit and the filter recommender consume, and validate the classical
+background estimator against real gradients.
+
+\textbf{Preconditions.} None beyond a body and tripod. Runs alongside RB-5 on
+the same frames if the settings are held fixed.
+
+\begin{enumerate}
+\item Same fixed field, same exposure, same ISO, \textbf{once per hour, all
+      night}.
+\item Repeat across a full lunation: at least one night near new moon, one at
+      first quarter, one near full, one at last quarter. Four nights spread over
+      four weeks.
+\item Include one session pointed low toward the light dome and one high toward
+      zenith on the same night --- the gradient between them is the
+      light-pollution signal.
+\item Record moon altitude, illuminated fraction, and moon--field angular
+      separation (all computable from time and site, but record the site
+      coordinates).
+\end{enumerate}
+
+\textbf{Acceptance.} Background ADU varies monotonically with moon illumination
+at fixed altitude. If it does not, something is auto-adjusting --- check that
+exposure, ISO and white balance are truly locked.
+
+\subsection*{RB-8 --- Exposure bandit logging (R5, rental)}
+\addcontentsline{toc}{subsection}{RB-8 --- Bandit logging}
+
+\textbf{Purpose.} Build a logged-bandit dataset that supports \emph{offline}
+policy evaluation, so that a policy can be validated without spending rental
+nights on live exploration.
+
+\textbf{Preconditions.} Tracked mount; a body that tethers with bulb (T3i/T6S
+are the safest bets after BP-1); D6 ideally resolved so airmass and moon
+separation come from a solved pointing.
+
+\begin{enumerate}
+\item \textbf{Phase 1 --- uniform logging.} For the first 200 subs, select the
+      exposure arm \textbf{uniformly at random} from
+      $\{10, 30, 60, 90, 120, 180, 300\}$\,s. Record the arm \emph{and} its
+      selection probability $1/7$.
+\item \textbf{Phase 2 --- $\varepsilon$-greedy.} Thereafter use
+      $\varepsilon = 0.2$: with probability 0.2 choose uniformly, otherwise
+      choose the current best. \textbf{Record the realised probability for the
+      chosen arm on every decision} --- this is the propensity, and without it
+      no unbiased off-policy estimate exists.
+\item \textbf{Record the 17-dim context} at decision time, before the exposure:
+      sky background, moon illumination, $\cos\theta_{\mathrm{moon}}$, filter
+      one-hot, target-type one-hot, seeing (star FWHM), airmass, guiding RMS.
+      If there is no guider, record guiding RMS as \textbf{absent}, not zero.
+\item \textbf{Record all five reward components separately} ---
+      sub accepted, SNR in range, sub rejected, saturation $>5\%$, trailing ---
+      in \co{frame\_measurements.payload\_json}. Never store only the scalar
+      sum.
+\item Vary target type across sessions --- galaxy, nebula, open cluster,
+      globular --- since target type is four of the seventeen context
+      dimensions and a single-target campaign leaves three of them constant.
+\end{enumerate}
+
+\textbf{Acceptance.} Every logged tuple carries a propensity. Every arm has
+been selected at least 20 times. At least three distinct moon phases and two
+target types are represented.
+
+\textbf{Abort criteria.} If the propensity is not being logged, \textbf{stop and
+fix it before continuing} --- data without it cannot be used for anything except
+online learning, and the entire reason for the campaign is to avoid learning
+online on rented time.
+
+\subsection*{RB-9 --- Filter sequence (descoped)}
+\addcontentsline{toc}{subsection}{RB-9 --- Filter sequence (descoped)}
+
+Documented for completeness; not scheduled. If a loaner rig arrives with a
+filter wheel, log every switch through \co{filter\_switch\_events} (schema
+already present, migration 003) with: time, from-filter, to-filter, reason,
+sky conditions at the time, and the realised SNR of the subs on each side. That
+costs nothing and preserves the option. Do not purchase hardware for FOR --- see
+\S\ref{m:for}.
+
+\section*{Appendix C --- Observation log schema}
+\addcontentsline{toc}{section}{Appendix C --- Observation log schema}
+
+\subsection*{C.1 Session header (once per night)}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.30\textwidth}p{0.16\textwidth}p{0.44\textwidth}@{}}
+\toprule
+\textbf{Field} & \textbf{Type} & \textbf{Note} \\
+\midrule
+\co{session\_id} & uuid & generated \\
+\co{night\_id} & date & local date of \emph{sunset}, so one night is one ID across midnight \\
+\co{rig\_id} & string & R1--R5, matching \S\ref{sec:rigs} \\
+\co{site\_lat}, \co{site\_lon}, \co{site\_elev} & float & needed for airmass and moon geometry \\
+\co{telescope}, \co{camera}, \co{barlow}, \co{focuser} & string & the exact optical train \\
+\co{plate\_scale\_arcsec\_px} & float & from BP-4, per configuration \\
+\co{saturation\_adu} & int & from BP-2, per body and ISO \\
+\co{observer} & string & \\
+\co{start\_time}, \co{end\_time} & ISO 8601 with offset & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection*{C.2 Environment series (every 15 minutes)}
+
+\co{timestamp}, \co{ambient\_temp\_c}, \co{humidity\_pct}, \co{dew\_point\_c},
+\co{wind\_beaufort}, \co{sky\_class} (0--4 per RB-5),
+\co{transparency\_naked\_eye\_limiting\_mag}, \co{seeing\_impression}
+(1--5, subjective, but recorded consistently), \co{notes}.
+
+\begin{keybox}
+Every one of these may be \textbf{absent}. Absent is a value; write
+\co{null}, not a guess. \co{frames.temperature\_state} already models exactly
+this distinction and the log must not undermine it.
+\end{keybox}
+
+\subsection*{C.3 Run record (per focus run or per campaign block)}
+
+\co{run\_id}, \co{run\_type} (\co{focus\_sweep} $\vert$ \co{trailing\_ladder}
+$\vert$ \co{cloud\_block} $\vert$ \co{drift} $\vert$ \co{bandit} $\vert$
+\co{calibration}), \co{target\_name}, \co{target\_ra}, \co{target\_dec},
+\co{target\_alt}, \co{target\_az}, \co{start\_position}, \co{step\_size},
+\co{n\_positions}, \co{direction}, \co{tracking\_on}, \co{exposure\_s},
+\co{iso\_or\_gain}, \co{filter}, \co{status}
+(\co{completed} $\vert$ \co{aborted}), \co{abort\_reason}.
+
+\subsection*{C.4 Disturbance record (as they happen)}
+
+\co{timestamp}, \co{kind} (\co{bump} $\vert$ \co{refocus} $\vert$
+\co{cloud} $\vert$ \co{headlights} $\vert$ \co{dew} $\vert$ \co{battery} $\vert$
+\co{wind\_gust} $\vert$ \co{other}), \co{affected\_run\_id}, \co{description}.
+
+\textbf{This is the block that gets skipped and should not be.} One unlogged
+bump in the middle of a sweep produces a bimodal V-curve that the fitter will
+resolve to the wrong minimum, and there is no way to detect it from the pixels
+alone.
+
+\subsection*{C.5 Machine-readable form}
+
+The sidecar importer (\S G2/G4) consumes one JSON file per session:
+
+\begin{lstlisting}[language=]
+{
+  "session": { "session_id": "...", "night_id": "2026-09-14",
+               "rig_id": "R2", "site_lat": 36.07, "site_lon": -79.81,
+               "telescope": "Zhumell Z114 + 2x Barlow",
+               "camera": "SVBony SV105",
+               "plate_scale_arcsec_px": 0.71,
+               "saturation_adu": 255 },
+  "environment": [
+    { "t": "2026-09-14T21:15:00-04:00", "ambient_temp_c": 21.4,
+      "humidity_pct": 68, "wind_beaufort": 1, "sky_class": 0,
+      "seeing_impression": 3 },
+    { "t": "2026-09-14T21:30:00-04:00", "ambient_temp_c": 20.9,
+      "humidity_pct": 71, "wind_beaufort": 1, "sky_class": 1,
+      "seeing_impression": 3 }
+  ],
+  "runs": [
+    { "run_id": "...", "run_type": "focus_sweep", "target_name": "M39",
+      "start_position": 1240, "step_size": 14, "n_positions": 21,
+      "direction": "outward", "tracking_on": false,
+      "exposure_s": 0.15, "iso_or_gain": 300, "status": "completed",
+      "positions": [
+        { "index": 0, "reading_um": 1240, "t": "...", "files": ["IMG_0001.CR2"] }
+      ]
+    }
+  ],
+  "disturbances": [
+    { "t": "2026-09-14T23:02:00-04:00", "kind": "headlights",
+      "affected_run_id": "...", "description": "car in driveway, 2 frames" }
+  ]
+}
+\end{lstlisting}
+
+\begin{keybox}
+Fill the card on paper in the field and transcribe to JSON indoors the same
+night. Do not plan to remember it in the morning --- you will not, and the
+transcription step is also a useful review that catches missing entries while
+the night is still recoverable.
+\end{keybox}
+
+\section*{Appendix D --- Post-session ingest checklist}
+\addcontentsline{toc}{section}{Appendix D --- Post-session ingest checklist}
+
+\begin{enumerate}
+\item \textbf{Do not format the card.} Copy files off it; keep the originals
+      until the checksums verify.
+\item Transcribe the paper card to the JSON schema of \S C.5 \textbf{the same
+      night}.
+\item Copy frames to the capture root, preserving the camera's filenames.
+\item Run the sidecar importer for anything the daemon did not capture itself.
+      Confirm it stamps \co{driver\_name = "offline\_import"}.
+\item Start the daemon and let \co{reconcile()} run. Read its log --- it reports
+      committed rows with missing files and staged files with no row.
+\item Verify checksums against \co{frame\_assets.checksum\_sha256}. A mismatch
+      means a bad copy; recopy from the card, which is why step 1 exists.
+\item Count what you got, against what you attempted:
+\begin{lstlisting}[language=bash]
+sqlite3 achernar.db "
+  SELECT capture_type, capture_status, COUNT(*)
+  FROM frames WHERE date(captured_at)='2026-09-14'
+  GROUP BY 1,2;"
+sqlite3 achernar.db "
+  SELECT status, COUNT(*) FROM capture_attempts
+  WHERE date(started_at)='2026-09-14' GROUP BY 1;"
+\end{lstlisting}
+\item Dry-run the dataset builder and \textbf{check the group count, not the row
+      count}:
+\begin{lstlisting}[language=bash]
+python -m ml.data_pipeline.build_focus_quality_dataset \
+  --db achernar.db --output /tmp/check.npz
+python3 -c "import numpy as np; d=np.load('/tmp/check.npz',allow_pickle=True); \
+  print('rows', d['crops'].shape[0], 'groups', len(set(d['run_key'].tolist())))"
+\end{lstlisting}
+\item Confirm the saturation gate actually ran on this night's frames. If it
+      reports \emph{not performed}, D1 or D2 is still open and the night's focus
+      labels are suspect.
+\item Back up: capture root + \co{achernar.db} + the session JSON, to a second
+      physical drive. Only then reuse the card.
+\item Update the running tally --- runs per rig, frames per COC class, nights
+      per campaign --- against the budgets in Part~III, and pick the next
+      night's target accordingly.
+\end{enumerate}
+
+\section*{Appendix E --- Standing decisions}
+\addcontentsline{toc}{section}{Appendix E --- Standing decisions}
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.30\textwidth}p{0.60\textwidth}@{}}
+\toprule
+\textbf{Decision} & \textbf{Rationale} \\
+\midrule
+Collect COC labels as 5-class & Collapsible to the spec's binary head; the reverse is impossible, and the sky is not re-observable (D7). \\
+2$\times$ Barlow is mandatory on the Z114 & Native focal length is undersampled at best focus for every available camera (\S\ref{sec:sampling}). \\
+Descope FOR (Model 8) & No wheel, no filters, \co{hardware/filter\_wheel.rs} is \co{todo!()}, and its features depend on models that do not exist yet (\S\ref{m:for}). \\
+TME edge by distillation, not contrastive & AstroM3's published weights already exist; only the image adapter is untrained, and $10^5$ contrastive objects are out of reach (\S\ref{m:tme}). \\
+FOP data by passive harvesting & 20 rows per run cannot reach $10^4$ from dedicated sweeps alone (\S\ref{m:fop}). \\
+Ambient temperature logged by hand for v1 & \co{hardware/sensors.rs} is \co{todo!()}; manual logging is well within the Kalman filter's assumed $\sigma_z = 3$ steps (\S\ref{m:fdf}). \\
+Dial indicator instead of a motorised focuser for v0/v1 & \$15 buys 10\,\textmu m absolute position, which makes manual runs FOP-eligible (RB-2). \\
+Rental window spent last & It is the scarce resource; field procedures should be debugged on free gear first (\S\ref{sec:critical}). \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\vspace{1em}
+\begin{keybox}
+\textbf{Open questions for you to resolve, in priority order.}
+\begin{enumerate}
+\item Does the loan programme's rig include an electronic focuser, and on what
+      protocol? This decides whether \$200--300 needs spending and whether T2
+      and T3 merge.
+\item Does \co{cargo build} pass on the Mac (BP-0)? Everything downstream is
+      contingent.
+\item Can libuvc open the SV105 on macOS (BP-1)? If not, R1 and R2 need a Linux
+      host.
+\item Which of the five bodies actually support remote capture (BP-1)?
+\item Does any camera reach prime focus on the Z114 (BP-3)?
+\end{enumerate}
+\end{keybox}
+
+\end{document}
