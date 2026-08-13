@@ -1,0 +1,415 @@
+{
+  "contract_version": "1.0.0",
+  "spec_section": "7.6.2",
+  "n_features": 38,
+  "group_sizes": {
+    "quality": 3,
+    "classical": 4,
+    "position": 5,
+    "temperature": 4,
+    "filter": 7,
+    "history": 6,
+    "direction": 3,
+    "rig": 3,
+    "sky": 3
+  },
+  "features": [
+    {
+      "index": 0,
+      "name": "predicted_hfr",
+      "group": "quality",
+      "norm": "z-score",
+      "meaning": "FQE-predicted frame HFR (px)",
+      "source": "frames.quality_json -> fqe_hfr_px",
+      "availability": "available",
+      "note": "Written by autofocus_quality_json since the write path was widened; SharedObservation carried it all along and persist_observed_frame used to drop it, so every frame captured before that fix has a null here. Null also when no FQE model is loaded \u2014 mask on it, do not impute."
+    },
+    {
+      "index": 1,
+      "name": "sharpness_score",
+      "group": "quality",
+      "norm": "z-score",
+      "meaning": "held at 0.0 \u2014 see note",
+      "source": "(none)",
+      "availability": "rejected",
+      "note": "vision/shared_observation.rs removed focus_quality / sharpness_score / frame_quality_score on the grounds that they were 'three views of one HFR value with no calibrated meaning'. That reasoning is right and the spec's slot is redundant with predicted_hfr. The slot is held at a constant to preserve indices 2..37 rather than renumbering a published contract."
+    },
+    {
+      "index": 2,
+      "name": "quality_uncertainty",
+      "group": "quality",
+      "norm": "z-score",
+      "meaning": "predictive sigma of log-HFR",
+      "source": "frames.quality_json -> fqe_sigma_log_hfr (preferred), else quality_uncertainty",
+      "availability": "available",
+      "note": "Persisted alongside predicted_hfr. The classical path's own quality_uncertainty is documented as always None, so fqe_sigma_log_hfr is the real source and it exists only while FQE runs in shadow. fqe_calibrated says whether the sigma is a fitted predictive interval or raw between-star scatter; the two are not interchangeable."
+    },
+    {
+      "index": 3,
+      "name": "classical_hfr",
+      "group": "classical",
+      "norm": "log",
+      "meaning": "SEP half-flux radius (px)",
+      "source": "focus_samples.hfr",
+      "availability": "available",
+      "note": ""
+    },
+    {
+      "index": 4,
+      "name": "classical_fwhm",
+      "group": "classical",
+      "norm": "log",
+      "meaning": "fitted PSF FWHM (px)",
+      "source": "focus_samples.fwhm",
+      "availability": "missing",
+      "note": "The column exists and is always NULL: focus_agent.rs states fwhm stays None 'unless a Gaussian/Moffat fit was actually performed', and none is. focus_samples.hfd is populated but is 2*HFR, deliberately named so it is never mistaken for a fitted FWHM \u2014 substituting it would feed the model classical_hfr twice under two names."
+    },
+    {
+      "index": 5,
+      "name": "fit_quality",
+      "group": "classical",
+      "norm": "z-score",
+      "meaning": "r^2 of the focus curve fit over the samples so far",
+      "source": "derived: ClassicalFocusSolver over samples with captured_at <= this row",
+      "availability": "missing",
+      "note": "PARITY HAZARD. The daemon fits the curve once, at the end of the run, and does not persist r^2. Training must therefore recompute it as a *partial* fit over only the samples preceding each row \u2014 using the whole-run fit would leak the answer, since the fit optimum is the label. Whatever partial-fit rule training adopts, focus_inference must use the identical one online."
+    },
+    {
+      "index": 6,
+      "name": "star_count",
+      "group": "classical",
+      "norm": "log",
+      "meaning": "stars detected in the frame",
+      "source": "focus_samples.star_count",
+      "availability": "available",
+      "note": ""
+    },
+    {
+      "index": 7,
+      "name": "pos_norm",
+      "group": "position",
+      "norm": "p / p_max",
+      "meaning": "absolute focuser position, normalized to travel",
+      "source": "focus_samples.position / focuser_profiles.max_position",
+      "availability": "available",
+      "note": ""
+    },
+    {
+      "index": 8,
+      "name": "dist_from_start_norm",
+      "group": "position",
+      "norm": "/ max step",
+      "meaning": "signed steps from where the run began",
+      "source": "focus_samples.position - focus_runs.start_position",
+      "availability": "available",
+      "note": ""
+    },
+    {
+      "index": 9,
+      "name": "sample_idx_norm",
+      "group": "position",
+      "norm": "as defined",
+      "meaning": "ordinal of this sample within the run, normalized",
+      "source": "rank of focus_samples.captured_at within run_id",
+      "availability": "available",
+      "note": ""
+    },
+    {
+      "index": 10,
+      "name": "dir_encoded",
+      "group": "position",
+      "norm": "as defined",
+      "meaning": "-1 inward / 0 first sample / +1 outward",
+      "source": "sign(position - previous position within run)",
+      "availability": "available",
+      "note": "Varies only across runs that actually reverse. The agent grew a SweepPattern::Reversal ordering, so the capability exists; whether the column varies is now a collection-practice question. The plan calls for roughly one run in three \u2014 check the mix before training rather than assuming it."
+    },
+    {
+      "index": 11,
+      "name": "run_initial_hfr",
+      "group": "position",
+      "norm": "log",
+      "meaning": "HFR of the run's first sample (px)",
+      "source": "first focus_samples.hfr by captured_at within run_id",
+      "availability": "available",
+      "note": ""
+    },
+    {
+      "index": 12,
+      "name": "ambient_temp_norm",
+      "group": "temperature",
+      "norm": "z-score",
+      "meaning": "outside air temperature (degC)",
+      "source": "environment_log.ambient_temp_c, nearest observed_at within the night; join focus_runs.night_id = environment_log.night_id",
+      "availability": "available",
+      "note": "Joinable since migration 007 put night_id on focus_runs \u2014 before that the observer's readings went into a table nothing could reach from a run. Present only for nights the observer actually logged, which no code can guarantee. Ambient is not substitutable by sensor temperature: a DSLR die self-heats through a session, so the two diverge in exactly the direction that matters most."
+    },
+    {
+      "index": 13,
+      "name": "sensor_temp_norm",
+      "group": "temperature",
+      "norm": "z-score",
+      "meaning": "camera-reported temperature (degC)",
+      "source": "focus_samples.temperature, provenance in quality_json.temperature_state",
+      "availability": "available",
+      "note": "Populated with an explicit temperature_state of measured/estimated/missing beside it. Rows whose state is not 'measured' should be masked, not imputed."
+    },
+    {
+      "index": 14,
+      "name": "temp_delta_from_run_start",
+      "group": "temperature",
+      "norm": "z-score",
+      "meaning": "degC change since the run's first sample",
+      "source": "focus_samples.temperature - first temperature within run_id",
+      "availability": "available",
+      "note": ""
+    },
+    {
+      "index": 15,
+      "name": "temp_coeff_norm",
+      "group": "temperature",
+      "norm": "z-score",
+      "meaning": "the rig's fitted alpha (steps/degC)",
+      "source": "focuser_profiles.temp_coefficient",
+      "availability": "missing",
+      "note": "NULL until the FDF fits it, which needs a thermal night, which needs the focuser. Expected to fill in naturally; not a code defect."
+    },
+    {
+      "index": 16,
+      "name": "filter_l",
+      "group": "filter",
+      "norm": "one-hot",
+      "meaning": "1.0 when the run used L",
+      "source": "focus_runs.filter_name",
+      "availability": "degenerate",
+      "note": "D4: no filter wheel exists and hardware/filter_wheel.rs is two todo!() calls, so the whole block is constant. The data-collection document is explicit that this block must be dropped before training and the drop recorded in norm_params.json \u2014 otherwise seven dead inputs enter the ONNX graph and the first rig with a wheel silently misuses them."
+    },
+    {
+      "index": 17,
+      "name": "filter_r",
+      "group": "filter",
+      "norm": "one-hot",
+      "meaning": "1.0 when the run used R",
+      "source": "focus_runs.filter_name",
+      "availability": "degenerate",
+      "note": "D4: no filter wheel exists and hardware/filter_wheel.rs is two todo!() calls, so the whole block is constant. The data-collection document is explicit that this block must be dropped before training and the drop recorded in norm_params.json \u2014 otherwise seven dead inputs enter the ONNX graph and the first rig with a wheel silently misuses them."
+    },
+    {
+      "index": 18,
+      "name": "filter_g",
+      "group": "filter",
+      "norm": "one-hot",
+      "meaning": "1.0 when the run used G",
+      "source": "focus_runs.filter_name",
+      "availability": "degenerate",
+      "note": "D4: no filter wheel exists and hardware/filter_wheel.rs is two todo!() calls, so the whole block is constant. The data-collection document is explicit that this block must be dropped before training and the drop recorded in norm_params.json \u2014 otherwise seven dead inputs enter the ONNX graph and the first rig with a wheel silently misuses them."
+    },
+    {
+      "index": 19,
+      "name": "filter_b",
+      "group": "filter",
+      "norm": "one-hot",
+      "meaning": "1.0 when the run used B",
+      "source": "focus_runs.filter_name",
+      "availability": "degenerate",
+      "note": "D4: no filter wheel exists and hardware/filter_wheel.rs is two todo!() calls, so the whole block is constant. The data-collection document is explicit that this block must be dropped before training and the drop recorded in norm_params.json \u2014 otherwise seven dead inputs enter the ONNX graph and the first rig with a wheel silently misuses them."
+    },
+    {
+      "index": 20,
+      "name": "filter_ha",
+      "group": "filter",
+      "norm": "one-hot",
+      "meaning": "1.0 when the run used Ha",
+      "source": "focus_runs.filter_name",
+      "availability": "degenerate",
+      "note": "D4: no filter wheel exists and hardware/filter_wheel.rs is two todo!() calls, so the whole block is constant. The data-collection document is explicit that this block must be dropped before training and the drop recorded in norm_params.json \u2014 otherwise seven dead inputs enter the ONNX graph and the first rig with a wheel silently misuses them."
+    },
+    {
+      "index": 21,
+      "name": "filter_oiii",
+      "group": "filter",
+      "norm": "one-hot",
+      "meaning": "1.0 when the run used OIII",
+      "source": "focus_runs.filter_name",
+      "availability": "degenerate",
+      "note": "D4: no filter wheel exists and hardware/filter_wheel.rs is two todo!() calls, so the whole block is constant. The data-collection document is explicit that this block must be dropped before training and the drop recorded in norm_params.json \u2014 otherwise seven dead inputs enter the ONNX graph and the first rig with a wheel silently misuses them."
+    },
+    {
+      "index": 22,
+      "name": "filter_sii",
+      "group": "filter",
+      "norm": "one-hot",
+      "meaning": "1.0 when the run used SII",
+      "source": "focus_runs.filter_name",
+      "availability": "degenerate",
+      "note": "D4: no filter wheel exists and hardware/filter_wheel.rs is two todo!() calls, so the whole block is constant. The data-collection document is explicit that this block must be dropped before training and the drop recorded in norm_params.json \u2014 otherwise seven dead inputs enter the ONNX graph and the first rig with a wheel silently misuses them."
+    },
+    {
+      "index": 23,
+      "name": "prev_delta_1",
+      "group": "history",
+      "norm": "/ max step",
+      "meaning": "signed steps moved 1 sample(s) ago",
+      "source": "difference of consecutive focus_samples.position within run_id",
+      "availability": "available",
+      "note": "A monotone sweep makes all three equal to the constant step size; a reversal run varies their sign. Available since the agent gained SweepPattern::Reversal, subject to the same collection-mix caveat as dir_encoded."
+    },
+    {
+      "index": 24,
+      "name": "prev_delta_2",
+      "group": "history",
+      "norm": "/ max step",
+      "meaning": "signed steps moved 2 sample(s) ago",
+      "source": "difference of consecutive focus_samples.position within run_id",
+      "availability": "available",
+      "note": "A monotone sweep makes all three equal to the constant step size; a reversal run varies their sign. Available since the agent gained SweepPattern::Reversal, subject to the same collection-mix caveat as dir_encoded."
+    },
+    {
+      "index": 25,
+      "name": "prev_delta_3",
+      "group": "history",
+      "norm": "/ max step",
+      "meaning": "signed steps moved 3 sample(s) ago",
+      "source": "difference of consecutive focus_samples.position within run_id",
+      "availability": "available",
+      "note": "A monotone sweep makes all three equal to the constant step size; a reversal run varies their sign. Available since the agent gained SweepPattern::Reversal, subject to the same collection-mix caveat as dir_encoded."
+    },
+    {
+      "index": 26,
+      "name": "prev_hfr_delta_1",
+      "group": "history",
+      "norm": "/ max step",
+      "meaning": "change in HFR 1 sample(s) ago (px)",
+      "source": "difference of consecutive focus_samples.hfr within run_id",
+      "availability": "available",
+      "note": ""
+    },
+    {
+      "index": 27,
+      "name": "prev_hfr_delta_2",
+      "group": "history",
+      "norm": "/ max step",
+      "meaning": "change in HFR 2 sample(s) ago (px)",
+      "source": "difference of consecutive focus_samples.hfr within run_id",
+      "availability": "available",
+      "note": ""
+    },
+    {
+      "index": 28,
+      "name": "prev_hfr_delta_3",
+      "group": "history",
+      "norm": "/ max step",
+      "meaning": "change in HFR 3 sample(s) ago (px)",
+      "source": "difference of consecutive focus_samples.hfr within run_id",
+      "availability": "available",
+      "note": ""
+    },
+    {
+      "index": 29,
+      "name": "dir_changed_recently",
+      "group": "direction",
+      "norm": "bool",
+      "meaning": "1.0 if the focuser reversed within the last 3 samples",
+      "source": "derived from the sign sequence of position differences",
+      "availability": "available",
+      "note": "This is the feature the direction head learns from, so a dataset with no reversals cannot train the head at all \u2014 not merely train it poorly. SweepPattern::Reversal produces exactly one flip per run, asserted by reversal_sweep_changes_direction_exactly_once. Verify the collected mix before training: the capability existing is not the same as the nights having used it."
+    },
+    {
+      "index": 30,
+      "name": "steps_since_flip_norm",
+      "group": "direction",
+      "norm": "/ max step",
+      "meaning": "steps travelled since the last direction change",
+      "source": "derived from the sign sequence of position differences",
+      "availability": "available",
+      "note": "Same source as dir_changed_recently; with no flip in a run it counts the whole run every time."
+    },
+    {
+      "index": 31,
+      "name": "consec_improvements_norm",
+      "group": "direction",
+      "norm": "as defined",
+      "meaning": "consecutive samples whose HFR improved, normalized",
+      "source": "derived from the sign sequence of focus_samples.hfr differences",
+      "availability": "available",
+      "note": ""
+    },
+    {
+      "index": 32,
+      "name": "backlash_norm",
+      "group": "rig",
+      "norm": "/ max step",
+      "meaning": "measured backlash (steps)",
+      "source": "focuser_profiles.backlash_steps",
+      "availability": "available",
+      "note": "Defaults to 0 until BP-5 measures it; 0 is a truthful default here because an unmeasured focuser is compensated as if it had none."
+    },
+    {
+      "index": 33,
+      "name": "cfz_norm",
+      "group": "rig",
+      "norm": "/ max step",
+      "meaning": "critical focus zone (steps)",
+      "source": "derived: 4.88 * lambda * rigs.focal_ratio^2 * focuser_profiles.steps_per_micron",
+      "availability": "available",
+      "note": "steps_per_micron landed in migration 005 and is measurable from a V-curve wing (focus_drift::steps_per_micron_from_vcurve), so this is derivable without new plumbing once a rig row exists."
+    },
+    {
+      "index": 34,
+      "name": "filter_offset_norm",
+      "group": "rig",
+      "norm": "/ max step",
+      "meaning": "per-filter focus offset (steps)",
+      "source": "focuser_filter_offsets.offset_steps",
+      "availability": "degenerate",
+      "note": "D4 again: no wheel, so no offsets, so constant 0."
+    },
+    {
+      "index": 35,
+      "name": "background_norm",
+      "group": "sky",
+      "norm": "z-score",
+      "meaning": "sky background level (ADU)",
+      "source": "frames.quality_json -> background_adu",
+      "availability": "available",
+      "note": "Already written per autofocus frame and joinable through focus_samples.frame_id."
+    },
+    {
+      "index": 36,
+      "name": "saturation_frac",
+      "group": "sky",
+      "norm": "0-1",
+      "meaning": "fraction of detected stars that clipped",
+      "source": "frames.quality_json -> saturation_fraction",
+      "availability": "available",
+      "note": "Only meaningful when quality_json.saturation_gate_applied is true. On a body with no declared saturation_adu this reads 0.0 and means 'never tested', not 'clean' \u2014 the same D1 trap the FQE dataset builder now refuses. Mask on the gate flag, do not read the value alone."
+    },
+    {
+      "index": 37,
+      "name": "humidity_norm",
+      "group": "sky",
+      "norm": "0-1",
+      "meaning": "relative humidity (%)",
+      "source": "environment_log.humidity_pct, nearest observed_at within the night; join focus_runs.night_id = environment_log.night_id",
+      "availability": "available",
+      "note": "Same join as ambient_temp_norm, opened by migration 007, and the same caveat: recorded only when the observer wrote it on the card."
+    }
+  ],
+  "label": {
+    "name": "delta_steps",
+    "definition": "focus_runs.best_position - focus_samples.position",
+    "units": "focuser steps, signed (positive = move outward to reach focus)",
+    "retrospective": true,
+    "note": "best_position exists only once the run converges, so a run that failed or was aborted produces zero labelled rows no matter how many samples it captured. It is still worth persisting those samples \u2014 they carry valid FQE crops \u2014 but the FOP builder must exclude runs whose state is not Converged, and must never fall back to argmin(hfr) as a stand-in: the fitted optimum is interior to the sample grid and the argmin is not.",
+    "group": "focus_runs.id",
+    "secondary_group": "focus_runs.night_id"
+  },
+  "offset_buckets": [
+    0,
+    5,
+    15,
+    40,
+    120,
+    null
+  ]
+}

@@ -3,6 +3,28 @@
 
 use serde::{Deserialize, Serialize};
 
+/// What a Focus Offset Predictor run returns — Section 7.6.2.
+///
+/// Declared here, where it is consumed, rather than in a runner module that
+/// does not exist yet. It previously lived in `focus_inference`, whose only
+/// other contents were a `todo!()` reimplementation of the FQE inference that
+/// `vision/fqe_runner.rs` already does; that module is gone and this type
+/// outlived it because the policy layer genuinely needs a shape to accept.
+///
+/// The three fields are the heads of the distilled MLP in Section 7.6.2:
+/// signed delta, log-uncertainty, and the direction logits reduced to a choice.
+/// When the FOP runner lands it should own this the way `FqeRunner` owns
+/// `FqeOutput`, and this declaration should move there.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusOffsetPrediction {
+    /// Predicted signed steps from the current position to best focus.
+    pub delta_steps: f64,
+    /// Predictive standard deviation of `delta_steps`, in steps.
+    pub uncertainty_steps: f64,
+    /// -1 inward / 0 stop / +1 outward, from the direction head.
+    pub direction: i8,
+}
+
 /// Decision from the focus policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FocusDecision {
@@ -38,7 +60,7 @@ impl FocusPolicy {
     pub fn decide(
         &self,
         _classical_fit: Option<&super::classical_focus_solver::CurveFitResult>,
-        _ml_prediction: Option<&super::focus_inference::FocusOffsetOutput>,
+        _ml_prediction: Option<&FocusOffsetPrediction>,
         _current_position: i32,
         _samples: &[super::focus_agent::FocusSample],
     ) -> FocusDecision {

@@ -6,11 +6,14 @@ import tempfile
 import unittest
 
 import numpy as np
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data_pipeline.split_registry import (  # noqa: E402
     create_group_splits,
+    create_splits,
+    create_temporal_group_splits,
     load_registered_splits,
     splits_for_dataset,
 )
@@ -133,6 +136,142 @@ class TestRegressionCalibration(unittest.TestCase):
         self.assertIn("frame_sigma_scale", record)
         self.assertGreater(record["frame_sigma_scale"], 0.0)
         self.assertAlmostEqual(record["frame_coverage_95_test_after"], 0.95, delta=0.06)
+
+
+
+class TestTemporalSplits(unittest.TestCase):
+    """Spec Section 7.7.2's oldest-train / newest-test split.
+
+    The random-group split asks whether the model generalizes to an unseen run.
+    This one asks whether it survives a month of the focuser being re-greased,
+    the tube being swapped and the seeing season turning — drift that a shuffled
+    split hides completely by scattering each night across all three sets.
+    """
+
+    @staticmethod
+    def _dataset(n_groups=10, rows_per_group=3):
+        groups = np.repeat(
+            np.array([f"run-{i:02d}" for i in range(n_groups)]), rows_per_group
+        )
+        # One run per night, ascending. Deliberately *not* in group-name order
+        # for the shuffled case below.
+        stamps = np.repeat(
+            np.array([f"2026-11-{i + 1:02d}T22:00:00+00:00" for i in range(n_groups)]),
+            rows_per_group,
+        )
+        return groups, stamps
+
+    def test_test_set_is_strictly_newer_than_train(self):
+        groups, stamps = self._dataset()
+        splits = create_temporal_group_splits(groups, stamps)
+
+        def span(name):
+            values = stamps[splits[name]].tolist()
+            return min(values), max(values)
+
+        self.assertLess(span("train")[1], span("val")[0])
+        self.assertLess(span("val")[1], span("test")[0])
+
+    def test_groups_never_straddle_a_boundary(self):
+        # A run is placed by its earliest row, so every row of it lands on the
+        # same side even when the run spans a boundary timestamp.
+        groups, stamps = self._dataset()
+        splits = create_temporal_group_splits(groups, stamps)
+        sets = {name: set(groups[index]) for name, index in splits.items()}
+        self.assertTrue(sets["train"].isdisjoint(sets["val"]))
+        self.assertTrue(sets["train"].isdisjoint(sets["test"]))
+        self.assertTrue(sets["val"].isdisjoint(sets["test"]))
+        self.assertEqual(
+            sum(len(s) for s in sets.values()), len(set(groups.tolist()))
+        )
+
+    def test_ordering_follows_time_not_group_name(self):
+        # The whole split would be silently wrong if it fell back to sorting by
+        # id, which for `run-00 .. run-09` happens to look plausible.
+        groups = np.repeat(np.array(["run-a", "run-b", "run-c", "run-d"]), 2)
+        stamps = np.repeat(
+            np.array(
+                [
+                    "2026-12-04T22:00:00+00:00",  # run-a is the NEWEST
+                    "2026-12-01T22:00:00+00:00",
+                    "2026-12-02T22:00:00+00:00",
+                    "2026-12-03T22:00:00+00:00",
+                ]
+            ),
+            2,
+        )
+        splits = create_temporal_group_splits(groups, stamps)
+        self.assertEqual(set(groups[splits["test"]]), {"run-a"})
+
+    def test_all_splits_are_nonempty(self):
+        groups, stamps = self._dataset(n_groups=3, rows_per_group=1)
+        splits = create_temporal_group_splits(groups, stamps)
+        self.assertTrue(all(index.size > 0 for index in splits.values()))
+
+    def test_too_few_groups_fails(self):
+        with self.assertRaises(ValueError):
+            create_temporal_group_splits(np.array(["a", "a"]), np.array(["t1", "t2"]))
+
+    def test_misaligned_inputs_are_rejected(self):
+        with self.assertRaises(ValueError):
+            create_temporal_group_splits(np.array(["a", "b", "c"]), np.array(["t1"]))
+
+    def test_registry_records_the_strategy_and_boundaries(self):
+        import json
+
+        groups, stamps = self._dataset()
+        with tempfile.TemporaryDirectory() as directory:
+            dataset_path = os.path.join(directory, "fqe.npz")
+            np.savez_compressed(
+                dataset_path, split_group=groups, captured_at=stamps
+            )
+            create_splits(dataset_path, strategy="temporal")
+
+            registry = json.loads(
+                Path(os.path.splitext(dataset_path)[0] + ".splits.json").read_text()
+            )
+            self.assertEqual(registry["strategy"], "temporal")
+            self.assertEqual(registry["order_field"], "captured_at")
+            # Spec 7.7.2 ratios, not the 80/10/10 the random-group split uses.
+            self.assertAlmostEqual(registry["ratios"]["train"], 0.70)
+            self.assertAlmostEqual(registry["ratios"]["val"], 0.15)
+            # A deterministic ordering has no seed to record; claiming one would
+            # imply the split could be re-rolled.
+            self.assertIsNone(registry["seed"])
+            self.assertLess(
+                registry["boundaries"]["train"]["last"],
+                registry["boundaries"]["test"]["first"],
+            )
+
+    def test_temporal_strategy_needs_a_timestamp_column(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dataset_path = os.path.join(directory, "fqe.npz")
+            np.savez_compressed(
+                dataset_path, split_group=np.array(["a", "b", "c"])
+            )
+            with self.assertRaises(ValueError) as ctx:
+                create_splits(dataset_path, strategy="temporal")
+            self.assertIn("captured_at", str(ctx.exception))
+
+    def test_random_group_remains_the_default(self):
+        # Every existing registry was built this way; changing the default would
+        # silently re-split datasets that models were already trained against.
+        groups, stamps = self._dataset()
+        with tempfile.TemporaryDirectory() as directory:
+            dataset_path = os.path.join(directory, "fqe.npz")
+            np.savez_compressed(
+                dataset_path, split_group=groups, captured_at=stamps
+            )
+            create_splits(dataset_path, seed=3)
+
+            import json
+
+            registry = json.loads(
+                Path(os.path.splitext(dataset_path)[0] + ".splits.json").read_text()
+            )
+            self.assertEqual(registry["strategy"], "random_group")
+            self.assertEqual(registry["seed"], 3)
+            self.assertAlmostEqual(registry["ratios"]["train"], 0.8)
 
 
 if __name__ == "__main__":

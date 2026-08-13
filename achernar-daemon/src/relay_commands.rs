@@ -2,13 +2,10 @@ use base64::{engine::general_purpose, Engine as _};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::api::camera::{option_name, option_type_name, parse_option, CamParamInfo, FormatInfo};
 use crate::hardware::{
-    camera::OlsCameraDriver,
     capabilities::driver_capability_report,
     focuser::{ConnectedFocuser, Focuser, FocuserDriver, SimFocuser},
     mount::{EqCoord, Mount, MountDriver},
-    ols_ffi::OlsCamOptionId,
 };
 use crate::state::AppState;
 
@@ -53,13 +50,15 @@ fn payload_bool(payload: &Value, key: &str) -> Result<bool, String> {
 pub async fn execute(state: AppState, command: &RelayCommand) -> Result<Value, String> {
     match command.action.as_str() {
         "equipment.connect" => connect_equipment(state, &command.payload).await,
+        "equipment.disconnect" => disconnect_equipment(state, &command.payload).await,
         "equipment.status" => Ok(crate::telemetry::equipment_status(&state)),
         "drivers.capabilities" => Ok(json!(driver_capability_report())),
-        "camera.parameters" => camera_parameters(state),
-        "camera.formats" => camera_formats(state),
-        "camera.set_parameter" => camera_set_parameter(state, &command.payload),
-        "camera.start_stream" => start_camera_stream(state, &command.payload),
-        "camera.abort" => abort_camera(state),
+        "camera.descriptor" => camera_descriptor(state).await,
+        "camera.parameters" => camera_parameters(state).await,
+        "camera.formats" => camera_formats(state).await,
+        "camera.set_parameter" => camera_set_parameter(state, &command.payload).await,
+        "camera.start_stream" => start_camera_stream(state, &command.payload).await,
+        "camera.stop_stream" | "camera.abort" => abort_camera(state).await,
         "camera.capture" => camera_capture(state, &command.payload).await,
         "camera.snapshot" => camera_snapshot(state),
         "mount.slew" => mount_slew(state, &command.payload),
@@ -74,95 +73,42 @@ pub async fn execute(state: AppState, command: &RelayCommand) -> Result<Value, S
     }
 }
 
-fn camera_parameters(state: AppState) -> Result<Value, String> {
-    let cam_lock = state.camera.lock().unwrap();
-    let camera = cam_lock
-        .as_ref()
-        .ok_or_else(|| "No camera connected".to_string())?;
-    let options = camera.supported_options().map_err(|e| e.to_string())?;
-    let mut params = Vec::with_capacity(options.len());
-
-    for id in options {
-        if let Ok(p) = camera.get_parameter(id) {
-            // Selection options (iso, shutterspeed, capturetarget) are useless
-            // as bare indices; ship the camera's labels so a remote client can
-            // render "1/125" rather than "17".
-            let choices = if p.option_type
-                == crate::hardware::ols_ffi::OlsCamOptionType::Selection
-            {
-                camera.parameter_choices(id).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-            let current_value = choices.get(p.cur_val as usize).and_then(|label| match id {
-                OlsCamOptionId::Shutter => {
-                    crate::hardware::dslr_controls::parse_shutter_seconds(label)
-                }
-                OlsCamOptionId::Iso => crate::hardware::dslr_controls::parse_iso(label),
-                _ => None,
-            });
-
-            params.push(CamParamInfo {
-                name: option_name(id).to_string(),
-                kind: option_type_name(p.option_type).to_string(),
-                read_only: p.read_only,
-                min: p.min_val,
-                max: p.max_val,
-                step: p.step_size,
-                default: p.def_val,
-                current: p.cur_val,
-                choices,
-                current_value,
-            });
-        }
-    }
-
-    Ok(json!(params))
+async fn camera_descriptor(state: AppState) -> Result<Value, String> {
+    let axum::Json(descriptor) =
+        crate::api::camera::get_camera_descriptor(axum::extract::State(state))
+            .await
+            .map_err(|error| error.message)?;
+    serde_json::to_value(descriptor).map_err(|error| error.to_string())
 }
 
-fn camera_formats(state: AppState) -> Result<Value, String> {
-    let cam_lock = state.camera.lock().unwrap();
-    let camera = cam_lock
-        .as_ref()
-        .ok_or_else(|| "No camera connected".to_string())?;
-    let formats = camera.formats().map_err(|e| e.to_string())?;
-    let list: Vec<FormatInfo> = formats
-        .iter()
-        .enumerate()
-        .map(|(i, f)| FormatInfo {
-            index: i,
-            format: format!("{:?}", f.format),
-            width: f.width,
-            height: f.height,
-            bin: f.bin,
-            framerate: f.framerate,
-            mode: if f.is_liveview() { "liveview" } else { "still" },
-        })
-        .collect();
-
-    Ok(json!(list))
+async fn camera_parameters(state: AppState) -> Result<Value, String> {
+    let axum::Json(parameters) = crate::api::camera::get_parameters(axum::extract::State(state))
+        .await
+        .map_err(|error| error.message)?;
+    serde_json::to_value(parameters).map_err(|error| error.to_string())
 }
 
-fn camera_set_parameter(state: AppState, payload: &Value) -> Result<Value, String> {
+async fn camera_formats(state: AppState) -> Result<Value, String> {
+    let axum::Json(formats) = crate::api::camera::get_formats(axum::extract::State(state))
+        .await
+        .map_err(|error| error.message)?;
+    serde_json::to_value(formats).map_err(|error| error.to_string())
+}
+
+async fn camera_set_parameter(state: AppState, payload: &Value) -> Result<Value, String> {
     let name = payload
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| "payload.name is required".to_string())?;
-    let value = payload_f64(payload, "value")?;
-    let id = parse_option(name).ok_or_else(|| format!("Unknown camera parameter: {name}"))?;
-
-    let cam_lock = state.camera.lock().unwrap();
-    let camera = cam_lock
-        .as_ref()
-        .ok_or_else(|| "No camera connected".to_string())?;
-    camera.set_parameter(id, value).map_err(|e| e.to_string())?;
-    let current = camera.get_parameter(id).map(|p| p.cur_val).unwrap_or(value);
-
-    Ok(json!({
-        "status": "ok",
-        "name": name,
-        "value": current,
-    }))
+    let req = crate::api::camera::SetParamRequest {
+        name: name.to_string(),
+        value: payload_f64(payload, "value")?,
+    };
+    let axum::Json(value) =
+        crate::api::camera::set_parameter(axum::extract::State(state), axum::Json(req))
+            .await
+            .map_err(|error| error.message)?;
+    Ok(value)
 }
 
 /// Cloud-relay capture.
@@ -180,15 +126,7 @@ async fn camera_capture(state: AppState, payload: &Value) -> Result<Value, Strin
 
     let image = crate::api::camera::perform_capture(state, params)
         .await
-        .map_err(|status| match status {
-            axum::http::StatusCode::PRECONDITION_FAILED => {
-                "Capture requires a connected camera and an active stream".to_string()
-            }
-            axum::http::StatusCode::GATEWAY_TIMEOUT => {
-                "No camera frame is available yet".to_string()
-            }
-            other => format!("Capture failed: {other}"),
-        })?;
+        .map_err(|error| error.message)?;
 
     serde_json::to_value(image).map_err(|e| e.to_string())
 }
@@ -201,52 +139,41 @@ async fn connect_equipment(state: AppState, payload: &Value) -> Result<Value, St
         .and_then(Value::as_str)
         .map(str::to_string);
 
+    let index = payload
+        .get("index")
+        .and_then(Value::as_i64)
+        .map(|value| value as i32);
+
     match equipment_type.as_str() {
-        "camera" => connect_camera(state, &driver, option),
+        "camera" => {
+            let req = crate::api::ConnectRequest {
+                equipment_type: Some("camera".to_string()),
+                driver,
+                option,
+                index,
+            };
+            crate::api::connect_camera(state, req)
+                .await
+                .map(|axum::Json(value)| value)
+                .map_err(|error| error.message)
+        }
         "mount" => connect_mount(state, &driver, option),
         "focuser" => connect_focuser(state, &driver, option),
         other => Err(format!("Unsupported equipment_type: {other}")),
     }
 }
 
-fn connect_camera(state: AppState, driver: &str, option: Option<String>) -> Result<Value, String> {
-    let driver_result = match driver {
-        "sim" => OlsCameraDriver::new_sim(option.as_deref().unwrap_or("./sim")),
-        "alpaca" => {
-            OlsCameraDriver::new_alpaca(option.as_deref().unwrap_or("http://localhost:11111"))
-        }
-        "asi" => OlsCameraDriver::new_asi(),
-        "svb" => OlsCameraDriver::new_svb(),
-        "toup" => OlsCameraDriver::new_toup(),
-        "wdir" | "watchdir" => OlsCameraDriver::new_wdir(option.as_deref().unwrap_or("./watch")),
-        "gphoto2" | "dslr" => OlsCameraDriver::new_gphoto2(),
-        "uvc" | "webcam" => OlsCameraDriver::new_uvc(),
-        "indi" => OlsCameraDriver::new_indi(),
-        "indigo" => OlsCameraDriver::new_indigo(),
-        other => return Err(format!("Unsupported camera driver: {other}")),
-    };
-
-    let mut camera_driver = driver_result.map_err(|e| e.to_string())?;
-    let cameras = camera_driver.list_cameras().map_err(|e| e.to_string())?;
-    if cameras.is_empty() {
-        return Err("No cameras found for selected driver".to_string());
-    }
-    let camera = camera_driver.open_camera(0).map_err(|e| e.to_string())?;
-    let camera_name = camera
-        .name()
-        .unwrap_or_else(|_| "Unknown camera".to_string());
-
-    *state.camera_driver.lock().unwrap() = Some(camera_driver);
-    *state.camera_name.lock().unwrap() = Some(camera_name.clone());
-    *state.camera.lock().unwrap() = Some(camera);
-
-    Ok(json!({
-        "status": "connected",
-        "equipment_type": "camera",
-        "driver": driver,
-        "camera": camera_name,
-        "cameras_found": cameras,
-    }))
+async fn disconnect_equipment(state: AppState, payload: &Value) -> Result<Value, String> {
+    let equipment_type = payload_str(payload, "equipment_type", "all");
+    let axum::Json(response) = crate::api::disconnect_equipment(
+        axum::extract::State(state),
+        Some(axum::Json(crate::api::DisconnectRequest {
+            equipment_type: Some(equipment_type.clone()),
+        })),
+    )
+    .await
+    .map_err(|error| error.message)?;
+    Ok(response)
 }
 
 fn connect_mount(state: AppState, driver: &str, option: Option<String>) -> Result<Value, String> {
@@ -320,47 +247,21 @@ fn connect_focuser(state: AppState, driver: &str, option: Option<String>) -> Res
     }))
 }
 
-fn start_camera_stream(state: AppState, payload: &Value) -> Result<Value, String> {
-    let format_index = payload
-        .get("format_index")
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        .max(0) as usize;
-
-    let mut camera_lock = state.camera.lock().unwrap();
-    let camera = camera_lock
-        .as_mut()
-        .ok_or_else(|| "No camera connected".to_string())?;
-    let formats = camera.formats().map_err(|e| e.to_string())?;
-    let fmt = formats
-        .get(format_index)
-        .or_else(|| formats.first())
-        .ok_or_else(|| "Camera reports no stream formats".to_string())?;
-
-    camera
-        .start_stream(
-            fmt,
-            state.latest_frame.clone(),
-            state.camera_config.saturation_adu,
-        )
-        .map_err(|e| e.to_string())?;
-    *state.streaming.lock().unwrap() = true;
-
-    Ok(json!({
-        "status": "streaming",
-        "format": format!("{:?}", fmt.format),
-        "width": fmt.width,
-        "height": fmt.height,
-    }))
+async fn start_camera_stream(state: AppState, payload: &Value) -> Result<Value, String> {
+    let format_index = match payload.get("format_index").and_then(Value::as_i64) {
+        Some(value) if value < 0 => return Err("format_index cannot be negative".to_string()),
+        Some(value) => Some(value as usize),
+        None => None,
+    };
+    crate::api::camera::start_stream_control(&state, format_index)
+        .await
+        .map_err(|error| error.message)
 }
 
-fn abort_camera(state: AppState) -> Result<Value, String> {
-    let mut camera = state.camera.lock().unwrap();
-    if let Some(camera) = camera.as_mut() {
-        let _ = camera.stop_stream();
-    }
-    *state.streaming.lock().unwrap() = false;
-    Ok(json!({ "status": "stopped" }))
+async fn abort_camera(state: AppState) -> Result<Value, String> {
+    crate::api::camera::stop_stream_control(&state)
+        .await
+        .map_err(|error| error.message)
 }
 
 fn camera_snapshot(state: AppState) -> Result<Value, String> {

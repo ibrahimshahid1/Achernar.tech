@@ -54,7 +54,7 @@ import sqlite3
 import sys
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # ─── File-role classification ────────────────────────────────────────────────
@@ -207,14 +207,27 @@ def load_log(path: Path | None) -> dict:
 
 
 def night_id_for(timestamp: str, fallback: str) -> str:
-    """Local date of sunset. Frames before 12:00 belong to the previous night."""
+    """Local date of sunset. Anything before local noon belongs to the previous night.
+
+    Must stay identical to `storage::night::night_id` in the daemon. The two
+    write rows that later get grouped together, and two definitions of "night"
+    would cut one session in half with nothing to show it had happened.
+
+    The noon test is applied in **local** time. An aware timestamp is converted
+    first, because the UTC hour is not the observer's hour: 2026-11-15T14:00Z is
+    09:00 Eastern, still the night of the 14th, but its UTC hour of 14 reads as
+    an afternoon and would have opened a new night in the middle of a session.
+    A naive timestamp — what a field card written by hand actually contains — is
+    taken as already local.
+    """
     try:
         dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
     except (ValueError, AttributeError):
         return fallback
+    if dt.tzinfo is not None:
+        dt = dt.astimezone()
     if dt.hour < 12:
-        day = dt.toordinal() - 1
-        return datetime.fromordinal(day).strftime("%Y-%m-%d")
+        return (dt - timedelta(days=1)).strftime("%Y-%m-%d")
     return dt.strftime("%Y-%m-%d")
 
 

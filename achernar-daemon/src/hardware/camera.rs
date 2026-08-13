@@ -54,14 +54,19 @@ pub struct StreamFormat {
 }
 
 impl StreamFormat {
-    /// True when this looks like a driver-provided live-view feed rather than
-    /// a full-resolution still: an MJPEG format advertising a real framerate.
+    /// True when this looks like a driver-provided continuous live-view feed
+    /// rather than a full-resolution still: any format advertising a frame
+    /// rate or the OLS `-1` sentinel for an unknown frame rate. ASI, SVBony,
+    /// simulator and watch-folder streams all use `-1`; labelling those as one
+    /// mechanical shutter actuation per frame is actively misleading.
+    /// UVC Mono8/YUV2 feeds are just as continuous as MJPEG; pixel encoding
+    /// does not decide whether a mechanical shutter is actuated.
     ///
     /// The gphoto2 driver enumerates live view first precisely so that callers
     /// which do not choose a format never actuate the shutter; this predicate
     /// lets the daemon label the mode in API responses.
     pub fn is_liveview(&self) -> bool {
-        self.format == ols_ffi::OlsStreamType::Mjpeg && self.framerate > 0.0
+        self.framerate != 0.0
     }
 }
 
@@ -126,6 +131,9 @@ pub struct SourceImage {
 /// A captured frame with owned data
 #[derive(Debug, Clone)]
 pub struct FrameData {
+    /// Daemon-assigned stream generation. Unlike a driver counter this never
+    /// resets on reconnect, so old-camera pixels cannot cross a lifecycle.
+    pub stream_generation: u64,
     pub format: ols_ffi::OlsStreamType,
     pub bayer: ols_ffi::OlsBayerType,
     pub frame_counter: i32,
@@ -440,6 +448,8 @@ unsafe impl Send for OlsCamera {}
 
 struct CallbackData {
     latest_frame: Arc<Mutex<Option<FrameData>>>,
+    stream_generation: u64,
+    active_generation: Arc<std::sync::atomic::AtomicU64>,
     /// Stamped onto every frame this stream produces. Held per-stream rather
     /// than read from a global so two cameras on one rig can carry different
     /// values. See `FrameData::saturation_adu`.
@@ -508,10 +518,14 @@ impl OlsCamera {
         format: &StreamFormat,
         frame_store: Arc<Mutex<Option<FrameData>>>,
         saturation_adu: Option<f32>,
+        stream_generation: u64,
+        active_generation: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<()> {
         let cb_data = Box::new(CallbackData {
             latest_frame: frame_store,
             saturation_adu,
+            stream_generation,
+            active_generation,
         });
         let user_data = &*cb_data as *const CallbackData as *mut c_void;
 
@@ -805,6 +819,13 @@ unsafe extern "C" fn frame_callback_trampoline(
     }
 
     let cb_data = &*(user_data as *const CallbackData);
+    if cb_data
+        .active_generation
+        .load(std::sync::atomic::Ordering::Acquire)
+        != cb_data.stream_generation
+    {
+        return;
+    }
     let frame_ref = &*frame;
 
     // Skip error frames
@@ -834,6 +855,7 @@ unsafe extern "C" fn frame_callback_trampoline(
     };
 
     let frame_data = FrameData {
+        stream_generation: cb_data.stream_generation,
         format: frame_ref.format,
         bayer: frame_ref.bayer,
         frame_counter: frame_ref.frame_counter,
@@ -846,6 +868,12 @@ unsafe extern "C" fn frame_callback_trampoline(
     };
 
     if let Ok(mut store) = cb_data.latest_frame.lock() {
-        *store = Some(frame_data);
+        if cb_data
+            .active_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+            == cb_data.stream_generation
+        {
+            *store = Some(frame_data);
+        }
     }
 }

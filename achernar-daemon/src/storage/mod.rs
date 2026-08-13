@@ -13,6 +13,7 @@ pub mod focus_samples_repo;
 pub mod frames_repo;
 pub mod guider_state_repo;
 pub mod local_store;
+pub mod night;
 pub mod plate_solve_repo;
 pub mod pointing_model_repo;
 pub mod sessions_repo;

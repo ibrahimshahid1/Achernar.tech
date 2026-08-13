@@ -116,6 +116,53 @@ pub struct SharedObservation {
     pub observation_valid: bool,
 }
 
+#[cfg(test)]
+impl SharedObservation {
+    /// A structurally valid observation with no measurement in it.
+    ///
+    /// Every width and quality field is `None` and every count is zero, which
+    /// is what the vision loop publishes for a frame it could not measure.
+    /// Tests set only the fields they are about, so adding a field to the
+    /// struct does not require editing every test that builds one.
+    pub fn empty_for_test() -> Self {
+        Self {
+            timestamp: chrono::Utc::now(),
+            status: super::quality::QualityStatus::NoUsableStars,
+            rejection_reasons: Vec::new(),
+            hfr_px: None,
+            hfd_px: None,
+            fwhm_px: None,
+            image_fwhm_arcsec: None,
+            quality_uncertainty: None,
+            hfr_log_sigma: None,
+            star_count: 0,
+            star_count_used: 0,
+            star_rejections: StarRejectionTallies::default(),
+            fqe_hfr_px: None,
+            fqe_sigma_log_hfr: None,
+            fqe_star_count: None,
+            fqe_model_version: None,
+            fqe_calibrated: None,
+            cloud_probability: 0.0,
+            cloud_event: CloudEvent::None,
+            trailing_severity: 0.0,
+            trailing_axis: None,
+            trailing_direction_pa: None,
+            background_adu: 0.0,
+            sky_background_adu: 0.0,
+            background_sigma: 0.0,
+            snr_proxy_median: 0.0,
+            saturation_fraction: 0.0,
+            saturation_gate: crate::vision::quality::SaturationGate::default(),
+            pointing_error_arcmin: None,
+            wcs_residual_arcsec: None,
+            last_solve_confidence: None,
+            last_solve_at: None,
+            observation_valid: false,
+        }
+    }
+}
+
 /// CloudEvent for publishing observations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VisionCloudEvent {

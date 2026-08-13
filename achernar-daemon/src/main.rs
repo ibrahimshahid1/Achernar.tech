@@ -127,25 +127,21 @@ async fn main() -> anyhow::Result<()> {
     // restate focal ratio and pixel size in achernar.toml — those columns have
     // been in the schema since migration 002, and a second place to type the
     // same facts is the friction that keeps drift forecasting switched off.
-    let rig_optics = match storage::device_profiles_repo::load_rig_optics(
-        local_store.pool(),
-        &rig_id,
-    )
-    .await
-    {
-        Ok(Some(optics)) => {
-            info!("Rig optics: {optics:?}");
-            Some(optics)
-        }
-        Ok(None) => {
-            info!("No `rigs` row for {rig_id}; optics must come from achernar.toml");
-            None
-        }
-        Err(e) => {
-            tracing::warn!("Could not read rig optics: {e}");
-            None
-        }
-    };
+    let rig_optics =
+        match storage::device_profiles_repo::load_rig_optics(local_store.pool(), &rig_id).await {
+            Ok(Some(optics)) => {
+                info!("Rig optics: {optics:?}");
+                Some(optics)
+            }
+            Ok(None) => {
+                info!("No `rigs` row for {rig_id}; optics must come from achernar.toml");
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Could not read rig optics: {e}");
+                None
+            }
+        };
 
     let app_state = AppState::new(
         config.focus.clone(),
@@ -202,6 +198,7 @@ async fn health_check() -> &'static str {
 
 fn camera_routes() -> Router<AppState> {
     Router::new()
+        .route("/", get(api::camera::get_camera_descriptor))
         .route("/capture", post(api::camera::capture))
         .route("/abort", post(api::camera::abort))
         .route("/snapshot", post(api::camera::snapshot))
@@ -211,6 +208,7 @@ fn camera_routes() -> Router<AppState> {
         )
         .route("/formats", get(api::camera::get_formats))
         .route("/stream/start", post(api::camera::start_stream))
+        .route("/stream/stop", post(api::camera::stop_stream))
         .route("/stream/mjpeg", get(api::camera::stream_mjpeg))
         .route("/stream", get(camera_stream_ws))
 }

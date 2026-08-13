@@ -6,6 +6,16 @@ network, so this directory holds **no** `model.onnx` and never will. The
 `drift_model_path` key that used to point at one has been removed from
 `FocusModelsConfig` — it was conceptually wrong, not merely unset.
 
+`ml/models/focus_drift_kalman.py` has been deleted for the same reason. It
+declared a second Kalman filter over the same three-element state — and a
+different one: `q = 0.01, r = 1.0`, where the specification sets
+σ_p = 2 steps, σ_ṗ = 0.5 steps/min, σ_z = 3 steps, and `DriftConfig` carries the
+physical argument for each. Two implementations of one filter with silently
+different noise priors is a worse position than one implementation, and the
+Rust side is the one that runs. There is nothing for a Python FDF to do:
+unlike every other model here, this one is fitted online from converged
+autofocus runs rather than trained offline from a dataset.
+
 ## What used to be here
 
 `kalman_state.json` was removed. It was trying to be two things at once:

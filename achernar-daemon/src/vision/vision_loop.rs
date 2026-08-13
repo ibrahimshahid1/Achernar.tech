@@ -57,14 +57,23 @@ pub async fn run(state: AppState, rate_hz: f64) {
         1.0 / period.as_secs_f64()
     );
     let mut trends = VisionTrendState::default();
+    let mut trend_generation = state.current_camera_generation();
 
     loop {
         ticker.tick().await;
 
+        let generation = state.current_camera_generation();
+        if generation != trend_generation {
+            trends = VisionTrendState::default();
+            trend_generation = generation;
+        }
         let frame = state.latest_frame.lock().unwrap().clone();
         let Some(frame) = frame else {
             continue;
         };
+        if frame.stream_generation != generation {
+            continue;
+        }
 
         let previous = state
             .vision_observation
@@ -79,6 +88,17 @@ pub async fn run(state: AppState, rate_hz: f64) {
             Some(state.fqe_runner.as_ref()),
         ) {
             Ok(observation) => {
+                // A disconnect/restart can happen while vision is processing.
+                // Never republish pixels or trends from the old stream after
+                // lifecycle invalidation has cleared the observation bus.
+                let _publication = state.camera_observation_barrier.lock().unwrap();
+                if frame.stream_generation != generation
+                    || state.current_camera_generation() != generation
+                {
+                    trends = VisionTrendState::default();
+                    trend_generation = state.current_camera_generation();
+                    continue;
+                }
                 if let Ok(mut bus) = state.vision_observation.write() {
                     *bus = Some(observation.clone());
                 }

@@ -153,6 +153,16 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "focuser_scale",
         include_str!("../../migrations/005_focuser_scale.sql"),
     ),
+    (
+        6,
+        "environment_log",
+        include_str!("../../migrations/006_environment_log.sql"),
+    ),
+    (
+        7,
+        "grouping_keys",
+        include_str!("../../migrations/007_grouping_keys.sql"),
+    ),
 ];
 
 /// True for errors that mean "this statement's effect is already present".
@@ -210,6 +220,54 @@ pub(crate) fn migrations_for_test() -> &'static [(i64, &'static str, &'static st
 #[cfg(test)]
 pub(crate) fn split_statements_for_test(sql: &str) -> Vec<String> {
     split_statements(sql)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MIGRATIONS;
+
+    /// Every `migrations/*.sql` file must appear in `MIGRATIONS`.
+    ///
+    /// `006_environment_log.sql` sat on disk for a week without being listed
+    /// here, so the daemon never created `environment_log` or
+    /// `disturbance_log`. It went unnoticed because `tools/import_session.py`
+    /// applies that one file itself, so the importer's own tests passed against
+    /// tables the daemon would never have. Adding a migration is two edits in
+    /// two directories and nothing connected them; now something does.
+    #[test]
+    fn every_migration_file_is_registered() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .expect("migrations directory")
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                (path.extension()? == "sql").then(|| path.file_name()?.to_str().map(str::to_string))?
+            })
+            .collect();
+        on_disk.sort();
+
+        let mut registered: Vec<String> = MIGRATIONS
+            .iter()
+            .map(|(version, name, _)| format!("{version:03}_{name}.sql"))
+            .collect();
+        registered.sort();
+
+        assert_eq!(
+            on_disk, registered,
+            "migrations/ and the MIGRATIONS ledger disagree. A file present on \
+             disk but absent here never runs; the reverse will not compile."
+        );
+    }
+
+    /// Versions are the ledger's primary key and its ordering.
+    #[test]
+    fn migration_versions_are_unique_and_ascending() {
+        let versions: Vec<i64> = MIGRATIONS.iter().map(|(version, _, _)| *version).collect();
+        let mut sorted = versions.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(versions, sorted, "migration versions must be unique and ascending");
+    }
 }
 
 fn storage_error(context: &'static str) -> impl Fn(sqlx::Error) -> crate::error::AchernarError {

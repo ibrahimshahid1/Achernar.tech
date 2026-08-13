@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <fstream>
 #include <memory>
@@ -371,6 +372,45 @@ private:
 struct CallbackTrampoline {
   OlsFrameCallback callback;
   void *user_data;
+
+  // A camera SDK owns a copy of the C++ callback and may invoke it from a
+  // worker thread while stop/disconnect is running.  The Rust `user_data`
+  // pointer is only valid until the bridge reports that the callback is
+  // quiescent, so raw-pointer capture is not sufficient here.
+  std::mutex mutex;
+  std::condition_variable idle;
+  bool active = true;
+  size_t in_flight = 0;
+
+  void invoke(const OlsFrame &frame) {
+    OlsFrameCallback callback_copy = nullptr;
+    void *user_data_copy = nullptr;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!active) return;
+      ++in_flight;
+      callback_copy = callback;
+      user_data_copy = user_data;
+    }
+
+    callback_copy(&frame, user_data_copy);
+
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      --in_flight;
+      if (in_flight == 0) idle.notify_all();
+    }
+  }
+
+  // Prevent new calls and wait for a callback already inside Rust to return.
+  // Once this completes, Rust may safely release `user_data` even if a broken
+  // SDK invokes its retained C++ lambda again: that lambda owns this object,
+  // observes `active == false`, and never dereferences the Rust pointer.
+  void deactivate() {
+    std::unique_lock<std::mutex> lock(mutex);
+    active = false;
+    idle.wait(lock, [this] { return in_flight == 0; });
+  }
 };
 
 } // namespace ols_bridge
@@ -688,7 +728,8 @@ struct OlsCamera_t {
   std::unique_ptr<ols::Camera> camera;
   std::vector<ols::CamStreamFormat> formats;
   std::vector<ols::CamOptionId> options;
-  std::unique_ptr<ols_bridge::CallbackTrampoline> trampoline;
+  std::shared_ptr<ols_bridge::CallbackTrampoline> trampoline;
+  bool stream_state_uncertain = false;
 };
 
 OlsError ols_driver_open_camera(OlsCameraDriver *driver, int32_t index,
@@ -751,6 +792,12 @@ OlsError ols_camera_format_get(OlsCamera *cam, int32_t index,
 OlsError ols_camera_start_stream(OlsCamera *cam, const OlsStreamFormat *fmt,
                                  OlsFrameCallback callback, void *user_data) {
   try {
+    if (cam->stream_state_uncertain)
+      return set_error(OLS_ERR_IO,
+                       "Previous stream did not stop cleanly; reconnect camera");
+    if (cam->trampoline)
+      return set_error(OLS_ERR_IO, "Camera stream is already active");
+
     ols::CamStreamFormat ols_fmt;
     ols_fmt.format = (ols::CamStreamType)fmt->format;
     ols_fmt.width = fmt->width;
@@ -764,9 +811,10 @@ OlsError ols_camera_start_stream(OlsCamera *cam, const OlsStreamFormat *fmt,
     ols_fmt.roi_den = fmt->roi_den > 0 ? fmt->roi_den : 1;
     ols_fmt.framerate = fmt->framerate;
 
-    cam->trampoline.reset(
-        new ols_bridge::CallbackTrampoline{callback, user_data});
-    auto *tramp = cam->trampoline.get();
+    auto tramp = std::make_shared<ols_bridge::CallbackTrampoline>();
+    tramp->callback = callback;
+    tramp->user_data = user_data;
+    cam->trampoline = tramp;
 
     ols::CamErrorCode e;
     cam->camera->start_stream(
@@ -786,24 +834,54 @@ OlsError ols_camera_start_stream(OlsCamera *cam, const OlsStreamFormat *fmt,
           f.source_data = (const uint8_t *)frame.source_data;
           f.source_data_size = frame.source_data_size;
           f.source_ext = frame.source_ext;
-          tramp->callback(&f, tramp->user_data);
+          tramp->invoke(f);
         },
         e);
-    if (e) return set_error(OLS_ERR_IO, e.message());
+    if (e) {
+      // The Rust caller owns user_data and frees it as soon as this function
+      // reports failure. A driver may have installed its callback before
+      // discovering that streaming could not start; leave no trampoline that
+      // can later dereference that freed pointer.
+      tramp->deactivate();
+      ols::CamErrorCode stop_error;
+      cam->camera->stop_stream(stop_error);
+      cam->stream_state_uncertain = (bool)stop_error;
+      cam->trampoline.reset();
+      return set_error(OLS_ERR_IO, e.message());
+    }
+    cam->stream_state_uncertain = false;
     return OLS_OK;
   } catch (std::exception const &ex) {
+    if (cam->trampoline) cam->trampoline->deactivate();
+    try {
+      ols::CamErrorCode stop_error;
+      cam->camera->stop_stream(stop_error);
+      cam->stream_state_uncertain = (bool)stop_error;
+    } catch (...) {
+      cam->stream_state_uncertain = true;
+    }
+    cam->trampoline.reset();
     return set_error(OLS_ERR_GENERIC, ex);
   }
 }
 
 OlsError ols_camera_stop_stream(OlsCamera *cam) {
   try {
+    auto tramp = cam->trampoline;
+    if (tramp) tramp->deactivate();
     ols::CamErrorCode e;
     cam->camera->stop_stream(e);
+    // The SDK callback owns a shared reference and has been deactivated, so it
+    // is safe to release the camera's reference even if the SDK reports a stop
+    // error or invokes its stale lambda later.
     cam->trampoline.reset();
+    cam->stream_state_uncertain = (bool)e;
     if (e) return set_error(OLS_ERR_IO, e.message());
     return OLS_OK;
   } catch (std::exception const &ex) {
+    if (cam->trampoline) cam->trampoline->deactivate();
+    cam->trampoline.reset();
+    cam->stream_state_uncertain = true;
     return set_error(OLS_ERR_GENERIC, ex);
   }
 }
@@ -993,7 +1071,14 @@ OlsError ols_camera_delete_captured(OlsCamera *cam,
 
 void ols_capture_destroy(OlsStillCapture *capture) { delete capture; }
 
-void ols_camera_destroy(OlsCamera *cam) { delete cam; }
+void ols_camera_destroy(OlsCamera *cam) {
+  if (!cam) return;
+  // A caller may destroy without an explicit stop, or after a stop error.
+  // Quiesce the cross-language callback before the driver destructor runs so
+  // no SDK worker can enter user code after this function returns.
+  if (cam->trampoline) cam->trampoline->deactivate();
+  delete cam;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 //  RAW Decode (LibRaw)

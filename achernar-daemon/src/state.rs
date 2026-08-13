@@ -12,12 +12,92 @@ use crate::hardware::{
 use crate::vision::observed_frame::ObservedFrame;
 use crate::vision::shared_observation::SharedObservation;
 use crate::{
-    config::FocusConfig, focus::focus_agent::FocusAgent,
-    focus::focus_drift::FocusDriftForecaster, storage::frames_repo::FrameStore,
-    storage::local_store::LocalStore,
+    config::FocusConfig, focus::focus_agent::FocusAgent, focus::focus_drift::FocusDriftForecaster,
+    storage::frames_repo::FrameStore, storage::local_store::LocalStore,
 };
-use std::sync::atomic::AtomicBool;
+use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+
+/// Frontend-facing lifecycle of the one camera currently owned by the daemon.
+///
+/// Keep this separate from the legacy `streaming` boolean. A preview stream is
+/// not an exposure, and treating the two as synonyms makes it impossible for a
+/// client to show truthful progress or decide whether an operation can be
+/// cancelled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CameraActivity {
+    Disconnected,
+    Connecting,
+    Idle,
+    Streaming,
+    Exposing,
+    Downloading,
+    Processing,
+    Disconnecting,
+    Error,
+}
+
+/// Small, lock-independent snapshot of camera control state.
+///
+/// Hardware calls may block inside a vendor SDK for seconds or minutes. Status
+/// and telemetry endpoints read this snapshot instead of waiting on the camera
+/// mutex, so a web client remains responsive during a long exposure.
+#[derive(Debug, Clone, Serialize)]
+pub struct CameraRuntimeState {
+    pub connection_id: Option<String>,
+    pub activity: CameraActivity,
+    pub streaming: bool,
+    pub driver_id: Option<String>,
+    pub device_index: Option<i32>,
+    pub camera_name: Option<String>,
+    pub active_format_index: Option<usize>,
+    pub operation_id: Option<String>,
+    pub exposure_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub exposure_duration_s: Option<f64>,
+    pub temperature_c: Option<f64>,
+    pub cooler_on: Option<bool>,
+    pub last_error: Option<String>,
+}
+
+impl Default for CameraRuntimeState {
+    fn default() -> Self {
+        Self {
+            connection_id: None,
+            activity: CameraActivity::Disconnected,
+            streaming: false,
+            driver_id: None,
+            device_index: None,
+            camera_name: None,
+            active_format_index: None,
+            operation_id: None,
+            exposure_started_at: None,
+            exposure_duration_s: None,
+            temperature_c: None,
+            cooler_on: None,
+            last_error: None,
+        }
+    }
+}
+
+impl CameraRuntimeState {
+    /// Progress is deliberately an estimate: many camera SDKs report no
+    /// download progress. It is still useful during the timed exposure, and is
+    /// omitted for every state where a percentage would be invented.
+    pub fn exposure_progress(&self, now: chrono::DateTime<chrono::Utc>) -> Option<f64> {
+        if self.activity != CameraActivity::Exposing {
+            return None;
+        }
+        let started = self.exposure_started_at?;
+        let duration = self.exposure_duration_s?;
+        if !duration.is_finite() || duration <= 0.0 {
+            return None;
+        }
+        let elapsed_ms = now.signed_duration_since(started).num_milliseconds().max(0) as f64;
+        Some((elapsed_ms / 1000.0 / duration).clamp(0.0, 1.0))
+    }
+}
 
 /// Shared application state injected into all Axum route handlers.
 ///
@@ -27,7 +107,8 @@ use std::sync::{Arc, Mutex, RwLock};
 /// this order and never in any other:
 ///
 /// ```text
-/// acquisition → camera_driver → camera → camera_name → streaming → latest_frame
+/// acquisition → camera_driver → camera → camera_name → streaming
+///             → camera_observation_barrier → latest_frame → camera_runtime
 ///             → focus_agent → focus_drift
 /// ```
 ///
@@ -82,6 +163,17 @@ pub struct AppState {
     /// Latest frame received from the camera stream
     pub latest_frame: Arc<Mutex<Option<FrameData>>>,
 
+    /// Monotonic identity of the active camera stream. Late callbacks and
+    /// vision work from an invalidated stream are discarded by generation.
+    pub camera_generation: Arc<AtomicU64>,
+
+    /// Makes stream invalidation atomic with publication of derived vision
+    /// state. Generation checks alone leave a small check-then-publish window:
+    /// a disconnect can clear the buses after the check and vision can then
+    /// republish the old camera's result. Only lifecycle clearing and the
+    /// vision publication commit take this lock; frame callbacks do not.
+    pub camera_observation_barrier: Arc<Mutex<()>>,
+
     /// Latest shared perception bus observation. Controllers read this, not raw pixels.
     pub vision_observation: Arc<RwLock<Option<SharedObservation>>>,
 
@@ -98,6 +190,10 @@ pub struct AppState {
 
     /// Whether the camera stream is active
     pub streaming: Arc<Mutex<bool>>,
+
+    /// Non-blocking identity/activity snapshot for API and telemetry clients.
+    /// Never hold this lock while calling into a camera driver.
+    pub camera_runtime: Arc<RwLock<CameraRuntimeState>>,
 
     /// Deterministic autofocus state machine
     pub focus_agent: Arc<tokio::sync::Mutex<FocusAgent>>,
@@ -220,11 +316,14 @@ impl AppState {
             focuser: Arc::new(Mutex::new(None)),
             focuser_name: Arc::new(Mutex::new(None)),
             latest_frame: Arc::new(Mutex::new(None)),
+            camera_generation: Arc::new(AtomicU64::new(0)),
+            camera_observation_barrier: Arc::new(Mutex::new(())),
             vision_observation: Arc::new(RwLock::new(None)),
             last_observed_frame: Arc::new(RwLock::new(None)),
             vision_updates,
             camera_name: Arc::new(Mutex::new(None)),
             streaming: Arc::new(Mutex::new(false)),
+            camera_runtime: Arc::new(RwLock::new(CameraRuntimeState::default())),
             focus_agent: Arc::new(tokio::sync::Mutex::new(FocusAgent::new())),
             focus_abort_requested: Arc::new(AtomicBool::new(false)),
             focus_drift,
@@ -238,6 +337,24 @@ impl AppState {
             rig_id,
             fqe_runner,
         }
+    }
+
+    /// Remove every value derived from a previous stream generation.
+    ///
+    /// Camera frame counters commonly restart at zero after reconnect. Leaving
+    /// an older frame in the mailbox can therefore make a fresh capture wait
+    /// forever for a counter greater than the previous camera's value, while
+    /// preview and vision clients briefly display pixels from the wrong device.
+    pub fn clear_camera_observations(&self) {
+        let _barrier = self.camera_observation_barrier.lock().unwrap();
+        self.camera_generation.fetch_add(1, Ordering::AcqRel);
+        *self.latest_frame.lock().unwrap() = None;
+        *self.vision_observation.write().unwrap() = None;
+        *self.last_observed_frame.write().unwrap() = None;
+    }
+
+    pub fn current_camera_generation(&self) -> u64 {
+        self.camera_generation.load(Ordering::Acquire)
     }
 
     /// Construct the drift forecaster from config, restoring any snapshot.
@@ -339,5 +456,84 @@ impl AppState {
             Some(Arc::new(tokio::sync::Mutex::new(forecaster))),
             state_path,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phase1_camera_activity_has_stable_snake_case_json_values() {
+        let cases = [
+            (CameraActivity::Disconnected, "disconnected"),
+            (CameraActivity::Connecting, "connecting"),
+            (CameraActivity::Idle, "idle"),
+            (CameraActivity::Streaming, "streaming"),
+            (CameraActivity::Exposing, "exposing"),
+            (CameraActivity::Downloading, "downloading"),
+            (CameraActivity::Processing, "processing"),
+            (CameraActivity::Disconnecting, "disconnecting"),
+            (CameraActivity::Error, "error"),
+        ];
+
+        for (activity, expected) in cases {
+            assert_eq!(serde_json::to_value(activity).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_value::<CameraActivity>(serde_json::json!(expected)).unwrap(),
+                activity
+            );
+        }
+    }
+
+    #[test]
+    fn phase1_camera_exposure_progress_is_clamped_and_only_exists_while_exposing() {
+        let start = chrono::Utc::now();
+        let mut runtime = CameraRuntimeState {
+            activity: CameraActivity::Exposing,
+            exposure_started_at: Some(start),
+            exposure_duration_s: Some(10.0),
+            ..CameraRuntimeState::default()
+        };
+
+        assert_eq!(
+            runtime.exposure_progress(start - chrono::Duration::seconds(2)),
+            Some(0.0)
+        );
+        assert_eq!(
+            runtime.exposure_progress(start + chrono::Duration::milliseconds(2500)),
+            Some(0.25)
+        );
+        assert_eq!(
+            runtime.exposure_progress(start + chrono::Duration::seconds(20)),
+            Some(1.0)
+        );
+
+        runtime.activity = CameraActivity::Downloading;
+        assert_eq!(
+            runtime.exposure_progress(start + chrono::Duration::seconds(5)),
+            None
+        );
+    }
+
+    #[test]
+    fn phase1_camera_exposure_progress_rejects_missing_or_invalid_timing() {
+        let now = chrono::Utc::now();
+        let mut runtime = CameraRuntimeState {
+            activity: CameraActivity::Exposing,
+            ..CameraRuntimeState::default()
+        };
+
+        assert_eq!(runtime.exposure_progress(now), None);
+
+        runtime.exposure_started_at = Some(now);
+        for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            runtime.exposure_duration_s = Some(invalid);
+            assert_eq!(
+                runtime.exposure_progress(now),
+                None,
+                "duration {invalid:?} must not produce invented progress"
+            );
+        }
     }
 }

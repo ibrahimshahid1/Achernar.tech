@@ -66,7 +66,9 @@ pub enum AssetRole {
     NativeRaw,
     /// The camera's own JPEG, when the body was set to RAW+JPEG or JPEG.
     CameraJpeg,
-    /// FITS derived from the sensor data.
+    /// FITS containing sensor data. It is derived when `derived_from` names a
+    /// camera-authored asset; without lineage it is the canonical encoding of
+    /// a stream-only astronomy camera exposure.
     SensorFits,
     /// 16-bit luma used by the vision/FQE pipeline.
     AnalysisLuma,
@@ -135,7 +137,12 @@ pub struct PendingAsset {
 }
 
 impl PendingAsset {
-    pub fn new(role: AssetRole, filename: impl Into<String>, media_type: impl Into<String>, bytes: Vec<u8>) -> Self {
+    pub fn new(
+        role: AssetRole,
+        filename: impl Into<String>,
+        media_type: impl Into<String>,
+        bytes: Vec<u8>,
+    ) -> Self {
         Self {
             role,
             filename: filename.into(),
@@ -170,6 +177,10 @@ impl PendingAsset {
     pub fn with_original_filename(mut self, name: impl Into<String>) -> Self {
         self.original_filename = Some(name.into());
         self
+    }
+
+    fn is_canonical_source(&self) -> bool {
+        self.role.is_native() || (self.role == AssetRole::SensorFits && self.derived_from.is_none())
     }
 }
 
@@ -360,7 +371,7 @@ impl CaptureStore {
             )
             .into());
         }
-        if !capture.assets.iter().any(|a| a.role.is_native()) {
+        if !capture.assets.iter().any(PendingAsset::is_canonical_source) {
             // A bundle of purely derived products has no ground truth behind
             // it; something upstream lost the camera's own output.
             return Err(StorageError::Database(
@@ -376,7 +387,9 @@ impl CaptureStore {
         // <root>/<rig>/<night>/<session>/<frame-id>
         let relative_dir = PathBuf::from(sanitize(&capture.rig_id))
             .join(&night)
-            .join(sanitize(capture.session_id.as_deref().unwrap_or("no-session")))
+            .join(sanitize(
+                capture.session_id.as_deref().unwrap_or("no-session"),
+            ))
             .join(sanitize(&capture.frame_id));
         let final_dir = self.root.join(&relative_dir);
         let parent = final_dir
@@ -421,7 +434,14 @@ impl CaptureStore {
 
         // ─── 4. Catalogue, inside one transaction ───
         let commit = self
-            .write_rows(pool, &capture, &staged, &relative_dir, &started_at, &completed_at)
+            .write_rows(
+                pool,
+                &capture,
+                &staged,
+                &relative_dir,
+                &started_at,
+                &completed_at,
+            )
             .await;
 
         let mut tx = match commit {
@@ -495,7 +515,11 @@ impl CaptureStore {
         let legacy = staged
             .iter()
             .find(|a| a.role == AssetRole::AnalysisLuma.as_str())
-            .or_else(|| staged.iter().find(|a| a.role == AssetRole::SensorFits.as_str()))
+            .or_else(|| {
+                staged
+                    .iter()
+                    .find(|a| a.role == AssetRole::SensorFits.as_str())
+            })
             .or_else(|| staged.first());
         let legacy_path = legacy.map(|a| a.relative_path.clone()).unwrap_or_default();
         let legacy_sum = legacy.map(|a| a.sha256.clone());
@@ -509,14 +533,14 @@ impl CaptureStore {
         sqlx::query(
             r#"INSERT INTO frames (
                    id, session_id, local_path, checksum_sha256, width, height,
-                   exposure_s, gain, filter_name, temperature, quality_json, captured_at,
+                   exposure_s, gain, filter_name, temperature, quality_json, captured_at, night_id,
                    capture_id, rig_id, camera_name, capture_type, capture_status,
                    exposure_started_at, exposure_completed_at,
                    requested_exposure_s, requested_gain, iso, shutter_label,
                    offset_val, binning, focuser_position,
                    temperature_source, temperature_state,
                    software_version, driver_name, acquisition_json
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?,
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?,
                          ?, ?, ?, ?, 'committed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&capture.frame_id)
@@ -530,6 +554,9 @@ impl CaptureStore {
         .bind(&capture.filter_name)
         .bind(capture.temperature)
         .bind(started_at)
+        .bind(crate::storage::night::night_id(unix_to_datetime(
+            capture.exposure_started_at,
+        )))
         .bind(&capture.capture_id)
         .bind(&capture.rig_id)
         .bind(&capture.camera_name)
@@ -869,11 +896,10 @@ fn remove_partials(root: &Path) -> usize {
 //  Helpers
 // ═══════════════════════════════════════════════════════════════════
 
-/// Observing night, defined as the UTC date shifted back 12 hours so a session
-/// running past midnight stays in one directory rather than splitting in half.
+/// Observing night under the same local-noon boundary used by every dataset
+/// grouping key. A directory and its catalogue row must never disagree.
 fn night_of(unix_seconds: f64) -> String {
-    let dt = unix_to_datetime(unix_seconds) - chrono::Duration::hours(12);
-    dt.format("%Y-%m-%d").to_string()
+    crate::storage::night::night_id(unix_to_datetime(unix_seconds))
 }
 
 fn unix_to_datetime(unix_seconds: f64) -> chrono::DateTime<chrono::Utc> {
@@ -940,6 +966,10 @@ mod tests {
                 let _ = sqlx::query(&statement).execute(&pool).await;
             }
         }
+        sqlx::query("INSERT INTO sessions (id, rig_id) VALUES ('sess-1', 'rig-1')")
+            .execute(&pool)
+            .await
+            .unwrap();
         pool
     }
 
@@ -997,7 +1027,13 @@ mod tests {
 
         let capture = sample("frame-1");
         store
-            .begin_attempt(&pool, &capture.capture_id, Some("sess-1"), "rig-1", &serde_json::json!({}))
+            .begin_attempt(
+                &pool,
+                &capture.capture_id,
+                Some("sess-1"),
+                "rig-1",
+                &serde_json::json!({}),
+            )
             .await
             .unwrap();
         let committed = store.persist_capture(&pool, capture).await.unwrap();
@@ -1051,12 +1087,11 @@ mod tests {
                 .unwrap();
         assert_eq!(attempt.0, "committed");
 
-        let outbox: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM sync_queue WHERE entity_id = ?")
-                .bind("frame-1")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let outbox: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM sync_queue WHERE entity_id = ?")
+            .bind("frame-1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(outbox.0, 1);
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1084,7 +1119,13 @@ mod tests {
 
         let capture = sample("frame-3");
         store
-            .begin_attempt(&pool, &capture.capture_id, Some("sess-1"), "rig-1", &serde_json::json!({}))
+            .begin_attempt(
+                &pool,
+                &capture.capture_id,
+                Some("sess-1"),
+                "rig-1",
+                &serde_json::json!({}),
+            )
             .await
             .unwrap();
         let committed = store.persist_capture(&pool, capture).await.unwrap();
@@ -1120,7 +1161,7 @@ mod tests {
     fn filenames_cannot_escape_the_bundle() {
         assert_eq!(sanitize_filename("../../etc/passwd"), "asset.bin");
         assert_eq!(sanitize_filename("image.cr3"), "image.cr3");
-        assert_eq!(sanitize("rig/../.."), "rig_____");
+        assert_eq!(sanitize("rig/../.."), "rig______");
     }
 
     #[test]

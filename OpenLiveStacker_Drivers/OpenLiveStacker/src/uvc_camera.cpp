@@ -463,7 +463,11 @@ namespace ols {
         std::string name_;
         uvc_device_handle_t *devh_ = nullptr;
         uvc_stream_ctrl_t ctrl_;
-        bool stream_active_ = true;
+        // No stream exists until uvc_start_streaming succeeds.  Starting at
+        // true made the first start/destructor call uvc_stop_streaming on a
+        // handle that had never been started, which is especially visible on
+        // reconnect with inexpensive UVC astronomy cameras such as the SV105.
+        bool stream_active_ = false;
         std::vector<CamStreamFormat> formats_;
         CamStreamFormat format_;
         int frame_counter_ = 0;

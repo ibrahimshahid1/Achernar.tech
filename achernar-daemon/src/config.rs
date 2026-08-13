@@ -63,6 +63,29 @@ pub struct FocusConfig {
     /// Settle time in ms after each focus move
     #[serde(default = "default_settle_ms")]
     pub settle_ms: u64,
+
+    /// Half-width of the sweep, in sample points either side of the start.
+    ///
+    /// The sweep visits `2 * sweep_radius_points + 1` positions, so the default
+    /// of 3 gives the seven-point sweep this agent has always run. It used to be
+    /// a hard-coded `(-3..=3)`, which is enough to fit a curve and not enough
+    /// for the data campaign: the observing plan calls for 25-position sweeps,
+    /// and the Focus Offset Predictor's balanced sampler buckets |delta| out to
+    /// 120+ steps, which a +/-3 sweep at a 50-step size can only just reach at
+    /// its extremes. Raise it to 12 for campaign nights.
+    ///
+    /// Still bounded by `safety.max_total_travel_per_run`, which silently
+    /// truncates the sweep rather than overrunning the budget.
+    #[serde(default = "default_sweep_radius_points")]
+    pub sweep_radius_points: u32,
+
+    /// The order positions are visited in. See `focus_agent::SweepPattern`.
+    ///
+    /// Overridable per run through `POST /focus/run`, because the mix is an
+    /// observing decision rather than an installation one — the plan calls for
+    /// roughly one run in three to be a reversal.
+    #[serde(default)]
+    pub sweep_pattern: crate::focus::focus_agent::SweepPattern,
 }
 
 impl Default for FocusConfig {
@@ -75,6 +98,8 @@ impl Default for FocusConfig {
             initial_step_size: default_step_size(),
             samples_per_position: default_samples_per_position(),
             settle_ms: default_settle_ms(),
+            sweep_radius_points: default_sweep_radius_points(),
+            sweep_pattern: crate::focus::focus_agent::SweepPattern::default(),
         }
     }
 }
@@ -727,6 +752,9 @@ fn default_step_size() -> i32 {
     50
 }
 fn default_samples_per_position() -> u32 {
+    3
+}
+fn default_sweep_radius_points() -> u32 {
     3
 }
 fn default_settle_ms() -> u64 {

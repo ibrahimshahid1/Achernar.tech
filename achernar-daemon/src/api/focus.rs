@@ -4,7 +4,7 @@
 use crate::control::safety_guard::{FocusSafetyGuard, SafetyVerdict};
 use crate::error::{AchernarError, FocusError, HardwareError};
 use crate::focus::focus_agent::{FocusRunContext, FocusRunState, FocusSample};
-use crate::state::AppState;
+use crate::state::{AppState, CameraActivity};
 use crate::storage::local_store::LocalStore;
 use crate::vision::observed_frame::ObservedFrame;
 use crate::vision::shared_observation::SharedObservation;
@@ -27,12 +27,37 @@ pub struct StartFocusRunRequest {
     pub method: Option<String>,
     pub filter_name: Option<String>,
     pub step_size: Option<i32>,
+    /// `"monotonic"` (default) or `"reversal"`. See `focus_agent::SweepPattern`.
+    ///
+    /// Per-run rather than per-installation: the observing plan wants roughly
+    /// one run in three to reverse, which is a decision a night's script makes,
+    /// not one an operator edits into a config file between sweeps.
+    pub sweep_pattern: Option<String>,
+    /// Positions either side of the start, overriding `sweep_radius_points`.
+    /// 3 gives the seven-point sweep; campaign nights want 12 (25 points).
+    pub sweep_radius_points: Option<u32>,
 }
 
 /// POST /api/v1/focus/run — start a new autofocus run
 pub async fn start_focus_run(
     State(state): State<AppState>,
     Json(req): Json<StartFocusRunRequest>,
+) -> Result<Json<FocusRunResponse>, StatusCode> {
+    // Like a camera exposure, an autofocus sweep is a hardware transaction,
+    // not a browser-request lifetime. Closing the page must not drop the
+    // acquisition guard halfway through a focuser move and let another camera
+    // command interleave. The explicit `/focus/abort` signal remains active.
+    tokio::spawn(async move { start_focus_run_owned(state, req).await })
+        .await
+        .map_err(|error| {
+            tracing::error!("Autofocus task failed: {error}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+}
+
+async fn start_focus_run_owned(
+    state: AppState,
+    req: StartFocusRunRequest,
 ) -> Result<Json<FocusRunResponse>, StatusCode> {
     let method = req.method.as_deref().unwrap_or("classical");
     if !matches!(method, "classical" | "deterministic" | "hfr") {
@@ -44,6 +69,28 @@ pub async fn start_focus_run(
     if let Some(step_size) = req.step_size {
         config.initial_step_size = step_size.abs().max(1);
     }
+    if let Some(radius) = req.sweep_radius_points {
+        config.sweep_radius_points = radius.max(1);
+    }
+    if let Some(requested) = req.sweep_pattern.as_deref() {
+        // Reject an unrecognised pattern rather than silently sweeping
+        // monotonically: a night's script that asks for reversals and quietly
+        // gets none produces a dataset whose direction features look collected
+        // and are not, which is only discoverable months later at training time.
+        match crate::focus::focus_agent::SweepPattern::parse(requested) {
+            Some(pattern) => config.sweep_pattern = pattern,
+            None => {
+                tracing::warn!("Unsupported sweep pattern requested: {requested}");
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
+
+    // Autofocus owns camera acquisition for the complete sweep. Parameter
+    // writes, stream stop/restart, capture and disconnect must not interleave
+    // with frames whose HFR labels are being collected. The abort endpoint is
+    // intentionally out-of-band and signals through `focus_abort_requested`.
+    let _acquisition = state.acquisition.lock().await;
     state.focus_abort_requested.store(false, Ordering::SeqCst);
 
     ensure_streaming(&state).await.map_err(status_for_error)?;
@@ -554,14 +601,25 @@ async fn ensure_streaming(state: &AppState) -> crate::error::Result<()> {
     let format = formats.first().ok_or_else(|| {
         HardwareError::Unsupported("Camera reports no stream formats".to_string())
     })?;
+    state.clear_camera_observations();
+    let generation = state.current_camera_generation();
     camera
         .start_stream(
             format,
             state.latest_frame.clone(),
             state.camera_config.saturation_adu,
+            generation,
+            state.camera_generation.clone(),
         )
         .map_err(|err| HardwareError::Communication(err.to_string()))?;
     *state.streaming.lock().unwrap() = true;
+    {
+        let mut runtime = state.camera_runtime.write().unwrap();
+        runtime.activity = CameraActivity::Streaming;
+        runtime.streaming = true;
+        runtime.active_format_index = Some(0);
+        runtime.last_error = None;
+    }
     Ok(())
 }
 
@@ -656,44 +714,19 @@ async fn persist_observed_frame(
         captured_at: Some(captured_at),
         filter_name: filter_name.map(str::to_string),
         temperature,
-        quality_json: serde_json::json!({
-            "source": "autofocus",
-            "rig_id": rig_id,
-            "camera_id": camera_name,
-            "focuser_id": focuser_name,
-            "filter_name": filter_name,
-            "focuser_position": position,
-            // Provenance: the camera frame these pixels and this label came from.
-            "frame_counter": observed.frame_counter,
-            "capture_unix_time": observed.capture_unix_time,
-            "hfr_px": observation.hfr_px,
-            // 2*HFR (HFD), not a fitted FWHM — named so the dataset builder never
-            // mistakes it for a PSF FWHM.
-            "hfd_px": observation.hfd_px,
-            "fwhm_px": observation.fwhm_px,
-            "star_count": observation.star_count,
-            "star_count_used": observation.star_count_used,
-            "status": observation.status,
-            "quality_uncertainty": observation.quality_uncertainty,
-            "hfr_log_sigma": observation.hfr_log_sigma,
-            "background_adu": observation.background_adu,
-            "background_sigma": observation.background_sigma,
-            "saturation_fraction": observation.saturation_fraction,
-            "max_adu": luma.max_adu,
-            // Saturation provenance, written so the dataset builder can filter
-            // on it. `saturation_fraction: 0.0` and `saturated: 0` mean "clean
-            // frame" only when the gate actually ran; on a body with no declared
-            // saturation point they mean nothing was tested, and every clipped
-            // core is in the HFR this row labels.
-            "saturation_adu": luma.saturation_adu,
-            "saturation_gate_applied": observation.saturation_gate.was_applied(),
-            // Provenance for the temperature in the column beside this blob.
-            // `measured` / `estimated` / `missing` — a drift model trained on a
-            // mixture of the three, unable to tell them apart, is learning noise.
-            "temperature_state": temperature_state,
-            "temperature_source": temperature_source,
-            "observation_valid": observation.observation_valid,
-        }),
+        quality_json: autofocus_quality_json(
+            position,
+            rig_id,
+            filter_name,
+            camera_name.as_deref(),
+            focuser_name.as_deref(),
+            observed.frame_counter,
+            observed.capture_unix_time,
+            observation,
+            &luma,
+            temperature_state,
+            temperature_source,
+        ),
         ..Default::default()
     };
 
@@ -708,6 +741,90 @@ async fn persist_observed_frame(
             None
         }
     }
+}
+
+/// Everything about an autofocus frame that is not a column of its own.
+///
+/// This is the provenance record two dataset builders read. `frames.quality_json`
+/// is where `ml/data_pipeline/build_focus_quality_dataset.py` finds the
+/// saturation point it gates on, and where the FOP's builder will find the
+/// Quality and Sky feature groups declared in `ml/contracts/fop_features.py`.
+///
+/// Split out of `persist_observed_frame` so it can be tested without an
+/// `AppState`, a camera, or a database — the keys emitted here are a contract
+/// with the Python side, and a contract nothing asserts is a contract that
+/// drifts.
+#[allow(clippy::too_many_arguments)]
+fn autofocus_quality_json(
+    position: i32,
+    rig_id: &str,
+    filter_name: Option<&str>,
+    camera_name: Option<&str>,
+    focuser_name: Option<&str>,
+    frame_counter: i32,
+    capture_unix_time: f64,
+    observation: &SharedObservation,
+    luma: &crate::vision::quality::LumaFrame,
+    temperature_state: crate::storage::capture_store::TemperatureState,
+    temperature_source: Option<String>,
+) -> serde_json::Value {
+    serde_json::json!({
+            "source": "autofocus",
+            "rig_id": rig_id,
+            "camera_id": camera_name,
+            "focuser_id": focuser_name,
+            "filter_name": filter_name,
+            "focuser_position": position,
+            // Provenance: the camera frame these pixels and this label came from.
+            "frame_counter": frame_counter,
+            "capture_unix_time": capture_unix_time,
+            "hfr_px": observation.hfr_px,
+            // 2*HFR (HFD), not a fitted FWHM — named so the dataset builder never
+            // mistakes it for a PSF FWHM.
+            "hfd_px": observation.hfd_px,
+            "fwhm_px": observation.fwhm_px,
+            "star_count": observation.star_count,
+            "star_count_used": observation.star_count_used,
+            "status": observation.status,
+            "quality_uncertainty": observation.quality_uncertainty,
+            "hfr_log_sigma": observation.hfr_log_sigma,
+            "background_adu": observation.background_adu,
+            "background_sigma": observation.background_sigma,
+            "saturation_fraction": observation.saturation_fraction,
+            // The FQE's own reading of this frame — the Quality(3) group of the
+            // Focus Offset Predictor's input (ml/contracts/fop_features.py).
+            //
+            // The vision loop computes these on every gated frame and, until
+            // now, this function dropped them: the shadow prediction lived only
+            // as long as the in-memory SharedObservation. That is survivable for
+            // the FQE, whose pixels are on disk and can be re-scored at any
+            // time, and fatal for the FOP, whose input *is* this derived state.
+            // A sweep recorded without it can never be turned into FOP rows.
+            //
+            // Recording the version and calibration flag beside the values is
+            // not bookkeeping for its own sake: two runs a week apart may have
+            // been scored by different model versions, and a shadow evaluation
+            // that pools them without knowing which is measuring nothing.
+            "fqe_hfr_px": observation.fqe_hfr_px,
+            "fqe_sigma_log_hfr": observation.fqe_sigma_log_hfr,
+            "fqe_star_count": observation.fqe_star_count,
+            "fqe_model_version": observation.fqe_model_version,
+            "fqe_calibrated": observation.fqe_calibrated,
+            "max_adu": luma.max_adu,
+            // Saturation provenance, written so the dataset builder can filter
+            // on it. `saturation_fraction: 0.0` and `saturated: 0` mean "clean
+            // frame" only when the gate actually ran; on a body with no declared
+            // saturation point they mean nothing was tested, and every clipped
+            // core is in the HFR this row labels.
+            "saturation_adu": luma.saturation_adu,
+            "saturation_gate_applied": observation.saturation_gate.was_applied(),
+            // Provenance for the temperature in the column beside this blob.
+            // `measured` / `estimated` / `missing` — a drift model trained on a
+            // mixture of the three, unable to tell them apart, is learning noise.
+            "temperature_state": temperature_state,
+            "temperature_source": temperature_source,
+            "observation_valid": observation.observation_valid,
+    })
 }
 
 fn connected_rig_id(state: &AppState) -> String {
@@ -874,13 +991,17 @@ fn sample_from_observation(
 async fn persist_focus_run(store: &LocalStore, run: &FocusRunContext) -> crate::error::Result<()> {
     let run_id = run.run_id.to_string();
     let mut transaction = store.pool().begin().await.map_err(storage_error)?;
+    // The night this run belongs to, derived from when it started rather than
+    // when it finished: a sweep that begins at 23:55 and ends at 00:05 is one
+    // run on one night, and taking the end time would file it under the next.
+    let night_id = crate::storage::night::night_id(run.started_at);
     sqlx::query(
         r#"
         INSERT INTO focus_runs (
             id, rig_id, filter_name, start_position, best_position, best_hfr,
-            state, temperature, started_at, completed_at
+            state, temperature, started_at, completed_at, night_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             rig_id = excluded.rig_id,
             filter_name = excluded.filter_name,
@@ -890,7 +1011,8 @@ async fn persist_focus_run(store: &LocalStore, run: &FocusRunContext) -> crate::
             state = excluded.state,
             temperature = excluded.temperature,
             started_at = excluded.started_at,
-            completed_at = excluded.completed_at
+            completed_at = excluded.completed_at,
+            night_id = excluded.night_id
         "#,
     )
     .bind(&run_id)
@@ -903,6 +1025,13 @@ async fn persist_focus_run(store: &LocalStore, run: &FocusRunContext) -> crate::
     .bind(run.temperature)
     .bind(run.started_at.to_rfc3339())
     .bind(chrono::Utc::now().to_rfc3339())
+    .bind(&night_id)
+    // `session_id` is deliberately not bound. Nothing in the daemon opens a
+    // session yet — `storage::sessions_repo` is an empty stub — so binding one
+    // would mean inventing an id that references no row. The column is in the
+    // schema because `environment_log` and the sidecar importer both carry a
+    // session_id, and a run recorded during an imported session needs somewhere
+    // to say so. Until sessions exist, night_id is the join key that works.
     .execute(&mut *transaction)
     .await
     .map_err(storage_error)?;
@@ -986,5 +1115,198 @@ fn status_for_error(err: AchernarError) -> StatusCode {
         AchernarError::Hardware(_) => StatusCode::BAD_GATEWAY,
         AchernarError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::capture_store::TemperatureState;
+    use crate::vision::quality::LumaFrame;
+
+    fn luma() -> LumaFrame {
+        LumaFrame {
+            pixels: vec![100.0; 4],
+            width: 2,
+            height: 2,
+            max_adu: 65535.0,
+            saturation_adu: Some(16383.0),
+        }
+    }
+
+    fn quality_json_for(observation: &SharedObservation) -> serde_json::Value {
+        autofocus_quality_json(
+            12_345,
+            "rig-1",
+            Some("L"),
+            Some("Canon EOS T6S"),
+            Some("myFP2ESP32"),
+            7,
+            1_770_000_000.0,
+            observation,
+            &luma(),
+            TemperatureState::Measured,
+            Some("camera".to_string()),
+        )
+    }
+
+    /// The FQE's shadow prediction must survive the trip to disk.
+    ///
+    /// It did not before: `SharedObservation` carried it, `persist_observed_frame`
+    /// did not copy it, and the value died with the in-memory observation. For
+    /// the FQE that is recoverable — the crops are on disk and can be re-scored.
+    /// For the Focus Offset Predictor it is not: these three numbers are its
+    /// Quality feature group, they are derived state rather than pixels, and a
+    /// sweep recorded without them can never be turned into FOP rows.
+    #[test]
+    fn fqe_shadow_prediction_reaches_quality_json() {
+        let mut observation = SharedObservation::empty_for_test();
+        observation.fqe_hfr_px = Some(3.25);
+        observation.fqe_sigma_log_hfr = Some(0.11);
+        observation.fqe_star_count = Some(42);
+        observation.fqe_model_version = Some("1.1.0".to_string());
+        observation.fqe_calibrated = Some(true);
+
+        let json = quality_json_for(&observation);
+
+        assert_eq!(json["fqe_hfr_px"].as_f64().unwrap(), 3.25);
+        assert!((json["fqe_sigma_log_hfr"].as_f64().unwrap() - 0.11).abs() < 1e-6);
+        assert_eq!(json["fqe_star_count"].as_u64().unwrap(), 42);
+        assert_eq!(json["fqe_model_version"].as_str().unwrap(), "1.1.0");
+        assert_eq!(json["fqe_calibrated"].as_bool().unwrap(), true);
+    }
+
+    /// A frame the FQE could not score records nulls, not zeros.
+    ///
+    /// Same discipline as `temperature_state`: a zero HFR is a *measurement*,
+    /// and a training set that cannot tell it from "no model was loaded" will
+    /// learn from the difference between them.
+    #[test]
+    fn absent_fqe_prediction_is_null_not_zero() {
+        let json = quality_json_for(&SharedObservation::empty_for_test());
+
+        for key in [
+            "fqe_hfr_px",
+            "fqe_sigma_log_hfr",
+            "fqe_star_count",
+            "fqe_model_version",
+            "fqe_calibrated",
+        ] {
+            assert!(json[key].is_null(), "{key} should be null when unmeasured");
+        }
+    }
+
+    /// The saturation provenance the FQE dataset builder gates on (defect D1).
+    #[test]
+    fn saturation_provenance_is_recorded() {
+        let json = quality_json_for(&SharedObservation::empty_for_test());
+
+        // The declared sensor clip point, not the container ceiling. Both are
+        // written; the builder must prefer the former.
+        assert_eq!(json["saturation_adu"].as_f64().unwrap(), 16383.0);
+        assert_eq!(json["max_adu"].as_f64().unwrap(), 65535.0);
+        assert!(json["saturation_gate_applied"].is_boolean());
+    }
+
+    /// Every `frames.quality_json` key the FOP contract claims to read must
+    /// actually be emitted here.
+    ///
+    /// This is the cross-language half of the contract. `ml/contracts/
+    /// fop_features.py` records, per feature, the exact column or JSON key that
+    /// supplies it; that file is generated into `fop_features_v1.json`, and this
+    /// test reads it back and checks the Rust writer against it. Without it the
+    /// two sides drift the way the FQE's three descriptions did — silently,
+    /// until a model trains on a column of nulls.
+    #[test]
+    fn every_quality_json_source_named_by_the_fop_contract_is_emitted() {
+        let contract_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../ml/contracts/fop_features_v1.json");
+        let contract: serde_json::Value = match std::fs::read_to_string(&contract_path) {
+            Ok(text) => serde_json::from_str(&text).expect("contract JSON parses"),
+            // The daemon must remain buildable without the ML tree beside it.
+            Err(_) => return,
+        };
+
+        // A fully-populated observation: the question is whether the key is
+        // written at all, not whether this particular frame had a value.
+        let mut observation = SharedObservation::empty_for_test();
+        observation.fqe_hfr_px = Some(3.25);
+        observation.fqe_sigma_log_hfr = Some(0.11);
+        let json = quality_json_for(&observation);
+
+        let features = contract["features"].as_array().expect("features array");
+        let mut checked = 0;
+        for feature in features {
+            let source = feature["source"].as_str().unwrap_or_default();
+            // Sources are written as `frames.quality_json -> key` , optionally
+            // with a ", else fallback" clause naming a second key.
+            let Some(rest) = source.strip_prefix("frames.quality_json -> ") else {
+                continue;
+            };
+            for key in rest.split(", else ").map(|k| {
+                k.trim()
+                    .trim_end_matches(" (preferred)")
+                    .trim()
+            }) {
+                assert!(
+                    json.get(key).is_some(),
+                    "FOP contract feature {:?} reads frames.quality_json -> {key}, \
+                     but autofocus_quality_json never writes that key",
+                    feature["name"].as_str().unwrap_or("?"),
+                );
+                checked += 1;
+            }
+        }
+        assert!(
+            checked >= 4,
+            "expected the contract to name several quality_json sources, found {checked} \
+             — the source strings may have been reworded, which would make this test vacuous"
+        );
+    }
+
+    /// A converged run records the night it happened on (migration 007).
+    ///
+    /// This is the join key between a focus run and `environment_log` — the
+    /// hand-logged ambient temperature the drift forecaster needs and the sky
+    /// class the cloud classifier needs. Before it existed the observer's
+    /// readings went into a table that nothing could reach from a focus run.
+    #[tokio::test]
+    async fn persisted_run_records_its_night() {
+        let dir = std::env::temp_dir().join(format!("achernar-focus-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("achernar.db");
+        let store = LocalStore::open(db.to_str().unwrap()).await.unwrap();
+
+        // 23:55 local on one day and 00:05 the next are the same observing
+        // night; a run started at either must file under the earlier date.
+        let started_at = chrono::Utc::now();
+        let run = FocusRunContext {
+            run_id: uuid::Uuid::new_v4(),
+            rig_id: "rig-1".to_string(),
+            filter_name: Some("L".to_string()),
+            temperature: Some(8.5),
+            start_position: 10_000,
+            state: FocusRunState::Converged,
+            started_at,
+            samples: Vec::new(),
+            best_position: Some(10_120),
+            best_hfr: Some(2.4),
+        };
+
+        persist_focus_run(&store, &run).await.unwrap();
+
+        let night: (Option<String>,) =
+            sqlx::query_as("SELECT night_id FROM focus_runs WHERE id = ?")
+                .bind(run.run_id.to_string())
+                .fetch_one(store.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            night.0.as_deref(),
+            Some(crate::storage::night::night_id(started_at).as_str()),
+            "focus_runs.night_id must come from started_at under the local-noon rule"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

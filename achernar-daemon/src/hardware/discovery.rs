@@ -53,6 +53,12 @@ pub struct DiscoveredCamera {
     pub index: i32,
     /// Vendor-reported device name.
     pub name: String,
+    /// Round-trips directly into `POST /connect`. This is stable only for this
+    /// scan; driver enumeration order can change after USB reconnect.
+    pub selection_key: String,
+    /// Null until the native driver exposes a serial number or VID/PID tuple.
+    pub hardware_id: Option<String>,
+    pub transport: &'static str,
 }
 
 /// Result of probing one driver. Reported even on failure: "the ASI SDK is
@@ -126,6 +132,35 @@ pub async fn discover_cameras(state: &AppState) -> DiscoveryReport {
             .to_string(),
     ];
 
+    // Scanning creates SDK driver instances and may claim USB handles. Keep it
+    // in the same camera command domain as connect/capture, but do not queue a
+    // browser scan behind a multi-minute exposure or autofocus run.
+    let acquisition = match state.acquisition.clone().try_lock_owned() {
+        Ok(guard) => guard,
+        Err(_) => {
+            notes.push(
+                "Camera control is busy, so no probe was run. Try again after the current \
+                 exposure or autofocus operation completes."
+                    .to_string(),
+            );
+            return DiscoveryReport {
+                cameras: Vec::new(),
+                probes: LOCAL_CAMERA_DRIVERS
+                    .iter()
+                    .map(|&(id, label, _)| ProbeOutcome {
+                        driver_id: id,
+                        driver_label: label,
+                        status: "skipped",
+                        device_count: 0,
+                        detail: Some("camera control is busy".to_string()),
+                    })
+                    .collect(),
+                scanned_at: chrono::Utc::now(),
+                notes,
+            };
+        }
+    };
+
     let camera_in_use = state
         .camera
         .lock()
@@ -160,7 +195,7 @@ pub async fn discover_cameras(state: &AppState) -> DiscoveryReport {
 
     // Destructured by value (`&(..)`): iterating a slice yields references, and
     // the report fields are `&'static str`, not `&&str`.
-    for &(driver_id, driver_label, flag) in LOCAL_CAMERA_DRIVERS {
+    for (probe_index, &(driver_id, driver_label, flag)) in LOCAL_CAMERA_DRIVERS.iter().enumerate() {
         if !is_compiled(flag) {
             probes.push(ProbeOutcome {
                 driver_id,
@@ -175,12 +210,12 @@ pub async fn discover_cameras(state: &AppState) -> DiscoveryReport {
         // The driver holds a raw pointer and is not Send, so it is created,
         // enumerated and dropped entirely inside the blocking closure — only
         // the resulting names cross back.
-        let probe = tokio::task::spawn_blocking(move || {
+        let mut probe = tokio::task::spawn_blocking(move || {
             let mut driver = create_local_driver(driver_id)?;
             driver.list_cameras()
         });
 
-        match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+        match tokio::time::timeout(PROBE_TIMEOUT, &mut probe).await {
             Ok(Ok(Ok(names))) => {
                 for (index, name) in names.iter().enumerate() {
                     cameras.push(DiscoveredCamera {
@@ -188,6 +223,9 @@ pub async fn discover_cameras(state: &AppState) -> DiscoveryReport {
                         driver_label,
                         index: index as i32,
                         name: name.clone(),
+                        selection_key: format!("{driver_id}:{index}"),
+                        hardware_id: None,
+                        transport: "local",
                     });
                 }
                 probes.push(ProbeOutcome {
@@ -232,6 +270,36 @@ pub async fn discover_cameras(state: &AppState) -> DiscoveryReport {
                         PROBE_TIMEOUT.as_secs()
                     )),
                 });
+
+                // A blocking FFI call cannot be cancelled. Keep camera
+                // ownership until the abandoned SDK probe really exits and do
+                // not start more SDKs after it. This may leave discovery busy
+                // until daemon restart if a vendor SDK is permanently wedged,
+                // which is safer than opening the same device concurrently.
+                for &(remaining_id, remaining_label, _) in &LOCAL_CAMERA_DRIVERS[probe_index + 1..]
+                {
+                    probes.push(ProbeOutcome {
+                        driver_id: remaining_id,
+                        driver_label: remaining_label,
+                        status: "skipped",
+                        device_count: 0,
+                        detail: Some(format!("scan stopped after the {driver_id} SDK timed out")),
+                    });
+                }
+                notes.push(format!(
+                    "The {driver_label} SDK did not return. Camera control remains busy until \
+                     that probe exits; restart the daemon if it is permanently wedged."
+                ));
+                tokio::spawn(async move {
+                    let _acquisition = acquisition;
+                    let _ = probe.await;
+                });
+                return DiscoveryReport {
+                    cameras,
+                    probes,
+                    scanned_at: chrono::Utc::now(),
+                    notes,
+                };
             }
         }
     }
@@ -298,6 +366,9 @@ mod tests {
                 driver_label: "SVBony",
                 index: 0,
                 name: "SVBONY SV105".to_string(),
+                selection_key: "svb:0".to_string(),
+                hardware_id: None,
+                transport: "local",
             }],
             probes: vec![ProbeOutcome {
                 driver_id: "asi",

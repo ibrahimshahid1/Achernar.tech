@@ -7,6 +7,63 @@ use std::future::Future;
 
 use super::classical_focus_solver::ClassicalFocusSolver;
 
+/// The order a sweep visits its positions in.
+///
+/// This is a *data collection* control, not a focusing one: both patterns visit
+/// the same set of positions and fit the same curve, so they converge equally
+/// well. What differs is what the run teaches the Focus Offset Predictor.
+///
+/// Nine of the FOP's 38 features — the History and Direction groups, listed in
+/// `ml/contracts/fop_features.py` — describe what the focuser has recently done:
+/// `prev_delta_1/2/3`, `dir_changed_recently`, `steps_since_flip_norm`,
+/// `dir_encoded`. A sweep that marches from one end to the other never reverses,
+/// so every one of those features holds the same value on every row of every
+/// run. The direction head is not merely trained poorly by such a dataset; it
+/// has nothing to learn from at all, because its target never varies.
+///
+/// The observing plan therefore calls for roughly one run in three to be a
+/// reversal. That is a per-night decision, so the pattern is overridable on the
+/// request rather than fixed in the config file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepPattern {
+    /// Visit positions in ascending order, low to high.
+    ///
+    /// The default, and the right choice for ordinary focusing: approaching
+    /// every position from the same direction means backlash enters each
+    /// measurement identically instead of appearing as a step in the curve.
+    #[default]
+    Monotonic,
+
+    /// Start in the middle, run outward to the high end, then reverse and cover
+    /// the low end descending.
+    ///
+    /// Produces exactly one direction change, at a known point, and both signs
+    /// of travel. Deliberately takes backlash on the chin — the reverse leg's
+    /// positions carry the focuser's mechanical slop — because a model that has
+    /// never seen a reversal cannot compensate for one. Expect a slightly worse
+    /// curve fit on these runs; that is the trade being made.
+    Reversal,
+}
+
+impl SweepPattern {
+    /// Parse the value accepted by `POST /focus/run`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "monotonic" | "sorted" => Some(Self::Monotonic),
+            "reversal" | "reverse" => Some(Self::Reversal),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Monotonic => "monotonic",
+            Self::Reversal => "reversal",
+        }
+    }
+}
+
 /// State machine for an autofocus run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FocusRunState {
@@ -305,17 +362,29 @@ fn aggregate_samples_by_position(samples: &[FocusSample]) -> (Vec<i32>, Vec<f64>
 }
 
 fn sweep_positions(config: &crate::config::FocusConfig, start_position: i32) -> Vec<i32> {
+    let ascending = sweep_positions_ascending(config, start_position);
+    order_sweep(ascending, start_position, config.sweep_pattern)
+}
+
+/// The set of positions to sample, low to high. Independent of visit order.
+fn sweep_positions_ascending(
+    config: &crate::config::FocusConfig,
+    start_position: i32,
+) -> Vec<i32> {
     let step = config
         .initial_step_size
         .saturating_abs()
         .max(1)
         .min(config.safety.max_step_single.saturating_abs().max(1));
-    // The worst complete path is start -> low -> high -> fitted optimum: 5R.
+    // The worst complete path is start -> one end -> other end -> fitted
+    // optimum: 5R, for both patterns. Monotonic walks start->low->high->optimum
+    // (R + 2R + 2R); reversal walks start->high->low->optimum (R + 2R + 2R).
     // Reserve the final return move up front so a valid sweep cannot exhaust the
     // run budget and leave the focuser at the last sampled position.
-    let max_radius =
-        (config.safety.max_total_travel_per_run.max(0) / 5).min(step.saturating_mul(3));
-    let mut positions = (-3..=3)
+    let radius_points = i32::try_from(config.sweep_radius_points.max(1)).unwrap_or(i32::MAX);
+    let max_radius = (config.safety.max_total_travel_per_run.max(0) / 5)
+        .min(step.saturating_mul(radius_points));
+    let mut positions = (-radius_points..=radius_points)
         .map(|offset: i32| start_position.saturating_add(offset.saturating_mul(step)))
         .filter(|position| {
             (i64::from(*position) - i64::from(start_position)).abs() <= i64::from(max_radius)
@@ -327,9 +396,41 @@ fn sweep_positions(config: &crate::config::FocusConfig, start_position: i32) -> 
     positions
 }
 
+/// Impose the visit order for `pattern` on an ascending position list.
+///
+/// Split from position selection so the two can be reasoned about separately:
+/// which positions get sampled is a safety-and-optics question, the order they
+/// are visited in is a data question, and conflating them is what made the
+/// original `(-3..=3).sort()` look like a complete answer to both.
+fn order_sweep(ascending: Vec<i32>, start_position: i32, pattern: SweepPattern) -> Vec<i32> {
+    match pattern {
+        SweepPattern::Monotonic => ascending,
+        SweepPattern::Reversal => {
+            // Split at the start position: everything at or above it is walked
+            // outward first, then the remainder is walked back down. The flip
+            // lands at the high end, so the run carries one clean direction
+            // change with samples either side of it.
+            let split = ascending.partition_point(|position| *position < start_position);
+
+            // A start position outside the sampled range leaves nothing to
+            // reverse through. Fall back rather than emit a sweep that claims a
+            // flip it does not contain — the FOP's direction features would be
+            // recorded as varying when they did not.
+            if split == 0 || split == ascending.len() {
+                return ascending;
+            }
+
+            let mut ordered = Vec::with_capacity(ascending.len());
+            ordered.extend_from_slice(&ascending[split..]);
+            ordered.extend(ascending[..split].iter().rev().copied());
+            ordered
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{sweep_positions, FocusAgent, FocusRunState, FocusSample};
+    use super::{sweep_positions, FocusAgent, FocusRunState, FocusSample, SweepPattern};
     use crate::config::FocusConfig;
 
     #[tokio::test]
@@ -513,5 +614,151 @@ mod tests {
         let positions = sweep_positions(&config, 10_000);
 
         assert_eq!(positions, vec![9_900, 9_950, 10_000, 10_050, 10_100]);
+    }
+
+    fn wide_config() -> FocusConfig {
+        let mut config = FocusConfig::default();
+        config.initial_step_size = 50;
+        config.safety.min_position = 0;
+        config.safety.max_position = 20_000;
+        config.safety.max_step_single = 500;
+        config.safety.max_total_travel_per_run = 10_000;
+        config
+    }
+
+    /// Sign changes in the position sequence. This is what the FOP's Direction
+    /// feature group is computed from, so it is the thing worth asserting.
+    fn direction_flips(positions: &[i32]) -> usize {
+        positions
+            .windows(2)
+            .map(|pair| (pair[1] - pair[0]).signum())
+            .filter(|sign| *sign != 0)
+            .collect::<Vec<_>>()
+            .windows(2)
+            .filter(|signs| signs[0] != signs[1])
+            .count()
+    }
+
+    #[test]
+    fn monotonic_sweep_never_reverses() {
+        let mut config = wide_config();
+        config.sweep_pattern = SweepPattern::Monotonic;
+
+        let positions = sweep_positions(&config, 10_000);
+
+        assert_eq!(direction_flips(&positions), 0);
+        let mut sorted = positions.clone();
+        sorted.sort_unstable();
+        assert_eq!(positions, sorted);
+    }
+
+    /// The point of the whole pattern: one direction change, so
+    /// `dir_changed_recently` and `steps_since_flip_norm` have something to be.
+    #[test]
+    fn reversal_sweep_changes_direction_exactly_once() {
+        let mut config = wide_config();
+        config.sweep_pattern = SweepPattern::Reversal;
+
+        let positions = sweep_positions(&config, 10_000);
+
+        assert_eq!(
+            direction_flips(&positions),
+            1,
+            "reversal sweep should flip exactly once, got {positions:?}"
+        );
+    }
+
+    #[test]
+    fn reversal_sweep_visits_the_same_positions_as_monotonic() {
+        // Both patterns must fit the same curve from the same samples; only the
+        // order differs. A reversal that also changed the sampled set would
+        // confound "did reversing hurt the fit" with "did we sample elsewhere".
+        let mut monotonic = wide_config();
+        monotonic.sweep_pattern = SweepPattern::Monotonic;
+        let mut reversal = wide_config();
+        reversal.sweep_pattern = SweepPattern::Reversal;
+
+        let mut a = sweep_positions(&monotonic, 10_000);
+        let mut b = sweep_positions(&reversal, 10_000);
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn reversal_sweep_starts_by_moving_outward_from_the_start() {
+        let mut config = wide_config();
+        config.sweep_pattern = SweepPattern::Reversal;
+
+        let positions = sweep_positions(&config, 10_000);
+
+        assert_eq!(positions[0], 10_000, "should begin where the focuser is");
+        assert!(positions[1] > positions[0], "first leg runs outward");
+        assert_eq!(
+            *positions.last().unwrap(),
+            10_000 - 3 * 50,
+            "should finish at the low end after reversing"
+        );
+    }
+
+    /// Clamping can push the start to the edge of the sampled range, leaving no
+    /// samples on one side to reverse through.
+    #[test]
+    fn reversal_falls_back_to_monotonic_when_no_flip_is_possible() {
+        let mut config = wide_config();
+        config.sweep_pattern = SweepPattern::Reversal;
+        config.safety.min_position = 10_000;
+        config.safety.max_position = 10_150;
+
+        let positions = sweep_positions(&config, 10_000);
+
+        assert_eq!(direction_flips(&positions), 0);
+        let mut sorted = positions.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            positions, sorted,
+            "with nothing below the start, the sweep is plain ascending"
+        );
+    }
+
+    /// The campaign wants 25-position sweeps; the agent used to hard-code 7.
+    #[test]
+    fn sweep_radius_controls_the_position_count() {
+        let mut config = wide_config();
+        config.sweep_radius_points = 12;
+
+        let positions = sweep_positions(&config, 10_000);
+
+        assert_eq!(positions.len(), 25);
+        assert_eq!(*positions.first().unwrap(), 10_000 - 12 * 50);
+        assert_eq!(*positions.last().unwrap(), 10_000 + 12 * 50);
+    }
+
+    /// A wide sweep must still be truncated by the travel budget rather than
+    /// overrunning it — the budget guards the focuser, not the dataset.
+    #[test]
+    fn travel_budget_still_truncates_a_wide_sweep() {
+        let mut config = wide_config();
+        config.sweep_radius_points = 12;
+        config.safety.max_total_travel_per_run = 500; // radius <= 100 steps
+
+        let positions = sweep_positions(&config, 10_000);
+
+        assert!(
+            positions.iter().all(|p| (p - 10_000).abs() <= 100),
+            "positions {positions:?} exceed the travel budget"
+        );
+    }
+
+    #[test]
+    fn sweep_pattern_parses_the_request_spellings() {
+        assert_eq!(SweepPattern::parse("reversal"), Some(SweepPattern::Reversal));
+        assert_eq!(SweepPattern::parse("Reverse"), Some(SweepPattern::Reversal));
+        assert_eq!(
+            SweepPattern::parse(" MONOTONIC "),
+            Some(SweepPattern::Monotonic)
+        );
+        assert_eq!(SweepPattern::parse("zigzag"), None);
+        assert_eq!(SweepPattern::default(), SweepPattern::Monotonic);
     }
 }

@@ -107,13 +107,18 @@ impl FrameStore {
         let quality_json =
             serde_json::to_string(&meta.quality_json).unwrap_or_else(|_| "{}".to_string());
 
+        // Derived here rather than asked of the caller: every writer would
+        // compute it the same way, and one that forgot would produce a frame
+        // that silently drops out of any night-grouped split.
+        let night_id = crate::storage::night::night_id(captured_at);
+
         let insert_result = sqlx::query(
             r#"
             INSERT INTO frames (
                 id, session_id, local_path, checksum_sha256, width, height, exposure_s, gain,
-                filter_name, temperature, quality_json, captured_at
+                filter_name, temperature, quality_json, captured_at, night_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&id)
@@ -128,6 +133,7 @@ impl FrameStore {
         .bind(meta.temperature)
         .bind(&quality_json)
         .bind(captured_at.to_rfc3339())
+        .bind(&night_id)
         .execute(pool)
         .await;
         if let Err(err) = insert_result {
@@ -150,22 +156,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("achernar-frames-{}", uuid::Uuid::new_v4()));
         let store = FrameStore::new(&dir);
 
+        // Build the fixture from the real migrations. This test used to declare
+        // its own `frames` table, which is the drift `migrations_for_test`
+        // exists to prevent — it went stale the moment migration 007 added
+        // `night_id`, and the insert would have failed against a table that no
+        // deployed database has looked like since migration 004.
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        sqlx::query(
-            r#"CREATE TABLE frames (
-                id TEXT PRIMARY KEY, session_id TEXT, local_path TEXT NOT NULL,
-                object_key TEXT, checksum_sha256 TEXT, width INTEGER, height INTEGER,
-                exposure_s REAL, gain REAL, filter_name TEXT, temperature REAL,
-                wcs_json TEXT NOT NULL DEFAULT '{}', quality_json TEXT NOT NULL DEFAULT '{}',
-                captured_at TEXT NOT NULL, synced_at TEXT
-            )"#,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        for (_, _, sql) in crate::storage::local_store::migrations_for_test() {
+            for statement in crate::storage::local_store::split_statements_for_test(sql) {
+                let _ = sqlx::query(&statement).execute(&pool).await;
+            }
+        }
 
         let frame = LumaFrame {
             pixels: vec![1000.0_f32; 8 * 8],
@@ -194,6 +198,21 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(checksum.0.len(), 64);
+
+        // Every frame carries the night it was taken on, so a night-grouped
+        // split can see it. A NULL here silently excludes the frame from the
+        // split unit the cloud and background models are evaluated on.
+        let night: (Option<String>,) = sqlx::query_as("SELECT night_id FROM frames WHERE id = ?")
+            .bind(&persisted.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let night = night.0.expect("night_id is written on every frame");
+        assert_eq!(
+            night,
+            crate::storage::night::night_id(chrono::Utc::now()),
+            "night_id must come from the capture timestamp under the local-noon rule"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -22,6 +22,28 @@ initial_step_size = 50
 samples_per_position = 3
 settle_ms = 500
 
+# Positions either side of the start: the sweep visits 2*N+1 of them.
+# 3 gives the 7-point sweep, which is enough to fit a curve. Campaign nights
+# want 12 (25 points) — more positions means more rows per run and, at the
+# extremes, the large |delta| samples the Focus Offset Predictor's balanced
+# sampler buckets out to 120+ steps. Still truncated by
+# safety.max_total_travel_per_run, so raising it cannot overrun the budget.
+sweep_radius_points = 3
+
+# Visit order: "monotonic" (default) or "reversal".
+#
+# Monotonic approaches every position from the same direction, so backlash
+# enters each measurement identically — the right default for focusing.
+# Reversal deliberately changes direction once mid-run. It is slightly worse
+# for the curve fit and it is the only way to collect the FOP's History and
+# Direction features, which are 9 of its 38 inputs and are constant in a
+# monotone sweep.
+#
+# Usually set per run instead, via `POST /focus/run {"sweep_pattern":
+# "reversal"}` — the observing plan wants roughly one run in three to reverse,
+# which is a decision a night's script makes rather than a file does.
+sweep_pattern = "monotonic"
+
 [focus.safety]                # Hard limits enforced by safety_guard.rs (7.3.3)
 min_position = 0
 max_position = 50000
@@ -39,7 +61,13 @@ compensation_steps = 0
 
 [focus.models]               # Edge ONNX models (Section 7.6.10 layout)
 # quality_model_path = "../models/focus_quality/1.0.0/model.onnx"
-# offset_model_path  = "../models/focus_offset/0.3.0/model.onnx"
+#
+# offset_model_path has no bundle to point at yet. The Focus Offset Predictor
+# cannot be trained until a focuser reports absolute position (defect D3), and
+# the placeholder that used to sit at models/focus_offset/0.3.0/ was deleted for
+# declaring a 10-feature input against a 38-feature specification. The real
+# input contract is ml/contracts/fop_features.py.
+# offset_model_path  = "../models/focus_offset/<version>/model.onnx"
 #
 # There is deliberately no drift_model_path. The focus-drift forecaster is a
 # 3-state Kalman filter, not a neural network — there is no ONNX file to point

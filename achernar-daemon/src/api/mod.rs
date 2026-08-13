@@ -1,3 +1,4 @@
+pub mod api_error;
 pub mod camera;
 pub mod focus;
 pub mod focuser;
@@ -15,6 +16,8 @@ use crate::hardware::{
     mount::{Mount, MountDriver},
 };
 use crate::state::AppState;
+use crate::state::CameraActivity;
+use api_error::ApiError;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EquipmentStatus {
@@ -27,10 +30,17 @@ pub struct EquipmentStatus {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CameraStatus {
     pub name: String,
-    pub temperature: f64,
-    pub cooling: bool,
+    pub connected: bool,
+    pub status: CameraActivity,
+    pub temperature: Option<f64>,
+    pub cooling: Option<bool>,
     pub exposing: bool,
     pub streaming: bool,
+    pub progress: Option<f64>,
+    pub driver_id: Option<String>,
+    pub device_index: Option<i32>,
+    pub connection_id: Option<String>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -69,45 +79,37 @@ pub struct ConnectRequest {
     pub index: Option<i32>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct DisconnectRequest {
+    /// camera | mount | focuser | all. Defaults to all for compatibility with
+    /// the original body-less endpoint.
+    pub equipment_type: Option<String>,
+}
+
 pub async fn get_status(
     State(state): State<AppState>,
 ) -> Result<Json<EquipmentStatus>, StatusCode> {
     let camera_status = {
-        // Take the locks in the order documented on AppState — camera, then
-        // camera_name, then streaming — and hold no two of them at once.
-        //
-        // This used to hold `camera_name` and `streaming` while reaching for
-        // `camera`, while `start_stream` held `camera` while reaching for
-        // `streaming`. Opposite orders, so a status poll arriving during a
-        // stream start deadlocked both tasks and, with them, the daemon.
-        // Copying each value out and dropping the guard removes the nesting
-        // entirely rather than relying on everyone remembering the order.
-        let camera_readings = {
-            let cam = state.camera.lock().unwrap();
-            cam.as_ref().map(|c| {
-                let temperature = c
-                    .get_parameter(crate::hardware::ols_ffi::OlsCamOptionId::Temperature)
-                    .map(|p| p.cur_val)
-                    .unwrap_or(-10.0);
-                let cooling = c
-                    .get_parameter(crate::hardware::ols_ffi::OlsCamOptionId::CoolerOn)
-                    .map(|p| p.cur_val > 0.5)
-                    .unwrap_or(false);
-                (temperature, cooling)
-            })
-        };
-        let cam_name = state.camera_name.lock().unwrap().clone();
-        let streaming = *state.streaming.lock().unwrap();
-
-        cam_name.map(|name| {
-            let (temperature, cooling) = camera_readings.unwrap_or((-10.0, false));
-            CameraStatus {
-                name,
-                temperature,
-                cooling,
-                exposing: streaming,
-                streaming,
-            }
+        // Status must never wait behind a vendor SDK call. Camera telemetry is
+        // cached when controls/descriptors are read and unknown values remain
+        // null rather than becoming a plausible-looking -10 C.
+        let runtime = state.camera_runtime.read().unwrap().clone();
+        runtime.connection_id.as_ref().map(|_| CameraStatus {
+            name: runtime
+                .camera_name
+                .clone()
+                .unwrap_or_else(|| "Unknown camera".to_string()),
+            connected: true,
+            status: runtime.activity,
+            temperature: runtime.temperature_c,
+            cooling: runtime.cooler_on,
+            exposing: runtime.activity == CameraActivity::Exposing,
+            streaming: runtime.streaming,
+            progress: runtime.exposure_progress(chrono::Utc::now()),
+            driver_id: runtime.driver_id.clone(),
+            device_index: runtime.device_index,
+            connection_id: runtime.connection_id.clone(),
+            last_error: runtime.last_error.clone(),
         })
     };
 
@@ -181,7 +183,7 @@ pub async fn discover_devices(State(state): State<AppState>) -> Json<DiscoveryRe
 pub async fn connect_equipment(
     State(state): State<AppState>,
     Json(req): Json<ConnectRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     tracing::info!(
         "Connect request: driver={}, option={:?}",
         req.driver,
@@ -196,99 +198,185 @@ pub async fn connect_equipment(
 
     match equipment_type.as_str() {
         "camera" => connect_camera(state, req).await,
-        "mount" => connect_mount(state, req).await,
-        "focuser" => connect_focuser(state, req).await,
+        "mount" => connect_mount(state, req).await.map_err(|status| {
+            ApiError::new(
+                status,
+                "mount_connect_failed",
+                "Could not connect the mount",
+            )
+        }),
+        "focuser" => connect_focuser(state, req).await.map_err(|status| {
+            ApiError::new(
+                status,
+                "focuser_connect_failed",
+                "Could not connect the focuser",
+            )
+        }),
         _ => {
             tracing::warn!("Unsupported equipment type: {}", equipment_type);
-            Err(StatusCode::BAD_REQUEST)
+            Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "unsupported_equipment_type",
+                format!("Unsupported equipment type '{equipment_type}'"),
+            ))
         }
     }
 }
 
-async fn connect_camera(
+pub(crate) async fn connect_camera(
     state: AppState,
     req: ConnectRequest,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let driver_result = match req.driver.as_str() {
-        "sim" => {
-            let sim_dir = req.option.unwrap_or_else(|| "./sim".to_string());
-            OlsCameraDriver::new_sim(&sim_dir)
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let _acquisition = state.acquisition.lock().await;
+
+    if state.camera.lock().unwrap().is_some() {
+        tracing::warn!("Connect rejected: a camera is already connected");
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "camera_already_connected",
+            "Disconnect the current camera before connecting another one",
+        ));
+    }
+    state.clear_camera_observations();
+    {
+        let mut runtime = state.camera_runtime.write().unwrap();
+        *runtime = crate::state::CameraRuntimeState::default();
+        runtime.activity = CameraActivity::Connecting;
+        runtime.driver_id = Some(req.driver.clone());
+        runtime.device_index = Some(req.index.unwrap_or(0));
+    }
+
+    let driver_id = req.driver.clone();
+    let driver_option = req.option.clone();
+    let requested_index = req.index.unwrap_or(0);
+    type ConnectedCamera = (
+        OlsCameraDriver,
+        crate::hardware::camera::OlsCamera,
+        String,
+        Vec<String>,
+        i32,
+    );
+    type ConnectFailure = (StatusCode, String);
+
+    // Vendor driver construction, enumeration and open are blocking FFI. Keep
+    // the acquisition ownership guard, but run the SDK work off Axum's async
+    // worker so `/status` and telemetry remain responsive during a slow open.
+    let worker_driver_id = driver_id.clone();
+    let connect_worker = tokio::task::spawn_blocking(move || {
+        let driver_result = match worker_driver_id.as_str() {
+            "sim" => {
+                OlsCameraDriver::new_sim(&driver_option.unwrap_or_else(|| "./sim".to_string()))
+            }
+            "alpaca" => OlsCameraDriver::new_alpaca(
+                &driver_option.unwrap_or_else(|| "http://localhost:11111".to_string()),
+            ),
+            "asi" => OlsCameraDriver::new_asi(),
+            "svb" => OlsCameraDriver::new_svb(),
+            "toup" => OlsCameraDriver::new_toup(),
+            "wdir" | "watchdir" => {
+                OlsCameraDriver::new_wdir(&driver_option.unwrap_or_else(|| "./watch".to_string()))
+            }
+            "gphoto2" | "dslr" => OlsCameraDriver::new_gphoto2(),
+            "uvc" | "webcam" => OlsCameraDriver::new_uvc(),
+            "indi" => OlsCameraDriver::new_indi(),
+            "indigo" => OlsCameraDriver::new_indigo(),
+            other => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("Unsupported camera driver '{other}'"),
+                ));
+            }
+        };
+
+        let mut driver = driver_result.map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create {worker_driver_id} driver: {error}"),
+            )
+        })?;
+        let cameras = driver.list_cameras().map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to enumerate {worker_driver_id} cameras: {error}"),
+            )
+        })?;
+        if cameras.is_empty() {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "No cameras found for the selected driver".to_string(),
+            ));
         }
-        "alpaca" => {
-            let url = req
-                .option
-                .unwrap_or_else(|| "http://localhost:11111".to_string());
-            OlsCameraDriver::new_alpaca(&url)
+        if requested_index < 0 || requested_index as usize >= cameras.len() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Camera index {requested_index} is out of range; driver reports {} camera(s)",
+                    cameras.len()
+                ),
+            ));
         }
-        "asi" => OlsCameraDriver::new_asi(),
-        "svb" => OlsCameraDriver::new_svb(),
-        "toup" => OlsCameraDriver::new_toup(),
-        "wdir" | "watchdir" => {
-            let dir = req.option.unwrap_or_else(|| "./watch".to_string());
-            OlsCameraDriver::new_wdir(&dir)
-        }
-        "gphoto2" | "dslr" => OlsCameraDriver::new_gphoto2(),
-        "uvc" | "webcam" => OlsCameraDriver::new_uvc(),
-        "indi" => OlsCameraDriver::new_indi(),
-        "indigo" => OlsCameraDriver::new_indigo(),
-        _ => {
-            tracing::warn!("Unsupported camera driver: {}", req.driver);
-            return Err(StatusCode::BAD_REQUEST);
+
+        let camera = driver.open_camera(requested_index).map_err(|error| {
+            (
+                StatusCode::BAD_GATEWAY,
+                format!("Failed to open camera {requested_index}: {error}"),
+            )
+        })?;
+        let camera_name = camera.name().unwrap_or_else(|_| "Unknown".to_string());
+        Ok((driver, camera, camera_name, cameras, requested_index))
+    });
+    let connect_result: Result<ConnectedCamera, ConnectFailure> = match connect_worker.await {
+        Ok(result) => result,
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Camera connection worker failed: {error}"),
+        )),
+    };
+
+    let (driver, camera, camera_name, cameras, index) = match connect_result {
+        Ok(connected) => connected,
+        Err((status, message)) => {
+            tracing::error!("{message}");
+            let mut runtime = state.camera_runtime.write().unwrap();
+            runtime.activity = CameraActivity::Error;
+            runtime.last_error = Some(message.clone());
+            return Err(ApiError::new(status, connect_error_code(status), message));
         }
     };
 
-    match driver_result {
-        Ok(mut driver) => {
-            // List cameras
-            let cameras = driver.list_cameras().map_err(|e| {
-                tracing::error!("Failed to list cameras: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+    tracing::info!("Found cameras: {:?}", cameras);
+    *state.camera_driver.lock().unwrap() = Some(driver);
+    *state.camera_name.lock().unwrap() = Some(camera_name.clone());
+    *state.camera.lock().unwrap() = Some(camera);
+    *state.streaming.lock().unwrap() = false;
+    let connection_id = uuid::Uuid::new_v4().to_string();
+    {
+        let mut runtime = state.camera_runtime.write().unwrap();
+        runtime.connection_id = Some(connection_id.clone());
+        runtime.activity = CameraActivity::Idle;
+        runtime.streaming = false;
+        runtime.camera_name = Some(camera_name.clone());
+        runtime.driver_id = Some(driver_id.clone());
+        runtime.device_index = Some(index);
+        runtime.last_error = None;
+    }
 
-            tracing::info!("Found cameras: {:?}", cameras);
+    Ok(Json(serde_json::json!({
+        "status": "connected",
+        "connection_id": connection_id,
+        "driver": driver_id,
+        "camera": camera_name,
+        "index": index,
+        "cameras_found": cameras,
+    })))
+}
 
-            if cameras.is_empty() {
-                return Err(StatusCode::NOT_FOUND);
-            }
-
-            // Open the requested camera. An out-of-range index is rejected
-            // rather than clamped to 0: silently opening a different camera
-            // than the operator selected is how a guider ends up taking the
-            // light frames.
-            let index = req.index.unwrap_or(0);
-            if index < 0 || index as usize >= cameras.len() {
-                tracing::warn!(
-                    "Camera index {index} out of range; driver {} enumerated {} camera(s)",
-                    req.driver,
-                    cameras.len()
-                );
-                return Err(StatusCode::BAD_REQUEST);
-            }
-
-            let camera = driver.open_camera(index).map_err(|e| {
-                tracing::error!("Failed to open camera {index}: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-            let cam_name = camera.name().unwrap_or_else(|_| "Unknown".to_string());
-
-            // Store in state
-            *state.camera_driver.lock().unwrap() = Some(driver);
-            *state.camera_name.lock().unwrap() = Some(cam_name.clone());
-            *state.camera.lock().unwrap() = Some(camera);
-
-            Ok(Json(serde_json::json!({
-                "status": "connected",
-                "driver": req.driver,
-                "camera": cam_name,
-                "index": index,
-                "cameras_found": cameras,
-            })))
-        }
-        Err(e) => {
-            tracing::error!("Failed to create {} driver: {}", req.driver, e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+fn connect_error_code(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "invalid_camera_selection",
+        StatusCode::NOT_FOUND => "camera_not_found",
+        StatusCode::BAD_GATEWAY => "camera_hardware_error",
+        _ => "camera_connect_failed",
     }
 }
 
@@ -386,26 +474,66 @@ async fn connect_focuser(
     })))
 }
 
-pub async fn disconnect_equipment(State(state): State<AppState>) -> Result<StatusCode, StatusCode> {
-    tracing::info!("Disconnect requested");
+pub(crate) async fn disconnect_camera(state: &AppState) -> Result<(), ApiError> {
+    let _acquisition = state.acquisition.lock().await;
+    let has_camera = state.camera.lock().unwrap().is_some();
+    if has_camera {
+        state.camera_runtime.write().unwrap().activity = CameraActivity::Disconnecting;
+    }
 
-    // Stop stream if active
-    {
+    let was_streaming = *state.streaming.lock().unwrap();
+    if was_streaming {
         let mut cam = state.camera.lock().unwrap();
         if let Some(camera) = cam.as_mut() {
-            let _ = camera.stop_stream();
+            if let Err(e) = camera.stop_stream() {
+                tracing::warn!("Camera stream did not stop cleanly during disconnect: {e}");
+            }
         }
     }
 
-    // Clear state
     *state.streaming.lock().unwrap() = false;
     *state.camera.lock().unwrap() = None;
     *state.camera_name.lock().unwrap() = None;
     *state.camera_driver.lock().unwrap() = None;
-    *state.mount.lock().unwrap() = None;
-    *state.mount_name.lock().unwrap() = None;
-    *state.focuser.lock().unwrap() = None;
-    *state.focuser_name.lock().unwrap() = None;
+    state.clear_camera_observations();
+    *state.camera_runtime.write().unwrap() = crate::state::CameraRuntimeState::default();
+    Ok(())
+}
 
-    Ok(StatusCode::OK)
+pub async fn disconnect_equipment(
+    State(state): State<AppState>,
+    request: Option<Json<DisconnectRequest>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    tracing::info!("Disconnect requested");
+    let equipment_type = request
+        .and_then(|Json(req)| req.equipment_type)
+        .unwrap_or_else(|| "all".to_string())
+        .to_ascii_lowercase();
+
+    if matches!(equipment_type.as_str(), "camera" | "all") {
+        disconnect_camera(&state).await?;
+    }
+    if matches!(equipment_type.as_str(), "mount" | "all") {
+        *state.mount.lock().unwrap() = None;
+        *state.mount_name.lock().unwrap() = None;
+    }
+    if matches!(equipment_type.as_str(), "focuser" | "all") {
+        *state.focuser.lock().unwrap() = None;
+        *state.focuser_name.lock().unwrap() = None;
+    }
+    if !matches!(
+        equipment_type.as_str(),
+        "camera" | "mount" | "focuser" | "all"
+    ) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported_equipment_type",
+            format!("Unsupported equipment type '{equipment_type}'"),
+        ));
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "disconnected",
+        "equipment_type": equipment_type,
+    })))
 }

@@ -4,35 +4,34 @@ use crate::state::AppState;
 
 pub fn equipment_status(state: &AppState) -> Value {
     let camera_status = {
-        let name = state.camera_name.lock().unwrap();
-        let streaming = state.streaming.lock().unwrap();
-        let frame = state.latest_frame.lock().unwrap();
-        let frame_info = frame.as_ref().map(|f| {
+        // Copy every slot independently. In particular, never hold the latest
+        // frame while reaching for the camera mutex: start/stop callbacks take
+        // those in the opposite direction and used to deadlock telemetry.
+        let runtime = state.camera_runtime.read().unwrap().clone();
+        let frame = state.latest_frame.lock().unwrap().clone();
+        let frame_info = frame.map(|f| {
             json!({
+                "stream_generation": f.stream_generation,
                 "frame_counter": f.frame_counter,
                 "width": f.width,
                 "height": f.height,
                 "format": format!("{:?}", f.format),
             })
         });
-        name.as_ref().map(|camera_name| {
-            let temperature = {
-                let cam = state.camera.lock().unwrap();
-                cam.as_ref()
-                    .and_then(|c| {
-                        c.get_parameter(crate::hardware::ols_ffi::OlsCamOptionId::Temperature)
-                            .ok()
-                    })
-                    .map(|p| p.cur_val)
-                    .unwrap_or(-10.0)
-            };
+        runtime.connection_id.as_ref().map(|_| {
             json!({
                 "connected": true,
-                "name": camera_name,
-                "temperature": temperature,
-                "cooling": false,
-                "exposing": *streaming,
-                "streaming": *streaming,
+                "connection_id": runtime.connection_id,
+                "name": runtime.camera_name,
+                "driver_id": runtime.driver_id,
+                "device_index": runtime.device_index,
+                "status": runtime.activity,
+                "temperature": runtime.temperature_c,
+                "cooling": runtime.cooler_on,
+                "exposing": runtime.activity == crate::state::CameraActivity::Exposing,
+                "streaming": runtime.streaming,
+                "progress": runtime.exposure_progress(chrono::Utc::now()),
+                "last_error": runtime.last_error,
                 "latest_frame": frame_info,
             })
         })
