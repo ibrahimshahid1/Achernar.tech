@@ -44,7 +44,7 @@ The default HTTP prefix is `/api/v1`. The daemon also exposes telemetry at `/ws/
 | `GET` | `/api/v1/camera/formats` | Current connection's selectable acquisition formats. |
 | `GET` | `/api/v1/camera/parameters` | Current camera's supported control descriptors and values. |
 | `POST` | `/api/v1/camera/parameters` | Sets one control and returns its hardware readback. |
-| `POST` | `/api/v1/camera/stream/start?format_index=N` | Starts the selected format, defaulting to index `0`. |
+| `POST` | `/api/v1/camera/stream/start?format_index=N` | Starts the selected format. If omitted, the daemon prefers MJPEG, then another previewable format, then the first advertised format. An explicit index is always honored exactly. |
 | `POST` | `/api/v1/camera/stream/stop` | Stops the stream. |
 | `POST` | `/api/v1/camera/abort` | Compatibility stream-stop alias; idempotent while disconnected. It does **not** abort an exposure. |
 | `GET` + upgrade | `/api/v1/camera/stream` | Binary WebSocket live view. It does not start the hardware stream. |

@@ -7,7 +7,7 @@ from django.db import models
 import uuid
 
 
-ASTROM3_EMBEDDING_DIM = 512
+ASTROM3_EMBEDDING_DIM  = 512
 ASTROM3_MODALITY_CHOICES = [
     ('image', 'Image'),
     ('photometry', 'Photometry'),

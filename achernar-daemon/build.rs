@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Find cmake binary - cargo build scripts don't always inherit the full user PATH
@@ -13,35 +13,105 @@ fn find_cmake() -> String {
         "/opt/homebrew/bin/cmake",
         "/usr/local/bin/cmake",
         "/Applications/CMake.app/Contents/bin/cmake",
+        r"C:\Program Files\CMake\bin\cmake.exe",
+        r"C:\Program Files (x86)\CMake\bin\cmake.exe",
     ] {
         if std::path::Path::new(path).exists() {
             return path.to_string();
         }
     }
-    panic!("cmake not found! Install with: brew install cmake");
+    panic!(
+        "cmake not found; install CMake 3.21+ (macOS: brew install cmake, \
+         Windows: winget install Kitware.CMake)"
+    );
 }
 
 fn main() {
     let cmake = find_cmake();
-    let out_dir = env::var("OUT_DIR").unwrap();
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let bridge_dir = PathBuf::from(&manifest_dir).join("ols-bridge");
-    let build_dir = PathBuf::from(&out_dir).join("ols-bridge-build");
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
+    );
+    let target_os = env::var("CARGO_CFG_TARGET_OS").expect("Cargo target OS is available");
+    let target_arch =
+        env::var("CARGO_CFG_TARGET_ARCH").expect("Cargo target architecture is available");
+    let bridge_dir = manifest_dir.join("ols-bridge");
+    let build_dir = out_dir.join("ols-bridge-build");
 
     // Create build directory
     std::fs::create_dir_all(&build_dir).expect("Failed to create build dir");
 
-    // Run cmake configure
-    let cmake_status = Command::new(&cmake)
-        .args([
-            "-S",
-            bridge_dir.to_str().unwrap(),
-            "-B",
-            build_dir.to_str().unwrap(),
-            "-DCMAKE_BUILD_TYPE=Release",
-        ])
-        .status()
-        .expect("Failed to run cmake configure");
+    // Configure the native bridge. On Windows, vcpkg's CMake toolchain owns
+    // OpenCV/TIFF discovery; pkg-config is intentionally not required.
+    let mut configure = Command::new(&cmake);
+    configure
+        .arg("-S")
+        .arg(&bridge_dir)
+        .arg("-B")
+        .arg(&build_dir)
+        .arg("-DCMAKE_BUILD_TYPE=Release");
+
+    if target_os == "windows" {
+        configure.arg("-DACHERNAR_ENABLE_VENDOR_DRIVERS=OFF");
+
+        // CMake's default Windows generator is Visual Studio, which may still
+        // default to Win32 even when Rust is targeting x86_64-pc-windows-msvc.
+        // `-A` is valid for Visual Studio generators but not Ninja.
+        let generator = env::var("CMAKE_GENERATOR").ok();
+        if generator
+            .as_deref()
+            .map_or(true, |name| name.contains("Visual Studio"))
+        {
+            configure
+                .arg("-A")
+                .arg(windows_cmake_platform(&target_arch));
+        }
+
+        let native_dir = out_dir.join("native");
+        std::fs::create_dir_all(&native_dir).expect("Failed to create native output dir");
+        for variable in [
+            "CMAKE_RUNTIME_OUTPUT_DIRECTORY",
+            "CMAKE_LIBRARY_OUTPUT_DIRECTORY",
+            "CMAKE_ARCHIVE_OUTPUT_DIRECTORY",
+            "CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE",
+            "CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE",
+            "CMAKE_ARCHIVE_OUTPUT_DIRECTORY_RELEASE",
+        ] {
+            configure.arg(format!("-D{variable}={}", native_dir.display()));
+        }
+
+        let toolchain = env::var_os("CMAKE_TOOLCHAIN_FILE")
+            .map(PathBuf::from)
+            .or_else(|| {
+                env::var_os("VCPKG_ROOT")
+                    .map(PathBuf::from)
+                    .map(|root| root.join("scripts/buildsystems/vcpkg.cmake"))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "Windows builds require vcpkg. Set VCPKG_ROOT to the vcpkg \
+                     checkout, or CMAKE_TOOLCHAIN_FILE to vcpkg.cmake"
+                )
+            });
+        if !toolchain.is_file() {
+            panic!("vcpkg CMake toolchain not found at {}", toolchain.display());
+        }
+
+        let triplet = env::var("VCPKG_TARGET_TRIPLET")
+            .or_else(|_| env::var("VCPKG_DEFAULT_TRIPLET"))
+            .unwrap_or_else(|_| windows_vcpkg_triplet(&target_arch).to_string());
+        let installed_dir = env::var_os("VCPKG_INSTALLED_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| manifest_dir.join("vcpkg_installed"));
+
+        configure
+            .arg(format!("-DCMAKE_TOOLCHAIN_FILE={}", toolchain.display()))
+            .arg(format!("-DVCPKG_TARGET_TRIPLET={triplet}"))
+            .arg(format!("-DVCPKG_MANIFEST_DIR={}", manifest_dir.display()))
+            .arg(format!("-DVCPKG_INSTALLED_DIR={}", installed_dir.display()));
+    }
+
+    let cmake_status = configure.status().expect("Failed to run cmake configure");
 
     if !cmake_status.success() {
         panic!("cmake configure failed");
@@ -49,13 +119,9 @@ fn main() {
 
     // Run cmake build
     let build_status = Command::new(&cmake)
-        .args([
-            "--build",
-            build_dir.to_str().unwrap(),
-            "--config",
-            "Release",
-            "-j",
-        ])
+        .arg("--build")
+        .arg(&build_dir)
+        .args(["--config", "Release", "--parallel"])
         .status()
         .expect("Failed to run cmake build");
 
@@ -63,142 +129,45 @@ fn main() {
         panic!("cmake build failed");
     }
 
-    // Tell cargo where to find the static library
+    // Single-config generators place outputs at the build root; Visual Studio
+    // and other multi-config generators place Release outputs one level down.
     println!("cargo:rustc-link-search=native={}", build_dir.display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        build_dir.join("Release").display()
+    );
 
-    // Link the bridge static library
-    println!("cargo:rustc-link-lib=static=ols_bridge");
+    if target_os == "windows" {
+        // Link the import library for ols_bridge.dll. CMake owns its complete
+        // OpenCV/TIFF/Media Foundation link graph.
+        println!("cargo:rustc-link-lib=dylib=ols_bridge");
+        println!(
+            "cargo:rustc-link-search=native={}",
+            out_dir.join("native").display()
+        );
+        stage_windows_runtime_dlls(&out_dir);
+    } else {
+        println!("cargo:rustc-link-lib=static=ols_bridge");
+    }
 
     // Link C++ standard library
-    #[cfg(target_os = "macos")]
-    println!("cargo:rustc-link-lib=dylib=c++");
-    #[cfg(target_os = "linux")]
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-
-    // Link OpenCV - find via pkg-config
-    let opencv_libs = pkg_config_libs("opencv4");
-    for lib in &opencv_libs.link_paths {
-        println!("cargo:rustc-link-search=native={}", lib.display());
-    }
-    for lib in &opencv_libs.libs {
-        println!("cargo:rustc-link-lib=dylib={}", lib);
+    match target_os.as_str() {
+        "macos" => println!("cargo:rustc-link-lib=dylib=c++"),
+        "linux" => println!("cargo:rustc-link-lib=dylib=stdc++"),
+        _ => {}
     }
 
-    // Link libtiff - find via pkg-config
-    let tiff_libs = pkg_config_libs("libtiff-4");
-    for lib in &tiff_libs.link_paths {
-        println!("cargo:rustc-link-search=native={}", lib.display());
-    }
-    for lib in &tiff_libs.libs {
-        println!("cargo:rustc-link-lib=dylib={}", lib);
-    }
-
-    // Homebrew fallback search paths
-    if std::path::Path::new("/opt/homebrew/lib").exists() {
-        println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
-    }
-
-    // ─── Vendor Camera SDK linking ───
-    // These SDKs are auto-detected by CMake, but Rust linker also
-    // needs to know where to find the dynamic libraries.
-    let project_root = PathBuf::from(&manifest_dir).parent().unwrap().to_path_buf();
-    let sdks_root = project_root.join("sdks");
-
-    // ASI (ZWO) Camera SDK
-    let asi_sdk = sdks_root.join("ASI/ASI_Camera_SDK/ASI_linux_mac_SDK_V1.41");
-    if asi_sdk.join("include/ASICamera2.h").exists() {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let asi_lib = asi_sdk.join("lib/mac_arm64");
-        #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
-        let asi_lib = asi_sdk.join("lib/mac");
-        #[cfg(target_os = "linux")]
-        let asi_lib = asi_sdk.join("lib/x64");
-        if asi_lib.exists() {
-            #[cfg(target_os = "macos")]
-            let link_dir =
-                prepare_macos_dylib(&asi_lib, "ASICamera2", std::path::Path::new(&out_dir));
-            #[cfg(target_os = "linux")]
-            let link_dir = asi_lib.clone();
-
-            println!("cargo:rustc-link-search=native={}", link_dir.display());
-            println!("cargo:rustc-link-lib=dylib=ASICamera2");
-            // Runtime rpath so dyld can find the original library in original SDK folder
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", asi_lib.display());
-        }
-    }
-
-    // SVBony Camera SDK
-    let svb_sdk = sdks_root.join("Svbony/macos/SVBCameraSDK");
-    if svb_sdk.join("include/SVBCameraSDK.h").exists() {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        let svb_lib = svb_sdk.join("lib/arm64");
-        #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
-        let svb_lib = svb_sdk.join("lib/x64");
-        #[cfg(target_os = "linux")]
-        let svb_lib = svb_sdk.join("lib/x64");
-        if svb_lib.exists() {
-            #[cfg(target_os = "macos")]
-            let link_dir =
-                prepare_macos_dylib(&svb_lib, "SVBCameraSDK", std::path::Path::new(&out_dir));
-            #[cfg(target_os = "linux")]
-            let link_dir = svb_lib.clone();
-
-            println!("cargo:rustc-link-search=native={}", link_dir.display());
-            println!("cargo:rustc-link-lib=dylib=SVBCameraSDK");
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", svb_lib.display());
-        }
-    }
-
-    // ToupTek Camera SDK
-    let toup_sdk = sdks_root.join("touptek");
-    if toup_sdk.join("inc/toupcam.h").exists() {
-        #[cfg(target_os = "macos")]
-        let toup_lib = toup_sdk.join("mac");
-        #[cfg(target_os = "linux")]
-        let toup_lib = toup_sdk.join("linux/x64");
-        if toup_lib.exists() {
-            #[cfg(target_os = "macos")]
-            let link_dir =
-                prepare_macos_dylib(&toup_lib, "toupcam", std::path::Path::new(&out_dir));
-            #[cfg(target_os = "linux")]
-            let link_dir = toup_lib.clone();
-
-            println!("cargo:rustc-link-search=native={}", link_dir.display());
-            println!("cargo:rustc-link-lib=dylib=toupcam");
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", toup_lib.display());
-        }
-    }
-
-    // ─── Optional system camera libraries (gphoto2, libuvc, INDI, INDIGO) ───
-    // Mirrors the CMake driver detection. The bridge is a *static* lib, so these
-    // dependency libs must be linked at the final binary stage. Emit link flags
-    // only when present, so the default build (none installed) is unaffected.
-    link_optional_pkg("libgphoto2");
-    link_optional_pkg("libuvc");
-    link_optional_indi();
-    link_optional_libraw();
-
-    // INDIGO library
-    for inc in [
-        "/opt/homebrew/include",
-        "/usr/local/include",
-        "/usr/include",
-    ] {
-        if std::path::Path::new(&format!("{inc}/indigo/indigo_bus.h")).exists() {
-            println!(
-                "cargo:rustc-link-search=native={}",
-                inc.replace("/include", "/lib")
-            );
-            println!("cargo:rustc-link-lib=dylib=indigo");
-            break;
-        }
+    if target_os != "windows" {
+        link_unix_native_dependencies(&manifest_dir, &out_dir, &target_os, &target_arch);
     }
 
     // Rebuild if bridge sources change
     println!("cargo:rerun-if-changed=ols-bridge/src/ols_bridge.cpp");
     println!("cargo:rerun-if-changed=ols-bridge/src/camera_base.cpp");
+    println!("cargo:rerun-if-changed=ols-bridge/src/windows_mf_camera.cpp");
     println!("cargo:rerun-if-changed=ols-bridge/include/ols_bridge.h");
     println!("cargo:rerun-if-changed=ols-bridge/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=vcpkg.json");
     println!("cargo:rerun-if-changed=ols-bridge/shims/cppcms/json.h");
     println!("cargo:rerun-if-changed=ols-bridge/shims/booster/aio/endpoint.h");
     println!("cargo:rerun-if-changed=ols-bridge/shims/booster/aio/basic_socket.h");
@@ -207,11 +176,21 @@ fn main() {
     println!("cargo:rerun-if-env-changed=INDI_ROOT");
     println!("cargo:rerun-if-env-changed=INDI_DIR");
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    println!("cargo:rerun-if-env-changed=CMAKE_GENERATOR");
+    println!("cargo:rerun-if-env-changed=CMAKE_TOOLCHAIN_FILE");
+    println!("cargo:rerun-if-env-changed=VCPKG_ROOT");
+    println!("cargo:rerun-if-env-changed=VCPKG_TARGET_TRIPLET");
+    println!("cargo:rerun-if-env-changed=VCPKG_DEFAULT_TRIPLET");
+    println!("cargo:rerun-if-env-changed=VCPKG_INSTALLED_DIR");
     for path in [
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_camera.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_client.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_mount.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_focuser.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/mount.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/focuser.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/util.cpp",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/tiffmat.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/asi_camera.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/svb_camera.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/toup_camera.cpp",
@@ -223,10 +202,198 @@ fn main() {
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/indigo_camera.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/camera.h",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/alpaca_client.h",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/include/os_util.h",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/include/util.h",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/include/tiffmat.h",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/libraw_wrapper.h",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/sw_bin.h",
     ] {
         println!("cargo:rerun-if-changed={path}");
+    }
+}
+
+fn windows_vcpkg_triplet(target_arch: &str) -> &'static str {
+    match target_arch {
+        "x86_64" => "x64-windows",
+        "x86" => "x86-windows",
+        "aarch64" => "arm64-windows",
+        other => panic!("unsupported Windows target architecture: {other}"),
+    }
+}
+
+fn windows_cmake_platform(target_arch: &str) -> &'static str {
+    match target_arch {
+        "x86_64" => "x64",
+        "x86" => "Win32",
+        "aarch64" => "ARM64",
+        other => panic!("unsupported Windows target architecture: {other}"),
+    }
+}
+
+/// Copy the bridge and its vcpkg runtime dependencies next to both normal
+/// Cargo binaries and test binaries. `cargo run` augments PATH with native
+/// link-search directories, but a directly launched daemon (and some test
+/// runners) does not. Staging makes the resulting target directory portable
+/// without relying on developer-shell environment state.
+fn stage_windows_runtime_dlls(out_dir: &Path) {
+    let native_dir = out_dir.join("native");
+    let profile_dir = out_dir
+        .parent() // .../build/achernar-daemon-<hash>
+        .and_then(Path::parent) // .../build
+        .and_then(Path::parent) // .../{debug,release}
+        .unwrap_or_else(|| panic!("unexpected Cargo OUT_DIR layout: {}", out_dir.display()));
+    let test_dir = profile_dir.join("deps");
+    std::fs::create_dir_all(&test_dir).unwrap_or_else(|error| {
+        panic!(
+            "failed to create Windows test runtime directory {}: {error}",
+            test_dir.display()
+        )
+    });
+
+    let entries = std::fs::read_dir(&native_dir).unwrap_or_else(|error| {
+        panic!(
+            "failed to inspect Windows native output {}: {error}",
+            native_dir.display()
+        )
+    });
+    let mut dll_count = 0;
+    for entry in entries {
+        let path = entry.expect("failed to read native build output").path();
+        let is_dll = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map_or(false, |extension| extension.eq_ignore_ascii_case("dll"));
+        if !is_dll {
+            continue;
+        }
+        let file_name = path.file_name().expect("native DLL has a filename");
+        for destination_dir in [profile_dir, test_dir.as_path()] {
+            let destination = destination_dir.join(file_name);
+            std::fs::copy(&path, &destination).unwrap_or_else(|error| {
+                panic!(
+                    "failed to stage {} at {}: {error}",
+                    path.display(),
+                    destination.display()
+                )
+            });
+        }
+        dll_count += 1;
+    }
+
+    if dll_count == 0 {
+        panic!(
+            "Windows native build produced no runtime DLLs in {}",
+            native_dir.display()
+        );
+    }
+}
+
+/// Emit native dependency link flags for the Unix static-bridge build.
+/// Windows deliberately does not enter this path: its DLL is fully linked by
+/// CMake and exposes only the flat bridge ABI to Rust.
+fn link_unix_native_dependencies(
+    manifest_dir: &Path,
+    out_dir: &Path,
+    target_os: &str,
+    target_arch: &str,
+) {
+    for package in ["opencv4", "libtiff-4"] {
+        let libs = pkg_config_libs(package);
+        for path in &libs.link_paths {
+            println!("cargo:rustc-link-search=native={}", path.display());
+        }
+        for lib in &libs.libs {
+            println!("cargo:rustc-link-lib=dylib={lib}");
+        }
+    }
+
+    if Path::new("/opt/homebrew/lib").exists() {
+        println!("cargo:rustc-link-search=native=/opt/homebrew/lib");
+    }
+
+    let project_root = manifest_dir
+        .parent()
+        .expect("daemon lives directly below the project root");
+    let sdks_root = project_root.join("sdks");
+
+    let asi_sdk = sdks_root.join("ASI/ASI_Camera_SDK/ASI_linux_mac_SDK_V1.41");
+    if asi_sdk.join("include/ASICamera2.h").exists() {
+        let asi_lib = match (target_os, target_arch) {
+            ("macos", "aarch64") => asi_sdk.join("lib/mac_arm64"),
+            ("macos", _) => asi_sdk.join("lib/mac"),
+            ("linux", _) => asi_sdk.join("lib/x64"),
+            _ => PathBuf::new(),
+        };
+        if asi_lib.is_dir() {
+            let link_dir = if target_os == "macos" {
+                prepare_macos_dylib(&asi_lib, "ASICamera2", out_dir)
+            } else {
+                asi_lib.clone()
+            };
+            println!("cargo:rustc-link-search=native={}", link_dir.display());
+            println!("cargo:rustc-link-lib=dylib=ASICamera2");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", asi_lib.display());
+        }
+    }
+
+    let svb_sdk = sdks_root.join("Svbony/macos/SVBCameraSDK");
+    if svb_sdk.join("include/SVBCameraSDK.h").exists() {
+        let svb_lib = match (target_os, target_arch) {
+            ("macos", "aarch64") => svb_sdk.join("lib/arm64"),
+            ("macos", _) | ("linux", _) => svb_sdk.join("lib/x64"),
+            _ => PathBuf::new(),
+        };
+        if svb_lib.is_dir() {
+            let link_dir = if target_os == "macos" {
+                prepare_macos_dylib(&svb_lib, "SVBCameraSDK", out_dir)
+            } else {
+                svb_lib.clone()
+            };
+            println!("cargo:rustc-link-search=native={}", link_dir.display());
+            println!("cargo:rustc-link-lib=dylib=SVBCameraSDK");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", svb_lib.display());
+        }
+    }
+
+    let toup_sdk = sdks_root.join("touptek");
+    if toup_sdk.join("inc/toupcam.h").exists() {
+        let toup_lib = match target_os {
+            "macos" => toup_sdk.join("mac"),
+            "linux" => toup_sdk.join("linux/x64"),
+            _ => PathBuf::new(),
+        };
+        if toup_lib.is_dir() {
+            let link_dir = if target_os == "macos" {
+                prepare_macos_dylib(&toup_lib, "toupcam", out_dir)
+            } else {
+                toup_lib.clone()
+            };
+            println!("cargo:rustc-link-search=native={}", link_dir.display());
+            println!("cargo:rustc-link-lib=dylib=toupcam");
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", toup_lib.display());
+        }
+    }
+
+    link_optional_pkg("libgphoto2");
+    link_optional_pkg("libuvc");
+    link_optional_indi();
+    link_optional_libraw();
+
+    for include_dir in [
+        "/opt/homebrew/include",
+        "/usr/local/include",
+        "/usr/include",
+    ] {
+        if Path::new(include_dir).join("indigo/indigo_bus.h").exists() {
+            if let Some(prefix) = Path::new(include_dir).parent() {
+                println!(
+                    "cargo:rustc-link-search=native={}",
+                    prefix.join("lib").display()
+                );
+            }
+            println!("cargo:rustc-link-lib=dylib=indigo");
+            break;
+        }
     }
 }
 
@@ -441,32 +608,9 @@ fn link_optional_indi() {
     }
 }
 
-/// Search a directory tree for a file whose name starts with `prefix`.
-/// Returns the parent directory of the first match.
-fn find_file_in_dir(dir: &std::path::Path, prefix: &str) -> Option<PathBuf> {
-    if !dir.exists() {
-        return None;
-    }
-    for entry in std::fs::read_dir(dir).ok()? {
-        let entry = entry.ok()?;
-        let path = entry.path();
-        if path.is_dir() {
-            if let Some(found) = find_file_in_dir(&path, prefix) {
-                return Some(found);
-            }
-        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with(prefix) {
-                return path.parent().map(|p| p.to_path_buf());
-            }
-        }
-    }
-    None
-}
-
 /// On macOS, vendors often ship dylibs with `@loader_path/libFoo.dylib` hardcoded.
 /// We copy the library to OUT_DIR and patch its ID to `@rpath/libFoo.dylib` so the built executable
 /// uses an rpath-based lookup, avoiding crash upon `cargo run`.
-#[cfg(target_os = "macos")]
 fn prepare_macos_dylib(
     sdk_lib_dir: &std::path::Path,
     lib_name: &str,

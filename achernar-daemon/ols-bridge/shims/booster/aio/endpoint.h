@@ -5,14 +5,29 @@
 #pragma once
 #include <string>
 #include <cstring>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
+#include <algorithm>
+#ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#else
+#  include <arpa/inet.h>
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#endif
 
 namespace booster {
 namespace aio {
 
     enum { pf_inet = AF_INET, sock_datagram = SOCK_DGRAM };
+
+#ifdef _WIN32
+    using socket_length = int;
+#else
+    using socket_length = socklen_t;
+#endif
 
     class endpoint {
     public:
@@ -23,11 +38,11 @@ namespace aio {
             addr_.sin_port = htons(port);
             inet_pton(AF_INET, ip.c_str(), &addr_.sin_addr);
         }
-        std::pair<struct sockaddr *, socklen_t> raw() {
+        std::pair<struct sockaddr *, socket_length> raw() {
             return {(struct sockaddr *)&addr_, sizeof(addr_)};
         }
-        void raw(struct sockaddr *sa, socklen_t len) {
-            memcpy(&addr_, sa, std::min(len, (socklen_t)sizeof(addr_)));
+        void raw(struct sockaddr *sa, socket_length len) {
+            memcpy(&addr_, sa, std::min(len, (socket_length)sizeof(addr_)));
         }
         std::string ip() const {
             char buf[INET_ADDRSTRLEN + 1] = {};

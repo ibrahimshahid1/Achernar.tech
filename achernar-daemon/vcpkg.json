@@ -1,0 +1,19 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "achernar-daemon-native",
+  "version-string": "0.1.0",
+  "description": "Native dependencies used by the Achernar Windows rig daemon",
+  "builtin-baseline": "da411b1cfb549469ae350136f954deed7ad8c650",
+  "dependencies": [
+    {
+      "name": "opencv4",
+      "default-features": false,
+      "features": [
+        "jpeg",
+        "png",
+        "tiff"
+      ]
+    },
+    "tiff"
+  ]
+}

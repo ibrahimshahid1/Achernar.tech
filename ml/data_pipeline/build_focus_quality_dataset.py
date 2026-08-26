@@ -33,6 +33,7 @@ import json
 import os
 import sqlite3
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -106,6 +107,45 @@ def saturation_level_from_quality(quality_json: str) -> float | None:
 _saturation_level_from_quality = saturation_level_from_quality
 
 
+def resolve_night_id(frame_night_id, run_night_id, captured_at: str) -> str:
+    """The observing night a row belongs to.
+
+    Night is a **split key** — COC splits on it and the FQE reports it as a
+    deployment stratum — so getting it wrong silently invalidates a
+    generalisation number.
+
+    Prefer the stored column. `frames.night_id` and `focus_runs.night_id` are
+    written by the daemon (migration 007) and by `tools/import_session.py`, both
+    of which apply the local-sunset-date rule in `storage/night.rs`; and for a
+    hand-imported sweep the observer's field card is a better authority on which
+    night it was than a file timestamp.
+
+    Only when neither column is populated fall back to the timestamp — and then
+    apply the same noon rule rather than slicing the date. A plain
+    ``captured_at[:10]`` puts a 23:50 sweep and the 00:10 sweep that follows it
+    on different nights, which is exactly the split-corrupting behaviour that
+    rule exists to prevent.
+    """
+    for stored in (frame_night_id, run_night_id):
+        if stored:
+            text = str(stored).strip()
+            if text:
+                return text
+
+    if len(captured_at) < 10:
+        return "unknown-night"
+    try:
+        moment = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+    except ValueError:
+        return captured_at[:10]
+    if moment.tzinfo is not None:
+        moment = moment.astimezone()
+    if moment.hour < 12:
+        moment = moment - timedelta(days=1)
+    return moment.strftime("%Y-%m-%d")
+
+
+
 def _quality_dict(raw: str) -> dict:
     try:
         value = json.loads(raw) if raw else {}
@@ -172,16 +212,39 @@ def build_dataset(
 
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
+
+    # `night_id` arrived in migration 007. A database written before it is still
+    # perfectly readable — the night is then derived from the timestamp — so the
+    # column is selected only when present rather than made a hard requirement.
+    # A dataset builder that refuses to open last month's database is a worse
+    # failure than the imprecise grouping it was trying to avoid.
+    def _has_column(table: str, column: str) -> bool:
+        return any(
+            row[1] == column for row in con.execute(f"PRAGMA table_info({table})")
+        )
+
+    frame_night = (
+        "f.night_id AS frame_night_id"
+        if _has_column("frames", "night_id")
+        else "NULL AS frame_night_id"
+    )
+    run_night = (
+        "fr.night_id AS run_night_id"
+        if _has_column("focus_runs", "night_id")
+        else "NULL AS run_night_id"
+    )
+
     rows = con.execute(
-        """
+        f"""
         SELECT fs.run_id AS run_key, fs.position AS position, fs.hfr AS classical_hfr_px,
                fs.frame_id AS frame_id,
                f.local_path AS local_path, f.checksum_sha256 AS checksum_sha256,
                f.quality_json AS quality_json, f.filter_name AS frame_filter_name,
                f.temperature AS frame_temperature, f.exposure_s AS exposure_s,
                f.gain AS gain, f.captured_at AS frame_captured_at,
+               {frame_night},
                fr.rig_id AS rig_id, fr.filter_name AS run_filter_name,
-               fr.started_at AS run_started_at
+               fr.started_at AS run_started_at, {run_night}
         FROM focus_samples fs
         JOIN frames f ON f.id = fs.frame_id
         LEFT JOIN focus_runs fr ON fr.id = fs.run_id
@@ -263,7 +326,9 @@ def build_dataset(
             or "unknown-filter"
         )
         captured_at = str(row["frame_captured_at"] or row["run_started_at"] or "")
-        night_id = captured_at[:10] if len(captured_at) >= 10 else "unknown-night"
+        night_id = resolve_night_id(
+            row["frame_night_id"], row["run_night_id"], captured_at
+        )
 
         for source in _select_spatial_sources(
             sources, img.shape[1], img.shape[0], max_stars_per_frame

@@ -1,0 +1,95 @@
+name: Windows rig daemon
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, develop]
+    paths:
+      - "achernar-daemon/**"
+      - "OpenLiveStacker_Drivers/OpenLiveStacker/include/**"
+      - "OpenLiveStacker_Drivers/OpenLiveStacker/src/**"
+      - "OpenLiveStacker_Drivers/OpenLiveStacker/sim/**"
+      - "scripts/windows/**"
+      - ".github/workflows/windows-daemon.yml"
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - "achernar-daemon/**"
+      - "OpenLiveStacker_Drivers/OpenLiveStacker/include/**"
+      - "OpenLiveStacker_Drivers/OpenLiveStacker/src/**"
+      - "OpenLiveStacker_Drivers/OpenLiveStacker/sim/**"
+      - "scripts/windows/**"
+      - ".github/workflows/windows-daemon.yml"
+
+concurrency:
+  group: windows-daemon-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-simulator-smoke:
+    name: Windows x64 — build, test, simulator API
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+      VCPKG_TARGET_TRIPLET: x64-windows
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+      VCPKG_INSTALLED_DIR: ${{ github.workspace }}\achernar-daemon\vcpkg_installed
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Locate hosted-runner vcpkg
+        shell: pwsh
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          if ([string]::IsNullOrWhiteSpace($root)) { $root = "C:\vcpkg" }
+          if (-not (Test-Path (Join-Path $root "vcpkg.exe"))) {
+            throw "The hosted runner's vcpkg installation was not found at $root"
+          }
+          "VCPKG_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Cache native dependencies
+        uses: actions/cache@v4
+        with:
+          path: achernar-daemon/vcpkg_installed
+          key: windows-vcpkg-x64-${{ hashFiles('achernar-daemon/vcpkg.json') }}
+          restore-keys: |
+            windows-vcpkg-x64-
+
+      - name: Restore native dependencies
+        shell: pwsh
+        run: .\scripts\windows\bootstrap.ps1 -VcpkgRoot $env:VCPKG_ROOT
+
+      - name: Build and run Rust tests
+        shell: pwsh
+        run: .\scripts\windows\build.ps1 -Configuration Debug -VcpkgRoot $env:VCPKG_ROOT -SkipDependencies -RunTests
+
+      - name: Exercise daemon API with simulator
+        shell: pwsh
+        run: |
+          $daemon = Join-Path $pwd "achernar-daemon\target\x86_64-pc-windows-msvc\debug\achernar-daemon.exe"
+          $work = Join-Path $env:RUNNER_TEMP "achernar-windows-smoke"
+          .\scripts\windows\smoke-api.ps1 `
+            -DaemonPath $daemon `
+            -Driver sim `
+            -CameraNamePattern "" `
+            -DriverOption (Join-Path $pwd "OpenLiveStacker_Drivers\OpenLiveStacker\sim") `
+            -WorkDirectory $work `
+            -KeepArtifacts
+
+      - name: Upload smoke-test logs and capture evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-daemon-smoke
+          path: ${{ runner.temp }}\achernar-windows-smoke
+          if-no-files-found: warn
+          retention-days: 7

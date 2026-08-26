@@ -53,7 +53,14 @@ yarn-error.log
 # Rust (achernar-daemon)
 target/
 Cargo.lock
+# The daemon is a shipped application, not a reusable library. Pin its complete
+# Rust dependency graph so Windows developer machines and CI test the same code.
+!achernar-daemon/Cargo.lock
 *.rs.bk
+
+# Windows native dependency restore/bootstrap output.
+.tools/vcpkg/
+achernar-daemon/vcpkg_installed/
 
 # SQLite offline store, wherever it lands.
 # This used to be `achernar-daemon/achernar.db*` only, so a daemon started from

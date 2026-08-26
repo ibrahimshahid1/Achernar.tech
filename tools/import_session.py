@@ -71,6 +71,56 @@ VALID_CAPTURE_TYPES = {"light", "dark", "flat", "bias"}
 
 MANIFEST_VERSION = "manifest.v1.json"
 
+# Mirrors `saturation_threshold` in achernar-daemon/src/vision/background.rs and
+# SATURATION_FRACTION in ml/data_pipeline/build_focus_quality_dataset.py. Sensor
+# response goes non-linear below the hard clip, so the gate sits at 98%.
+SATURATION_FRACTION = 0.98
+
+# A container ceiling at or below this is an 8-bit stream, where the container
+# *is* the clip point — the 8-bit arm of `resolve_saturation_adu` in
+# vision/quality.rs. Above it we are looking at a 16-bit container, whose
+# ceiling says nothing about where the sensor actually saturates.
+EIGHT_BIT_MAX_ADU = 255.0
+
+# How far from a position's logged timestamp a frame may sit and still be
+# considered part of that position. Only used when the field card gives neither
+# filenames nor frame ids. A focus sweep dwells seconds per position, so this is
+# deliberately tight — a wrong match here silently corrupts the position axis,
+# which is the one thing a sweep exists to record.
+DEFAULT_MATCH_WINDOW_S = 30.0
+
+# `focus_samples.position` is an INTEGER axis with no unit of its own. A
+# motorised focuser reports steps; a dial indicator reports displacement. The
+# unit is therefore recorded per frame in `acquisition_json.focuser_position_unit`
+# rather than assumed, and `--position-unit-um` converts a `reading_um` field
+# card entry into whatever integer axis the run is using. The default of 1.0
+# stores micrometres directly, which is self-describing and monotonic — the two
+# properties the focus models actually require of this axis.
+DEFAULT_POSITION_UNIT_UM = 1.0
+
+# Run states written by this tool. Deliberately NOT the daemon's `Converged`:
+# a hand-cranked sweep has no fitted vertex, and claiming one would let a
+# sample argmin be mistaken for a solver result.
+RUN_STATE_IMPORTED = "Imported"
+RUN_STATE_ABORTED = "Aborted"
+
+
+def _ensure_ml_on_path() -> None:
+    """Make `ml/labels/psf_measure.py` importable however this tool is invoked.
+
+    The field HFR must come from the same labeler the dataset builder uses, and
+    that module lives under `ml/`, which is a sibling of `tools/` rather than a
+    package on the default path. Without this the measurement quietly fails and
+    a whole night's sweep imports with no samples — the failure is reported, but
+    reporting it at 1 a.m. is too late.
+    """
+    ml_dir = Path(__file__).resolve().parent.parent / "ml"
+    if ml_dir.is_dir() and str(ml_dir) not in sys.path:
+        sys.path.insert(0, str(ml_dir))
+
+
+_ensure_ml_on_path()
+
 
 def classify(path: Path) -> str | None:
     suffix = path.suffix.lower()
@@ -231,6 +281,188 @@ def night_id_for(timestamp: str, fallback: str) -> str:
     return dt.strftime("%Y-%m-%d")
 
 
+# ─── Frame measurement (for the field V-curve check) ─────────────────────────
+
+
+def load_luma(path: Path):
+    """Read an image file as a 2-D float array, or return None.
+
+    Only formats a hand-run sweep actually produces are handled: the 16-bit PNG
+    the daemon writes for focus frames, TIFF, FITS, and the JPEG half of a
+    RAW+JPEG pair. RAW is deliberately NOT decoded here — doing it correctly
+    means LibRaw semantics (no black subtraction, no rescaling) and this tool
+    has no business owning a second, divergent RAW path. A RAW-only sweep still
+    imports; it just carries no field HFR.
+    """
+    import numpy as np
+
+    # A frame staged by this import is still called `<name>.png.partial`, so the
+    # last suffix is the staging marker rather than the format. Strip it before
+    # dispatching, or every in-transaction measurement silently reads as an
+    # unknown format and the sweep loses every sample it just imported.
+    name = path.name
+    if name.endswith(".partial"):
+        name = name[: -len(".partial")]
+    suffix = Path(name).suffix.lower()
+
+    if suffix in FITS_SUFFIXES:
+        try:
+            from astropy.io import fits
+        except ImportError:
+            return None
+        with fits.open(path) as hdul:
+            for hdu in hdul:
+                if getattr(hdu, "data", None) is not None and hdu.data.ndim == 2:
+                    return np.asarray(hdu.data, dtype=np.float64)
+        return None
+
+    if suffix in PNG_SUFFIXES or suffix in JPEG_SUFFIXES:
+        try:
+            from PIL import Image
+        except ImportError:
+            return None
+        with Image.open(path) as image:
+            array = np.asarray(image)
+        if array.ndim == 3:
+            # Rec. 601 luma. Only reached for the JPEG half of a pair; the
+            # daemon's own focus frames are already single-channel.
+            array = (
+                0.299 * array[..., 0] + 0.587 * array[..., 1] + 0.114 * array[..., 2]
+            )
+        if array.ndim != 2:
+            return None
+        return array.astype(np.float64)
+
+    return None
+
+
+def container_max_adu(image) -> float:
+    """Full scale of the container the samples arrived in — 255 or 65535.
+
+    The container ceiling, never the sensor's saturation point. Conflating the
+    two is defect D1, and the whole reason `LumaFrame` carries both.
+    """
+    return EIGHT_BIT_MAX_ADU if float(image.max()) <= EIGHT_BIT_MAX_ADU else 65535.0
+
+
+def resolve_saturation_adu(image, declared: float | None) -> float | None:
+    """The sensor's linear saturation point in this frame's units, or None.
+
+    Mirrors `resolve_saturation_adu` in vision/quality.rs exactly:
+
+    * a declared value always wins (it came from BP-2, per body and ISO);
+    * an 8-bit container *is* its own clip point, because an 8-bit sample
+      physically cannot exceed 255 and one that reads 255 is clipped;
+    * a 16-bit container says nothing — a 14-bit body sends 16-bit samples that
+      stop at 16383, and nothing in the pixels reveals that. Return None, so
+      the gate reports itself as not performed rather than silently passing.
+    """
+    if declared is not None:
+        try:
+            value = float(declared)
+        except (TypeError, ValueError):
+            return None
+        return value if value > 0.0 else None
+
+    max_adu = container_max_adu(image)
+    return max_adu if max_adu <= EIGHT_BIT_MAX_ADU else None
+
+
+def readable_path(path: Path) -> Path | None:
+    """The path a frame's bytes can actually be read from right now.
+
+    Focus runs are resolved *inside* the import transaction, which is before
+    staged files are renamed off `.partial` — the same ordering that makes a
+    crash mid-import leave nothing half-recorded. So a frame committed moments
+    ago is readable only under its staging name. Frames imported on an earlier
+    run are readable under their final name.
+    """
+    if path.exists():
+        return path
+    partial = path.with_name(path.name + ".partial")
+    return partial if partial.exists() else None
+
+
+def measure_frame(path: Path, declared_saturation: float | None) -> dict | None:
+    """Frame-level HFR for a sweep frame, or None when it cannot be measured.
+
+    Runs the *same* labeler the dataset builder runs (`measure_frame_sep`), so a
+    V-curve inspected at 2 a.m. and the labels produced weeks later come from
+    one implementation. This value is a field sanity check, not the training
+    label: `build_focus_quality_dataset.py` re-measures every crop from the
+    preserved pixels.
+
+    Returns None when the frame is unreadable, has no measurable stars, or SEP
+    is unavailable. None is propagated as "no sample", never as a zero — zero is
+    the mathematically best value for a width metric and would put a blank frame
+    at the bottom of a V-curve.
+    """
+    image = load_luma(path)
+    if image is None:
+        return None
+
+    sat = resolve_saturation_adu(image, declared_saturation)
+    gate_applied = sat is not None
+    threshold = sat * SATURATION_FRACTION if sat is not None else float("inf")
+
+    try:
+        from labels.psf_measure import measure_frame_sep
+
+        _sources, label = measure_frame_sep(
+            image, saturation_level=threshold, fit_fwhm=False
+        )
+    except Exception:
+        return None
+
+    if label.hfr_px_median is None:
+        return None
+
+    return {
+        "hfr_px": float(label.hfr_px_median),
+        "hfd_px": float(label.hfr_px_median) * 2.0,
+        "star_count": int(label.star_count_detected),
+        "star_count_used": int(label.star_count_used),
+        "background_adu": float(label.sky_median_adu),
+        "background_sigma": float(label.sky_rms_adu),
+        "max_adu": container_max_adu(image),
+        "saturation_adu": sat,
+        "saturation_gate_applied": gate_applied,
+        "saturation_fraction": float(label.saturated_star_fraction),
+    }
+
+
+def quality_json_for(measurement: dict | None, declared_saturation: float | None) -> str:
+    """The `frames.quality_json` an imported frame carries.
+
+    This is not decoration. `build_focus_quality_dataset.py` reads
+    `saturation_adu` / `saturation_gate_applied` / `max_adu` out of this column
+    to decide whether a frame may enter the training set at all, and an empty
+    `{}` — what this tool used to write — resolves to "unknown", which the
+    builder correctly treats as a reason to drop the frame. An import that
+    writes no quality_json produces a zero-row dataset and no error message.
+
+    When nothing can be measured, `saturation_gate_applied` is written as
+    `false` explicitly. That is the honest record and it makes the builder's
+    refusal legible instead of mysterious.
+    """
+    if measurement is None:
+        payload = {
+            "source": "offline_import",
+            "observation_valid": False,
+            "saturation_gate_applied": False,
+        }
+        if declared_saturation is not None:
+            payload["saturation_adu"] = float(declared_saturation)
+            payload["saturation_gate_applied"] = True
+        return json.dumps(payload)
+
+    payload = {k: v for k, v in measurement.items()}
+    payload["source"] = "offline_import"
+    payload["observation_valid"] = True
+    payload["status"] = "Valid"
+    return json.dumps(payload)
+
+
 # ─── Import ──────────────────────────────────────────────────────────────────
 
 
@@ -280,6 +512,8 @@ def import_session(
     rig_id: str | None = None,
     dry_run: bool = False,
     migrations_dir: Path | None = None,
+    position_unit_um: float = DEFAULT_POSITION_UNIT_UM,
+    match_window_s: float = DEFAULT_MATCH_WINDOW_S,
 ) -> dict:
     if capture_type not in VALID_CAPTURE_TYPES:
         raise ValueError(
@@ -291,7 +525,15 @@ def import_session(
     rig_id = rig_id or session.get("rig_id")
     session_id = session.get("session_id") or str(uuid.uuid4())
     camera_name = session.get("camera")
-    default_night = session.get("night_id") or datetime.now().strftime("%Y-%m-%d")
+    # What the observer wrote on the card, if anything. Kept separate from the
+    # fallback below because "the card says 14 Sept" and "nobody said, so assume
+    # today" are different claims and only the first may override a timestamp.
+    declared_night = session.get("night_id")
+    default_night = declared_night or datetime.now().strftime("%Y-%m-%d")
+    # Appendix C.1 carries `saturation_adu` per body and ISO, measured by BP-2.
+    # It is the difference between a frame the dataset builder will accept and
+    # one it drops as ungated, so it is read here rather than guessed later.
+    declared_saturation = session.get("saturation_adu")
 
     candidates = [
         p for p in sorted(files_dir.rglob("*")) if p.is_file() and classify(p)
@@ -316,8 +558,15 @@ def import_session(
         "environment_rows": 0,
         "disturbance_rows": 0,
         "labels_written": 0,
+        "focus_runs_inserted": 0,
+        "focus_samples_inserted": 0,
+        "positions_unresolved": 0,
+        "samples_unmeasurable": 0,
     }
     staged: list[Path] = []
+    # Original filename -> frame id, so the field card's `files` entries can be
+    # linked to the rows this import just created.
+    filename_to_frame: dict[str, str] = {}
 
     try:
         for stem, group in group_by_capture(candidates).items():
@@ -349,7 +598,15 @@ def import_session(
                 iso = session.get("iso_or_gain")
 
             body = exif.get("Model") or camera_name
-            night = night_id_for(captured_at, default_night)
+            # A night derived from file mtime is a filesystem artifact, not an
+            # observation: copying a card in the morning would file every frame
+            # under the wrong night, and night is a split key. When the shutter
+            # time is unknown and the card declares a night, the card wins.
+            night = (
+                declared_night
+                if (metadata_source == "file_mtime" and declared_night)
+                else night_id_for(captured_at, default_night)
+            )
             frame_id = str(uuid.uuid4())
 
             assets = []
@@ -399,6 +656,11 @@ def import_session(
                 "session_log": str(log_path) if log_path else None,
                 "exif_model": str(body) if body else None,
                 "group_stem": stem,
+                # `focus_samples.position` and `frames.focuser_position` are
+                # bare integers. A motorised run counts steps and a dial
+                # indicator counts displacement; nothing in the number says
+                # which, so the unit travels with the frame.
+                "focuser_position_unit": f"{position_unit_um:g}um",
             }
 
             manifest = {
@@ -423,8 +685,9 @@ def import_session(
                         id, session_id, local_path, checksum_sha256,
                         exposure_s, gain, captured_at, quality_json,
                         rig_id, camera_name, capture_type, capture_status,
-                        iso, temperature_state, driver_name, acquisition_json
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        iso, temperature_state, driver_name, acquisition_json,
+                        night_id
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         frame_id,
@@ -434,7 +697,12 @@ def import_session(
                         exposure_s,
                         None,
                         captured_at,
-                        "{}",
+                        # Placeholder. A frame that turns out to belong to a
+                        # sweep gets a measured quality_json from
+                        # `import_focus_runs`; one that does not keeps this,
+                        # which the dataset builder correctly reads as "gate
+                        # never ran" and drops from any FQE set.
+                        quality_json_for(None, declared_saturation),
                         rig_id,
                         str(body) if body else None,
                         capture_type,
@@ -445,6 +713,7 @@ def import_session(
                         "missing",
                         "offline_import",
                         json.dumps(acquisition),
+                        night,
                     ),
                 )
                 for asset in assets:
@@ -476,6 +745,8 @@ def import_session(
 
             for asset in assets:
                 seen.add(asset["checksum_sha256"])
+                filename_to_frame[asset["original_filename"]] = frame_id
+                filename_to_frame.setdefault(Path(asset["original_filename"]).stem, frame_id)
             stats["frames_inserted"] += 1
 
         # ─── Environment + disturbance series ───
@@ -528,6 +799,26 @@ def import_session(
                 stats["disturbance_rows"] += 1
 
             stats["labels_written"] = attach_sky_labels(con, session_id)
+
+            # Focus runs last: every route in `resolve_position_frames` reads
+            # `frames` rows, so they must already be inserted, and the whole
+            # thing still rides the one transaction opened above.
+            stats.update(
+                import_focus_runs(
+                    con,
+                    log,
+                    filename_to_frame,
+                    session_id=session_id,
+                    rig_id=rig_id,
+                    default_night=default_night,
+                    declared_night=declared_night,
+                    capture_root=capture_root,
+                    declared_saturation=declared_saturation,
+                    position_unit_um=position_unit_um,
+                    match_window_s=match_window_s,
+                    dry_run=False,
+                )
+            )
             con.commit()
 
             # Only after the transaction commits do the staged files become
@@ -545,6 +836,287 @@ def import_session(
         raise
     finally:
         con.close()
+
+    return stats
+
+
+def resolve_position_frames(
+    con: sqlite3.Connection,
+    entry: dict,
+    filename_to_frame: dict[str, str],
+    session_id: str,
+    match_window_s: float,
+) -> tuple[list[str], str | None]:
+    """Frame ids belonging to one sweep position, and how they were found.
+
+    Three routes, tried in order of how much they can be trusted:
+
+    1. ``frame_ids`` — unambiguous. For a scripted capture that recorded them.
+    2. ``files`` — the schema's own field (Appendix C.5). Matched against the
+       frames imported in this run, then against `frame_assets.original_filename`
+       for frames imported earlier, so a re-run of the card after the files are
+       already in does not need the files present again.
+    3. ``t`` — a timestamp window, for frames the *daemon* captured during the
+       sweep while the operator turned the knob by hand. Last resort and
+       deliberately narrow: a sweep dwells seconds per position, so a loose
+       window silently attaches a frame to the wrong position, and a corrupted
+       position axis is indistinguishable from bad seeing afterwards.
+
+    Returns ``([], None)`` when nothing matches, so the caller can report the
+    position as unresolved instead of inventing a link.
+    """
+    explicit = entry.get("frame_ids") or []
+    if explicit:
+        found = [
+            row[0]
+            for fid in explicit
+            for row in con.execute("SELECT id FROM frames WHERE id = ?", (str(fid),))
+        ]
+        if found:
+            return found, "frame_ids"
+
+    names = entry.get("files") or []
+    if names:
+        resolved: list[str] = []
+        for name in names:
+            key = Path(str(name)).name
+            frame_id = filename_to_frame.get(key) or filename_to_frame.get(Path(key).stem)
+            if frame_id is None:
+                row = con.execute(
+                    "SELECT frame_id FROM frame_assets WHERE original_filename = ? LIMIT 1",
+                    (key,),
+                ).fetchone()
+                frame_id = row[0] if row else None
+            if frame_id and frame_id not in resolved:
+                resolved.append(frame_id)
+        if resolved:
+            return resolved, "files"
+
+    stamp = entry.get("t")
+    if stamp:
+        try:
+            target = datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+        except ValueError:
+            return [], None
+        if target.tzinfo is None:
+            target = target.astimezone()
+        rows = con.execute(
+            "SELECT id, captured_at FROM frames WHERE session_id = ?", (session_id,)
+        ).fetchall()
+        hits = []
+        for row in rows:
+            try:
+                got = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+            if got.tzinfo is None:
+                got = got.astimezone()
+            if abs((got - target).total_seconds()) <= match_window_s:
+                hits.append(row[0])
+        if hits:
+            return hits, "timestamp"
+
+    return [], None
+
+
+def position_value(entry: dict, position_unit_um: float) -> int | None:
+    """The integer position axis for one sweep entry.
+
+    ``position`` is taken verbatim when present — it is already in whatever unit
+    the run uses. ``reading_um`` is a dial-indicator displacement in micrometres
+    and is divided by ``position_unit_um`` to land on the same axis. The unit is
+    recorded per frame rather than assumed, because a motorised run's steps and
+    a hand-cranked run's micrometres are both integers and nothing in the number
+    itself says which it is.
+    """
+    if entry.get("position") is not None:
+        try:
+            return int(round(float(entry["position"])))
+        except (TypeError, ValueError):
+            return None
+    if entry.get("reading_um") is not None:
+        try:
+            return int(round(float(entry["reading_um"]) / float(position_unit_um)))
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+    return None
+
+
+def import_focus_runs(
+    con: sqlite3.Connection,
+    log: dict,
+    filename_to_frame: dict[str, str],
+    session_id: str,
+    rig_id: str | None,
+    default_night: str,
+    capture_root: Path,
+    declared_saturation: float | None,
+    declared_night: str | None = None,
+    position_unit_um: float = DEFAULT_POSITION_UNIT_UM,
+    match_window_s: float = DEFAULT_MATCH_WINDOW_S,
+    dry_run: bool = False,
+) -> dict:
+    """Turn the field card's ``runs[]`` array into `focus_runs` + `focus_samples`.
+
+    WHY THIS EXISTS
+
+    Spec Section 9.1: "Every autofocus run generates labeled training data
+    automatically — the highest-value dataset in the system." That holds for a
+    motorised focuser, where `/focus/run` drives the sweep and
+    `api/focus.rs::persist_focus_run` writes the rows. On a manual rack-and-
+    pinion it does not: the daemon cannot command the focuser, so no run is
+    recorded, and `build_focus_quality_dataset.py` — which reads
+    ``FROM focus_samples JOIN frames ON frames.id = focus_samples.frame_id`` —
+    cannot see the frames at all.
+
+    Runbook RB-2 is the primary focus-data procedure until an electronic
+    focuser exists. Without this function it produces files that no downstream
+    stage can read. With it, a hand-cranked sweep and a daemon-driven one land
+    in the same two tables and split on the same `run_id` group key.
+
+    WHAT IT DOES NOT CLAIM
+
+    ``state`` is `Imported`, never `Converged`. ``best_position`` is the
+    **sample argmin** over measured positions, not a fitted V-curve vertex;
+    on a 10 µm dial against a ~42 µm critical focus zone that is a coarse
+    estimate, and a Focus Offset Predictor built on these runs should refit
+    rather than trust it. Runs the card marks aborted keep every sample and are
+    stored as `Aborted`, because dropping them would put survivorship bias into
+    the one dataset that is expensive to collect.
+    """
+    stats = {
+        "focus_runs_inserted": 0,
+        "focus_samples_inserted": 0,
+        "positions_unresolved": 0,
+        "samples_unmeasurable": 0,
+    }
+
+    runs = [
+        run
+        for run in log.get("runs", [])
+        if str(run.get("run_type", "focus_sweep")) == "focus_sweep"
+    ]
+    if not runs:
+        return stats
+
+    for run in runs:
+        run_id = str(run.get("run_id") or uuid.uuid4())
+        positions = run.get("positions") or []
+        if not positions:
+            continue
+
+        samples: list[tuple] = []
+        for entry in positions:
+            position = position_value(entry, position_unit_um)
+            if position is None:
+                stats["positions_unresolved"] += 1
+                continue
+
+            frame_ids, _route = resolve_position_frames(
+                con, entry, filename_to_frame, session_id, match_window_s
+            )
+            if not frame_ids:
+                stats["positions_unresolved"] += 1
+                continue
+
+            for frame_id in frame_ids:
+                row = con.execute(
+                    "SELECT local_path, captured_at FROM frames WHERE id = ?",
+                    (frame_id,),
+                ).fetchone()
+                if row is None:
+                    stats["positions_unresolved"] += 1
+                    continue
+
+                path = Path(str(row[0]))
+                if not path.is_absolute():
+                    path = capture_root / path
+                source = readable_path(path)
+                measurement = measure_frame(source, declared_saturation) if source else None
+                if measurement is None:
+                    # `focus_samples.hfr` is NOT NULL and there is no honest
+                    # number to put there. Skipping loses this frame from the
+                    # run; fabricating one would corrupt the V-curve for every
+                    # frame in it.
+                    stats["samples_unmeasurable"] += 1
+                    continue
+
+                samples.append(
+                    (
+                        run_id,
+                        position,
+                        measurement["hfr_px"],
+                        measurement["hfd_px"],
+                        measurement["star_count"],
+                        entry.get("t") or row[1],
+                        frame_id,
+                        measurement,
+                    )
+                )
+
+        if not samples:
+            continue
+
+        best = min(samples, key=lambda s: s[2])
+        status = str(run.get("status", "completed")).lower()
+        state = RUN_STATE_ABORTED if status == "aborted" else RUN_STATE_IMPORTED
+        started = run.get("started_at") or samples[0][5]
+        completed = run.get("completed_at") or samples[-1][5]
+
+        if dry_run:
+            stats["focus_runs_inserted"] += 1
+            stats["focus_samples_inserted"] += len(samples)
+            continue
+
+        con.execute(
+            """
+            INSERT OR REPLACE INTO focus_runs (
+                id, rig_id, filter_name, start_position, best_position,
+                best_hfr, state, temperature, started_at, completed_at,
+                night_id, session_id
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                run_id,
+                rig_id or "unknown-rig",
+                run.get("filter"),
+                position_value(run, position_unit_um) or samples[0][1],
+                best[1] if state == RUN_STATE_IMPORTED else None,
+                best[2] if state == RUN_STATE_IMPORTED else None,
+                state,
+                run.get("ambient_temp_c"),
+                started,
+                completed,
+                # A sweep happens inside one observing night by definition,
+                # so a declared night on the card is authoritative for the run.
+                declared_night or night_id_for(str(started), default_night),
+                session_id,
+            ),
+        )
+        stats["focus_runs_inserted"] += 1
+
+        for run_key, position, hfr, hfd, stars, captured, frame_id, measurement in samples:
+            con.execute(
+                """
+                INSERT INTO focus_samples (
+                    run_id, position, hfr, hfd, star_count, captured_at, frame_id
+                ) VALUES (?,?,?,?,?,?,?)
+                """,
+                (run_key, position, hfr, hfd, stars, captured, frame_id),
+            )
+            # The position axis and the measurement both belong on the frame
+            # too: the FOP reads `frames.focuser_position`, and the dataset
+            # builder gates on `frames.quality_json`.
+            con.execute(
+                """
+                UPDATE frames
+                   SET focuser_position = ?,
+                       quality_json = ?
+                 WHERE id = ?
+                """,
+                (position, quality_json_for(measurement, declared_saturation), frame_id),
+            )
+            stats["focus_samples_inserted"] += 1
 
     return stats
 
@@ -630,6 +1202,28 @@ def main() -> int:
     parser.add_argument("--rig-id")
     parser.add_argument("--migrations", type=Path, help="Path to achernar-daemon/migrations")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--position-unit-um",
+        type=float,
+        default=DEFAULT_POSITION_UNIT_UM,
+        help=(
+            "Micrometres per unit of the integer position axis, applied to a "
+            "field card's `reading_um`. Default 1.0 stores micrometres. Use 10 "
+            "to store 0.01 mm dial-indicator divisions. Recorded per frame in "
+            "acquisition_json.focuser_position_unit."
+        ),
+    )
+    parser.add_argument(
+        "--match-window-s",
+        type=float,
+        default=DEFAULT_MATCH_WINDOW_S,
+        help=(
+            "Seconds a frame may sit from a sweep position's logged timestamp "
+            "and still be attached to it. Only used when the card gives no "
+            "`files` or `frame_ids`. Keep it tight: a wrong match corrupts the "
+            "position axis invisibly."
+        ),
+    )
     args = parser.parse_args()
 
     stats = import_session(
@@ -641,6 +1235,8 @@ def main() -> int:
         rig_id=args.rig_id,
         dry_run=args.dry_run,
         migrations_dir=args.migrations,
+        position_unit_um=args.position_unit_um,
+        match_window_s=args.match_window_s,
     )
 
     prefix = "would import" if args.dry_run else "imported"
@@ -652,10 +1248,33 @@ def main() -> int:
     ):
         if stats[key]:
             print(f"  {key.replace('_', ' ')}: {stats[key]}")
+
+    if stats["focus_runs_inserted"]:
+        print(
+            f"  focus runs: {stats['focus_runs_inserted']} "
+            f"({stats['focus_samples_inserted']} samples)"
+        )
+    if stats["positions_unresolved"]:
+        print(
+            f"  ! {stats['positions_unresolved']} sweep position(s) matched no frame — "
+            "check the `files` entries on the field card against the filenames on the card reader"
+        )
+    if stats["samples_unmeasurable"]:
+        print(
+            f"  ! {stats['samples_unmeasurable']} frame(s) in a sweep yielded no HFR "
+            "(too few stars, unreadable format, or RAW without a derived FITS) and "
+            "were left out of the run rather than given a fabricated width"
+        )
     if stats["metadata_from_mtime"]:
         print(
             "  ! some timestamps came from file mtime, not the shutter — "
             "recorded in acquisition_json.metadata_source"
+        )
+    if stats["frames_inserted"] and not stats["focus_runs_inserted"] and stats["focus_samples_inserted"] == 0:
+        print(
+            "  note: no focus runs in this import. Frames carry "
+            "saturation_gate_applied=false and the FQE dataset builder will skip "
+            "them — expected for a COC/calibration campaign, a problem for a sweep."
         )
     return 0
 

@@ -1,9 +1,22 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.21)
 project(ols_bridge LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# Keep the first Windows bring-up deliberately small and deterministic.  The
+# vendor SDK bundles currently checked out in this repository contain macOS
+# and Linux binaries, not MSVC import libraries.  They must never be selected
+# merely because their headers happen to be present on a Windows checkout.
+option(ACHERNAR_ENABLE_VENDOR_DRIVERS
+    "Build camera drivers backed by the bundled vendor SDKs" ON)
+if(WIN32 AND ACHERNAR_ENABLE_VENDOR_DRIVERS)
+    message(STATUS
+        "Bundled vendor camera SDKs are not Windows-compatible; ASI/SVB/Toup "
+        "drivers will remain disabled until Windows SDK packages are supplied")
+endif()
 
 # ─── Paths ───
 set(PROJECT_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../..")
@@ -23,7 +36,29 @@ if(APPLE)
 endif()
 
 # ─── Find required packages ───
-find_package(PkgConfig REQUIRED)
+#
+# Windows uses vcpkg's CMake package configs.  Requiring pkg-config there is
+# both unnecessary and hostile to a standard MSVC developer environment.  On
+# Unix we retain the existing pkg-config behavior, including Homebrew's keg
+# handling below.
+if(WIN32)
+    find_package(OpenCV 4 CONFIG REQUIRED COMPONENTS core imgproc imgcodecs)
+    find_package(TIFF REQUIRED)
+
+    set(ACHERNAR_OPENCV_INCLUDE_DIRS ${OpenCV_INCLUDE_DIRS})
+    set(ACHERNAR_OPENCV_LIBS ${OpenCV_LIBS})
+    set(ACHERNAR_TIFF_INCLUDE_DIRS ${TIFF_INCLUDE_DIRS})
+    if(TARGET TIFF::TIFF)
+        set(ACHERNAR_TIFF_LIBS TIFF::TIFF)
+    elseif(TARGET TIFF::tiff)
+        # Some libtiff config packages use the lower-case target name.
+        set(ACHERNAR_TIFF_LIBS TIFF::tiff)
+    else()
+        set(ACHERNAR_TIFF_LIBS ${TIFF_LIBRARIES})
+    endif()
+else()
+    find_package(PkgConfig REQUIRED)
+endif()
 
 # Homebrew's main `opencv` formula now tracks OpenCV 5, which ships opencv5.pc
 # and NOT opencv4.pc. OpenCV 4 is available only via the `opencv@4` formula,
@@ -54,8 +89,14 @@ if(APPLE)
     endif()
 endif()
 
-pkg_check_modules(OPENCV REQUIRED opencv4)
-pkg_check_modules(TIFF REQUIRED libtiff-4)
+if(NOT WIN32)
+    pkg_check_modules(OPENCV REQUIRED opencv4)
+    pkg_check_modules(TIFF REQUIRED libtiff-4)
+    set(ACHERNAR_OPENCV_INCLUDE_DIRS ${OPENCV_INCLUDE_DIRS})
+    set(ACHERNAR_OPENCV_LIBS ${OPENCV_LIBRARIES})
+    set(ACHERNAR_TIFF_INCLUDE_DIRS ${TIFF_INCLUDE_DIRS})
+    set(ACHERNAR_TIFF_LIBS ${TIFF_LIBRARIES})
+endif()
 
 # ─── Core sources (always compiled) ───
 set(BRIDGE_SOURCES
@@ -82,7 +123,7 @@ set(EXTRA_LINK_DIRS "")
 set(EXTRA_LIBS "")
 
 # Watch-directory pseudo-camera uses Linux inotify via OLS DirWatch.
-if(LINUX)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/wdir_camera.cpp)
 else()
     message(STATUS "ℹ️  Watch-directory camera disabled — requires Linux inotify")
@@ -94,7 +135,8 @@ endif()
 set(ASI_SDK_DIR "${SDKS_ROOT}/ASI/ASI_Camera_SDK/ASI_linux_mac_SDK_V1.41")
 set(ASI_INC "${ASI_SDK_DIR}/include")
 
-if(EXISTS "${ASI_INC}/ASICamera2.h")
+if(ACHERNAR_ENABLE_VENDOR_DRIVERS AND NOT WIN32 AND
+   EXISTS "${ASI_INC}/ASICamera2.h")
     message(STATUS "✅ ASI SDK found at ${ASI_SDK_DIR}")
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/asi_camera.cpp)
     list(APPEND EXTRA_INCLUDE_DIRS ${ASI_INC})
@@ -122,7 +164,8 @@ endif()
 set(SVB_SDK_DIR "${SDKS_ROOT}/Svbony/macos/SVBCameraSDK")
 set(SVB_INC "${SVB_SDK_DIR}/include")
 
-if(EXISTS "${SVB_INC}/SVBCameraSDK.h")
+if(ACHERNAR_ENABLE_VENDOR_DRIVERS AND NOT WIN32 AND
+   EXISTS "${SVB_INC}/SVBCameraSDK.h")
     message(STATUS "✅ SVBony SDK found at ${SVB_SDK_DIR}")
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/svb_camera.cpp)
     list(APPEND EXTRA_INCLUDE_DIRS ${SVB_INC})
@@ -153,7 +196,7 @@ find_file(TOUPCAM_HEADER toupcam.h
     NO_DEFAULT_PATH
 )
 
-if(TOUPCAM_HEADER)
+if(ACHERNAR_ENABLE_VENDOR_DRIVERS AND NOT WIN32 AND TOUPCAM_HEADER)
     get_filename_component(TOUP_INC "${TOUPCAM_HEADER}" DIRECTORY)
     message(STATUS "✅ ToupTek SDK found: ${TOUPCAM_HEADER}")
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/toup_camera.cpp)
@@ -187,10 +230,12 @@ set(INDI_HINT_PREFIXES
 )
 list(REMOVE_ITEM INDI_HINT_PREFIXES "")
 
-pkg_check_modules(LIBINDI QUIET libindi)
-pkg_check_modules(INDICLIENT QUIET indiclient)
+if(NOT WIN32)
+    pkg_check_modules(LIBINDI QUIET libindi)
+    pkg_check_modules(INDICLIENT QUIET indiclient)
+endif()
 
-if(NOT LIBINDI_FOUND AND NOT INDICLIENT_FOUND)
+if(NOT WIN32 AND NOT LIBINDI_FOUND AND NOT INDICLIENT_FOUND)
     find_path(INDI_INCLUDE_DIR
         NAMES libindi/baseclient.h
         PATHS ${INDI_HINT_PREFIXES}
@@ -203,7 +248,9 @@ if(NOT LIBINDI_FOUND AND NOT INDICLIENT_FOUND)
     )
 endif()
 
-if(LIBINDI_FOUND OR INDICLIENT_FOUND OR (INDI_INCLUDE_DIR AND INDI_CLIENT_LIBRARY))
+if(NOT WIN32 AND
+   (LIBINDI_FOUND OR INDICLIENT_FOUND OR
+    (INDI_INCLUDE_DIR AND INDI_CLIENT_LIBRARY)))
     message(STATUS "✅ INDI found — INDI mount/camera drivers enabled")
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/indi_mount.cpp)
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/indi_camera.cpp)
@@ -242,25 +289,44 @@ endif()
 # ═══════════════════════════════════════════════════════════════════
 #  UVC (USB video cameras / webcams, optional — requires libuvc)
 # ═══════════════════════════════════════════════════════════════════
-pkg_check_modules(LIBUVC libuvc)
-if(LIBUVC_FOUND)
+if(WIN32)
+    # Use Media Foundation through the standard Windows camera driver. This
+    # deliberately avoids libusb/WinUSB and therefore does not require Zadig
+    # or break the camera for SharpCap and other astronomy applications.
+    set(WINDOWS_MF_CAMERA_SOURCE "${BRIDGE_SRC}/windows_mf_camera.cpp")
+    if(EXISTS "${WINDOWS_MF_CAMERA_SOURCE}")
+        message(STATUS "Windows Media Foundation camera driver enabled")
+        list(APPEND BRIDGE_SOURCES ${WINDOWS_MF_CAMERA_SOURCE})
+        list(APPEND EXTRA_LIBS
+            mfplat mf mfreadwrite mfuuid strmiids ole32 oleaut32)
+        add_definitions(-DWITH_UVC)
+    else()
+        message(STATUS
+            "Windows Media Foundation source not present - USB video driver disabled")
+    endif()
+else()
+    pkg_check_modules(LIBUVC QUIET libuvc)
+endif()
+if(NOT WIN32 AND LIBUVC_FOUND)
     message(STATUS "✅ libuvc found — UVC camera driver enabled")
     list(APPEND BRIDGE_SOURCES ${OLS_SRC}/uvc_camera.cpp)
     list(APPEND EXTRA_INCLUDE_DIRS ${LIBUVC_INCLUDE_DIRS})
     list(APPEND EXTRA_LINK_DIRS ${LIBUVC_LIBRARY_DIRS})
     list(APPEND EXTRA_LIBS ${LIBUVC_LIBRARIES})
     add_definitions(-DWITH_UVC)
-else()
+elseif(NOT WIN32)
     message(STATUS "ℹ️  libuvc not found — UVC camera driver disabled")
 endif()
 
 # ═══════════════════════════════════════════════════════════════════
 #  INDIGO (optional — requires INDIGO libraries)
 # ═══════════════════════════════════════════════════════════════════
-find_file(INDIGO_HEADER indigo/indigo_bus.h
-    PATHS "/opt/homebrew/include" "/usr/local/include" "/usr/include"
-)
-if(INDIGO_HEADER)
+if(NOT WIN32)
+    find_file(INDIGO_HEADER indigo/indigo_bus.h
+        PATHS "/opt/homebrew/include" "/usr/local/include" "/usr/include"
+    )
+endif()
+if(NOT WIN32 AND INDIGO_HEADER)
     get_filename_component(INDIGO_INC_DIR "${INDIGO_HEADER}" DIRECTORY)  # .../indigo/
     get_filename_component(INDIGO_INC_DIR "${INDIGO_INC_DIR}" DIRECTORY) # .../include/
     message(STATUS "✅ INDIGO found — INDIGO camera driver enabled (${INDIGO_INC_DIR})")
@@ -287,9 +353,11 @@ endif()
 #
 # Probe pkg-config first (LibRaw installs libraw.pc), then fall back to a
 # header search so source builds and non-pkg-config installs still work.
-pkg_check_modules(LIBRAW QUIET libraw)
+if(NOT WIN32)
+    pkg_check_modules(LIBRAW QUIET libraw)
+endif()
 
-if(NOT LIBRAW_FOUND)
+if(NOT WIN32 AND NOT LIBRAW_FOUND)
     find_file(LIBRAW_HEADER libraw/libraw.h
         PATHS "/opt/homebrew/include" "/usr/local/include" "/usr/include" "/opt/local/include"
     )
@@ -299,7 +367,7 @@ if(NOT LIBRAW_FOUND)
     )
 endif()
 
-if(LIBRAW_FOUND OR (LIBRAW_HEADER AND LIBRAW_LIBRARY))
+if(NOT WIN32 AND (LIBRAW_FOUND OR (LIBRAW_HEADER AND LIBRAW_LIBRARY)))
     if(LIBRAW_FOUND)
         message(STATUS "✅ LibRaw found via pkg-config ${LIBRAW_VERSION} — RAW decoding enabled")
         list(APPEND EXTRA_INCLUDE_DIRS ${LIBRAW_INCLUDE_DIRS})
@@ -324,10 +392,12 @@ endif()
 # ═══════════════════════════════════════════════════════════════════
 #  GPhoto2 (DSLR / mirrorless support, optional)
 # ═══════════════════════════════════════════════════════════════════
-find_file(GPHOTO2_HEADER gphoto2/gphoto2.h
-    PATHS "/opt/homebrew/include" "/usr/local/include" "/usr/include"
-)
-if(GPHOTO2_HEADER)
+if(NOT WIN32)
+    find_file(GPHOTO2_HEADER gphoto2/gphoto2.h
+        PATHS "/opt/homebrew/include" "/usr/local/include" "/usr/include"
+    )
+endif()
+if(NOT WIN32 AND GPHOTO2_HEADER)
     # GPHOTO2_HEADER is e.g. /opt/homebrew/.../include/gphoto2/gphoto2.h
     # We need the grandparent dir (the "include/" dir) on the include path
     get_filename_component(GPHOTO2_INC_DIR "${GPHOTO2_HEADER}" DIRECTORY)  # .../gphoto2/
@@ -352,16 +422,25 @@ else()
     message(STATUS "ℹ️  GPhoto2 not found — DSLR camera driver disabled")
 endif()
 
+# ══════════════════════════════════════════════════════════════════
+#  Build the native bridge
 # ═══════════════════════════════════════════════════════════════════
-#  Build the static library
-# ═══════════════════════════════════════════════════════════════════
-add_library(ols_bridge STATIC ${BRIDGE_SOURCES})
+# A DLL is intentional on Windows: CMake can then own the complete native link
+# graph (OpenCV, TIFF and their vcpkg dependencies), while Cargo links only the
+# generated import library.  Unix keeps the historical static bridge because
+# build.rs already emits the corresponding pkg-config link flags there.
+if(WIN32)
+    add_library(ols_bridge SHARED ${BRIDGE_SOURCES})
+    set_target_properties(ols_bridge PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
+else()
+    add_library(ols_bridge STATIC ${BRIDGE_SOURCES})
+endif()
 
 target_include_directories(ols_bridge PRIVATE
     ${BRIDGE_INC}
     ${OLS_INC}
-    ${OPENCV_INCLUDE_DIRS}
-    ${TIFF_INCLUDE_DIRS}
+    ${ACHERNAR_OPENCV_INCLUDE_DIRS}
+    ${ACHERNAR_TIFF_INCLUDE_DIRS}
     # Shims MUST come before system paths so our cppcms/booster
     # replacements are found instead of any real installations
     ${SHIMS_DIR}
@@ -372,25 +451,47 @@ target_include_directories(ols_bridge PRIVATE
 
 target_link_directories(ols_bridge PRIVATE ${EXTRA_LINK_DIRS})
 
-target_link_libraries(ols_bridge
-    ${OPENCV_LIBRARIES}
-    ${TIFF_LIBRARIES}
+target_link_libraries(ols_bridge PRIVATE
+    ${ACHERNAR_OPENCV_LIBS}
+    ${ACHERNAR_TIFF_LIBS}
     ${EXTRA_LIBS}
 )
+
+if(WIN32)
+    # Alpaca discovery and HTTP transport use Winsock and adapter enumeration.
+    target_link_libraries(ols_bridge PRIVATE ws2_32 iphlpapi)
+
+    # Put vcpkg runtime DLLs alongside ols_bridge.dll. build.rs subsequently
+    # stages this directory beside Cargo executables and test binaries.
+    add_custom_command(TARGET ols_bridge POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_RUNTIME_DLLS:ols_bridge>
+                $<TARGET_FILE_DIR:ols_bridge>
+        COMMAND_EXPAND_LISTS
+        VERBATIM)
+endif()
 
 target_compile_definitions(ols_bridge PRIVATE
     OLS_BRIDGE_NO_CPPCMS=1
 )
 
-# Suppress warnings in third-party code
-target_compile_options(ols_bridge PRIVATE
-    -Wno-deprecated-declarations
-    -Wno-unused-parameter
-    -Wno-sign-compare
-    -Wno-unused-variable
-    -Wno-unused-function
-    -Wno-missing-field-initializers
-)
+# Suppress warnings in third-party code without passing GCC flags to cl.exe.
+if(MSVC)
+    target_compile_options(ols_bridge PRIVATE /W3 /EHsc /permissive- /utf-8)
+    target_compile_definitions(ols_bridge PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        _USE_MATH_DEFINES
+        _CRT_SECURE_NO_WARNINGS)
+else()
+    target_compile_options(ols_bridge PRIVATE
+        -Wno-deprecated-declarations
+        -Wno-unused-parameter
+        -Wno-sign-compare
+        -Wno-unused-variable
+        -Wno-unused-function
+        -Wno-missing-field-initializers)
+endif()
 
 # ─── Status Summary ───
 message(STATUS "")

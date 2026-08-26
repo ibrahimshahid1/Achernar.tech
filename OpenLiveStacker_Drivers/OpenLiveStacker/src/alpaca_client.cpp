@@ -319,25 +319,52 @@ namespace ols {
             booster::aio::basic_socket s;
             s.open(booster::aio::pf_inet,booster::aio::sock_datagram);
             int enable = 1;
-            if(setsockopt(s.native(),SOL_SOCKET,SO_BROADCAST,(char const *)&enable,sizeof(enable)) < 0)
-                throw std::system_error(errno, std::generic_category()); 
+            if(setsockopt(s.native(),SOL_SOCKET,SO_BROADCAST,(char const *)&enable,sizeof(enable)) < 0) {
+#ifdef _WIN32
+                throw std::system_error(::WSAGetLastError(), std::system_category());
+#else
+                throw std::system_error(errno, std::generic_category());
+#endif
+            }
+#ifdef _WIN32
+            // Winsock expects SO_RCVTIMEO as a DWORD count of milliseconds;
+            // POSIX sockets expect timeval. Passing timeval compiles on
+            // Windows but produces an invalid timeout value.
+            DWORD receive_timeout_ms = 500;
+            if(setsockopt(s.native(),SOL_SOCKET,SO_RCVTIMEO,
+                          reinterpret_cast<char const *>(&receive_timeout_ms),
+                          sizeof(receive_timeout_ms)) < 0) {
+                throw std::system_error(::WSAGetLastError(), std::system_category());
+            }
+#else
             struct timeval tv;
             tv.tv_sec = 0;
             tv.tv_usec = 500000;
             if(setsockopt(s.native(),SOL_SOCKET,SO_RCVTIMEO,(char const *)&tv,sizeof(tv)) < 0) {
-                throw std::system_error(errno, std::generic_category()); 
+                throw std::system_error(errno, std::generic_category());
             }
+#endif
             std::string message = "alpacadiscovery1";
             for(std::string const &target_ip :baddr) {
                 booster::aio::endpoint ep(target_ip,32227);
                 auto addr = ep.raw();
                 for(int attempts = 0; attempts < 2; attempts ++) {
-                    if(sendto(s.native(),message.c_str(),message.size(),0,addr.first,addr.second) < 0) {
-                        throw std::system_error(errno, std::generic_category()); 
+                    if(sendto(s.native(),message.c_str(),
+                              static_cast<int>(message.size()),0,
+                              addr.first,addr.second) < 0) {
+#ifdef _WIN32
+                        throw std::system_error(::WSAGetLastError(), std::system_category());
+#else
+                        throw std::system_error(errno, std::generic_category());
+#endif
                     }
                     char buffer[256] = {};
                     struct sockaddr_in sender;
+#ifdef _WIN32
+                    int len = sizeof(sender);
+#else
                     socklen_t len = sizeof(sender);
+#endif
                     if(recvfrom(s.native(),buffer,sizeof(buffer) - 1,0,(struct sockaddr *)&sender,&len) > 0) {
                         booster::aio::endpoint remote_ep;
                         remote_ep.raw((struct sockaddr *)&sender,len);

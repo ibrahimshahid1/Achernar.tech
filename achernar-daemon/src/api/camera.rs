@@ -163,7 +163,22 @@ fn select_format(
             "The connected camera reports no acquisition formats",
         ));
     }
-    let index = requested.unwrap_or(0);
+    // UVC descriptor order is device-defined.  In particular, inexpensive
+    // cameras often advertise YUY2 before MJPEG; YUY2 is useful to the vision
+    // loop but the browser preview encoder cannot display it yet.  An omitted
+    // index means "give me a usable preview", while an explicit index remains
+    // exact and is never silently substituted.
+    let index = requested.unwrap_or_else(|| {
+        formats
+            .iter()
+            .position(|format| format.format == OlsStreamType::Mjpeg)
+            .or_else(|| {
+                formats
+                    .iter()
+                    .position(|format| stream_type_previewable(format.format))
+            })
+            .unwrap_or(0)
+    });
     let format = formats.get(index).copied().ok_or_else(|| {
         ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -2145,19 +2160,20 @@ mod tests {
     }
 
     #[test]
-    fn phase1_camera_select_format_defaults_to_first_and_accepts_exact_index() {
+    fn phase1_camera_select_format_defaults_to_previewable_and_accepts_exact_index() {
         let formats = [
+            stream_format(OlsStreamType::Yuv2, 1920, 1080, 1, 5.0),
             stream_format(OlsStreamType::Mjpeg, 1920, 1080, 1, 30.0),
             stream_format(OlsStreamType::Mono16, 1280, 960, 2, 0.0),
         ];
 
         let (default_index, default_format) = select_format(&formats, None).unwrap();
-        assert_eq!(default_index, 0);
+        assert_eq!(default_index, 1);
         assert_eq!(default_format.format, OlsStreamType::Mjpeg);
         assert_eq!((default_format.width, default_format.height), (1920, 1080));
 
-        let (selected_index, selected_format) = select_format(&formats, Some(1)).unwrap();
-        assert_eq!(selected_index, 1);
+        let (selected_index, selected_format) = select_format(&formats, Some(2)).unwrap();
+        assert_eq!(selected_index, 2);
         assert_eq!(selected_format.format, OlsStreamType::Mono16);
         assert_eq!(selected_format.bin, 2);
     }
