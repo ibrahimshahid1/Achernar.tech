@@ -4,6 +4,10 @@
 //! the lifecycle of OLS C++ objects and convert between C and Rust types.
 
 use super::ols_ffi;
+use crate::processing::debayer::{
+    ByteOrder, CfaPattern, NativeThreshold, PixelGeometry, SampleDomain, SampleType, SensorColor,
+    SensorDescriptor,
+};
 use anyhow::{anyhow, Result};
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
@@ -158,13 +162,169 @@ pub struct FrameData {
     /// and from the RAW decoder's `white_level` on the capture path. No driver
     /// reports it today; when one can, this is the field it fills.
     pub saturation_adu: Option<f32>,
+    /// Explicit pixel-domain contract. Absence means scientific analysis is
+    /// unavailable; previews can still consume the original buffer.
+    pub sensor_descriptor: Option<SensorDescriptor>,
+}
+
+impl FrameData {
+    pub fn analysis_sensor_descriptor(&self) -> crate::error::Result<&SensorDescriptor> {
+        let unavailable = |reason: &str| {
+            crate::error::AchernarError::Hardware(crate::error::HardwareError::Communication(
+                reason.to_string(),
+            ))
+        };
+        if self.source.is_some() {
+            return Err(unavailable(
+                "Legacy SourceImage pixels have an unqualified decode domain (A04)",
+            ));
+        }
+        let descriptor = self.sensor_descriptor.as_ref().ok_or_else(|| {
+            unavailable(
+            "Scientific analysis unavailable: no qualified sensor/CFA descriptor for this frame"
+        )
+        })?;
+        if descriptor.width != self.width.max(0) as usize
+            || descriptor.height != self.height.max(0) as usize
+        {
+            return Err(unavailable(
+                "Sensor descriptor dimensions differ from frame identity",
+            ));
+        }
+        let compatible = match (self.format, &descriptor.sample_type, &descriptor.color) {
+            (ols_ffi::OlsStreamType::Mono8, SampleType::U8, SensorColor::Mono)
+            | (ols_ffi::OlsStreamType::Mono16, SampleType::U16, SensorColor::Mono) => {
+                self.bayer == ols_ffi::OlsBayerType::Na
+            }
+            (
+                ols_ffi::OlsStreamType::Raw8,
+                SampleType::U8,
+                SensorColor::Bayer {
+                    pattern,
+                    origin_x,
+                    origin_y,
+                },
+            )
+            | (
+                ols_ffi::OlsStreamType::Raw16,
+                SampleType::U16,
+                SensorColor::Bayer {
+                    pattern,
+                    origin_x,
+                    origin_y,
+                },
+            ) => bayer_pattern(self.bayer)
+                .map(|actual| {
+                    (0..2).all(|y| {
+                        (0..2).all(|x| {
+                            pattern.channel(x + origin_x % 2, y + origin_y % 2)
+                                == actual.channel(x, y)
+                        })
+                    })
+                })
+                .unwrap_or(false),
+            _ => false,
+        };
+        if !compatible {
+            return Err(unavailable("Preview, unknown CFA, or incompatible sensor descriptor cannot enter scientific analysis"));
+        }
+        descriptor
+            .validate(self.data.len())
+            .map_err(|error| unavailable(&error.to_string()))?;
+        Ok(descriptor)
+    }
+}
+
+fn bayer_pattern(bayer: ols_ffi::OlsBayerType) -> Option<CfaPattern> {
+    match bayer {
+        ols_ffi::OlsBayerType::Rg => Some(CfaPattern::Rggb),
+        ols_ffi::OlsBayerType::Bg => Some(CfaPattern::Bggr),
+        ols_ffi::OlsBayerType::Gr => Some(CfaPattern::Grbg),
+        ols_ffi::OlsBayerType::Gb => Some(CfaPattern::Gbrg),
+        ols_ffi::OlsBayerType::Na => None,
+    }
+}
+
+/// The native stream ABI supplies packed host-endian rows and Bayer phase at
+/// buffer origin. Restrict color to full-ROI/bin1 because it does not convey
+/// crop offsets or Bayer-aware binning. Coordinates refer only to this buffer.
+fn stream_sensor_descriptor(
+    format: &StreamFormat,
+    frame: &ols_ffi::OlsFrame,
+    has_source: bool,
+    saturation_adu: Option<f32>,
+) -> Option<SensorDescriptor> {
+    if has_source
+        || frame.format != format.format
+        || frame.width <= 0
+        || frame.height <= 0
+        || frame.width != format.width
+        || frame.height != format.height
+    {
+        return None;
+    }
+    let sample_type = match frame.format {
+        ols_ffi::OlsStreamType::Mono8 | ols_ffi::OlsStreamType::Raw8 => SampleType::U8,
+        ols_ffi::OlsStreamType::Mono16 | ols_ffi::OlsStreamType::Raw16 => SampleType::U16,
+        _ => return None,
+    };
+    let color = match frame.format {
+        ols_ffi::OlsStreamType::Mono8 | ols_ffi::OlsStreamType::Mono16
+            if frame.bayer == ols_ffi::OlsBayerType::Na =>
+        {
+            SensorColor::Mono
+        }
+        ols_ffi::OlsStreamType::Raw8 | ols_ffi::OlsStreamType::Raw16
+            if format.bin == 1 && format.roi_num == format.roi_den && format.roi_den > 0 =>
+        {
+            SensorColor::Bayer {
+                pattern: bayer_pattern(frame.bayer)?,
+                origin_x: 0,
+                origin_y: 0,
+            }
+        }
+        _ => return None,
+    };
+    let width = frame.width as usize;
+    let height = frame.height as usize;
+    let bytes_per_sample = if matches!(sample_type, SampleType::U8) {
+        1
+    } else {
+        2
+    };
+    let stride = width.checked_mul(bytes_per_sample)?;
+    if frame.data_size != stride.checked_mul(height)? {
+        return None;
+    }
+    Some(SensorDescriptor {
+        schema_version: 1,
+        width,
+        height,
+        row_stride_bytes: stride,
+        sample_type,
+        byte_order: if cfg!(target_endian = "little") {
+            ByteOrder::Little
+        } else {
+            ByteOrder::Big
+        },
+        color,
+        domain: SampleDomain::NativeAdu,
+        geometry: PixelGeometry::identity("stream_buffer_pixels"),
+        saturation: saturation_adu
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .map(|adu| NativeThreshold {
+                adu,
+                source: "camera_configuration_declaration".to_string(),
+            }),
+        calibration_ids: Vec::new(),
+    })
 }
 
 /// One file a single exposure produced, copied out of the bridge.
 #[derive(Debug, Clone)]
 pub struct CapturedAsset {
-    /// Path on the camera's storage, kept so the file can be deleted after the
-    /// bytes are durably persisted.
+    /// Original camera path for provenance and later reconciliation. A local
+    /// commit alone does not authorize deleting the camera copy.
     pub camera_path: String,
     /// Lowercase extension without the dot: "cr3", "cr2", "rw2", "jpg".
     pub extension: String,
@@ -196,7 +356,7 @@ impl CapturedAsset {
     }
 }
 
-/// The complete result of one shutter actuation.
+/// Recovered outcome of one shutter actuation; inspect bundle completeness.
 ///
 /// Everything here describes that single exposure and nothing else. It never
 /// passes through the streaming frame callback, so there is no window in which
@@ -217,6 +377,9 @@ pub struct StillCapture {
     pub iso_label: String,
     /// Every file the exposure produced — two on a RAW+JPEG body.
     pub assets: Vec<CapturedAsset>,
+    /// Event/download evidence. Unknown expected companion count is preserved.
+    pub bundle: serde_json::Value,
+    pub bundle_complete: bool,
 }
 
 impl StillCapture {
@@ -236,9 +399,8 @@ impl StillCapture {
 
 /// Live handle to a completed capture inside the bridge.
 ///
-/// Held only long enough to copy the bytes out and, later, to delete the files
-/// from the camera. `Drop` releases the bridge-side buffers, so forgetting to
-/// clean up leaks nothing.
+/// Held long enough to copy the bytes out. `Drop` releases bridge buffers and
+/// retains camera files.
 pub struct StillCaptureHandle {
     handle: *mut ols_ffi::OlsStillCapture,
 }
@@ -425,6 +587,8 @@ impl OlsCameraDriver {
         Ok(OlsCamera {
             handle: cam_handle,
             _callback_data: None,
+            fault_handler: None,
+            stream_progress: Arc::new(Mutex::new(StreamProgress::default())),
         })
     }
 }
@@ -441,6 +605,8 @@ impl Drop for OlsCameraDriver {
 pub struct OlsCamera {
     handle: *mut ols_ffi::OlsCamera,
     _callback_data: Option<Box<CallbackData>>,
+    fault_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    stream_progress: Arc<Mutex<StreamProgress>>,
 }
 
 // Safety: OLS camera uses internal locking
@@ -454,9 +620,45 @@ struct CallbackData {
     /// than read from a global so two cameras on one rig can carry different
     /// values. See `FrameData::saturation_adu`.
     saturation_adu: Option<f32>,
+    format: StreamFormat,
+    fault_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    stream_progress: Arc<Mutex<StreamProgress>>,
+}
+
+#[derive(Default)]
+struct StreamProgress {
+    last_frame: Option<std::time::Instant>,
+    /// Only positive, declared preview rates have a bounded frame cadence.
+    /// The -1 sentinel may be a minutes-long astronomical exposure.
+    max_silence: Option<std::time::Duration>,
 }
 
 impl OlsCamera {
+    pub fn set_fault_handler(&mut self, handler: Arc<dyn Fn(String) + Send + Sync>) {
+        self.fault_handler = Some(handler);
+    }
+
+    /// True means a passive hardware transaction succeeded; false means this
+    /// driver's idle presence check is explicitly unsupported.
+    pub fn check_connection(&self) -> Result<bool> {
+        let rc = unsafe { ols_ffi::ols_camera_check_health(self.handle) };
+        if rc == ols_ffi::OLS_ERR_NOT_SUPPORTED {
+            return Ok(false);
+        }
+        check(rc)?;
+        Ok(true)
+    }
+
+    pub fn stream_health(&self) -> Result<()> {
+        let progress = self.stream_progress.lock().unwrap();
+        if let (Some(last), Some(limit)) = (progress.last_frame, progress.max_silence) {
+            if last.elapsed() > limit {
+                return Err(anyhow!("Camera preview stopped delivering frames"));
+            }
+        }
+        Ok(())
+    }
+
     /// Get camera name
     pub fn name(&self) -> Result<String> {
         let mut name_buf = vec![0u8; 256];
@@ -521,12 +723,24 @@ impl OlsCamera {
         stream_generation: u64,
         active_generation: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<()> {
+        if self.supports_still_capture() && !format.is_liveview() {
+            return Err(anyhow!("DSLR still streams cannot archive complete exposure bundles; use dedicated still capture (A02)."));
+        }
         let cb_data = Box::new(CallbackData {
             latest_frame: frame_store,
             saturation_adu,
+            format: format.clone(),
             stream_generation,
             active_generation,
+            fault_handler: self.fault_handler.clone(),
+            stream_progress: self.stream_progress.clone(),
         });
+        *self.stream_progress.lock().unwrap() = StreamProgress {
+            last_frame: Some(std::time::Instant::now()),
+            max_silence: (format.framerate.is_finite() && format.framerate > 0.0).then(|| {
+                std::time::Duration::from_secs_f64((10.0 / format.framerate as f64).max(5.0))
+            }),
+        };
         let user_data = &*cb_data as *const CallbackData as *mut c_void;
 
         let ffi_fmt: ols_ffi::OlsStreamFormat = format.into();
@@ -551,6 +765,7 @@ impl OlsCamera {
             check(ols_ffi::ols_camera_stop_stream(self.handle))?;
         }
         self._callback_data = None;
+        *self.stream_progress.lock().unwrap() = StreamProgress::default();
         Ok(())
     }
 
@@ -587,6 +802,10 @@ impl OlsCamera {
 
     /// Set camera parameter
     pub fn set_parameter(&self, id: ols_ffi::OlsCamOptionId, value: f64) -> Result<()> {
+        if id == ols_ffi::OlsCamOptionId::KeepImages {
+            crate::storage::capture_retention::validate_legacy_keep_images(value)
+                .map_err(|reason| anyhow!(reason))?;
+        }
         unsafe {
             check(ols_ffi::ols_camera_set_param(
                 self.handle as *mut _,
@@ -678,10 +897,9 @@ impl OlsCamera {
     /// 2.0 takes seconds. Call this from `spawn_blocking`, never on an async
     /// runtime thread.
     ///
-    /// The returned handle is kept alive alongside the copied data so the
-    /// caller can pass it to `delete_captured` after the bytes are safely on
-    /// disk. Dropping it without deleting simply leaves the files on the card,
-    /// which is the safe direction to fail.
+    /// Dropping the returned handle releases bridge buffers without deleting
+    /// camera files. Camera-file deletion is unavailable pending archive
+    /// durability/recovery qualification; a local commit alone is insufficient.
     pub fn capture_still(
         &self,
         exposure_seconds: f64,
@@ -697,7 +915,7 @@ impl OlsCamera {
 
         let mut raw: *mut ols_ffi::OlsStillCapture = std::ptr::null_mut();
         unsafe {
-            check(ols_ffi::ols_camera_capture_still(
+            check(ols_ffi::ols_camera_capture_still_snapshot(
                 self.handle,
                 &request,
                 &mut raw,
@@ -720,6 +938,45 @@ impl OlsCamera {
         };
         unsafe { check(ols_ffi::ols_capture_info(handle.handle, &mut info))? };
 
+        let mut evidence = ols_ffi::OlsCaptureBundleInfo {
+            evidence_version: 0,
+            struct_size: std::mem::size_of::<ols_ffi::OlsCaptureBundleInfo>() as u32,
+            event_complete: 0,
+            discovered_count: 0,
+            downloaded_count: 0,
+            missing_count: 0,
+            error_count: 0,
+            bundle_complete: 0,
+            evidence_json: std::ptr::null(),
+            error: std::ptr::null(),
+        };
+        unsafe {
+            check(ols_ffi::ols_capture_bundle_info(
+                handle.handle,
+                &mut evidence,
+            ))?
+        };
+        let evidence_text = cstr_or_default(evidence.evidence_json);
+        let parsed_evidence = serde_json::from_str::<serde_json::Value>(&evidence_text);
+        let evidence_valid = parsed_evidence.as_ref().is_ok_and(|json| {
+            json["evidence_version"] == 1
+                && json["triggered"] == true
+                && json["event_complete"] == true
+                && json["completion_grace_complete"] == true
+                && json["bundle_complete"] == true
+        });
+        let mut bundle = parsed_evidence.unwrap_or_else(|error| {
+            serde_json::json!({
+                "bundle_complete": false,
+                "evidence_parse_error": error.to_string(),
+                "unparsed_evidence": evidence_text,
+            })
+        });
+        if !bundle.is_object() {
+            bundle = serde_json::json!({"bundle_complete": false, "invalid_evidence": bundle});
+        }
+        let mut copy_errors = Vec::new();
+
         let mut assets = Vec::with_capacity(info.asset_count.max(0) as usize);
         for i in 0..info.asset_count {
             let mut a = ols_ffi::OlsCapturedAsset {
@@ -728,9 +985,14 @@ impl OlsCamera {
                 bytes: std::ptr::null(),
                 byte_length: 0,
             };
-            unsafe { check(ols_ffi::ols_capture_asset_get(handle.handle, i, &mut a))? };
+            if let Err(error) =
+                unsafe { check(ols_ffi::ols_capture_asset_get(handle.handle, i, &mut a)) }
+            {
+                copy_errors.push(format!("Asset {i} could not be copied: {error}"));
+                continue;
+            }
             if a.bytes.is_null() || a.byte_length == 0 {
-                tracing::warn!("Capture asset {} came back empty; skipping", i);
+                copy_errors.push(format!("Asset {i} was empty"));
                 continue;
             }
             assets.push(CapturedAsset {
@@ -740,9 +1002,21 @@ impl OlsCamera {
             });
         }
 
-        if assets.is_empty() {
-            return Err(anyhow!("Capture produced no readable assets"));
-        }
+        let bundle_complete = evidence.evidence_version == 1
+            && evidence.bundle_complete == 1
+            && evidence.event_complete == 1
+            && evidence.discovered_count > 0
+            && evidence.discovered_count == evidence.downloaded_count
+            && evidence.downloaded_count as usize == assets.len()
+            && evidence.missing_count == 0
+            && evidence.error_count == 0
+            && evidence_valid
+            && copy_errors.is_empty();
+        bundle["bundle_complete"] = serde_json::json!(bundle_complete);
+        bundle["copy_errors"] = serde_json::json!(copy_errors);
+        bundle["discovered_count"] = serde_json::json!(evidence.discovered_count);
+        bundle["downloaded_count"] = serde_json::json!(assets.len());
+        bundle["missing_count"] = serde_json::json!(evidence.missing_count);
 
         let capture = StillCapture {
             started_at: info.started_at,
@@ -752,22 +1026,10 @@ impl OlsCamera {
             shutter_label: cstr_or_default(info.shutter_label),
             iso_label: cstr_or_default(info.iso_label),
             assets,
+            bundle,
+            bundle_complete,
         };
         Ok((capture, handle))
-    }
-
-    /// Delete a capture's files from the camera.
-    ///
-    /// Call only after the bytes are durably persisted. Failure here is not
-    /// fatal — it wastes card space, whereas deleting too early destroys the
-    /// exposure.
-    pub fn delete_captured(&self, handle: &StillCaptureHandle) -> Result<()> {
-        unsafe {
-            check(ols_ffi::ols_camera_delete_captured(
-                self.handle,
-                handle.handle,
-            ))
-        }
     }
 
     /// Get supported option IDs
@@ -828,10 +1090,29 @@ unsafe extern "C" fn frame_callback_trampoline(
     }
     let frame_ref = &*frame;
 
-    // Skip error frames
+    // A terminal SDK error invalidates publication immediately. Cleanup runs
+    // off this callback: stopping here can join the current native thread.
     if frame_ref.format == ols_ffi::OlsStreamType::Error {
+        let reason = if !frame_ref.data.is_null() && frame_ref.data_size > 0 {
+            String::from_utf8_lossy(std::slice::from_raw_parts(
+                frame_ref.data,
+                frame_ref.data_size,
+            ))
+            .trim_end_matches('\0')
+            .to_string()
+        } else {
+            "Camera stream reported a hardware error".to_string()
+        };
+        if let Some(handler) = &cb_data.fault_handler {
+            handler(reason);
+        }
         return;
     }
+
+    if frame_ref.data.is_null() || frame_ref.data_size == 0 {
+        return;
+    }
+    cb_data.stream_progress.lock().unwrap().last_frame = Some(std::time::Instant::now());
 
     // Copy frame data into owned Vec
     let data_slice = std::slice::from_raw_parts(frame_ref.data, frame_ref.data_size);
@@ -865,6 +1146,12 @@ unsafe extern "C" fn frame_callback_trampoline(
         data: data_slice.to_vec(),
         source,
         saturation_adu: cb_data.saturation_adu,
+        sensor_descriptor: stream_sensor_descriptor(
+            &cb_data.format,
+            frame_ref,
+            !frame_ref.source_data.is_null() && frame_ref.source_data_size > 0,
+            cb_data.saturation_adu,
+        ),
     };
 
     if let Ok(mut store) = cb_data.latest_frame.lock() {
@@ -874,6 +1161,84 @@ unsafe extern "C" fn frame_callback_trampoline(
             == cb_data.stream_generation
         {
             *store = Some(frame_data);
+        }
+    }
+}
+
+#[cfg(test)]
+mod analysis_descriptor_tests {
+    use super::*;
+    use ols_ffi::{OlsBayerType as B, OlsStreamType as F};
+
+    fn format(kind: F) -> StreamFormat {
+        StreamFormat {
+            format: kind,
+            width: 8,
+            height: 8,
+            bin: 1,
+            roi_num: 1,
+            roi_den: 1,
+            framerate: -1.0,
+        }
+    }
+
+    fn native_frame(kind: F, bayer: B, bytes: &[u8]) -> ols_ffi::OlsFrame {
+        ols_ffi::OlsFrame {
+            format: kind,
+            bayer,
+            frame_counter: 1,
+            unix_timestamp: 1.0,
+            width: 8,
+            height: 8,
+            data: bytes.as_ptr(),
+            data_size: bytes.len(),
+            source_data: std::ptr::null(),
+            source_data_size: 0,
+            source_ext: std::ptr::null(),
+        }
+    }
+
+    #[test]
+    fn raw_stream_requires_known_phase_unbinned_full_roi_and_exact_packing() {
+        let bytes = vec![100_u8; 128];
+        let mut format = format(F::Raw16);
+        let mut frame = native_frame(F::Raw16, B::Rg, &bytes);
+        let descriptor = stream_sensor_descriptor(&format, &frame, false, Some(16383.0)).unwrap();
+        assert_eq!(
+            descriptor.geometry.coordinate_system,
+            "stream_buffer_pixels"
+        );
+        assert!(matches!(
+            descriptor.color,
+            SensorColor::Bayer {
+                pattern: CfaPattern::Rggb,
+                origin_x: 0,
+                origin_y: 0
+            }
+        ));
+        frame.bayer = B::Na;
+        assert!(stream_sensor_descriptor(&format, &frame, false, None).is_none());
+        frame.bayer = B::Rg;
+        format.bin = 2;
+        assert!(stream_sensor_descriptor(&format, &frame, false, None).is_none());
+        format.bin = 1;
+        format.roi_num = 1;
+        format.roi_den = 2;
+        assert!(stream_sensor_descriptor(&format, &frame, false, None).is_none());
+        format.roi_den = 1;
+        frame.data_size -= 1;
+        assert!(stream_sensor_descriptor(&format, &frame, false, None).is_none());
+    }
+
+    #[test]
+    fn legacy_decodes_and_previews_never_acquire_a_scientific_descriptor() {
+        let bytes = vec![100_u8; 64];
+        let frame = native_frame(F::Mono8, B::Na, &bytes);
+        assert!(stream_sensor_descriptor(&format(F::Mono8), &frame, true, None).is_none());
+        assert!(stream_sensor_descriptor(&format(F::Mono8), &frame, false, None).is_some());
+        for kind in [F::Mjpeg, F::Rgb24, F::Rgb48, F::Yuv2] {
+            let frame = native_frame(kind, B::Na, &bytes);
+            assert!(stream_sensor_descriptor(&format(kind), &frame, false, None).is_none());
         }
     }
 }

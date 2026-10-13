@@ -65,16 +65,21 @@ must match the dataset — see `AstroM3-main/src/data.py` and the
 [`AstroM3Processed`](https://huggingface.co/datasets/AstroMLCore/AstroM3Processed)
 dataset the user linked.
 
-## Two deployments in Achernar
+## Native integration and proposed edge research
 
-AstroM3 is used **twice** — one model family, one shared 512-d embedding space.
+The native loader integrates the published modalities. `AstroM3Edge` is a
+research retrofit, not a qualified daemon deployment. Its intended relationship
+to the native embedding space must be learned and evaluated; matching vector
+dimensions alone does not establish compatibility. See the
+[v5 architecture](../../achernar_v5.tex) and
+[compute-aware runtime ADR](../../docs/adr/compute-aware-model-runtime.md).
 
 ### 1. Cloud / planning (`apps.ai_engine`) — AstroM3 as published
 
 Native modalities (light curve + spectrum + metadata) over catalog targets:
 target ranking, similarity search, anomaly detection. Load via `loader.py`.
 
-### 2. Edge / daemon — AstroM3 retrofit (`edge.py`, `AstroM3Edge`)
+### 2. Proposed edge / daemon retrofit (`edge.py`, `AstroM3Edge`)
 
 The **pretrained AstroM3 cannot run directly on the daemon**:
 
@@ -91,11 +96,14 @@ AstroM3's own components:
 | photometry — `Informer` | on-mount telemetry — `Informer` (reused)|
 | metadata — `MetaModel`  | capture metadata — `MetaModel` (reused) |
 | spectra — `GalSpecNet`  | image crop — `ImageEncoder` (**new**)   |
-| 512-d CLIP space        | 512-d CLIP space (identical)            |
+| native embedding space | intended aligned space; not yet established by dimension alone |
 
-Same dim + same `CLIPLoss` ⇒ edge embeddings are comparable to cloud target
-embeddings. `warm_start_from_astrom3()` copies the metadata/telemetry encoder
-weights where shapes match; then train on Achernar data and export to ONNX.
+Using the same dimension and contrastive-loss form does not make independently
+trained embeddings comparable. `warm_start_from_astrom3()` copies compatible
+weights as initialization. A shared-space claim requires explicit alignment or
+distillation against the native space, suitable paired data, and held-out
+cross-domain retrieval/alignment tests. A future ONNX artifact must then pass
+the v5 scientific, deployment-parity and runtime-qualification gates.
 
 ```python
 from ml.astrom3.edge import AstroM3Edge, clip_loss

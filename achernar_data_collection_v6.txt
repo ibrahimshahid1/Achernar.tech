@@ -1,0 +1,716 @@
+Achernar
+
+Minimum Necessary Data Collection
+Public-data-firstdevelopment/v6
+
+
+
+
+Revision                  October12,2026
+Status                    Research-backedplan;implementationandfieldworkpending
+Architecture             achernar_v6.tex
+Evidence                   docs/public-dataset-audit-2026-10-12/
+Historicalproceduresourceachernar_data_collection.tex
+
+
+
+Decision
+Usepublichumanlabels,suitableapprovedarchiveproductsandcontrolledsimulationfor
+broadperceptiondevelopment.Collectlocallyonlythecameracalibration,independenttransfer
+examplesandmeasuredhardwareoutcomesthatpublicdatacannotprovide. Reuseexisting
+observationsfirst.Expandacampaignonlywhenanexperimentidentifiesthemissingevidence.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Thisplanreplacestheoriginalcampaignquotasasprerequisites.Itdoesnotclaimthatanyfixed
+smallerquotaissufficientfordeployment.Notraining,cameracalibration,hardwareactuationor
+modelpromotionwasperformedbythesourceaudit.Earlierdocumentsremaindatedevidence.
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+Contents
+
+
+1 Scope,prioritiesandstandingdecisions                          2
+   1.1 Whatremainsauthoritative. .. . . . . . . . . . . . . . . . . . . . . . . . . . . .  2
+
+2 Verifiedstartingpointandremainingengineeringwork                 2
+   2.1  Implementationgatesbeforenewacquisition. . . .. . . . . . . . . . . . . . . .  3
+
+3 Public-sourceintake:small,reversibleandtask-specific               4
+   3.1  Firstsourcechoices. . . . . . . . . . . . . . . .. . . . . . . . . . . . . . . . . . .  4
+   3.2 Admissionchecklistandtransfercaps. . . . . . . . . . . . . . . . . .. . . . . . .  4
+   3.3  Rightsandreproducibility. . . . . . . . . . . . . . . . . . . . . . . . . . . . .. .  5
+
+4 Scientificlabelsandevaluationgroups                             5
+   4.1  Labelsthatmustremaindistinct. . . . . . . . . . .. . . . . . . . . . . . . . . .  5
+   4.2  Splithierarchyandadaptivecollection. . . . . . . . . . . . . . . . .. . . . . . .  6
+
+5 Model-by-modelacquisitiondecision                             6
+
+6 Compactlocalrunbooks                                            7
+   6.1  RB-A:adjudicateexistingcloudsbeforecollectingmore. . . . . . . . . . . . . .  7
+   6.2  RB-B:targetedcloudtransferepisodes. . . . . . . . . . . . . .. . . . . . . . . .  8
+   6.3  RB-C:supported-modecameracharacterization. . . . . . . . . . . . . . . . . ..  8
+   6.4  RB-D:compactfocus-widthandoutcomeexperiment. . . . . . . . . . . . . . . .  9
+   6.5  RB-E:compacttrailing/confounderexperiment. . . . . . . . . . . . . . . . . . .  9
+   6.6  RB-F:passivethermalanddecisionlogging. . . . .. . . . . . . . . . . . . . . .  9
+
+7 Minimalproposedmanifestandfield-logcontract                    10
+
+8 Stop,expandorproceed:acceptancegates                         11
+
+9 Additionalalgorithmsanddeliberatedeferrals                   12
+
+10Sources,revisionandboundaries                              12
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                        1
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+1Scope,prioritiesandstandingdecisions
+
+Thepurposeistominimizewastedacquisitionwhilepreservinghonestscientificandoperational
+evaluation.Beginwithoneactualcamera/opticalconfigurationandthemodesintendedforuse.
+Asupportedone-rigprototypedoesnotneedarentedsecondrig;anunseen-rigclaimdoes.
+TheoriginalFQE20/60/150-runtiers,COCthousands-per-classcollection,TED3,600-frame
+campaign,five-bodycalibrationinventoryand10,000localplate-solved-frameadaptertriggerare
+nolongerrequiredstartingconditions.Theywereplanningenvelopes,notempiricalsample-size
+proofs.Theirreplacementisasequenceofsmall,decision-drivenexperiments.
+
+1.Freezethetask,intendeduse,supportedinputsandabaseline.
+2.Inspectasmallrealpayloadanditsrights/metadatabeforebulkintake.
+3.Reproduceclassicalmeasurementsandsyntheticstresstests.
+4.Runonepublic-trainedcandidatewhereitaddressesameasuredneed.
+5.Acquire/adjudicateonlylocaldevelopmentandindependentevaluationgaps.
+6. Checkdeploymentparity,thenobserveinshadowmodebeforeconsideringanyadditional
+   controlauthority.
+
+NativeAstroM3catalogresearchcanproceedindependently.FOP,learnedexposure/filter/guiding
+policiesandAstroM3Edgedonotblockusefulcloud,focus-width,backgroundortrailingmea-
+surements.Nodeadlineortrained-modelcountisanacceptancecriterion.
+
+1.1Whatremainsauthoritative
+
+Codeandmigrationsdetermineexecutablebehavior.V6definesproposeddatacontractsand
+decisions,notimplementedingestionortrainedmodels.ClassicalHFRcontrolscurrentautofocus;
+neuralFQEisshadowoutput.BGEandTEDretainclassicalbaselines.Modellifecycle,integrity,
+runtimequalification,activationandcontrollerauthorityremainseparate.
+Nonewhardwarepurchases,rentals,cloudforecastsordedicatedmultimodalfieldcampaigns
+arejustifiedsolelybythisplan.Apublicsourceisadmittedonlyforthetaskandintendeduse
+itsevidencesupports.
+
+2Verifiedstartingpointandremainingengineeringwork
+
+
+
+   Area                 Currentevidenceandconsequence
+   Localclouds          October11audit:533distinctreadableR50CR3s,508sky
+                             candidates,200provisionalclasscandidates,308unknownsand
+                             25invalidordinary-cloudexamples.Labelsarenotapproved
+                             truth;noreliablefull-frameclear/thinsetwasestablished.Clock
+                             isunreliableandfivegapgroupsarenotfiveindependentnights.
+                             Reviewbeforecollectingmore.
+   FQE                 Actual64-pixelgrayscaleshadowinferenceanda
+                             checksum/eligibility-awareSQLite-linkedbuilderexist.Public
+                             FITSarenotdirectlyaccepted;createanarchiveadapterwithout
+                             fakepositionsorfocus-runrecords.
+
+
+
+
+
+                                                                                                    2
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+
+
+   Area                 Currentevidenceandconsequence
+   Splitting             Temporalgroupedsplittingalreadyexists.Enforce
+                             night/rig/ancestorconstraintsfortheclaimbeingevaluated;do
+                             notrepeattheoldabsent-toolclaim.
+   CFAanalysis         RAW16isreadasgrayscale;debayermoduleisastub.Native
+                             CFA,validatedcolorplanesanddisplayluminancearedifferent
+                             measurementdomains.
+   COC                Pythonmodel/trainer,metadataandRustheuristicdisagreeon
+                             shape/task.Freezeaversionedinput/labelcontractbefore
+                             training.Notrainedproductioncloudpathisestablished.
+   TED/BGE          TEDCNNentrydelegatestoclassicalmoments.BGEuses
+                             robustglobalstatistics;aSEP-stylemeshbackgroundisnot
+                             establishedbyitswrappername.
+   FOP/FDF          FOPdatasetbuilderraisesNotImplementedError.FDFisan
+                             implementedthree-stateCPUestimator,notaneuraltraining
+                             task.
+
+
+Sourcepointersandthelimitsofthistargetedinspectionareintheauditmemos. Older
+capture/importdefectsmustberecheckedbeforefielduse;thehistoricalauditisnotproof
+theyallpersist.Inparticular,existingimportcodeisnotevidenceofcorrectCR3metadataor
+wrong-clocklabelhandling.
+
+2.1Implementationgatesbeforenewacquisition
+
+1. Freezeanalyticsversuspreviewtransforms,clippingunits,sourcemasks,cropgeometry,
+   missingnessandlabelsemantics.IfR50deploymentusesJPEGpreview,raw-onlytraining
+   doesnotestablishpreview-domainparity.
+2.Addsourcemanifestsandtaskadapters.Preserverawbytes,masks,calibrationlevel,native
+   unitsandoriginalexposureidentities.
+3.Addreviewedcloudpartial-labelconversionandanexplicitignoremask.Donotsilentlyfill
+   unannotatedareasormisspelledannotationclasses.
+4.Validate grouping/derivative ancestry before training.   Freeze independent calibra-
+   tion/validationandfinal-testroles.
+5. Confirmthefieldloggerrecordsactualsettings,clockquality,positionvalidityanddisturbances.
+   Aschemafieldisnotproofthehardwarefillsit.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    3
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+3Public-sourceintake:small,reversibleandtask-specific
+
+3.1Firstsourcechoices
+
+
+ Source              Initialusefulintake                 Decisionboundary
+
+ Lenghuhuman               22.1MBZIP,1,111embedded                   PrimaryCOCpilot.
+ regions                   512-pixelimagesandLabelMe                 Unknownpixelsremain
+                           regions.Inspectoverlaysandlabel           ignore;sourcesplitdoesnot
+                           corrections.                              establishR50transfer.
+ Lenghubulklogits    Noneinitially;laterastratified                  Teacherpredictionsareweak
+                           subsetonlyifneeded                        supervision;excludeholdout
+                                                                     ancestorsandnights.
+ GalSim              Version-pinnedanalytic                          Generatorparametersare
+                           optical/atmospheric/detectorscenes        notmeasuredrealHFRor
+                                                                     focusersteps.
+ MASTselected              Anamedpublic                              Preferexplicitpublic-domain
+ imaging                   mission/instrument/productwith            productevidence;rawDN,
+                           units,SCI/ERR/DQwhere                     electronsandelectrons/s
+                           applicable                                remaindistinct.
+ MILAN/HSC/                Boundedmetadata/headerresearch,           Separatenoncommercial
+ LCO                       thenselectedpixelsonlyifusefuland         researchlineage.Noproduct
+                           permitted                                 eligibilitybypublic-access
+                                                                     inference.
+ AstroM3native      Onecompatiblefull                                Existingencoders;nolocal
+                           configuration/checkpoint;initially        observations.Resolve
+                          100–1,000objectsforinference               identity/termsbeforeanew
+                                                                     imagematch.
+ MMU               Atmostoneapprovedimagesubset                      Optionalaftertask
+                           andasmallmatched-objectpilot              utility/identifiability.Donot
+                                                                     bulk-fetchthecollection.
+ SWIN/Almeria     Optionalexternal/nightordaylight                   SharedSWINancestorsstay
+                           diagnostic                                outoftrainingifSWINSEG
+                                                                     isatest.Trackseparate
+                                                                     terms.
+ DeepSpaceYolo/            Optionaltask-specificchallenge            Object
+ BTSbot/Trailblazer        examples                                  boxes/transients/satellites
+                                                                     arenotfocusortracking
+                                                                     truth.
+ DeepSky/WOANC  Noinitialdependency               Daytime/unreleasedor
+                                                                     request-only;donotdelaya
+                                                                     usefulexperimentforextra
+                                                                     sources.
+
+
+3.2Admissionchecklistandtransfercaps
+
+Forimagingarchives,startwithmetadatafor10–20exposuresfrom3–5sessionswhereavailable,
+andaproposed2GBtotalpilottransfercap. Thecapboundseffort,nottrainingadequacy.
+
+
+                                                                                                    4
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+
+Chooseasmallerindividual-productroutewhenonearchivebundleexceedsit.Donotexpand
+solelytofillarowcounter.Fullcloudlogits,theyearofMILAN,amulti-yearRubindatabase
+and100TBMMUarenotinitialrequirements.
+Before admitting each product, record:  exact release/revision and URL; license for
+data/code/weights separately; checksum; instrument/site/session; HDU or array meaning;
+nativeunitsandscale;masks/variance;processingstate;CFA/black/white/clippingevidence;
+timestampreliability;duplicateancestors;andavailablelabelswiththeiractualmeaning. If
+clippingcannotbeestablished,excludeitfromstrictFQElabelswhileoptionallyretainingan
+explicitrobustness-onlyexample.
+Asuitableimageisnotautomaticallyasuitableoutcomelabel.Aprocessedvariancemapisan
+independentpipelineestimate,notmeasuredsensornoisetruth.APSFmodelisafittedsource,
+notanindependentexposure.Asaturatedorcloudyarchiveframeisusefulforfailurebehavior
+onlywhenitsvalidityandlabelevidenceareretained.
+
+3.3Rightsandreproducibility
+
+LenghuhasanApache-2.0datasettag;teacher/backbonetermsareseparate.SWIN’soriginal
+hostslinkCCBY-NC4.0.MILAN/DeepSpaceYoloareCCBY-NC-ND;HSCarchivetermsare
+noncommercialscientific/educational;LCOstatesCCBY-NC2.0.AstroM3source,processed-
+datalistingsandpretrainedcheckpointshavedifferentterms;MMUpreservessubsetrestrictions.
+Asource-codelicensedoesnotsettleadownloadeddatabaseoruser-loglicense.
+Maintainaseparatelyidentifiableresearchlineageandanintended-use-clearedlineage.Retain
+permissions,citationsanddownstreamsourceancestry.Thisplanmakesnoblanketlegalassertion
+aboutwhetheraparticularweightisanadaptation.Additionalpermissionmayberecordedlater
+withoutsilentlyrewritingtheprovenanceofanexistingartifact.
+
+4Scientificlabelsandevaluationgroups
+
+4.1Labelsthatmustremaindistinct
+
+
+   Labeltype                Meaningandlimitation
+   Humancloudregion       Conservativesourceannotation.Unannotatedpixelsare
+                                  unknown.Cloudcoverageisnottransparencyorobserving
+                                  loss.
+   MeasuredHFR            Namedbackground/aperture/source-gatereferenceinpixels.
+                                  Agreementwithitslabeleralonedoesnotestablishbetter
+                                  focus.
+   FittedPSForuncertainty         Anamedpipeline/modelproduct,withitsownmeasurement
+   map                            assumptionsandcalibrationlevel.
+   Teacherlogits             Versionedmodeloutput;confidenceisnotindependently
+                                  verifiedcorrectnessorlocalprobabilitycalibration.
+   Latentsimulation               Defocuswaves,motionpath/length,truefluxandnoise
+   parameter                      parametersdefinedwithinthegenerator.Notmotorstepsor
+                                  noisymoments.
+   Noisyestimatedlabel      HFR/ellipticityfromanamedestimatoraftersampling,
+                                  noise,clippingandmasking;retainfailed/invalidresults.
+
+
+                                                                                                    5
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+
+
+   Labeltype                Meaningandlimitation
+   Focusoptimum/outcome   Position-referencedconvergedrunandverifiedfinal
+                                  image/move.NeitheronecropnorminimumsampledHFR
+                                  alonesuppliesit.
+   Policyreward             Attributablemeasuredresultofanexecutedactionundera
+                                  versionedobjective;unchosen-actionrewardsremainabsent.
+
+
+ForFQEretain log(HFR_px),uncertaintyandaccepted-sourcecoverage.Positionisprovenance,
+notapixels-onlyFQEinput.Disablerealwithin-runrankingonunrelatedarchiveexposures.
+Maintainaseparatesimulated-sequenceflagifrankingsyntheticcurves.
+ForTEDretainlatenttraillength/axialangle,noiselessreferenceshapeandnoisyestimated
+ellipticityseparately.Angleismodulo180degrees;almostroundsourcesneedanundefined/low-
+confidenceangle,notarbitrarydirection.Single-cropshapecannotidentifytrackingversuscoma
+orwind.UseWCSbeforeclaimingsky-coordinateRA/Decaxes.
+
+4.2Splithierarchyandadaptivecollection
+
+Allderivativesofasourceexposureorlatentscenefamilystaytogether;allmodalities/repeated
+observationsofanobjectstaytogether.Splitbeforeaugmentation.FQE/FOPrunsarenested
+withinnightsandrigs;usethecoarserlevelneededfortheclaim.COCneedswhole-night/weather-
+episode/camera-eraseparation.Similarskyframesseparatedbyminutesarenotindependent
+conditions.Unknowndatesrequireconservativegroupfamilies.
+Usedevelopmentdatafortransformsandtraining;independentvalidationforselection/calibration;
+anuntouchedfinalsetforafinalclaim.Nevertunethresholdsonthefinaltest.Ifitsfailures
+guidenewtraining,recordthatthetesthasbeenconsumedandobtainfreshfinalevidence.
+Publicbenchmarklabelsalreadyseenduringdevelopmentarenotanindependentlocaltest.
+Reportsourceexclusions,usableframecoverageandindependentgroupcounts.Amillioncrops
+arenotamillionobservingoutcomes. Confidenceintervalsmustrespectnight/run/episode
+clustering.Fixthefailureeventandtolerancebeforechoosingsamplesize.Withzerofailuresin
+independentstationarytrials,theone-sided95%upperboundis1  −0.051/n;59suchtrialsare
+neededforaboundbelow5%.Thisisanillustration,notademandfor59adjacentimagesoran
+assertionthat59sessionssettleeveryuse.
+
+5Model-by-modelacquisitiondecision
+
+
+ Model         Firstexperiment/reuse             Additionallocalevidenceonlyif
+                                                              needed
+ FQE          Classicalbenchmark,approvedpublic               Supported-inputbias/coverageand
+                   stars,analyticPSF/noisescenes,one          independentlyverifiedfocus
+                   compactcandidate                           outcomes.Beginwitha6–10-sweep
+                                                              effortcap,notareleaseminimum.
+ FOP          Testcanonical38featuresand                      Readableposition,sign/scale,
+                   synthetic/asymmetric/backlash              reversals,validatedoptimaand
+                   curvesagainstrobustclassicalfitting        finaloutcomes.Missingposition
+                                                              defersthemodel.
+
+                                                                                                    6
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+
+
+  Model         Firstexperiment/reuse             Additionallocalevidenceonlyif
+                                                               needed
+
+  FDF          Existing[p,v,k]estimatorand                     Harvestautofocusplus
+                    simulatedidentification/failuretests       ambient-temperaturerecords.
+                                                               Acquireextrathermaltrajectories
+                                                               onlyifheld-outforecastsor
+                                                               identifiabilityrequirethem.
+  COC          Lenghuhumanregionsandexisting                   Missingfullyclear/thin,
+                    R50adjudication                            moon/glow/contaminationor
+                                                               independentheld-outepisodes.No
+                                                               classthousandsbeforeatransfer
+                                                               result.
+  TED          Classicalmomentswithsimulated                   Onecompactambiguous-range
+                    motions/aberrations                        untrackedladderplusroundand
+                                                               confoundercases;expandonlyfor
+                                                               residuals.Tracked-domainclaims
+                                                               requirerealtrackedevidence.
+  BGE          Classicalfull-framebenchmarkand                 Benchcharacterizationofactual
+                    known-unitcalibrationproducts              enabledmode,noteverypossible
+                                                               body/ISO.Neuralnoisemaphas
+                                                               noinitialacquisitionentitlement.
+  Exposure      Physics/rulesbaselineandpassive                Calibratedsettings,safesupport
+                    action/outcomelogs                         andknownloggingprobabilitiesfor
+                                                               randomizedcomparisons;no
+                                                               speculativeexposurecampaign.
+  FOR          Deterministictarget/filterconstraints           Onlyactualfilter
+                    andoptionalsimulation                      hardware/response/overheadand
+                                                               outcomelogs.Keepdeferred.
+  TME          Nativeencoders,approved                         Nodedicatedfieldcollection.Edge
+                    configurationandoriginalobject             waitsforidentifiablestellarmatches
+                    identities                                 andimage-only/catalogbaselines.
+
+
+Everycapinthistableisanengineeringproposal.Retainingtheclassicalmethodafteranegative
+modelcomparisonisavaliddecision. Collectingthecapdoesnotconfershadoweligibility,
+promotionormotionauthority.
+
+6Compactlocalrunbooks
+
+6.1RB-A:adjudicateexistingcloudsbeforecollectingmore
+
+1. Preserve original CR3s and existing provisional ledgers.   Choose one reproducible
+   RAW/previewtransform,crop/skymaskanddeployedresolution.
+2. Reviewadiversepanelfromallcapturegroups,includingstar-bearingopenings,soft/low-
+   signalimages,foregroundandbright/transientcontamination.Comparenativedetailwith
+   theactualmodelinput;donotlabelfromaviewthemodelcannotseewithoutrecording
+   thatdifference.
+3. Recordcloudpresence/region,visible-skycoverageifsupportable,attenuationevidence,
+   contaminationandvalidityseparately.Preservelegacy0–4candidatesandalternates;leave
+
+                                                                                                      7
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+
+   ambiguityunknown. No-starsaloneisnotovercast. Nearbyweatheriscontext,nota
+   substituteforframetruth.
+4.Adjudicateusefulexistingexamplesbeforenewphotographs.Keepuncertainclock/session
+   groupsconservative;neverinferexactUTCfromfilemtime.
+5. Freezedevelopmentandindependentprospective-testrolesbeforelocaladaptation. The
+   currentburstcollectiondoesnotestablishallfiveclasses.
+
+6.2RB-B:targetedcloudtransferepisodes
+
+OnlystartafterRB-Aandasource-trainedinference/inputchecknameagap. Fixcamera
+clock/timezone,lens/pointing,manualfocus,exposurerecipeandRAWpreservation.Logsite,
+truetimeanchor,field/skymask,camerasettings,moon/illuminationwhencomputable,and
+observerevidence.
+Forafirsttranche,capeffortatapproximately3–5additionalindependentnightsorweather
+episodes,notacompulsorycampaign.Prioritizeclearversusthin/star-attenuationtransitions
+andonemissingglow/obstructioncontrast.Aregularsparsecadencesuchas30–60secondscan
+preservetransitions;chooseapproximately50–150diversekeyframespernightafterthinningif
+thatmanyaddinformation.Theseareworkloadbounds,notindependenceassumptions.Record
+shortcloudtransitionscontemporaneouslyratherthanspreadingone10-minutelabelacrossa
+changingfield.Independentreferencephotoscanhelpadjudicatebutdonotmeasureoptical
+depthautomatically.
+Keepatleastoneuntouchedepisodeforeachconditionclaimedandseparatevalidation/calibration
+groups.Ifaconditionappearsinonlyoneepisode,reportexploratorytransferratherthanan
+independentperformanceestimate. Stopanuninformativeuniformburst;furtherexamples
+shouldansweranamederrororuncertainty.Donotdeliberatelyexposeequipmenttorainor
+damagetomanufactureachallengecase;existinginvalidsandsafesimulationssuffice.
+
+6.3RB-C:supported-modecameracharacterization
+
+Startwithoneactualacquisitionmode/ISO/gainandalockeddecoderversion.Recordcamera,
+lens/optics,firmware,compression/bitdepth,sensortemperaturewhenmeasured,exposure,
+CFA/black/whitemetadataandprocessingstate.ForaJPEG/videomode,characterizethat
+transformedpathseparately;nativeRAWconstantsdonotautomaticallydescribeit.
+Aproposedsmallbenchstartingbudgetisroughly20shortestdark/bias-likeRAWsand8–12
+stableilluminationlevelswithatleastapairateachlevel.Usepaireddifferencestoseparate
+fixedspatialstructurefromtemporalvariance;recordmeansafterappropriateblackcorrection
+andinspectclippingandnonlinearity.Morerepeatsarejustifiedifpairconsistencyorconfidence
+ispoor.Cameraswithoutatruebiasmodeneedavalidshort-darkprotocol;compressedSV105
+videoisnotinterchangeablewithlinearsensorRAW.
+Characterizedarkbehavioronlyoverexposure/temperatureregimesintendedforuse;ordinary
+imagingdarkscansupplyitpassively.DonotbuildeveryISOandexposurelibrarybeforeatask
+requiresit.Flat-fieldcalibrationforscienceandPTCilluminationmeasurementsarerelatedbut
+distinctproducts.Preservealloriginalsandunits.Documentgain/read-noisefitassumptions
+andresiduals;asinglemean–varianceslopeisnotproofofidealPoissonbehavior.
+Thegateisreproducibleblack/clipping/linearityevidenceandacalibrationbundleforthe
+supportedmode. Unknownvaluesremainunknown;dropstrictlabelsdependentonmissing
+thresholds.Expandmodesonlywhenenabledintheproductorameasurederrorpointstothe
+missingcharacterization.
+
+
+                                                                                                   8
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+
+6.4RB-D:compactfocus-widthandoutcomeexperiment
+
+Confirmsafetravel/focusreachandacquisitionfirst;thisplandoesnotasserttheR50reaches
+primefocusontheZ114. Useaconfigurationthatactuallyproducesresolved,unsaturated
+stars. Reuseanyordinaryverifiedautofocusruns. Ifmanualfocuslacksreadableposition,
+recordorderedsettingsforwidthresearch;donotclaimsigned-stepFOPlabelsorautonomous
+verification.
+Beginwitha6–10-runeffortcapoverapproximately2–3distinctsessionswhenavailable.This
+candiagnosetransfer,notqualifyageneralrelease.Useenoughpositionsonbothsidesofan
+interiorminimum,densenearfocus;astarting9–15positionswith2–3repeatedframescan
+revealscatterbeforeexpandingtothehistorical21-by-5procedure.Adjustsamplingtoactual
+curveresolutionandrepeatability,notauniversalstepcount.
+Foreachsamplelogcapture/position/movetimes,actualreadablepositionandvalidity,direc-
+tion/reversal,settling,settings,temperatureprovenance,source/assetchecksumanddisturbances.
+Keepcentralandedgestars;retainrejection/coveragestatistics. Recordfailed/abortedruns
+withoutfakeoptima.Aninteriorfittedoptimumneedsuncertaintyandindependentfinal-image
+verificationafterthecommandedmove;thenlogtheobservedresult.
+Compareclassicalandneuralestimatesonmatchedacceptedstarsandfull-framecoverage.Use
+held-outrun/nightgroupsforranking,residualsandpost-moveoutcome. Nofocusimprove-
+mentmeansnoexpansionmerelytotrainalargernet. Realcontrolclaimsrequirereliable
+motor/sign/scale/backlashandactualfinaloutcomes;externalopticaldefocusinwavelengths
+cannotsupplythosesteps.
+
+
+6.5RB-E:compacttrailing/confounderexperiment
+
+Usethesameusefullocalsessionswherepossible.Selectcentralandedgestars;includeshortnear-
+roundexposuresanddenserstepswheremeasuredellipticityapproachestheexistingambiguous
+band. Aninitialone-sessionladderacross2–3fieldsand6–10exposuredurationswithafew
+repeatsisaplanningcap;recordactualdurationsandsourcecoverage.
+Anidealuntrackedsiderealdisplacementisapproximately15     .041cosδ arcsecpersecond,converted
+throughlocalimagegeometry. Itdoesnotexactlylabelobservedellipticityoridentifywind
+versustracking.Platescale/WCSoranothermeasuredangularcalibrationisrequiredforphysical
+units;image-coordinateshapebenchmarkscanproceedwithoutpretendingthoseunitsareknown.
+Alt-aztrackingretainsfieldrotation.
+Retaincoma,defocus,saturation,blends,weakstarsandrealwind/disturbanceflagsascon-
+founders.Awindysessionisanoptionalgap-fillingobservation,notacompulsorynight.Compare
+estimatedshape/axialangleandframefalsealertswiththeclassicalbaseline.Round/low-SNR
+anglescanbeundefined.Noneuralbenefitonthemeasuredambiguouscasesmeansstopthe
+CNNbranch.
+
+6.6RB-F:passivethermalanddecisionlogging
+
+Duringnecessaryautofocus,recordverifiedbestposition,ambienttemperatureandprobe/time
+quality,opticaltrain/filter,resetsandactualmovesuccess.ThecurrentFDFstateisposition,
+independentdriftrateandthermalcoefficient.Amonotonictemperature/timetrajectorycan
+confoundthelasttwo;seekindependentcooling/warmingbehavioronlyifidentificationor
+forecastsremainpoor.Donotprescribeafixeddegrees-Cspanasuniversallysufficient.Holdout
+nightsandcompareagainstrecent-best/no-driftbaselinesandtherig’smeasuredcritical-focus
+
+
+                                                                                                    9
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+
+threshold.
+For exposure/filter/guiding decisions retain predecision context and measurement ages;
+safe/availableactions;policy/version;requested/chosen/executedaction;probabilitieswhen
+randomized;actualsettings/ownership/overrides;frame/eventlineage;realizedrewardcompo-
+nentsandattributionwindow;andinterruptions.Donotinventpropensitiesfordeterministic
+pastchoices.Afittedafter-the-factpropensitymodeldoesnotcreaterandomizationorremove
+hiddenconfounding.Passivefixed-policydataisusefulforsimulatorcheckswithoutclaiming
+unbiasednew-policyevaluation.Nobanditexplorationstartsmerelytofillatrainingtable.
+
+7Minimalproposedmanifestandfield-logcontract
+
+Storesource/examplemanifestsseparatelyfromoperationalactionrecords.Taskadaptersmay
+leaveinapplicablefieldsabsent;theymustnotreplacemissingmeasurementswithplausible
+zeroes.Recordatleast:
+
+   Record                Requiredinformation
+
+   Sourcerelease         Provider,release/revision,directURL,data/code/weightterms,
+                               intended-usedispositionandevidence,originalchecksum.
+   Exposure             SourceexposureID,instrument/rig/mode,
+                               settings/units/calibrationlevel,clockquality/timeanchor,
+                               session/nightfamily,masksandraw/derivedlinks.
+   Derivedexample       Parentexposure/object/scenefamily,crop/resizegeometry,
+                               transform/calibrationversion,simulationseed/parameters,
+                               derivativechecksum.
+   Label                 Type/method/version,value/units,uncertainty/validity,partial
+                               ignoremaskorrejection,human/teacherprovenanceand
+                               correctionledger.
+   Partition              Datasetrevision,ancestorgroup,
+                               development/validation/calibration/final-testrole,
+                               camera-era/object/nightconstraintsandfrozenassignment.
+   Focusoutcome         Run/sample,readposition/sign/scale,direction/reversal,
+                               fit/optimumuncertainty,executedmoveandindependentfinal
+                               verification.
+   Decision              Predecisioncontext,safearms,policy/probabilities,requested
+                               andexecutedaction,observedreward/overhead,
+                               interruption/overrideandparentassets.
+
+
+AschemadraftdoesnotmeanimportersorSQLmigrationssupporteveryfield. Implement
+explicitadapters/validationandgoldentransformfixturesbeforecreatingtraining-readydatasets.
+ExistingmanuallyreviewedcloudCSVsarenotautomaticallyimporter-compatibletraining
+input.
+
+
+
+
+
+
+
+
+
+                                                                                                      10
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+8Stop,expandorproceed:acceptancegates
+
+Thematchedcomparisonsandacquisitiondecisionledgeraredetailedin docs/public-dat
+aset-audit-2026-10-12/experiment-design.md. ForCOCcomparethecurrentheuris-
+tic,public-human-onlycandidateandthesamecandidatewithdisjointlocaladaptationon
+identicalvalidationgroups. ForFQEcompareclassicalmeasurementwithonearchitecture
+undersynthetic,approvedpublic-realandmixedtraining. Donotenlargearchitectureand
+datasimultaneouslyandthenattributetheresulttoadataset.TED/BGEfirsttestwhether
+deterministicsource/mask/backgroundimprovementsresolvetheerror.
+Everyadditionaltranchemustnameagap,explainwhyexisting/public/syntheticevidence
+cannotanswerit,specifythecomparisonitwilldecide,freezeitsgroup/partitionrole,andstate
+aneffortcapandnextdecision. Data-efficiencycurvesusenestedtraininggroupsandfixed
+validationgroups. Donotrepeatedlypeekatafinaltestorstopareliabilitytestatitsfirst
+favorableresult.
+
+  Gate                 Stoporresolvefirst             Evidenceallowingthenextstage
+
+  Intake               Unclearrights,units,labels,                Smallactualpayload,reviewed
+                            ancestorsorclippingforstrict          metadata/termsandcorrect
+                            labels                                provenance.
+  Baseline              Noreproducibleclassical                   Known-unitbenchmark,
+                            measurementorreference                failures/coverageand
+                            semantics                             independentsyntheticchecks.
+  Candidatevalue       Onlyteacheragreementor                     Improvedrelevant
+                            simulatorsuccess;nooperational        error/coverage/latencytradeoff
+                            needidentified                        onfrozenindependent
+                                                                  development/validationgroups.
+  Localtransfer         Missingclear/thinormode                   Namedgapfilledandseparate
+                            parity;correlated-onlytest            independenttarget-domain
+                                                                  evidence.
+  Deployment          Unmatched                                   Goldeninput/outputparity,
+                            preprocessing/export,                 calibratedheld-outbehavior,
+                            uncalibrateduncertaintyor             resourcequalificationand
+                            unqualifiedruntime                    inspectableshadowlogs.
+  Control              Unknownmotion,unbounded                    Controller-specificrealoutcome
+                            action,noattributableoutcomes         evidenceandexisting
+                            orsupport                             safety/ownershipgates;artifact
+                                                                  selectionalonenevergrants
+                                                                  authority.
+  Expansion            Biggercorpus/riglistwithno                 Residualslice,missingsupported
+                            nameddecisionbenefit                  conditionorconfidenceinterval
+                                                                  justifiesspecificnewdata;freeze
+                                                                  itsrolebeforecollection.
+
+
+ForCOCreportlocalrecallatapredeclaredfalse-pauseconstraint,thin-cloudmisses,con-
+tamination/unknownbehaviorandcalibration;masksandwhole-framedecisionsneedseparate
+metrics.ForFQEreportaccepted-cohortlog-HFRerror,uncertaintyandfull-framecoverageplus
+realfocusoutcomes.TEDneedsellipticity/axial-angleerrorsandframefalsealerts,including
+confounders.BGEneedscalibratedunit/residual/gradient/crowdingchecks.FOP/FDFrequire
+
+
+                                                                                                    11
+
+Achernar/CollectionPlanv6                                               October12,2026
+
+
+actualconvergence/forecastoutcomes;policylearnersrequiredefensiblepolicycomparison.Na-
+tiveTMEneedsheld-out-objectretrieval/missing-modalitytests,notonlymatchingembedding
+dimensions.
+
+9Additionalalgorithmsanddeliberatedeferrals
+
+FW-1needscalibratedper-filterresponse,notanewgenericMLcorpus.FW-2isapolicywith
+action/outcomerequirements.FW-3beginswithexplicitconstraints/objectivesanddetermin-
+isticoptimizationscenarios. M-1/M-2needactualguide/dithercommandsandattributable
+settle/scienceoutcomes. M-3needsgenuinesolve-failure/recoveryneed,notalow-star-count
+proxy. M-4needsthismount’ssolvedresidualsoverheld-outskycoverage,coordinatesand
+mount/pierconfiguration.Publiclogsandsimulatedfieldshelpsoftwaretests;theydonotsupply
+themissinglocallabelsorusagerights.
+Donotstartaseparatecampaignforanyofthesebeforesupportedhardware,truthfultelemetry
+andafixedbaselineexist.Harvestduringordinaryuse.AstroM3Edgeisdeferreduntilobject
+IDs,validstellarmatches,identifiablesingle-imageinformationandanexplicitalignmenttarget
+exist.Neithera10,000-framequotanoralargegalaxyarchiveanswersthosequestions.
+
+10Sources,revisionandboundaries
+
+Thecompletesource/inspectionledger,versionIDs,hashes,licensedifferences,filedefectsand
+unresolvedquestionsarein:
+
+•docs/public-dataset-audit-2026-10-12/cloud-datasets.md
+•docs/public-dataset-audit-2026-10-12/imaging-datasets.md
+•docs/public-dataset-audit-2026-10-12/control-multimodal.md
+•docs/public-dataset-audit-2026-10-12/README.md
+•docs/public-dataset-audit-2026-10-12/experiment-design.md
+
+Principalprimarysources: Lenghupaper/release https://arxiv.org/html/2603.16429v1,
+https://huggingface.co/datasets/ruiyicheng/LenghuSky-8; MILAN https://ze
+nodo.org/records/6865830; HSC https://hsc-release.mtk.nao.ac.jp/doc/index
+.php/faq__pdr3/; LCO https://lco.global/observatory/termsofservice/; MAST
+https://stdatu.stsci.edu/publishing/data-use; GalSim https://github.com/Gal
+Sim-developers/GalSim;AstroM3 https://github.com/MeriDK/AstroM3;MMU https:
+//github.com/MultimodalUniverse/MultimodalUniverse;NIST https://itl.nist.gov/d
+iv898/software/dataplot/refman2/auxillar/exacbici.htm.
+Thefollow-upAIsynthesissuppliesusefulthree-workstreamframingandshared/per-rigseparation.
+Itsassertedcounts,fixedsessionsuggestionsandsimplifiedlifecyclearenotadoptedasevidence.
+V6preservesexplicitscientificunitsandv5’sorthogonalapproval/qualification/authoritystates.
+Thehistoricalmanualproceduresremainavailablewhenadditionalsamplingisjustified;obsolete
+quotasordefectsmustnotsilentlybecomecurrentgates.
+Thisisaplanandresearchresult.Training,adapterimplementation,cameracalibrationand
+hardwarequalificationareoutstandingwork. Thefirstusefulresultisasmalltrustworthy
+experimentandadecisionaboutwhattoretain,changeorcollectnext.
+
+
+
+
+
+
+                                                                                                 12

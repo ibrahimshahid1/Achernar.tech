@@ -19,6 +19,7 @@ pub const OLS_ERR_NOT_FOUND: c_int = 2;
 pub const OLS_ERR_INVALID: c_int = 3;
 pub const OLS_ERR_IO: c_int = 4;
 pub const OLS_ERR_NOT_CONNECTED: c_int = 5;
+pub const OLS_ERR_NOT_SUPPORTED: c_int = 6;
 
 // ═══════════════════════════════════════════════════════════════════
 //  Build Capability Flags
@@ -178,7 +179,7 @@ pub type OlsFrameCallback = unsafe extern "C" fn(frame: *const OlsFrame, user_da
 /// a daemon built from different revisions link fine and then read each
 /// other's structs at the wrong offsets, which shows up as corrupted frames
 /// rather than an error — so the versions are checked at startup instead.
-pub const OLS_BRIDGE_ABI_VERSION: u32 = 3;
+pub const OLS_BRIDGE_ABI_VERSION: u32 = 6;
 
 // ═══════════════════════════════════════════════════════════════════
 //  Single-Shot Still Capture
@@ -205,6 +206,21 @@ pub struct OlsStillCaptureInfo {
     pub shutter_label: *const c_char,
     pub iso_label: *const c_char,
     pub asset_count: i32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct OlsCaptureBundleInfo {
+    pub evidence_version: u32,
+    pub struct_size: u32,
+    pub event_complete: i32,
+    pub discovered_count: i32,
+    pub downloaded_count: i32,
+    pub missing_count: i32,
+    pub error_count: i32,
+    pub bundle_complete: i32,
+    pub evidence_json: *const c_char,
+    pub error: *const c_char,
 }
 
 #[repr(C)]
@@ -248,8 +264,8 @@ pub struct OlsRawImageInfo {
     /// Per-CFA-channel black offsets, added to `black_level`.
     pub cblack: [i32; 4],
     /// Dimensions of LibRaw's 2-D black table, `[0, 0]` when there is none.
-    /// Anything larger than 2x2 is not representable in `cblack`, so a
-    /// non-trivial value means the recorded black level is incomplete.
+    /// Spatial entries, including a 2x2 table, are separate from cblack[0..3].
+    /// The full table is in ols_rawimage_metadata_json.
     pub cblack_pattern: [i32; 2],
     /// Saturation point in ADU. NOT normalised to.
     pub white_level: i32,
@@ -418,6 +434,7 @@ extern "C" {
 
     // ═══ Camera Instance API ═══
     pub fn ols_camera_name(cam: *mut OlsCamera, name_buf: *mut c_char, name_buf_len: i32) -> c_int;
+    pub fn ols_camera_check_health(cam: *mut OlsCamera) -> c_int;
 
     pub fn ols_camera_format_count(cam: *mut OlsCamera, out_count: *mut i32) -> c_int;
 
@@ -475,6 +492,17 @@ extern "C" {
         out_capture: *mut *mut OlsStillCapture,
     ) -> c_int;
 
+    pub fn ols_camera_capture_still_snapshot(
+        cam: *mut OlsCamera,
+        request: *const OlsStillRequest,
+        out_capture: *mut *mut OlsStillCapture,
+    ) -> c_int;
+
+    pub fn ols_capture_bundle_info(
+        capture: *const OlsStillCapture,
+        out_info: *mut OlsCaptureBundleInfo,
+    ) -> c_int;
+
     pub fn ols_capture_info(
         capture: *const OlsStillCapture,
         out_info: *mut OlsStillCaptureInfo,
@@ -513,6 +541,8 @@ extern "C" {
     pub fn ols_rawimage_info(image: *const OlsRawImage, out_info: *mut OlsRawImageInfo) -> c_int;
 
     pub fn ols_rawimage_pixels(image: *const OlsRawImage, out_len: *mut usize) -> *const u8;
+
+    pub fn ols_rawimage_metadata_json(image: *const OlsRawImage) -> *const c_char;
 
     pub fn ols_rawimage_destroy(image: *mut OlsRawImage);
 

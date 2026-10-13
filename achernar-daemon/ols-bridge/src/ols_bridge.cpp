@@ -32,13 +32,11 @@
 #include <vector>
 
 #include <opencv2/imgcodecs.hpp>
+#include "../external/json.hpp"
 
-// LibRaw is optional. Included directly rather than via
-// OpenLiveStacker/include/libraw_wrapper.h on purpose: that header's
-// load_libraw() black-subtracts and rescales, which is right for the preview
-// stream and wrong for a science frame. See ols_decode_raw() below.
+// LibRaw is optional. All application RAW routes share an untouched unpack.
 #ifdef WITH_LIBRAW
-#include <libraw/libraw.h>
+#include "untouched_raw.h"
 #endif
 
 // ─── Thread-local error message ───
@@ -167,6 +165,7 @@ public:
   }
 
   virtual std::string name(CamErrorCode &) override { return "Simulation"; }
+  virtual bool check_connection(CamErrorCode &) override { return true; }
 
   virtual std::vector<CamStreamFormat> formats(CamErrorCode &) override {
     std::vector<CamStreamFormat> res;
@@ -769,6 +768,21 @@ OlsError ols_camera_name(OlsCamera *cam, char *name_buf, int32_t name_buf_len) {
   }
 }
 
+OlsError ols_camera_check_health(OlsCamera *cam) {
+  if (!cam || !cam->camera)
+    return set_error(OLS_ERR_NOT_CONNECTED, "No camera connected");
+  try {
+    ols::CamErrorCode e;
+    bool supported = cam->camera->check_connection(e);
+    if (e) return set_error(OLS_ERR_IO, e.message());
+    if (!supported)
+      return set_error(OLS_ERR_NOT_SUPPORTED, "Passive presence check is unsupported by this camera driver");
+    return OLS_OK;
+  } catch (std::exception const &ex) {
+    return set_error(OLS_ERR_IO, ex);
+  }
+}
+
 OlsError ols_camera_format_count(OlsCamera *cam, int32_t *out_count) {
   *out_count = (int32_t)cam->formats.size();
   return OLS_OK;
@@ -792,6 +806,11 @@ OlsError ols_camera_format_get(OlsCamera *cam, int32_t index,
 OlsError ols_camera_start_stream(OlsCamera *cam, const OlsStreamFormat *fmt,
                                  OlsFrameCallback callback, void *user_data) {
   try {
+    if (!cam || !fmt || !callback)
+      return set_error(OLS_ERR_INVALID, "Null stream argument");
+    if (cam->camera->supports_still_capture() && fmt->framerate == 0)
+      return set_error(OLS_ERR_INVALID,
+                       "DSLR still streams cannot archive complete bundles; use dedicated still capture (A02)");
     if (cam->stream_state_uncertain)
       return set_error(OLS_ERR_IO,
                        "Previous stream did not stop cleanly; reconnect camera");
@@ -979,6 +998,8 @@ OlsError ols_camera_param_choices(OlsCamera *cam, OlsCamOptionId id,
 
 struct OlsStillCapture_t {
   ols::StillCaptureResult result;
+  std::string evidence_json;
+  std::string error;
 };
 
 OlsError ols_camera_supports_still(OlsCamera *cam, int32_t *out_supported) {
@@ -988,8 +1009,8 @@ OlsError ols_camera_supports_still(OlsCamera *cam, int32_t *out_supported) {
   return OLS_OK;
 }
 
-OlsError ols_camera_capture_still(OlsCamera *cam, const OlsStillRequest *request,
-                                  OlsStillCapture **out_capture) {
+static OlsError capture_still_outcome(OlsCamera *cam, const OlsStillRequest *request,
+                                     OlsStillCapture **out_capture, bool snapshot) {
   try {
     if (!cam || !request || !out_capture)
       return set_error(OLS_ERR_INVALID, "Null argument");
@@ -1005,18 +1026,75 @@ OlsError ols_camera_capture_still(OlsCamera *cam, const OlsStillRequest *request
 
     ols::CamErrorCode e;
     auto result = cam->camera->capture_still(req, e);
-    if (e)
+    if (e && !snapshot)
       return set_error(OLS_ERR_IO, e.message());
-    if (result.assets.empty())
-      return set_error(OLS_ERR_IO, "Capture produced no assets");
+    if (result.assets.empty() && (!snapshot || !result.triggered))
+      return set_error(OLS_ERR_IO, e ? e.message() : "Capture produced no assets");
 
-    auto *handle = new OlsStillCapture_t();
+    auto handle = std::make_unique<OlsStillCapture_t>();
+    if (e) {
+      result.bundle_complete = false;
+      if (std::find(result.errors.begin(), result.errors.end(), e.message()) == result.errors.end())
+        result.errors.push_back(e.message());
+    }
+    nlohmann::json downloads = nlohmann::json::array();
+    for (auto const &download : result.downloads) {
+      downloads.push_back({{"camera_path", download.camera_path},
+                           {"byte_length", download.byte_length},
+                           {"download_complete", download.download_complete},
+                           {"error", download.error}});
+    }
+    handle->evidence_json = nlohmann::json({
+      {"evidence_version", 1}, {"triggered", result.triggered},
+      {"event_complete", result.event_complete},
+      {"completion_grace_complete", result.completion_grace_complete},
+      {"bundle_complete", result.bundle_complete},
+      {"drain_termination", result.drain_termination},
+      {"expected_asset_count", nullptr},
+      {"discovered_paths", result.discovered_paths},
+      {"downloads", downloads}, {"errors", result.errors},
+    }).dump();
+    handle->error = result.errors.empty() ? "" : result.errors.front();
     handle->result = std::move(result);
-    *out_capture = handle;
+    *out_capture = handle.release();
     return OLS_OK;
   } catch (std::exception const &ex) {
     return set_error(OLS_ERR_GENERIC, ex);
   }
+}
+
+OlsError ols_camera_capture_still(OlsCamera *cam, const OlsStillRequest *request,
+                                  OlsStillCapture **out_capture) {
+  return capture_still_outcome(cam, request, out_capture, false);
+}
+
+OlsError ols_camera_capture_still_snapshot(OlsCamera *cam, const OlsStillRequest *request,
+                                          OlsStillCapture **out_capture) {
+  return capture_still_outcome(cam, request, out_capture, true);
+}
+
+OlsError ols_capture_bundle_info(const OlsStillCapture *capture,
+                                OlsCaptureBundleInfo *out_info) {
+  if (!capture || !out_info || out_info->struct_size != sizeof(OlsCaptureBundleInfo))
+    return set_error(OLS_ERR_INVALID, "Invalid capture bundle info or struct size");
+  const auto &result = capture->result;
+  out_info->evidence_version = 1;
+  out_info->event_complete = result.event_complete ? 1 : 0;
+  out_info->discovered_count = static_cast<int32_t>(result.discovered_paths.size());
+  out_info->downloaded_count = static_cast<int32_t>(result.assets.size());
+  out_info->missing_count = static_cast<int32_t>(std::count_if(
+      result.discovered_paths.begin(), result.discovered_paths.end(),
+      [&result](const std::string &path) {
+        return std::none_of(result.downloads.begin(), result.downloads.end(),
+          [&path](const ols::CaptureDownloadEvidence &download) {
+            return download.camera_path == path && download.download_complete && download.byte_length > 0;
+          });
+      }));
+  out_info->error_count = static_cast<int32_t>(result.errors.size());
+  out_info->bundle_complete = result.bundle_complete ? 1 : 0;
+  out_info->evidence_json = capture->evidence_json.c_str();
+  out_info->error = capture->error.c_str();
+  return OLS_OK;
 }
 
 OlsError ols_capture_info(const OlsStillCapture *capture,
@@ -1056,17 +1134,13 @@ OlsError ols_capture_asset_get(const OlsStillCapture *capture, int32_t index,
 
 OlsError ols_camera_delete_captured(OlsCamera *cam,
                                     const OlsStillCapture *capture) {
-  try {
-    if (!cam || !capture)
-      return set_error(OLS_ERR_INVALID, "Null argument");
-    ols::CamErrorCode e;
-    cam->camera->delete_captured(capture->result.assets, e);
-    if (e)
-      return set_error(OLS_ERR_IO, e.message());
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
+  (void)cam;
+  (void)capture;
+  // Fail closed even for direct ABI callers. A local SQL commit alone is not
+  // a qualified receipt for deleting the camera's retained second copy.
+  return set_error(OLS_ERR_INVALID,
+                   "Camera deletion is disabled until verified capture "
+                   "persistence and recovery are qualified (A12)");
 }
 
 void ols_capture_destroy(OlsStillCapture *capture) { delete capture; }
@@ -1084,57 +1158,25 @@ void ols_camera_destroy(OlsCamera *cam) {
 //  RAW Decode (LibRaw)
 // ═══════════════════════════════════════════════════════════════════
 //
-// See the long comment in ols_bridge.h for why this does not call
-// ols::load_libraw() from libraw_wrapper.h. Short version: that function
-// black-subtracts and multiplies by an integer scale factor, both of which are
-// irreversible and both of which corrupt the ADU↔electron relationship every
-// downstream noise estimate depends on. The preview stream still uses it.
-
+// Shared with legacy load_libraw; neither route applies application-level
+// black subtraction, scaling, white balance or demosaic.
 struct OlsRawImage_t {
   std::vector<uint8_t> pixels;
-  // Backing store for info.make / info.model. Set before the info pointers.
   std::string make;
   std::string model;
-  OlsRawImageInfo info;
+  std::string metadata_json;
+  OlsRawImageInfo info{};
 };
 
 #ifdef WITH_LIBRAW
-
-/// dcraw's CFA lookup, evaluated in RAW-ARRAY coordinates.
-///
-/// Deliberately not `raw.COLOR()`. Whether COLOR() indexes from the raw-array
-/// origin or the visible-image origin has moved between LibRaw releases, and
-/// choosing wrong rotates RGGB→GRBG only on bodies whose top/left margin is
-/// odd — a bug that reproduces on one camera and not another and looks like a
-/// colour-balance problem rather than an indexing one. `idata.filters` is
-/// unambiguously the pattern of the raw array, and the pixel copy below indexes
-/// the raw array too, so the two agree by construction.
-static inline int ols_fc_raw(unsigned filters, int row, int col) {
-  return (filters >> ((((row) << 1 & 14) | ((col) & 1)) << 1)) & 3;
-}
-
-/// Bayer phase at raw-array coordinate (row0, col0) — i.e. at the top-left of
-/// the plane we are about to return, not of the sensor.
-static OlsBayerType ols_bayer_from_filters(unsigned filters, int row0, int col0) {
-  if (filters == 0)
-    return OLS_BAYER_NA; // no CFA: monochrome body, or already demosaiced
-
-  // LibRaw colour indices are 0=R 1=G 2=B 3=G(second green).
-  static const char lut[] = "RGBG";
-  char pat[5] = {0};
-  pat[0] = lut[ols_fc_raw(filters, row0, col0)];
-  pat[1] = lut[ols_fc_raw(filters, row0, col0 + 1)];
-  pat[2] = lut[ols_fc_raw(filters, row0 + 1, col0)];
-  pat[3] = lut[ols_fc_raw(filters, row0 + 1, col0 + 1)];
-
-  if (!strcmp(pat, "RGGB")) return OLS_BAYER_RG;
-  if (!strcmp(pat, "BGGR")) return OLS_BAYER_BG;
-  if (!strcmp(pat, "GRBG")) return OLS_BAYER_GR;
-  if (!strcmp(pat, "GBRG")) return OLS_BAYER_GB;
+static OlsBayerType ols_bayer_from_name(const std::string &name) {
+  if (name == "RGGB") return OLS_BAYER_RG;
+  if (name == "BGGR") return OLS_BAYER_BG;
+  if (name == "GRBG") return OLS_BAYER_GR;
+  if (name == "GBRG") return OLS_BAYER_GB;
   return OLS_BAYER_NA;
 }
-
-#endif // WITH_LIBRAW
+#endif
 
 OlsError ols_decode_raw(const uint8_t *data, size_t len, int32_t width,
                         int32_t height, int32_t bin, OlsRawImage **out_image) {
@@ -1169,92 +1211,20 @@ OlsError ols_decode_raw(const uint8_t *data, size_t len, int32_t width,
                        std::string("LibRaw could not parse the container: ") +
                            libraw_strerror(code));
 
-    if ((code = raw.unpack()) != LIBRAW_SUCCESS)
-      return set_error(OLS_ERR_IO, std::string("LibRaw unpack failed: ") +
-                                       libraw_strerror(code));
-
-    if (!raw.imgdata.rawdata.raw_image)
-      return set_error(OLS_ERR_INVALID,
-                       "File has no 16-bit Bayer plane (Foveon, sRAW and float "
-                       "DNG decode to other layouts and are not supported)");
-
-    if (raw.imgdata.idata.filters == 9)
-      return set_error(OLS_ERR_INVALID,
-                       "X-Trans (6x6 CFA) sensors are not supported by this "
-                       "decoder");
-
-    const libraw_image_sizes_t &sz = raw.imgdata.sizes;
-
-    // Crop geometry, mirroring load_libraw() so a frame decoded here lines up
-    // with the same frame decoded for preview.
-    //
-    // `sz.width`/`sz.height` are the VISIBLE dimensions; the raw array is
-    // `raw_width` x `raw_height` and the visible area starts at
-    // (top_margin, left_margin). Offsets are forced even (`/4*2`) so that a
-    // sub-region request cannot rotate the CFA phase relative to a full-frame
-    // request of the same file.
-    int w = 0, h = 0, dw = 0, dh = 0;
-    if (width > 0 && height > 0) {
-      w = width;
-      h = height;
-      dw = (sz.width - w) / 4 * 2;
-      dh = (sz.height - h) / 4 * 2;
-    } else {
-      w = sz.width / 2 * 2;
-      h = sz.height / 2 * 2;
-    }
-
-    const long x0 = (long)sz.left_margin + dw;
-    const long y0 = (long)sz.top_margin + dh;
-
-    if (w <= 0 || h <= 0 || (w & 1) || (h & 1) || dw < 0 || dh < 0 ||
-        x0 + w > (long)sz.raw_width || y0 + h > (long)sz.raw_height) {
-      char buf[320];
-      // LibRaw's size fields are ushort; cast so the format specifiers match
-      // after integral promotion.
-      snprintf(buf, sizeof(buf),
-               "Requested %dx%d does not fit: visible %ux%u, raw %ux%u, "
-               "margins l=%u t=%u, offset %dx%d",
-               w, h, (unsigned)sz.width, (unsigned)sz.height,
-               (unsigned)sz.raw_width, (unsigned)sz.raw_height,
-               (unsigned)sz.left_margin, (unsigned)sz.top_margin, dw, dh);
-      return set_error(OLS_ERR_INVALID, buf);
-    }
-
-    // raw_pitch is in BYTES and is not always tight — some unpackers pad rows.
-    // Older LibRaw builds leave it zero, in which case rows are tight.
-    const size_t pitch =
-        sz.raw_pitch ? (size_t)sz.raw_pitch : (size_t)sz.raw_width * 2;
-    if (pitch < (size_t)sz.raw_width * 2)
-      return set_error(OLS_ERR_GENERIC,
-                       "LibRaw reported a raw_pitch narrower than raw_width");
-
+    auto plane = ols::untouched_raw::unpack(raw, width, height, bin);
+    const auto &region = plane.region;
+    const auto &sz = raw.imgdata.sizes;
+    const auto spatial_black = ols::untouched_raw::black_table(raw);
     std::unique_ptr<OlsRawImage_t> image(new OlsRawImage_t());
-
-    // One copy, into a tightly-packed buffer, so `ols_rawimage_pixels` can
-    // honestly promise `width * height * 2` contiguous bytes and the Rust side
-    // never has to reason about stride. The alternative — keeping this LibRaw
-    // instance alive and handing out a pointer into its margin-inclusive
-    // buffer — saves this copy but holds LibRaw's larger allocation for the
-    // whole life of the handle, and makes every consumer stride-aware.
-    const size_t row_bytes = (size_t)w * 2;
-    image->pixels.resize(row_bytes * (size_t)h);
-    const uint8_t *src =
-        reinterpret_cast<const uint8_t *>(raw.imgdata.rawdata.raw_image);
-    for (int y = 0; y < h; ++y) {
-      memcpy(image->pixels.data() + (size_t)y * row_bytes,
-             src + ((size_t)y0 + (size_t)y) * pitch + (size_t)x0 * 2,
-             row_bytes);
-    }
+    image->pixels = std::move(plane.pixels);
 
     image->make = raw.imgdata.idata.make;
     image->model = raw.imgdata.idata.model;
 
     OlsRawImageInfo &info = image->info;
-    info.width = w;
-    info.height = h;
-    info.bayer =
-        ols_bayer_from_filters(raw.imgdata.idata.filters, (int)y0, (int)x0);
+    info.width = region.width;
+    info.height = region.height;
+    info.bayer = ols_bayer_from_name(plane.pattern);
     info.bits_per_sample = 16;
     info.black_level = (int32_t)raw.imgdata.color.black;
     for (int i = 0; i < 4; ++i)
@@ -1269,6 +1239,39 @@ OlsError ols_decode_raw(const uint8_t *data, size_t len, int32_t width,
     // Set last: these borrow from the strings above, which must be final.
     info.make = image->make.c_str();
     info.model = image->model.c_str();
+
+    nlohmann::json metadata = {
+        {"schema_version", 1}, {"decoder_version", LibRaw::version()},
+        {"unpack_function", raw.unpack_function_name() ? raw.unpack_function_name() : ""},
+        {"processing_version", ols::untouched_raw::version},
+        {"sample_domain", "libraw_unpack_output_adu"},
+        {"raw_width", sz.raw_width}, {"raw_height", sz.raw_height},
+        {"visible_width", sz.width}, {"visible_height", sz.height},
+        {"left_margin", sz.left_margin}, {"top_margin", sz.top_margin},
+        {"source_pitch_bytes", region.source_pitch},
+        {"crop_x", region.x}, {"crop_y", region.y},
+        {"width", region.width}, {"height", region.height},
+        {"pixel_aspect", sz.pixel_aspect}, {"orientation", sz.flip},
+        {"filters", raw.imgdata.idata.filters}, {"color_description", raw.imgdata.idata.cdesc},
+        {"bayer_at_crop_origin", plane.pattern}, {"black_table", spatial_black},
+        {"black_table_complete", true},
+        {"linear_max", {raw.imgdata.color.linear_max[0], raw.imgdata.color.linear_max[1],
+                        raw.imgdata.color.linear_max[2], raw.imgdata.color.linear_max[3]}},
+        {"white_level_source", "libraw_unpack_declared_maximum"},
+        {"nonlinearity_state", "not_measured"},
+        {"black_subtracted", false}, {"scaled", false}, {"white_balance_applied", false},
+        {"demosaic_applied", false}, {"rotation_applied", false}, {"bin", 1}
+    };
+#if LIBRAW_VERSION >= LIBRAW_MAKE_VERSION(0, 21, 0)
+    metadata["unpack_options"] = raw.imgdata.rawparams.options;
+    metadata["unpack_specials"] = raw.imgdata.rawparams.specials;
+    metadata["shot_select"] = raw.imgdata.rawparams.shot_select;
+#else
+    metadata["unpack_options"] = raw.imgdata.params.raw_processing_options;
+    metadata["unpack_specials"] = nullptr;
+    metadata["shot_select"] = raw.imgdata.params.shot_select;
+#endif
+    image->metadata_json = metadata.dump();
 
     *out_image = image.release();
     return OLS_OK;
@@ -1294,6 +1297,10 @@ const uint8_t *ols_rawimage_pixels(const OlsRawImage *image, size_t *out_len) {
   if (out_len)
     *out_len = image->pixels.size();
   return image->pixels.data();
+}
+
+const char *ols_rawimage_metadata_json(const OlsRawImage *image) {
+  return image ? image->metadata_json.c_str() : nullptr;
 }
 
 void ols_rawimage_destroy(OlsRawImage *image) { delete image; }

@@ -25,6 +25,20 @@ use super::quality::LumaFrame;
 /// builder applies the same rule; shifting an edge star off-center would create
 /// an input distribution the model never saw.
 pub fn fqe_input_from_frame(frame: &LumaFrame, cx: f32, cy: f32) -> Option<Array2<f32>> {
+    // A03 changes the input domain. Existing model exports have no qualification
+    // binding for the versioned linear intensity, masks or geometry, including
+    // shadow inference. Shape compatibility alone cannot enable this path.
+    if fqe_unavailable_reason(frame).is_some() {
+        return None;
+    }
+    centered_normalized_crop(frame, cx, cy)
+}
+
+pub fn fqe_unavailable_reason(_frame: &LumaFrame) -> Option<&'static str> {
+    Some("FQE disabled: no model bundle is qualified for the A03 analysis domain/version")
+}
+
+fn centered_normalized_crop(frame: &LumaFrame, cx: f32, cy: f32) -> Option<Array2<f32>> {
     if frame.width < FQE_CROP_SIZE
         || frame.height < FQE_CROP_SIZE
         || !cx.is_finite()
@@ -142,12 +156,29 @@ mod tests {
             height,
             max_adu: 65_535.0,
             saturation_adu: Some(65_535.0),
+            masks: Default::default(),
+            analysis_descriptor: None,
         };
 
-        let crop = fqe_input_from_frame(&frame, 100.0, 100.0).unwrap();
+        let crop = centered_normalized_crop(&frame, 100.0, 100.0).unwrap();
         assert_eq!(crop.shape(), &[FQE_CROP_SIZE, FQE_CROP_SIZE]);
         // The bright pixel lands at the crop center and normalizes to 1.0.
         assert_eq!(crop[[FQE_CROP_SIZE / 2, FQE_CROP_SIZE / 2]], 1.0);
+    }
+
+    #[test]
+    fn unqualified_analysis_cannot_reach_even_shadow_preprocessing() {
+        let frame = LumaFrame {
+            pixels: vec![10.0; 200 * 200],
+            width: 200,
+            height: 200,
+            max_adu: 65535.0,
+            saturation_adu: Some(16383.0),
+            masks: Default::default(),
+            analysis_descriptor: None,
+        };
+        assert!(fqe_input_from_frame(&frame, 100.0, 100.0).is_none());
+        assert!(fqe_unavailable_reason(&frame).unwrap().contains("A03"));
     }
 
     #[test]
@@ -158,11 +189,13 @@ mod tests {
             height: 200,
             max_adu: 65_535.0,
             saturation_adu: Some(65_535.0),
+            masks: Default::default(),
+            analysis_descriptor: None,
         };
 
-        assert!(fqe_input_from_frame(&frame, 31.0, 100.0).is_none());
-        assert!(fqe_input_from_frame(&frame, 32.0, 100.0).is_some());
-        assert!(fqe_input_from_frame(&frame, 168.0, 100.0).is_some());
-        assert!(fqe_input_from_frame(&frame, 169.0, 100.0).is_none());
+        assert!(centered_normalized_crop(&frame, 31.0, 100.0).is_none());
+        assert!(centered_normalized_crop(&frame, 32.0, 100.0).is_some());
+        assert!(centered_normalized_crop(&frame, 168.0, 100.0).is_some());
+        assert!(centered_normalized_crop(&frame, 169.0, 100.0).is_none());
     }
 }

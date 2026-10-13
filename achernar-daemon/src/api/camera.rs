@@ -7,6 +7,10 @@ use crate::api::api_error::ApiError;
 use crate::hardware::camera::{CamParam, FrameData, OlsCamera, StreamFormat};
 use crate::hardware::ols_ffi::{OlsCamOptionId, OlsCamOptionType, OlsStreamType};
 use crate::state::{AppState, CameraActivity};
+use crate::storage::capture_archive::ArchiveReservation;
+use crate::storage::capture_retention::{
+    validate_retention_policy, RetentionAcknowledgement, RetentionDecision, RetentionPolicy,
+};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CaptureParams {
@@ -23,6 +27,12 @@ pub struct CaptureParams {
     /// light | dark | flat | bias | focus | preview | verification
     #[serde(default)]
     pub capture_type: Option<String>,
+    /// Camera originals are retained by default. Destructive policies remain
+    /// unavailable until archive persistence/recovery qualification (A12).
+    #[serde(default)]
+    pub retention_policy: RetentionPolicy,
+    #[serde(default)]
+    pub retention_acknowledgement: Option<RetentionAcknowledgement>,
 }
 
 /// One artifact of a committed capture.
@@ -64,6 +74,7 @@ pub struct ImageData {
     /// they migrate to `assets`. It cannot express a RAW+JPEG capture, which is
     /// the whole reason `assets` exists — new code should not use it.
     pub path: Option<String>,
+    pub retention: RetentionDecision,
     pub metadata: ImageMetadata,
 }
 
@@ -236,6 +247,13 @@ pub(crate) async fn start_stream_control(
             .formats()
             .map_err(|e| ApiError::hardware(format!("Could not read camera formats: {e}")))?;
         let (index, format) = select_format(&formats, format_index)?;
+        if camera.supports_still_capture() && !format.is_liveview() {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "still_stream_unarchived",
+                "DSLR still streams cannot archive complete exposure bundles; use dedicated still capture (A02).",
+            ));
+        }
 
         // This is a new stream generation. Old preview/vision values must be
         // gone before a callback from the new device is allowed to arrive.
@@ -326,12 +344,12 @@ pub(crate) async fn perform_capture(
 ) -> Result<ImageData, ApiError> {
     // Detach the hardware transaction from the HTTP request lifetime. If a
     // browser tab closes mid-exposure, Tokio keeps this task (and its ownership
-    // gate) alive until the camera and atomic capture-store commit finish.
+    // gate) alive until the camera and local archive commit finish.
     let cleanup_state = state.clone();
     tokio::spawn(async move { perform_capture_owned(state, params).await })
         .await
         .map_err(|error| {
-            let message = format!("Capture task failed: {error}");
+            let message = format!("Capture task failed: {error}. Camera outcome is uncertain; reconnect or restart the daemon before another exposure");
             finish_capture_runtime(&cleanup_state, Some(message.clone()));
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -349,6 +367,20 @@ async fn perform_capture_owned(
     // exposure — which can be minutes — so a second request cannot change the
     // shutter out from under one already in flight.
     let _acquisition = state.acquisition.lock().await;
+    // Declared after the acquisition guard so unwinding marks the outcome
+    // uncertain before another waiting transaction can acquire the camera.
+    let _panic_guard = CapturePanicGuard(&state.camera_runtime);
+
+    let runtime = state.camera_runtime.read().unwrap().clone();
+    if runtime.connection_id.is_some() && runtime.activity == CameraActivity::Error {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "camera_reconnect_required",
+            runtime.last_error.unwrap_or_else(|| {
+                "Camera state is uncertain; disconnect and reconnect before capturing".to_string()
+            }),
+        ));
+    }
 
     let capture_id = uuid::Uuid::new_v4().to_string();
     let frame_id = uuid::Uuid::new_v4().to_string();
@@ -382,6 +414,9 @@ async fn perform_capture_owned(
         "filter": params.filter,
         "temperature": params.temperature,
         "capture_type": capture_type,
+        "retention_policy": params.retention_policy,
+        "retention_acknowledgement": params.retention_acknowledgement,
+        "retention": RetentionDecision::for_request(params.retention_policy, true),
     });
     if let Err(e) = state
         .capture_store
@@ -432,6 +467,7 @@ fn capture_error_code(status: StatusCode) -> &'static str {
         StatusCode::GATEWAY_TIMEOUT => "capture_timeout",
         StatusCode::UNSUPPORTED_MEDIA_TYPE => "capture_format_unsupported",
         StatusCode::BAD_GATEWAY => "camera_hardware_error",
+        StatusCode::SERVICE_UNAVAILABLE => "capture_archive_unavailable",
         _ => "capture_failed",
     }
 }
@@ -441,6 +477,8 @@ fn finish_capture_runtime(state: &AppState, error: Option<String>) {
     let mut runtime = state.camera_runtime.write().unwrap();
     runtime.activity = if runtime.connection_id.is_none() {
         CameraActivity::Disconnected
+    } else if runtime.activity == CameraActivity::Error {
+        CameraActivity::Error
     } else if streaming {
         CameraActivity::Streaming
     } else {
@@ -459,6 +497,45 @@ fn mark_capture_processing(state: &AppState) {
         runtime.exposure_started_at = None;
         runtime.exposure_duration_s = None;
     }
+}
+
+/// A failed native acquisition can include a shutter trigger whose response
+/// was lost. The current ABI cannot prove quiescence for that error path, so
+/// only a reconnect may clear it; early policy/storage validation is separate.
+struct CapturePanicGuard<'a>(&'a std::sync::RwLock<crate::state::CameraRuntimeState>);
+
+impl Drop for CapturePanicGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            let mut runtime = self.0.write().unwrap_or_else(|poison| poison.into_inner());
+            let capture_id = runtime
+                .operation_id
+                .clone()
+                .unwrap_or_else(|| "unidentified".into());
+            mark_capture_outcome_uncertain(
+                &mut runtime,
+                &capture_id,
+                "acquisition task panicked; a daemon restart may be required",
+            );
+            // Preserve the explicit error state even if the panic originated
+            // while this runtime lock was held. Other poisoned hardware locks
+            // still require a daemon restart.
+            self.0.clear_poison();
+        }
+    }
+}
+
+fn mark_capture_outcome_uncertain(
+    runtime: &mut crate::state::CameraRuntimeState,
+    capture_id: &str,
+    error: impl std::fmt::Display,
+) -> String {
+    let detail = format!(
+        "Capture {capture_id} failed without a confirmed idle outcome: {error}. Disconnect and reconnect before another exposure"
+    );
+    runtime.activity = CameraActivity::Error;
+    runtime.last_error = Some(detail.clone());
+    detail
 }
 
 /// Internal error carrying both the HTTP status and a message worth recording.
@@ -485,12 +562,24 @@ async fn run_capture(
 ) -> Result<ImageData, CaptureError> {
     let mut warnings: Vec<String> = Vec::new();
 
+    // Validate before querying or commanding hardware. Acknowledgement alone
+    // cannot bypass the pending archive durability qualification.
+    validate_retention_policy(params.retention_policy)
+        .map_err(|reason| CaptureError::new(StatusCode::UNPROCESSABLE_ENTITY, reason))?;
+
     if !params.exposure.is_finite() || params.exposure <= 0.0 {
         return Err(CaptureError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "Exposure must be a finite value greater than zero seconds",
         ));
     }
+
+    // Reserve before camera controls or any trigger. Queue failure therefore
+    // cannot create an exposure whose native bytes have nowhere to go.
+    let archive = state
+        .capture_archive
+        .reserve()
+        .map_err(|error| CaptureError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string()))?;
 
     // ─── 1. Confirm the camera can take a real still ───
     let (supports_still, camera_name) = {
@@ -508,8 +597,16 @@ async fn run_capture(
         // Sensor cameras (ASI/SVBony/ToupTek) have no separate still path; the
         // stream *is* the acquisition. Handled separately below rather than
         // pretending the DSLR path applies.
-        return capture_from_stream(state, capture_id, frame_id, capture_type, params, warnings)
-            .await;
+        return capture_from_stream(
+            state,
+            capture_id,
+            frame_id,
+            capture_type,
+            params,
+            warnings,
+            archive,
+        )
+        .await;
     }
 
     if params.binning.unwrap_or(1) != 1 {
@@ -556,13 +653,40 @@ async fn run_capture(
     .map_err(|e| {
         CaptureError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("capture task panicked: {e}"),
+            mark_capture_outcome_uncertain(
+                &mut state.camera_runtime.write().unwrap(),
+                capture_id,
+                format!("capture task panicked: {e}"),
+            ),
         )
     })?
-    .map_err(|e| CaptureError::new(StatusCode::BAD_GATEWAY, e.to_string()))?;
+    .map_err(|e| {
+        CaptureError::new(
+            StatusCode::BAD_GATEWAY,
+            mark_capture_outcome_uncertain(
+                &mut state.camera_runtime.write().unwrap(),
+                capture_id,
+                e,
+            ),
+        )
+    })?;
 
     let (capture, handle) = native;
     mark_capture_processing(state);
+    let retention = RetentionDecision::retaining(true);
+    if capture.bundle["event_complete"] != true
+        || capture.bundle["completion_grace_complete"] != true
+    {
+        let mut runtime = state.camera_runtime.write().unwrap();
+        runtime.activity = CameraActivity::Error;
+        runtime.last_error = Some(format!("Capture {capture_id} did not establish event completion; reconnect before another exposure"));
+    }
+    if capture.assets.is_empty() {
+        return Err(CaptureError::new(StatusCode::BAD_GATEWAY, format!(
+            "Capture {capture_id} produced no recoverable bytes; camera files were not deleted. Native outcome: {}",
+            capture.bundle,
+        )));
+    }
 
     let exposure_error_stops =
         crate::hardware::dslr_controls::stops_from(params.exposure, capture.applied_exposure_s);
@@ -583,13 +707,15 @@ async fn run_capture(
     let mut assets: Vec<crate::storage::capture_store::PendingAsset> = Vec::new();
     let mut width = 0u32;
     let mut height = 0u32;
+    let mut analysis_state = serde_json::json!({"state": "pending", "reason": "No complete supported sensor decode is available", "training_label_eligible": false});
 
-    for native_asset in &capture.assets {
+    for (index, native_asset) in capture.assets.iter().enumerate() {
         let role = match native_asset.role() {
             "camera_jpeg" => crate::storage::capture_store::AssetRole::CameraJpeg,
             _ => crate::storage::capture_store::AssetRole::NativeRaw,
         };
-        let filename = format!("image.{}", native_asset.extension);
+        // Multiple same-extension assets must not overwrite each other.
+        let filename = format!("image-{index}.{}", native_asset.extension);
         assets.push(
             crate::storage::capture_store::PendingAsset::new(
                 role,
@@ -602,14 +728,24 @@ async fn run_capture(
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| native_asset.camera_path.clone()),
-            ),
+            )
+            .with_provenance(serde_json::json!({
+                "camera_path": native_asset.camera_path,
+                "bundle_complete": capture.bundle_complete,
+                "native_bundle": capture.bundle,
+            })),
         );
     }
 
     // Derive a FITS from the primary asset. Deliberately non-fatal: a durably
     // saved CR3 *is* the exposure, and losing a derivation we can redo later
     // must never discard the original.
-    if let Some(primary) = capture.primary() {
+    if let Some(primary) = capture.primary().filter(|_| capture.bundle_complete) {
+        let primary_index = capture
+            .assets
+            .iter()
+            .position(|asset| std::ptr::eq(asset, primary))
+            .unwrap();
         match crate::fits::fits_from_source(
             &primary.bytes,
             &primary.extension,
@@ -623,7 +759,7 @@ async fn run_capture(
                 iso: (capture.applied_sensitivity > 0.0).then_some(capture.applied_sensitivity),
                 shutter_label: (!capture.shutter_label.is_empty())
                     .then(|| capture.shutter_label.clone()),
-                source_file: Some(format!("image.{}", primary.extension)),
+                source_file: Some(format!("image-{primary_index}.{}", primary.extension)),
                 // Filled in by the decoder, which is the only thing that knows
                 // the body's black and saturation levels.
                 calibration: None,
@@ -632,6 +768,12 @@ async fn run_capture(
             Ok(Some(fits)) => {
                 width = fits.width;
                 height = fits.height;
+                if let Some(reason) = fits.analysis_pending_reason.as_ref() {
+                    warnings.push(format!("Scientific analysis pending: {reason}"));
+                    analysis_state = serde_json::json!({"state": "pending", "reason": reason, "training_label_eligible": false});
+                } else {
+                    analysis_state = serde_json::json!({"state": "computational_baseline", "descriptor": "analysis/analysis.json", "training_label_eligible": false, "qualification": "optical_and_offline_loader_pending"});
+                }
 
                 // Everything the decoder chose not to apply. Recorded so a
                 // calibration step can apply it later, and so a frame can be
@@ -652,6 +794,7 @@ async fn run_capture(
                         "white_level": info.white_level,
                         "cam_mul": info.cam_mul,
                         "bayer": format!("{:?}", info.bayer),
+                        "decoder_metadata": info.decoder_metadata,
                         // Stated explicitly so a reader never has to infer it
                         // from the absence of a field.
                         "black_subtracted": false,
@@ -660,19 +803,12 @@ async fn run_capture(
                     });
                     if !info.black_level_is_complete() {
                         warnings.push(format!(
-                            "{} {} reports a {}x{} black-level table; only the four \
-                             per-channel offsets were recorded. Calibrate from bias \
-                             frames rather than the header.",
+                            "{} {} reports an incomplete {}x{} black-level table; calibration is unavailable.",
                             info.make, info.model, info.cblack_pattern[0], info.cblack_pattern[1]
                         ));
                     }
                     if info.bayer == crate::hardware::ols_ffi::OlsBayerType::Na {
-                        warnings.push(
-                            "Decoder found no Bayer pattern; the frame is being filed as \
-                             mono. If this is a colour body, BAYERPAT is missing and \
-                             debayering downstream will fail."
-                                .to_string(),
-                        );
+                        warnings.push("Decoder found no Bayer pattern; scientific analysis is unavailable because monochrome cannot be inferred from missing CFA metadata".to_string());
                     }
                 }
 
@@ -683,14 +819,18 @@ async fn run_capture(
                         "application/fits",
                         fits.bytes,
                     )
-                    .derived_from(if primary.role() == "camera_jpeg" {
-                        crate::storage::capture_store::AssetRole::CameraJpeg
-                    } else {
-                        crate::storage::capture_store::AssetRole::NativeRaw
-                    })
+                    .derived_from_asset(
+                        if primary.role() == "camera_jpeg" {
+                            crate::storage::capture_store::AssetRole::CameraJpeg
+                        } else {
+                            crate::storage::capture_store::AssetRole::NativeRaw
+                        },
+                        format!("image-{primary_index}.{}", primary.extension),
+                    )
                     .with_dimensions(fits.width as i64, fits.height as i64, fits.bit_depth as i64)
                     .with_provenance(decode_provenance),
                 );
+                assets.extend(fits.analysis_assets);
             }
             Ok(None) => {
                 warnings.push(format!(
@@ -735,34 +875,33 @@ async fn run_capture(
             "iso_label": capture.iso_label,
             "measured_duration_s": capture.exposure_duration_s(),
             "asset_count": capture.assets.len(),
+            "retention": retention,
+            "bundle": capture.bundle,
+            "analysis": analysis_state,
+            "quality": if capture.bundle_complete { serde_json::json!({"training_label_eligible": false, "acquisition_domain": "unqualified_sensor_analysis"}) } else {
+                serde_json::json!({"training_label_eligible": false, "acquisition_domain": "incomplete_native_capture"})
+            },
         }),
         assets,
     };
 
-    let committed = state
-        .capture_store
-        .persist_capture(state.local_store.pool(), pending)
-        .await
-        .map_err(|e| {
-            CaptureError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("persist capture: {e}"),
-            )
-        })?;
+    let committed = archive.persist(pending).await.map_err(|e| {
+        CaptureError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist capture: {e}"),
+        )
+    })?;
 
-    // ─── 6. Only now is it safe to reclaim the card ───
-    // The bytes are on disk, hashed, and referenced by a committed row.
-    {
-        let cam_lock = state.camera.lock().unwrap();
-        if let Some(camera) = cam_lock.as_ref() {
-            if let Err(e) = camera.delete_captured(&handle) {
-                // Not fatal: wasted card space, versus destroying an exposure.
-                tracing::warn!("Could not delete captured files from the camera: {e}");
-                warnings.push(format!("Files left on the camera: {e}"));
-            }
-        }
-    }
+    // Release bridge buffers without deleting camera files. A local commit
+    // does not authorize reclamation or establish a retained second copy.
     drop(handle);
+
+    if !capture.bundle_complete {
+        return Err(CaptureError::new(StatusCode::BAD_GATEWAY, format!(
+            "Capture {} was incomplete. Recovered bytes were archived as frame {} at {}; camera originals were not deleted. Native outcome: {}",
+            committed.capture_id, committed.frame_id, committed.relative_dir, capture.bundle,
+        )));
+    }
 
     // Build the asset list once; `legacy_path` needs it before ImageData is
     // constructed, and `committed.assets` is consumed by the conversion.
@@ -789,6 +928,7 @@ async fn run_capture(
         relative_dir: committed.relative_dir,
         assets: asset_infos,
         path: legacy,
+        retention,
         metadata: ImageMetadata {
             exposure: capture.applied_exposure_s,
             requested_exposure: params.exposure,
@@ -824,6 +964,7 @@ async fn capture_from_stream(
     capture_type: &str,
     params: &CaptureParams,
     mut warnings: Vec<String>,
+    archive: ArchiveReservation,
 ) -> Result<ImageData, CaptureError> {
     if !*state.streaming.lock().unwrap() {
         return Err(CaptureError::new(
@@ -974,7 +1115,7 @@ async fn capture_from_stream(
     // This FITS is produced by the daemon from the driver's stream bytes. It is
     // canonical for this sensor capture, but it is not a camera-authored RAW
     // container and must not be labelled/uploaded as one.
-    let assets = vec![crate::storage::capture_store::PendingAsset::new(
+    let mut assets = vec![crate::storage::capture_store::PendingAsset::new(
         crate::storage::capture_store::AssetRole::SensorFits,
         "image.fits",
         "application/fits",
@@ -987,6 +1128,34 @@ async fn capture_from_stream(
         "source": "driver_stream",
         "note": "sensor camera: no separate still path; daemon encoded the selected stream frame as FITS",
     }))];
+    let derived = frame
+        .analysis_sensor_descriptor()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))
+        .and_then(|descriptor| {
+            crate::processing::debayer::analyze(&crate::processing::debayer::SensorFrame {
+                descriptor,
+                data: &frame.data,
+                masks: Default::default(),
+            })
+        })
+        .and_then(|analysis| {
+            crate::storage::analysis_assets::analysis_assets(
+                &analysis,
+                "image.fits",
+                &assets[0].bytes,
+                &frame.data,
+            )
+        });
+    let analysis_state = match derived {
+        Ok(derived_assets) => {
+            assets.extend(derived_assets);
+            serde_json::json!({"state": "computational_baseline", "descriptor": "analysis/analysis.json", "training_label_eligible": false, "qualification": "optical_and_offline_loader_pending"})
+        }
+        Err(error) => {
+            warnings.push(format!("Scientific analysis pending: {error}"));
+            serde_json::json!({"state": "pending", "reason": error.to_string(), "training_label_eligible": false})
+        }
+    };
 
     let pending = crate::storage::capture_store::PendingCapture {
         capture_id: capture_id.to_string(),
@@ -1020,20 +1189,19 @@ async fn capture_from_stream(
             "applied_binning": actual_binning,
             "requested_offset": params.offset,
             "applied_offset": applied_offset,
+            "retention": RetentionDecision::retaining(frame.source.is_some()),
+            "analysis": analysis_state,
+            "quality": {"training_label_eligible": false, "acquisition_domain": "unqualified_sensor_analysis"},
         }),
         assets,
     };
 
-    let committed = state
-        .capture_store
-        .persist_capture(state.local_store.pool(), pending)
-        .await
-        .map_err(|e| {
-            CaptureError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("persist capture: {e}"),
-            )
-        })?;
+    let committed = archive.persist(pending).await.map_err(|e| {
+        CaptureError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist capture: {e}"),
+        )
+    })?;
 
     // Build the asset list once; `legacy_path` needs it before ImageData is
     // constructed, and `committed.assets` is consumed by the conversion.
@@ -1060,6 +1228,7 @@ async fn capture_from_stream(
         relative_dir: committed.relative_dir,
         assets: asset_infos,
         path: legacy,
+        retention: RetentionDecision::retaining(frame.source.is_some()),
         metadata: ImageMetadata {
             exposure: actual_exposure_s,
             requested_exposure: params.exposure,
@@ -1130,6 +1299,8 @@ pub(crate) fn read_temperature(
 
 fn read_focuser_position(state: &AppState) -> Option<i64> {
     let focuser = state.focuser.lock().ok()?;
+    crate::hardware::health::require_connected(state, crate::hardware::health::DeviceKind::Focuser)
+        .ok()?;
     focuser.as_ref()?.position().ok().map(|p| p as i64)
 }
 
@@ -1496,20 +1667,72 @@ pub async fn stop_stream(
 pub async fn snapshot(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let frame = state.latest_frame.lock().unwrap().clone();
-    let frame = frame.ok_or(StatusCode::NOT_FOUND)?;
-    let jpeg = encode_frame_jpeg(&frame).ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+    preview_snapshot_value(&state).map(Json)
+}
 
-    Ok(Json(serde_json::json!({
+/// One lifecycle/freshness contract for direct HTTP and relayed snapshots.
+/// Encoding happens outside publication locks, followed by a second check so
+/// disconnect/reconnect during JPEG work cannot publish retired pixels.
+pub(crate) fn preview_snapshot_value(state: &AppState) -> Result<serde_json::Value, StatusCode> {
+    let (connection_id, frame) = {
+        let _barrier = state.camera_observation_barrier.lock().unwrap();
+        let runtime = state.camera_runtime.read().unwrap().clone();
+        let connection_id = runtime
+            .connection_id
+            .ok_or(StatusCode::PRECONDITION_FAILED)?;
+        if !runtime.streaming {
+            return Err(StatusCode::PRECONDITION_FAILED);
+        }
+        let frame = state
+            .latest_frame
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or(StatusCode::NOT_FOUND)?;
+        if !preview_context_matches(state, &connection_id, &frame) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        (connection_id, frame)
+    };
+    let jpeg = encode_frame_jpeg(&frame).ok_or(StatusCode::UNSUPPORTED_MEDIA_TYPE)?;
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(jpeg);
+    let _barrier = state.camera_observation_barrier.lock().unwrap();
+    if !preview_context_matches(state, &connection_id, &frame) {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(serde_json::json!({
         "status": "ok",
         "format": "JPEG",
         "mime_type": "image/jpeg",
+        "connection_id": connection_id,
+        "stream_generation": frame.stream_generation,
         "width": frame.width,
         "height": frame.height,
         "frame_counter": frame.frame_counter,
         "timestamp": frame.unix_timestamp,
-        "data_base64": base64::engine::general_purpose::STANDARD.encode(jpeg),
-    })))
+        "data_base64": data_base64,
+    }))
+}
+
+// Caller holds camera_observation_barrier. The frame need not still be latest
+// at return: a newer frame from the same generation does not retire this one.
+fn preview_context_matches(state: &AppState, connection_id: &str, frame: &FrameData) -> bool {
+    let runtime = state.camera_runtime.read().unwrap().clone();
+    let registered = state
+        .devices
+        .read()
+        .unwrap()
+        .connection_id(crate::hardware::health::DeviceKind::Camera);
+    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    let age = now - frame.unix_timestamp;
+    runtime.connection_id.as_deref() == Some(connection_id)
+        && registered.as_deref() == Some(connection_id)
+        && runtime.streaming
+        && frame.stream_generation == state.current_camera_generation()
+        && frame.width > 0
+        && frame.height > 0
+        && frame.unix_timestamp.is_finite()
+        && (-1.0..=5.0).contains(&age)
 }
 
 /// MJPEG Stream placeholder
@@ -1577,7 +1800,8 @@ fn parameter_unit(id: OlsCamOptionId, option_type: OlsCamOptionType) -> Option<&
 
     use OlsCamOptionId::*;
     match id {
-        Exp | CaptureDelay => Some("ms"),
+        Exp => Some("ms"),
+        CaptureDelay => Some("s"),
         Temperature | CoolerTarget => Some("degC"),
         CoolerPowerPerc => Some("percent"),
         Gain | BlackLevel | Brightness | Contrast | Gamma | Wb | WbR | WbB => Some("driver_units"),
@@ -1608,7 +1832,10 @@ pub(crate) fn parameter_info(camera: &OlsCamera, id: OlsCamOptionId, p: CamParam
         group: parameter_group(id),
         unit: parameter_unit(id, p.option_type),
         kind: option_type_name(p.option_type).to_string(),
-        read_only: p.read_only,
+        // Preview start/stop owns the viewfinder flag. Exposing a competing
+        // raw toggle lets the camera and preview worker immediately undo it.
+        read_only: p.read_only
+            || matches!(id, OlsCamOptionId::KeepImages | OlsCamOptionId::Viewfinder),
         min: p.min_val,
         max: p.max_val,
         step: p.step_size,
@@ -1656,18 +1883,25 @@ fn update_runtime_telemetry(state: &AppState, controls: &[CamParamInfo]) {
 pub async fn get_parameters(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<CamParamInfo>>, ApiError> {
-    let _acquisition = state.acquisition.try_lock().map_err(|_| {
+    let acquisition = state.acquisition.clone().try_lock_owned().map_err(|_| {
         ApiError::new(
             StatusCode::CONFLICT,
             "camera_busy",
             "Camera controls cannot be refreshed during another camera operation",
         )
     })?;
-    let cam_lock = state.camera.lock().unwrap();
-    let camera = cam_lock.as_ref().ok_or_else(ApiError::no_camera)?;
-    let controls = read_parameters(camera)?;
-    drop(cam_lock);
-    update_runtime_telemetry(&state, &controls);
+    let worker_state = state.clone();
+    let controls = tokio::task::spawn_blocking(move || {
+        let _acquisition = acquisition;
+        let cam_lock = worker_state.camera.lock().unwrap();
+        let camera = cam_lock.as_ref().ok_or_else(ApiError::no_camera)?;
+        let controls = read_parameters(camera)?;
+        drop(cam_lock);
+        update_runtime_telemetry(&worker_state, &controls);
+        Ok::<_, ApiError>(controls)
+    })
+    .await
+    .map_err(|error| ApiError::hardware(format!("Camera control read failed: {error}")))??;
     Ok(Json(controls))
 }
 
@@ -1683,7 +1917,20 @@ pub async fn set_parameter(
     State(state): State<AppState>,
     Json(req): Json<SetParamRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let _acquisition = state.acquisition.lock().await;
+    // A hardware write and its readback may wait for the current USB preview
+    // transfer. Keep that work off the async workers that deliver live frames.
+    // Moving ownership into the worker also protects a write if HTTP is cancelled.
+    let acquisition = state.acquisition.clone().lock_owned().await;
+    tokio::task::spawn_blocking(move || {
+        let _acquisition = acquisition;
+        apply_parameter(&state, &req)
+    })
+    .await
+    .map_err(|error| ApiError::hardware(format!("Camera control write failed: {error}")))?
+    .map(Json)
+}
+
+fn apply_parameter(state: &AppState, req: &SetParamRequest) -> Result<serde_json::Value, ApiError> {
     let id = parse_option(&req.name).ok_or_else(|| {
         ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -1702,7 +1949,14 @@ pub async fn set_parameter(
             format!("The connected camera does not expose '{}'", req.name),
         )
     })?;
-    if parameter.read_only {
+    if id == OlsCamOptionId::Viewfinder {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "camera_control_managed",
+            "The camera viewfinder is managed by preview Start/Stop; use those controls instead",
+        ));
+    }
+    if parameter.read_only || id == OlsCamOptionId::KeepImages {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             "camera_control_read_only",
@@ -1746,19 +2000,34 @@ pub async fn set_parameter(
         .map(|p| p.cur_val)
         .map_err(|e| ApiError::hardware(format!("Could not read back '{}': {e}", req.name)))?;
 
+    if matches!(
+        parameter.option_type,
+        OlsCamOptionType::Selection | OlsCamOptionType::Bool
+    ) && current != req.value
+    {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "camera_control_not_applied",
+            format!(
+                "Camera did not apply '{}' choice {} (read back {}). Check the camera's shooting mode and control locks.",
+                req.name, req.value, current
+            ),
+        ));
+    }
+
     if id == OlsCamOptionId::Temperature {
         state.camera_runtime.write().unwrap().temperature_c = Some(current);
     } else if id == OlsCamOptionId::CoolerOn {
         state.camera_runtime.write().unwrap().cooler_on = Some(current > 0.5);
     }
 
-    Ok(Json(serde_json::json!({
+    Ok(serde_json::json!({
         "status": "ok",
         "name": req.name,
         "requested_value": req.value,
         "value": current,
         "applied_value": current,
-    })))
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -2077,7 +2346,7 @@ pub(crate) fn option_label(id: OlsCamOptionId) -> &'static str {
         HighFullwell => "High full-well mode",
         Iso => "ISO",
         Shutter => "Shutter speed",
-        Viewfinder => "Live view",
+        Viewfinder => "Camera viewfinder (use preview Start/Stop)",
         CaptureTarget => "Capture target",
         KeepImages => "Keep images on camera",
         CaptureDelay => "Inter-shot delay",
@@ -2140,6 +2409,86 @@ pub(crate) fn option_type_name(t: OlsCamOptionType) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_capture_error_requires_reconnect_without_inventing_idle_state() {
+        let mut runtime = crate::state::CameraRuntimeState::default();
+        runtime.connection_id = Some("camera-connection".into());
+        runtime.activity = CameraActivity::Exposing;
+        runtime.operation_id = Some("capture-uncertain".into());
+        let detail = mark_capture_outcome_uncertain(
+            &mut runtime,
+            "capture-uncertain",
+            "PTP trigger response was lost",
+        );
+        assert_eq!(runtime.activity, CameraActivity::Error);
+        assert_eq!(runtime.operation_id.as_deref(), Some("capture-uncertain"));
+        assert_eq!(runtime.last_error.as_deref(), Some(detail.as_str()));
+        assert!(detail.contains("capture-uncertain"));
+        assert!(detail.contains("PTP trigger response was lost"));
+        assert!(detail.contains("reconnect"));
+    }
+
+    #[tokio::test]
+    async fn acquisition_panic_marks_uncertain_before_releasing_ownership() {
+        let acquisition = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        let mut state = crate::state::CameraRuntimeState::default();
+        state.connection_id = Some("camera-connection".into());
+        state.activity = CameraActivity::Exposing;
+        state.operation_id = Some("panicked-capture".into());
+        let runtime = std::sync::Arc::new(std::sync::RwLock::new(state));
+        let task_acquisition = acquisition.clone();
+        let task_runtime = runtime.clone();
+        let result = tokio::spawn(async move {
+            let _ownership = task_acquisition.lock().await;
+            let _panic_guard = CapturePanicGuard(&task_runtime);
+            panic!("injected acquisition failure");
+        })
+        .await;
+        assert!(result.unwrap_err().is_panic());
+        let _next_ownership = acquisition.lock().await;
+        let state = runtime.read().unwrap();
+        assert_eq!(state.activity, CameraActivity::Error);
+        assert!(state
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("panicked-capture"));
+    }
+
+    #[test]
+    fn legacy_capture_requests_retain_camera_originals() {
+        for legacy in [
+            serde_json::json!({}),
+            serde_json::json!({"keep_images": true}),
+            serde_json::json!({"keep_images": false}),
+        ] {
+            let mut request = legacy;
+            request["exposure"] = serde_json::json!(1.0);
+            let params: CaptureParams = serde_json::from_value(request).unwrap();
+            assert_eq!(params.retention_policy, RetentionPolicy::RetainOnCamera);
+            assert!(validate_retention_policy(params.retention_policy).is_ok());
+        }
+    }
+
+    #[test]
+    fn acknowledgement_cannot_enable_unqualified_deletion() {
+        let params: CaptureParams = serde_json::from_value(serde_json::json!({
+            "exposure": 1.0,
+            "retention_policy": "delete_after_verified_local_commit",
+            "retention_acknowledgement": {"policy": "delete_after_verified_local_commit", "policy_version": 1}
+        })).unwrap();
+        assert!(params.retention_acknowledgement.is_some());
+        assert!(validate_retention_policy(params.retention_policy).is_err());
+    }
+
+    #[test]
+    fn unknown_retention_policy_is_not_silently_accepted() {
+        assert!(serde_json::from_value::<CaptureParams>(serde_json::json!({
+            "exposure": 1.0, "retention_policy": "delete_now"
+        }))
+        .is_err());
+    }
 
     fn stream_format(
         format: OlsStreamType,

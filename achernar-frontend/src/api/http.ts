@@ -34,7 +34,18 @@ export async function httpJson<TResponse>(
 
     if (!res.ok) {
         const text = await res.text().catch(() => undefined);
-        throw new HttpError(`HTTP ${res.status} for ${url}`, res.status, text);
+        let detail: string | undefined;
+        try {
+            const body = JSON.parse(text ?? "{}");
+            // Relay errors use a string; direct daemon errors carry a code
+            // and message. Show the hardware failure on either transport.
+            detail = typeof body.error === "string" ? body.error
+                : typeof body.error?.message === "string" ? body.error.message
+                    : typeof body.detail === "string" ? body.detail : undefined;
+        } catch {
+            // Non-JSON responses keep the status/URL fallback.
+        }
+        throw new HttpError(detail ?? `HTTP ${res.status} for ${url}`, res.status, text);
     }
 
     const text = await res.text();

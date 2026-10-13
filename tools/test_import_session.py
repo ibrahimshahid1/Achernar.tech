@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ml"))
 
 from import_session import (  # noqa: E402
     classify,
+    exif_datetime,
     group_by_capture,
     import_session,
     night_id_for,
@@ -68,6 +69,29 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(len(groups), 2)
         self.assertEqual(len(groups["IMG_1"]), 2)
 
+    def test_same_name_in_different_folders_is_two_exposures(self):
+        # Card counters repeat across nights; the folder is part of identity.
+        groups = group_by_capture(
+            [Path("n1/IMG_0001.CR3"), Path("n1/IMG_0001.JPG"), Path("n2/IMG_0001.CR3")]
+        )
+        self.assertEqual(sorted(len(g) for g in groups.values()), [1, 2])
+
+    def test_exif_time_uses_offset_precedence(self):
+        naive = {"DateTimeOriginal": "2026:10:08 21:30:00"}
+        # EXIF offset beats a declared one.
+        self.assertEqual(
+            exif_datetime({**naive, "OffsetTimeOriginal": "-04:00"}, "+00:00"),
+            ("2026-10-08T21:30:00-04:00", "exif_offset"),
+        )
+        self.assertEqual(
+            exif_datetime(naive, "-04:00"),
+            ("2026-10-08T21:30:00-04:00", "declared"),
+        )
+        ts, source = exif_datetime(naive)
+        self.assertEqual(source, "host_local_assumed")
+        self.assertTrue(ts.startswith("2026-10-08T21:30:00"))
+        self.assertEqual(exif_datetime({}), (None, None))
+
     def test_night_id_rolls_at_noon_not_midnight(self):
         # 01:30 belongs to the night that began the previous evening.
         self.assertEqual(night_id_for("2026-08-08T01:30:00+00:00", "x"), "2026-08-07")
@@ -93,8 +117,11 @@ class TestImport(unittest.TestCase):
 
             log = d / "session.json"
             log.write_text(json.dumps({
+                # The fixture camera clock runs on UTC; say so rather than
+                # relying on an implicit default.
                 "session": {"session_id": "sess-1", "night_id": "2026-08-07",
-                            "rig_id": "R4", "camera": "Canon EOS 760D"},
+                            "rig_id": "R4", "camera": "Canon EOS 760D",
+                            "camera_utc_offset": "+00:00"},
                 "environment": [
                     {"t": "2026-08-07T22:10:00+00:00", "ambient_temp_c": 21.4,
                      "humidity_pct": 68, "wind_beaufort": 1, "sky_class": 0},

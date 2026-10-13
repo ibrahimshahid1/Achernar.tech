@@ -11,7 +11,9 @@
 
 Achernar is a unified astronomy imaging and control system that democratizes high-quality astrophotography and research through a hybrid AI architecture. The system combines edge computing for real-time operations with cloud computing for collaboration, archiving, and large-scale model training.
 
-**Key Innovation**: Deploy quantized ONNX models on the edge for sub-millisecond decision making (focus, cloud detection) while utilizing a novel tri-modal embedding space (Image, Time-Series, Spectra) in the cloud for advanced recommendation engines and anomaly detection.
+**Local inference direction**: Run models beside the equipment and qualify each deployment against the host's measured performance. The implemented neural path is a CPU-default, batched Focus Quality Estimator (FQE) in shadow mode. The checked-in graph is an ineligible reference artifact with random weights; it is not a trained observing model.
+
+The [v5 architecture specification](achernar_v5.tex) and [compute-aware runtime ADR](docs/adr/compute-aware-model-runtime.md) describe the next design: choose a validated model variant and execution provider within memory and subsystem timing budgets. This is planned work; a detected GPU does not yet enable accelerated inference or a larger model.
 
 ## ✨ Key Features
 
@@ -23,15 +25,16 @@ Achernar is a unified astronomy imaging and control system that democratizes hig
 
 ### AI/ML Intelligence
 
-#### Edge AI (Real-Time, <50ms)
-- **Focus Scoring**: ViT-Tiny ONNX models with uncertainty quantification
-- **Cloud Detection**: MobileNetV3-Small binary classifier with confidence thresholds
-- **Trailing Detection**: CNN-based guiding issue detection
-- **Drift Tracking**: Kalman filter + ARIMA for predictive refocusing
-- **Settings Recommender**: Contextual bandit (LinUCB) for exposure/gain optimization
+#### Local intelligence: current and planned
+
+- **Current FQE infrastructure**: Batched 64×64 grayscale star crops, two-head log-HFR inference, robust pooling and hash-bound uncertainty calibration. Predictions are shadow telemetry; classical HFR remains the autofocus authority.
+- **Current cloud/trailing paths**: Heuristic/classical implementations. Trained neural COC and TED deployments remain planned.
+- **Current drift tracking**: An optional three-state Kalman forecaster publishes advisory refocus estimates; it does not move the focuser.
+- **Planned compute-aware runtime**: Compare qualified model variants using measured end-to-end latency, memory use and family-specific scientific quality. NVIDIA, Jetson and other accelerator support require explicit build and device validation.
+- **Fixed-compute methods**: Control, Kalman estimation and small statistical/bandit models retain their own contracts; available GPU memory does not change their scientific meaning.
 
 #### Cloud AI (Heavy Compute)
-- **Tri-Modal Embeddings**: AstroM3-compatible 512-D space for Image/Telemetry ↔ Light Curve ↔ Spectrum ↔ Metadata
+- **Tri-Modal Embeddings**: AstroM3 integration for light curves, spectra and metadata; the proposed image/telemetry retrofit needs explicit alignment training and validation before it can share the embedding space.
 - **Target Ranking**: Optimization-based scheduling (OR-Tools) with SNR prediction
 - **Quality Scoring**: Calibrated regression with SHAP explainability
 - **Anomaly Detection**: Isolation Forest / One-Class SVM for transient discovery
@@ -50,7 +53,7 @@ Achernar is a unified astronomy imaging and control system that democratizes hig
 - **Cloud Synchronization**: Automatic session sync when connectivity is restored
 - **Multi-Platform Support**: Desktop app (Tauri), web interface, mobile PWA
 - **Remote Operations**: Cloud-mediated IoT relay + WebRTC for low-latency control
-- **Field Deployable**: Runs on Raspberry Pi, Jetson Nano, Intel NUC, or laptops
+- **Field deployment targets**: Raspberry Pi, Jetson Nano, Intel NUC and laptops; validated build/provider combinations and local measurements determine available model capabilities.
 
 ## 🏗️ Architecture
 
@@ -122,9 +125,9 @@ graph TB
 
 ### Edge vs Cloud: Division of Labor
 
-| **Edge (Must Be Fast: <50ms)** | **Cloud (Heavier Compute)** |
+| **Local (Subsystem-Specific Deadlines)** | **Cloud (Heavier Compute)** |
 |--------------------------------|----------------------------|
-| Focus/cloud classifiers | Target ranking/scheduling |
+| FQE shadow inference; planned qualified COC/TED variants | Target ranking/scheduling |
 | Noise estimation | Tri-modal embedding training |
 | Kalman drift tracking | Anomaly detection at scale |
 | Contextual bandits (settings) | Global personalization |
@@ -132,6 +135,11 @@ graph TB
 | Uncertainty quantification | A/B testing & canary deployments |
 | Graceful fallback to rules | Heavy analytics & SHAP |
 | | Federated learning aggregation |
+
+This table describes the division of responsibility, including planned features.
+The v5 design measures preprocessing, transfers, inference and postprocessing
+against each subsystem's deadline. A single global latency number is not a
+hardware-support guarantee.
 
 ## 📁 Repository Structure
 ```
@@ -152,15 +160,17 @@ achernar.tech/
 ├── achernar-daemon/            # Rust daemon (core system)
 │   ├── src/
 │   │   ├── hardware/          # INDI/USB/Serial drivers
-│   │   ├── imaging/           # C++ FFI, OpenCV processing
-│   │   ├── ai/                # ONNX Runtime inference
+│   │   ├── processing/        # Calibration, debayering, stacking, plate solving
+│   │   ├── vision/            # Shared observations, preprocessing, FQE runner
+│   │   ├── models/            # Registry and generic runner scaffolding
+│   │   ├── ai/                # Legacy AI placeholders; not the active FQE path
 │   │   ├── control/           # State machine & sequences
 │   │   ├── storage/           # SQLite + FITS I/O
-│   │   └── server/            # Axum web server + WebSocket
-│   ├── models/                # ONNX model files
+│   │   └── api/               # Axum routes + WebSocket
+│   ├── achernar.example.toml  # Configuration parsed by src/config.rs
 │   └── Cargo.toml
 │
-├── achernar_backend/           # Django backend
+├── backend/                    # Django backend
 │   ├── api/                   # REST API (DRF)
 │   ├── realtime/              # Django Channels (WebSocket)
 │   ├── ml/                    # AI/ML cloud services
@@ -176,18 +186,18 @@ achernar.tech/
 │   │   ├── focus/             # Focus score regressor
 │   │   ├── cloud/             # Cloud classifier
 │   │   └── embeddings/        # Tri-modal CLIP-style
-│   ├── export/                # QAT → ONNX export
+│   ├── export/                # Precision-specific ONNX export
 │   └── notebooks/             # Exploratory analysis
 │
+├── models/                     # Versioned artifacts and metadata; reference FQE only
 ├── docs/
-│   ├── API.md                 # API documentation
-│   ├── HARDWARE.md            # Hardware setup guide
-│   ├── AI_ARCHITECTURE.md     # ML system design
-│   └── DEPLOYMENT.md          # Production deployment
+│   ├── adr/compute-aware-model-runtime.md  # Planned local runtime contract
+│   ├── STREAMING_ARCHITECTURE.md           # Frame/observation path
+│   └── Achernar-Technical-Audit.md         # Dated implementation audit
+├── achernar_v5.tex             # Revised architecture source; distinguishes status
 │
 ├── docker-compose.yml          # Development environment
 ├── pnpm-workspace.yaml         # Monorepo configuration
-├── achernar.toml.example       # Daemon configuration template
 └── README.md
 ```
 
@@ -228,8 +238,8 @@ achernar.tech/
 3. **Set up environment**
 ```bash
    cp .env.example .env
-   cp achernar.toml.example achernar.toml
-   # Edit .env and achernar.toml with your configuration
+   cp achernar-daemon/achernar.example.toml achernar-daemon/achernar.toml
+   # Edit .env and achernar-daemon/achernar.toml with your configuration
 ```
 
 4. **Start services with Docker**
@@ -244,11 +254,9 @@ achernar.tech/
    python manage.py createsuperuser  # Create admin account
 ```
 
-6. **Download AI models** (optional for development)
-```bash
-   cd achernar-daemon/models
-   ./download_models.sh  # Downloads pre-trained ONNX models
-```
+6. **Review the model status** (optional for development)
+
+   See [ML development](ml/README.md) for the FQE reference artifact and training workflow. There is no published trained FQE/COC/TED model download in this repository. The daemon skips the random reference artifact during automatic resolution and continues with classical measurements. To discover eligible local bundles from the daemon directory, set `ACHERNAR_MODELS_DIR=../models`; explicit FQE paths are configured under `[focus.models]`.
 
 7. **Start the development servers**
 ```bash
@@ -357,16 +365,27 @@ pnpm test
 
 ## 📊 AI/ML System Design
 
-### Edge Models (Real-Time)
+### Local model status and v5 direction
 
-| Model | Purpose | Architecture | Latency | Uncertainty |
-|-------|---------|--------------|---------|-------------|
-| Focus Scorer | HFR prediction | ViT-Tiny (INT8) | <50ms | MC Dropout |
-| Cloud Classifier | Clear vs cloudy | MobileNetV3-Small | <30ms | Temperature scaling |
-| Trailing Detector | Guiding issues | CNN on crops | <40ms | Ensemble |
-| Settings Bandit | Exposure/gain | LinUCB | <10ms | UCB bounds |
+| Family/method | Current status | v5 direction |
+|---------------|----------------|--------------|
+| FQE | CPU-default ONNX runner; 64×64 star batches; random reference excluded from auto-selection; shadow output only | Train comparable small/larger variants, qualify each artifact/provider path, preserve calibrated log-HFR semantics |
+| Cloud/obstruction (COC) | Heuristic path; no usable checked-in neural artifact | Add trained variants after data, quality and promotion gates exist |
+| Trailing (TED) | Classical/placeholder path | Validate any CNN extension against classical baselines |
+| Focus drift | Optional three-state Kalman advisory model | Remain a fixed-compute estimator with rig-specific state |
+| Control and bandits | Separate control/statistical contracts | Preserve safety limits and semantics independently of GPU capacity |
+
+No cross-device latency or accuracy improvement is claimed by these entries.
+The planned runtime candidate is an immutable artifact plus execution provider,
+provider options and input/batch profile. Selection is pinned initially for the
+observing session; classical processing remains available when no candidate
+qualifies. Proposed introspection endpoints are `GET /api/v1/ai/models` and
+`GET /api/v1/ai/runtime`; these endpoints are not implemented yet.
 
 ### Cloud Models (Heavy Compute)
+
+These are design targets. The listed refresh cadences are proposed, and do not
+describe a currently validated production service schedule.
 
 | Model | Purpose | Architecture | Update Frequency |
 |-------|---------|--------------|------------------|
@@ -375,14 +394,18 @@ pnpm test
 | Quality Scorer | Frame curation | Calibrated regression | Daily |
 | Anomaly Detector | Transient discovery | Isolation Forest | Weekly |
 
-### Training Pipeline
+### Proposed Training and Deployment Pipeline
+
+This diagram includes planned infrastructure. Precision-specific artifacts need
+their own quality and deployed-parity evidence before shadow qualification.
+
 ```mermaid
 graph LR
     A[Raw Data] --> B[Feature Store<br/>Parquet/DuckDB]
     B --> C[Weak Labeling<br/>Snorkel-style]
     C --> D[PyTorch Lightning<br/>Mixed Precision]
-    D --> E[QAT Export<br/>ONNX INT8]
-    E --> F[Edge Deployment<br/>ONNX Runtime]
+    D --> E[Validated Artifact Export<br/>FP32 / FP16 / INT8]
+    E --> F[Qualified Shadow Deployment<br/>ONNX Runtime]
     F --> G[User Feedback<br/>Active Learning]
     G --> A
 ```
@@ -390,7 +413,7 @@ graph LR
 ### Metrics We Track
 
 #### Edge Models
-- **Focus Regressor**: MAE vs HFR, Spearman ρ, latency, calibration error (ECE)
+- **Focus Regressor**: HFR error in pixels, log-HFR error, within-run ranking, held-out prediction-interval coverage and width, and end-to-end latency.
 - **Cloud Classifier**: AUROC, precision@high-recall, F1 score
 - **Trailing Detector**: Precision/recall, false positive rate
 
@@ -409,131 +432,74 @@ graph LR
 
 **Base URL**: `http://localhost:3030/api/v1`
 
-#### Get Equipment Status
-```http
-GET /status
-```
+The current [router](achernar-daemon/src/main.rs) and typed handlers define the
+request/response contracts. Inspect capabilities and device state before
+issuing hardware commands; a route's existence does not establish that the
+connected driver supports the operation.
 
-**Response**:
-```json
-{
-  "mount": "tracking",
-  "camera": "idle",
-  "focuser": "connected",
-  "temperature": 22.4,
-  "humidity": 45.2
-}
-```
+| Route relative to `/api/v1` | Purpose |
+|---|---|
+| `GET /status` | Equipment state and observations, with unknown values kept distinct from valid zeros |
+| `GET /drivers` | Compiled driver capabilities and availability |
+| `GET /commands` | Commands currently published through the relay |
+| `POST /camera/capture` | Physical capture and asset provenance; see the [camera handler](achernar-daemon/src/api/camera.rs) |
+| `GET /camera/stream` | Binary preview WebSocket; acquisition must be started separately |
+| `GET /camera/stream/mjpeg` | Placeholder route; multipart MJPEG is not implemented |
+| `/focus/*` | Current focus run, abort, status, history and drift routes |
 
-#### Capture Image
-```http
-POST /camera/capture
-Content-Type: application/json
-
-{
-  "exposure": 30.0,
-  "gain": 120,
-  "count": 5,
-  "filter": "Ha"
-}
-```
-
-**Response**:
-```json
-{
-  "job_id": "job_123",
-  "status": "queued"
-}
-```
-
-#### Mount Slew
-```http
-POST /mount/slew
-Content-Type: application/json
-
-{
-  "ra": 14.22,
-  "dec": -32.05
-}
-```
-
-#### Live View Stream
-```http
-GET /stream/mjpeg?fps=10&scale=0.5
-```
+Use the [testing guide](TESTING.md) for current request examples and the
+[streaming contract](docs/STREAMING_ARCHITECTURE.md) for frame parsing.
 
 ### WebSocket Telemetry
 
 **URL**: `ws://localhost:3030/ws/telemetry`
 
-**Message Format**:
-```json
-{
-  "type": "TELEMETRY_UPDATE",
-  "timestamp": 1702931000,
-  "payload": {
-    "mount": {
-      "ra": 14.22,
-      "dec": -32.05,
-      "pier_side": "west"
-    },
-    "camera": {
-      "temperature": -10.1,
-      "status": "exposing",
-      "progress": 0.45
-    },
-    "guiding": {
-      "rms_total": 0.35,
-      "dx": 0.1,
-      "dy": -0.2
-    },
-    "ai": {
-      "focus_hfr": 2.34,
-      "cloud_prob": 0.05,
-      "recommended_exposure": 45.0
-    }
-  }
-}
-```
+The socket publishes equipment telemetry and separate `VISION_UPDATE`
+observations. The [telemetry builder](achernar-daemon/src/telemetry.rs) and
+[shared observation type](achernar-daemon/src/vision/shared_observation.rs)
+define the current fields. FQE predictions remain optional shadow values;
+missing guider or model measurements must not be displayed as a successful zero.
 
 ### Cloud API
 
-See [API Documentation](./docs/API.md) for complete cloud API reference.
+The [Django URL configuration](backend/urls.py) lists mounted services. Relay
+support is narrower than the local daemon router; consult the published command
+registry and [streaming documentation](docs/STREAMING_ARCHITECTURE.md).
 
 ## 📚 Configuration
 
 ### Daemon Configuration (`achernar.toml`)
+
+The authoritative working example is
+[`achernar-daemon/achernar.example.toml`](achernar-daemon/achernar.example.toml).
+The current daemon supports the following relevant subset:
+
 ```toml
-[server]
-host = "0.0.0.0"
+[daemon]
 port = 3030
 log_level = "info"
 
-[equipment]
-profile_name = "RedCat51_Setup"
-
-[equipment.camera]
-driver = "zwo_asi"
-id = "ASI533MC_Pro"
-gain_default = 100
-offset = 50
-
-[equipment.mount]
-driver = "indi"
-device_name = "iOptron HEM27"
-host = "localhost"
-port = 7624
-
-[ai]
-enable_edge_inference = true
-model_path = "./models/onnx"
-cloud_threshold = 0.75
-uncertainty_threshold = 0.85
+[focus.models]
+# Optional explicit path to a validated local FQE bundle; output stays shadow.
+# quality_model_path = "../models/focus_quality/<version>/model.onnx"
 
 [storage]
-raw_path = "/mnt/astro_data/raw"
-archive_path = "/mnt/astro_data/archive"
+database_path = "achernar.db"
 ```
+
+The v5 policy below is a **design example**, not current configuration. Keep it
+commented until the runtime and parser support are implemented:
+
+```toml
+# [ai]
+# model_selection = "auto"
+# compute_budget = "balanced"  # efficient | balanced | quality
+# FQE output initially remains shadow-only; control authority is a separate gate.
+```
+
+The selection policy does not confer control authority. Future live use requires
+artifact promotion, valid calibration and local qualification; a manual pin or
+explicit path must not bypass those gates in the v5 runtime.
 
 ### Environment Variables (`.env`)
 ```bash
@@ -579,80 +545,56 @@ MLFLOW_TRACKING_URI=http://localhost:5000
 - **USB HID**
 - **Serial** commands
 
-### Minimum Hardware Requirements
+### Compute-aware deployment targets
 
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| CPU | Raspberry Pi 4 (4GB) | Intel NUC 11th gen |
-| RAM | 4 GB | 8 GB+ |
-| Storage | 64 GB SSD | 256 GB+ NVMe |
-| GPU | None | NVIDIA Jetson Nano |
-| Network | WiFi or Ethernet | Dual-band WiFi |
+| Target | Intended starting point | Required validation |
+|--------|-------------------------|---------------------|
+| Raspberry Pi | Classical processing and compact CPU candidates | aarch64 packaging, shared RAM reserve, sustained end-to-end timing |
+| Jetson Nano | Compact CPU baseline; candidate accelerated variants | Compatible provider build, supported operators, power mode and shared-memory budget |
+| NUC or laptop CPU | CPU variants that meet the observing workload budget | Thread settings, co-load, memory and tail latency |
+| Laptop with discrete GPU | Candidate larger or higher-resolution models | Supported provider/driver, actual graph placement, memory reserve, quality and timing gates |
 
-See [Hardware Setup Guide](./docs/HARDWARE.md) for detailed instructions.
+These are validation targets, not a completed support matrix or promised model
+tiers. A GPU alone does not establish eligibility, and extra compute improves
+scientific quality only when a separately validated variant demonstrates it.
+See the [build and hardware qualification guide](CROSS_PLATFORM_BUILD.md).
 
 ## 🚢 Deployment
 
-### Production Deployment
-```bash
-# Build optimized binaries
-cargo build --release --target x86_64-unknown-linux-gnu
+### Current build and release status
 
-# Build Docker images
-docker-compose -f docker-compose.prod.yml build
+Use the [current build instructions](CROSS_PLATFORM_BUILD.md) for native builds
+and platform prerequisites. The repository contains a development
+[`docker-compose.yml`](docker-compose.yml), but no production Compose file,
+`scripts/deploy.sh`, or `scripts/package_daemon.sh`. Earlier examples using those
+paths described intended automation, not executable release procedures.
 
-# Deploy to cloud
-./scripts/deploy.sh production
-```
+Raspberry Pi, Jetson, and accelerated laptop releases require target-specific
+native libraries, provider packaging, and the validation matrix in the build
+guide. Cross-compiling a Rust binary alone does not qualify a hardware release.
 
-### Edge Device Deployment
-```bash
-# Cross-compile for Raspberry Pi
-cargo build --release --target armv7-unknown-linux-gnueabihf
+## 🧪 Compute-aware runtime roadmap
 
-# Package with systemd service
-./scripts/package_daemon.sh
+The [runtime ADR](docs/adr/compute-aware-model-runtime.md) defines the acceptance
+gates. This documentation revision does not implement the following phases.
 
-# Install on device
-scp target/armv7-unknown-linux-gnueabihf/release/achernar-daemon pi@raspberrypi:~
-ssh pi@raspberrypi 'sudo ./install_daemon.sh'
-```
-
-See [Deployment Guide](./docs/DEPLOYMENT.md) for complete instructions.
-
-## 🧪 6-8 Week R&D Roadmap
-
-### Week 1-2: Foundation
-- ✅ Implement classical metrics (HFR, background, elongation)
-- ✅ Train tiny focus classifier/regressor (MobileNetV3-Small)
-- ✅ Export ONNX INT8 with calibration
-- ✅ Unit tests for <50ms latency
-- 🎯 **Deliverable**: Focus score in real-time UI
-
-### Week 3-4: Quality Control
-- 🔄 Cloud/obstruction classifier with confidence
-- 🔄 Contextual bandit v0 (LinUCB)
-- 🔄 MLflow/DVC setup
-- 🔄 FAISS prototype for retrieval
-- 🎯 **Deliverable**: Auto-reject with explainable alerts
-
-### Week 5-6: Embeddings & Ranking
-- ⏳ Bimodal embedding (image+metadata)
-- ⏳ "Similar subs" retrieval
-- ⏳ Target ranking with OR-Tools
-- ⏳ Model versioning in SQLite
-- 🎯 **Deliverable**: "Find similar framings", tonight's targets ranked
-
-### Week 7-8: Multi-Modal & Feedback
-- ⏳ Light-curve encoder + classification
-- ⏳ Calibrated quality scoring (Platt/Isotonic)
-- ⏳ User feedback collection (thumbs up/down)
-- ⏳ Active learning pipeline v0
-- 🎯 **Deliverable**: User corrects AI, sees improvement
+1. **Contracts**: Versioned manifest, family semantics, lifecycle states,
+   preprocessing/golden vectors and subsystem budgets.
+2. **FQE runtime**: CPU baseline, provider-aware candidate abstraction,
+   end-to-end benchmark cache, configuration and status API. Keep output shadow.
+3. **Scientific validation**: Train small and larger FQE variants using identical
+   frozen real-data splits; establish quality, calibration and subgroup gates.
+4. **Accelerator validation**: Test NVIDIA Linux and Jetson builds under sustained
+   observing load before declaring support or model tiers.
+5. **Additional families**: Add COC after its dataset and neural implementation
+   exist; defer TED/BGE expansion and other providers until validated.
+6. **Runtime adaptation**: Add conservative demotion, frame-boundary handover and
+   hysteresis after session-pinned selection is reliable.
 
 ## 🤝 Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines.
+Contributions are welcome. Follow the applicable checks in [TESTING.md](TESTING.md)
+and include implementation status and validation evidence in the change description.
 
 ### Development Workflow
 
@@ -671,7 +613,7 @@ Contributions are welcome! Please see [CONTRIBUTING.md](./CONTRIBUTING.md) for g
 
 ## 🐛 Known Issues & Limitations
 
-- **Edge Models**: Require manual download (not bundled to keep repo size small)
+- **Local models**: The checked-in FQE graph is a random, ineligible reference. Neural COC/TED artifacts, compute-aware selection and accelerator qualification are planned.
 - **INDI**: Some drivers may have compatibility issues on macOS
 - **Cloud Sync**: Large FITS files (>100MB) may timeout on slow connections
 - **WebRTC**: Symmetric NAT requires TURN server (not yet configured)
@@ -680,12 +622,15 @@ See [GitHub Issues](https://github.com/yourusername/achernar.tech/issues) for co
 
 ## 📖 Documentation
 
-- [Development Guide](./docs/DEVELOPMENT.md)
-- [API Documentation](./docs/API.md)
-- [AI/ML Architecture](./docs/AI_ARCHITECTURE.md)
-- [Hardware Setup](./docs/HARDWARE.md)
-- [Deployment Guide](./docs/DEPLOYMENT.md)
-- [Contributing Guidelines](./CONTRIBUTING.md)
+- [v5 Architecture Source](./achernar_v5.tex)
+- [v5 Architecture PDF](./achernar_v5.pdf)
+- [Architecture Document Guide and Rebuild Instructions](./docs/ARCHITECTURE_DOCUMENTS.md)
+- [Compute-aware Model Runtime ADR](./docs/adr/compute-aware-model-runtime.md)
+- [ML Development and Artifact Status](./ml/README.md)
+- [Cross-platform Builds](./CROSS_PLATFORM_BUILD.md)
+- [Testing](./TESTING.md)
+- [Streaming and Observation Contracts](./docs/STREAMING_ARCHITECTURE.md)
+- [Compute-aware Runtime Review](./docs/compute-aware-runtime-review-2026-10-03.md)
 
 ## 🙏 Acknowledgments
 

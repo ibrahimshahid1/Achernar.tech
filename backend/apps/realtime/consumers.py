@@ -14,7 +14,9 @@ from urllib.parse import parse_qs
 from channels.generic.websocket import AsyncWebsocketConsumer
 from channels.db import database_sync_to_async
 from django.core.cache import cache
+from django.db import transaction
 from django.utils import timezone
+from .state import HARDWARE_FIELDS, connected_hardware, snapshot_payload
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,19 @@ def command_result_key(command_id):
 
 def frame_preview_key(daemon_id):
     return f"achernar:frame_preview:{daemon_id}"
+
+
+def clear_snapshot(snapshot):
+    for field in HARDWARE_FIELDS.values():
+        setattr(snapshot, field, {})
+    snapshot.guiding_state = {}
+    snapshot.ai_metrics = {}
+    snapshot.device_health = {}
+    snapshot.save()
+
+
+def clear_cached_telemetry(daemon_id):
+    cache.delete_many([frame_preview_key(daemon_id), f'telemetry:{daemon_id}'])
 
 
 class DaemonConsumer(AsyncWebsocketConsumer):
@@ -69,14 +84,19 @@ class DaemonConsumer(AsyncWebsocketConsumer):
         await self.accept()
         
         # Mark daemon as connected in database
-        await self.mark_daemon_connected()
+        payload = await self.mark_daemon_connected()
+        if payload is not None:
+            await self.broadcast_telemetry(payload)
         
         logger.info(f"Daemon {self.daemon_id} connected")
     
     async def disconnect(self, close_code):
         """Handle daemon disconnection"""
-        await self.channel_layer.group_discard(self.group_name, self.channel_name)
-        await self.mark_daemon_disconnected()
+        if hasattr(self, 'group_name'):
+            await self.channel_layer.group_discard(self.group_name, self.channel_name)
+        payload = await self.mark_daemon_disconnected()
+        if payload is not None:
+            await self.broadcast_telemetry(payload)
         logger.info(f"Daemon {self.daemon_id} disconnected with code {close_code}")
     
     async def receive(self, text_data):
@@ -104,7 +124,10 @@ class DaemonConsumer(AsyncWebsocketConsumer):
                 await self.update_daemon_heartbeat()
                 
                 # Store telemetry snapshot
-                await self.store_telemetry_snapshot(data['payload'])
+                payload = await self.store_telemetry_snapshot(data['payload'])
+                if payload is None:
+                    return
+                data['payload'] = payload
                 
                 # Broadcast to all connected web clients for this daemon
                 await self.channel_layer.group_send(
@@ -137,7 +160,8 @@ class DaemonConsumer(AsyncWebsocketConsumer):
                     )
 
             elif message_type == 'FRAME_PREVIEW':
-                await self.store_frame_preview(data)
+                if not await self.store_frame_preview(data):
+                    return
                 await self.channel_layer.group_send(
                     f'daemon_{self.daemon_id}_clients',
                     {
@@ -162,6 +186,19 @@ class DaemonConsumer(AsyncWebsocketConsumer):
         """
         await self.send(text_data=json.dumps(event['data']))
 
+    async def broadcast_telemetry(self, payload):
+        await self.channel_layer.group_send(
+            f'daemon_{self.daemon_id}_clients',
+            {
+                'type': 'telemetry_broadcast',
+                'data': {
+                    'type': 'TELEMETRY_UPDATE',
+                    'timestamp': int(timezone.now().timestamp()),
+                    'payload': payload,
+                },
+            },
+        )
+
     @database_sync_to_async
     def daemon_exists(self):
         from .models import DaemonConnection
@@ -170,10 +207,15 @@ class DaemonConsumer(AsyncWebsocketConsumer):
     @database_sync_to_async
     def mark_daemon_connected(self):
         """Update daemon connection status in database"""
-        from .models import DaemonConnection
+        from .models import DaemonConnection, TelemetrySnapshot
         try:
-            daemon = DaemonConnection.objects.get(id=self.daemon_id)
-            daemon.mark_connected()
+            with transaction.atomic():
+                daemon = DaemonConnection.objects.select_for_update().get(id=self.daemon_id)
+                daemon.mark_connected(self.channel_name)
+                # A new gateway must supply its own first hardware snapshot.
+                TelemetrySnapshot.objects.filter(daemon=daemon).delete()
+                clear_cached_telemetry(self.daemon_id)
+                return snapshot_payload(daemon)
         except DaemonConnection.DoesNotExist:
             logger.warning(f"Daemon {self.daemon_id} not found in database")
 
@@ -193,10 +235,20 @@ class DaemonConsumer(AsyncWebsocketConsumer):
     @database_sync_to_async
     def mark_daemon_disconnected(self):
         """Update daemon disconnection status"""
-        from .models import DaemonConnection
+        from .models import DaemonConnection, TelemetrySnapshot
         try:
-            daemon = DaemonConnection.objects.get(id=self.daemon_id)
-            daemon.mark_disconnected()
+            with transaction.atomic():
+                daemon = DaemonConnection.objects.select_for_update().get(id=self.daemon_id)
+                # An old socket can close after its replacement has connected.
+                # Only the socket that owns the current session may clear it.
+                if daemon.gateway_channel_name != self.channel_name:
+                    return None
+                daemon.gateway_channel_name = ''
+                daemon.mark_disconnected()
+                snapshot, _ = TelemetrySnapshot.objects.get_or_create(daemon=daemon)
+                clear_snapshot(snapshot)
+                clear_cached_telemetry(self.daemon_id)
+                return snapshot_payload(daemon, snapshot)
         except DaemonConnection.DoesNotExist:
             pass
     
@@ -204,31 +256,36 @@ class DaemonConsumer(AsyncWebsocketConsumer):
     def update_daemon_heartbeat(self):
         """Update last heartbeat timestamp"""
         from .models import DaemonConnection
-        try:
-            daemon = DaemonConnection.objects.get(id=self.daemon_id)
-            daemon.update_heartbeat()
-        except DaemonConnection.DoesNotExist:
-            pass
+        DaemonConnection.objects.filter(
+            id=self.daemon_id, gateway_channel_name=self.channel_name, is_connected=True,
+        ).update(last_heartbeat=timezone.now())
     
     @database_sync_to_async
     def store_telemetry_snapshot(self, payload):
         """Store latest telemetry in database (Digital Twin)"""
         from .models import DaemonConnection, TelemetrySnapshot
         try:
-            daemon = DaemonConnection.objects.get(id=self.daemon_id)
-            snapshot, created = TelemetrySnapshot.objects.get_or_create(daemon=daemon)
-            
-            # Update individual state components.
-            # The daemon sends explicit `null` for absent hardware, so
-            # `.get(key, {})` is not enough (the default only applies when the
-            # key is missing, not when its value is None). Coerce null -> {} to
-            # satisfy the NOT NULL JSONField columns.
-            snapshot.mount_state = payload.get('mount') or {}
-            snapshot.camera_state = payload.get('camera') or {}
-            snapshot.focuser_state = payload.get('focuser') or {}
-            snapshot.guiding_state = payload.get('guiding') or {}
-            snapshot.ai_metrics = payload.get('ai') or {}
-            snapshot.save()
+            with transaction.atomic():
+                daemon = DaemonConnection.objects.select_for_update().get(id=self.daemon_id)
+                if not daemon.is_connected or daemon.gateway_channel_name != self.channel_name:
+                    return None
+                snapshot, _ = TelemetrySnapshot.objects.get_or_create(daemon=daemon)
+                previous_camera = snapshot.camera_state
+                # TELEMETRY_UPDATE is a complete snapshot. Missing, null or
+                # explicitly disconnected devices remove their old identity.
+                for name, field in HARDWARE_FIELDS.items():
+                    setattr(snapshot, field, connected_hardware(payload.get(name)) or {})
+                snapshot.guiding_state = payload.get('guiding') or {}
+                snapshot.ai_metrics = payload.get('ai') or {}
+                snapshot.device_health = payload.get('device_health') or {}
+                snapshot.save()
+                cache.delete(f'telemetry:{self.daemon_id}')
+                if (
+                    not snapshot.camera_state
+                    or previous_camera.get('connection_id') != snapshot.camera_state.get('connection_id')
+                ):
+                    cache.delete(frame_preview_key(self.daemon_id))
+                return snapshot_payload(daemon, snapshot)
         
         except DaemonConnection.DoesNotExist:
             pass
@@ -239,7 +296,16 @@ class DaemonConsumer(AsyncWebsocketConsumer):
 
     @database_sync_to_async
     def store_frame_preview(self, data):
-        cache.set(frame_preview_key(self.daemon_id), data, 15)
+        from .models import DaemonConnection, TelemetrySnapshot
+        with transaction.atomic():
+            daemon = DaemonConnection.objects.select_for_update().filter(
+                id=self.daemon_id, gateway_channel_name=self.channel_name, is_connected=True,
+            ).first()
+            snapshot = TelemetrySnapshot.objects.filter(daemon=daemon).first() if daemon else None
+            if not snapshot_payload(daemon, snapshot)['camera']:
+                return False
+            cache.set(frame_preview_key(self.daemon_id), data, 15)
+            return True
 
 
 class TelemetryConsumer(AsyncWebsocketConsumer):
@@ -327,17 +393,11 @@ class TelemetryConsumer(AsyncWebsocketConsumer):
             daemon = DaemonConnection.objects.get(id=self.daemon_id)
             snapshot = TelemetrySnapshot.objects.filter(daemon=daemon).first()
             
-            if snapshot:
+            if daemon:
                 telemetry_data = {
                     'type': 'TELEMETRY_UPDATE',
-                    'timestamp': int(snapshot.updated_at.timestamp()),
-                    'payload': {
-                        'mount': snapshot.mount_state,
-                        'camera': snapshot.camera_state,
-                        'focuser': snapshot.focuser_state,
-                        'guiding': snapshot.guiding_state,
-                        'ai': snapshot.ai_metrics,
-                    }
+                    'timestamp': int(timezone.now().timestamp()),
+                    'payload': snapshot_payload(daemon, snapshot),
                 }
                 return telemetry_data
         

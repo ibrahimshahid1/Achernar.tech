@@ -1,0 +1,28 @@
+{
+  "session": {
+    "session_id": null,
+    "night_id": "YYYY-MM-DD",
+    "rig_id": "R4",
+    "site_lat": null,
+    "site_lon": null,
+    "camera": "Canon EOS R50",
+    "camera_utc_offset": "-04:00",
+    "saturation_adu": null,
+    "observer": "Ibrahim Shahid",
+    "iso_or_gain": null
+  },
+  "environment": [],
+  "runs": [
+    {
+      "run_id": "YYYY-MM-DD-ptc-iso800",
+      "run_type": "calibration",
+      "target_name": "bench: bias + paired flats",
+      "tracking_on": false,
+      "exposure_s": null,
+      "iso_or_gain": 800,
+      "status": "completed",
+      "abort_reason": null
+    }
+  ],
+  "disturbances": []
+}

@@ -52,7 +52,12 @@ fn source_ellipses(frame: &LumaFrame, background: &BackgroundStats) -> Vec<Ellip
 
     for idx in 0..frame.pixels.len() {
         let value = frame.pixels[idx];
-        if visited[idx] || !value.is_finite() || value < threshold {
+        if visited[idx]
+            || !frame.measurement_pixel_valid(idx)
+            || frame.native_saturation_at(idx)
+            || !value.is_finite()
+            || value < threshold
+        {
             continue;
         }
 
@@ -62,6 +67,7 @@ fn source_ellipses(frame: &LumaFrame, background: &BackgroundStats) -> Vec<Ellip
         let mut flux = 0.0_f32;
         let mut weighted_x = 0.0_f32;
         let mut weighted_y = 0.0_f32;
+        let mut touches_masked_support = false;
 
         while let Some(current) = stack.pop() {
             let current_value = frame.pixels[current];
@@ -86,7 +92,11 @@ fn source_ellipses(frame: &LumaFrame, background: &BackgroundStats) -> Vec<Ellip
                     }
                     let neighbor = ny * frame.width + nx;
                     let neighbor_value = frame.pixels[neighbor];
+                    touches_masked_support |= !frame.measurement_pixel_valid(neighbor)
+                        || frame.native_saturation_at(neighbor);
                     if visited[neighbor]
+                        || !frame.measurement_pixel_valid(neighbor)
+                        || frame.native_saturation_at(neighbor)
                         || !neighbor_value.is_finite()
                         || neighbor_value < threshold
                     {
@@ -98,7 +108,11 @@ fn source_ellipses(frame: &LumaFrame, background: &BackgroundStats) -> Vec<Ellip
             }
         }
 
-        if points.len() < 5 || points.len() > 5_000 || flux <= f32::EPSILON {
+        if touches_masked_support
+            || points.len() < 5
+            || points.len() > 5_000
+            || flux <= f32::EPSILON
+        {
             continue;
         }
 
@@ -212,6 +226,8 @@ mod tests {
             height,
             max_adu: 65535.0,
             saturation_adu: Some(65535.0),
+            masks: Default::default(),
+            analysis_descriptor: None,
         };
         let background = estimate_background(&frame.pixels, frame.saturation_adu);
         let trailing = estimate_trailing(&frame, &background);

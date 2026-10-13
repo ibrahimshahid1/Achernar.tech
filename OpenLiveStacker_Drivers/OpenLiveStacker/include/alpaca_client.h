@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include "alpaca_selection.h"
 #include <vector>
 #include <memory>
 #include <cppcms/json.h>
@@ -49,7 +50,12 @@ namespace ols {
         {
             return base_url_;
         }
+        std::string connection_option() const
+        {
+            return base_url_ + (selection_.device_number < 0 ? "" : "#device=" + std::to_string(selection_.device_number));
+        }
     private:
+        AlpacaSelection selection_;
         static std::string discover(std::string const &type);
         std::multimap<std::string, std::string> std_params();
         static std::string to_lower(std::string s);

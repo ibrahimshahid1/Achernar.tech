@@ -1,6 +1,6 @@
 # tools/
 
-Three standalone utilities that close the gaps between "the daemon exists" and
+Standalone utilities that close the gaps between "the daemon exists" and
 "data is being collected." All are pure Python + numpy (+ Pillow); none needs
 the Rust toolchain, a telescope, or a clear sky.
 
@@ -57,7 +57,19 @@ ladder never reached the knee, the tool says so and reports a lower bound
 instead of a number.
 
 RAW input needs `rawpy` (`pip install rawpy`); otherwise convert with
-`dcraw -D -4 -T` first. It refuses demosaiced input, because interpolation mixes
+`dcraw -D -4 -T` first. Plain `dcraw` cannot read Canon CR3 (R50, M50). Use
+LibRaw's `dcraw_emu`, which takes the same flags; Homebrew's LibRaw 0.22.2
+lists the EOS R50:
+
+```bash
+for f in ~/ptc/r50-iso800/{bias,flats}/*.CR3; do
+  "$(brew --prefix libraw)/bin/dcraw_emu" -D -4 -T "$f"   # writes <f>.tiff beside it
+done
+```
+
+Then point `--bias`/`--flats` at the `.tiff` files. A pip `rawpy` wheel bundles
+its own LibRaw, which may predate the R50; if it raises on a CR3, use the
+route above. It refuses demosaiced input, because interpolation mixes
 neighbouring pixels and destroys the independence the method assumes. The four
 CFA phases are measured separately — they have different sensitivities and
 mixing them inflates the variance.
@@ -105,6 +117,22 @@ Metadata falls back EXIF → session log → file mtime, and records which in
 `acquisition_json.metadata_source`. A timestamp from mtime is not the same
 observation as one from the shutter.
 
+**Camera time zone.** EXIF `DateTimeOriginal` is the camera's wall clock with
+no zone. The importer takes the offset from EXIF `OffsetTimeOriginal` (Canon
+EOS R bodies write it once the in-camera time zone is set), else from
+`session.camera_utc_offset` / `--camera-utc-offset`, else assumes this
+machine's zone and says so. Each frame records which in
+`acquisition_json.timezone_source` (`exif_offset` | `declared` |
+`host_local_assumed`). It used to assume UTC, which put an EDT evening four
+hours away from the field card's sky labels so none matched.
+
+Files are grouped into exposures by **folder + stem**, so `IMG_0001` from two
+card folders stays two exposures.
+
+**JPEG is what makes EXIF readable.** CR3 is not parsed here, so a RAW-only
+import gets exposure/ISO from the session log and its time from file mtime.
+For the cloud campaign shoot RAW+JPEG.
+
 **Sky labels.** Entries in the log's `environment` array with a `sky_class` get
 matched to frames by timestamp (within 15 min) and written to
 `frame_measurements` as `measurement_type='cloud'`,
@@ -113,6 +141,23 @@ your label and a future COC model's prediction sit side by side on the same
 frame — which is what makes the model checkable against the person.
 
 Session log schema is Appendix C.5 of `achernar_data_collection.pdf`.
+
+---
+
+## `validate_session_log.py` — check the field card before import
+
+```bash
+python3 tools/validate_session_log.py ~/coc/2026-10-08/session.json
+```
+
+Errors (exit 1) are things that would produce wrong or unjoinable rows:
+placeholder or zone-less timestamps, sky classes outside 0–4, a cloud block
+with no labels, a disturbance pointing at a run that does not exist. Warnings
+are things a model will be weaker for (no site coordinates, no measured
+saturation, no exposure for RAW-only frames). It fills nothing in.
+
+Blank templates live in `templates/`; copy one per night and fill it in from
+the paper card.
 
 ---
 

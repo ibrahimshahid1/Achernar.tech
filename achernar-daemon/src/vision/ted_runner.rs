@@ -63,8 +63,11 @@ impl TedRunner {
             // deriving one from it would make the threshold depend on how bright
             // the brightest star in this particular frame happened to be.
             saturation_adu: None,
+            masks: Default::default(),
+            analysis_descriptor: None,
         };
-        let background = super::background::estimate_background(&frame.pixels, frame.saturation_adu);
+        let background =
+            super::background::estimate_background(&frame.pixels, frame.saturation_adu);
         let estimate = super::trailing::estimate_trailing(&frame, &background);
         let trailing_detected = estimate.severity >= self.elongation_threshold_to_severity();
         let axis = match estimate.axis.as_deref() {

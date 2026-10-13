@@ -25,6 +25,8 @@ pub async fn slew(
 ) -> Result<StatusCode, StatusCode> {
     tracing::info!("Slew requested: RA={}, Dec={}", req.ra, req.dec);
     let mount = state.mount.lock().unwrap();
+    crate::hardware::health::require_connected(&state, crate::hardware::health::DeviceKind::Mount)
+        .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
     let mount = mount.as_ref().ok_or(StatusCode::PRECONDITION_FAILED)?;
     mount
         .goto(EqCoord {
@@ -49,6 +51,8 @@ pub async fn sync(
 ) -> Result<StatusCode, StatusCode> {
     tracing::info!("Mount sync: RA={}, Dec={}", req.ra, req.dec);
     let mount = state.mount.lock().unwrap();
+    crate::hardware::health::require_connected(&state, crate::hardware::health::DeviceKind::Mount)
+        .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
     let mount = mount.as_ref().ok_or(StatusCode::PRECONDITION_FAILED)?;
     mount
         .sync(EqCoord {
@@ -75,6 +79,8 @@ pub async fn unpark() -> Result<StatusCode, StatusCode> {
 pub async fn abort(State(state): State<AppState>) -> Result<StatusCode, StatusCode> {
     tracing::info!("Mount abort requested");
     let mount = state.mount.lock().unwrap();
+    crate::hardware::health::require_connected(&state, crate::hardware::health::DeviceKind::Mount)
+        .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
     let mount = mount.as_ref().ok_or(StatusCode::PRECONDITION_FAILED)?;
     mount.stop().map_err(|e| {
         tracing::error!("Mount abort failed: {}", e);
@@ -89,6 +95,8 @@ pub async fn set_tracking(
 ) -> Result<StatusCode, StatusCode> {
     tracing::info!("Set tracking: {}", req.enabled);
     let mount = state.mount.lock().unwrap();
+    crate::hardware::health::require_connected(&state, crate::hardware::health::DeviceKind::Mount)
+        .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
     let mount = mount.as_ref().ok_or(StatusCode::PRECONDITION_FAILED)?;
     mount.set_tracking(req.enabled).map_err(|e| {
         tracing::error!("Set tracking failed: {}", e);

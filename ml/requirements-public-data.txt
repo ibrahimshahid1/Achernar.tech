@@ -1,0 +1,8 @@
+# Dataset import and validation only; model training dependencies are separate.
+numpy>=1.26
+pillow>=10
+scipy>=1.11
+astropy>=6
+sep>=1.2
+pyarrow>=15
+pytest>=8

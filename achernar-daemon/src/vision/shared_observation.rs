@@ -24,6 +24,13 @@ pub enum CloudEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedObservation {
     pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Exact scientific transform/domain used for this observation, if any.
+    #[serde(default)]
+    pub analysis_descriptor: Option<crate::processing::debayer::AnalysisDescriptor>,
+    #[serde(default)]
+    pub analysis_unavailable_reason: Option<String>,
+    #[serde(default)]
+    pub fqe_unavailable_reason: Option<String>,
 
     // --- From FocusQualityEstimator (classical fallback for now) ---
     pub status: QualityStatus,
@@ -116,17 +123,34 @@ pub struct SharedObservation {
     pub observation_valid: bool,
 }
 
-#[cfg(test)]
 impl SharedObservation {
+    #[cfg(test)]
+    pub fn empty_for_test() -> Self {
+        Self::empty()
+    }
+
+    pub fn analysis_unavailable(reason: String) -> Self {
+        let mut observation = Self::empty();
+        observation.status = QualityStatus::AnalysisUnavailable;
+        observation.rejection_reasons = vec![QualityRejectionReason::UnqualifiedPixelDomain];
+        observation.analysis_unavailable_reason = Some(reason);
+        observation.fqe_unavailable_reason =
+            Some("FQE disabled: scientific analysis is unavailable".to_string());
+        observation
+    }
+
     /// A structurally valid observation with no measurement in it.
     ///
     /// Every width and quality field is `None` and every count is zero, which
     /// is what the vision loop publishes for a frame it could not measure.
     /// Tests set only the fields they are about, so adding a field to the
     /// struct does not require editing every test that builds one.
-    pub fn empty_for_test() -> Self {
+    pub fn empty() -> Self {
         Self {
             timestamp: chrono::Utc::now(),
+            analysis_descriptor: None,
+            analysis_unavailable_reason: None,
+            fqe_unavailable_reason: None,
             status: super::quality::QualityStatus::NoUsableStars,
             rejection_reasons: Vec::new(),
             hfr_px: None,

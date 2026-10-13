@@ -1,0 +1,52 @@
+{
+  "session": {
+    "session_id": null,
+    "night_id": "YYYY-MM-DD",
+    "rig_id": "R4",
+    "site_lat": null,
+    "site_lon": null,
+    "site_elev": null,
+    "telescope": null,
+    "camera": "Canon EOS R50",
+    "lens": "RF-S 18-45mm at 18mm, f/4.5, manual focus at infinity",
+    "barlow": null,
+    "focuser": null,
+    "camera_utc_offset": "-04:00",
+    "plate_scale_arcsec_px": null,
+    "saturation_adu": null,
+    "observer": "Ibrahim Shahid",
+    "start_time": null,
+    "end_time": null,
+    "exposure_s": null,
+    "iso_or_gain": null
+  },
+  "environment": [
+    {
+      "t": "YYYY-MM-DDTHH:MM:00-04:00",
+      "ambient_temp_c": null,
+      "humidity_pct": null,
+      "dew_point_c": null,
+      "wind_beaufort": null,
+      "sky_class": null,
+      "transparency_naked_eye_limiting_mag": null,
+      "seeing_impression": null,
+      "notes": ""
+    }
+  ],
+  "runs": [
+    {
+      "run_id": "YYYY-MM-DD-coc-1",
+      "run_type": "cloud_block",
+      "target_name": "fixed alt/az",
+      "target_alt": 45,
+      "target_az": null,
+      "tracking_on": false,
+      "exposure_s": null,
+      "iso_or_gain": null,
+      "filter": null,
+      "status": "completed",
+      "abort_reason": null
+    }
+  ],
+  "disturbances": []
+}

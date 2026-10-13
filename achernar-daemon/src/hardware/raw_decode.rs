@@ -1,12 +1,10 @@
 //! Safe wrapper around the bridge's LibRaw decode.
 //!
-//! Turns the bytes of a camera-authored RAW container into a 16-bit Bayer
-//! plane of **untouched sensor ADU** — no black subtraction, no scaling, no
-//! white balance. Everything needed to calibrate the plane later travels
-//! alongside it in [`RawInfo`]. The long argument for that choice lives on
-//! `ols_decode_raw` in `ols-bridge/include/ols_bridge.h`; the one-line version
-//! is that a linear rescale adds no information, severs ADU from electrons, and
-//! cannot be undone.
+//! RAW containers become a borrowed 16-bit plane, unchanged by the application
+//! since LibRaw unpack: no additional black subtraction, scaling or white
+//! balance. Camera/container/LibRaw transformations may already precede that
+//! output. Versioned decoder evidence and the complete black table travel in
+//! [`RawInfo`]. Calibration remains a separate signed/float operation.
 //!
 //! # Memory
 //!
@@ -18,7 +16,8 @@
 
 use super::camera::{check, last_error};
 use super::ols_ffi;
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, ensure, Result};
+use serde::{Deserialize, Serialize};
 use std::ffi::CStr;
 
 /// Whether this build can decode RAW at all.
@@ -31,38 +30,156 @@ pub fn libraw_available() -> bool {
     flags & ols_ffi::OLS_CAP_DECODE_LIBRAW != 0
 }
 
+/// Versioned decoder evidence. All geometry is in LibRaw's unrotated raw-array
+/// coordinates. Metadata limits are not independently measured detector limits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawDecodeMetadata {
+    pub schema_version: u32,
+    pub decoder_version: String,
+    pub unpack_function: String,
+    pub processing_version: String,
+    pub sample_domain: String,
+    pub raw_width: u32,
+    pub raw_height: u32,
+    pub visible_width: u32,
+    pub visible_height: u32,
+    pub left_margin: u32,
+    pub top_margin: u32,
+    pub source_pitch_bytes: usize,
+    pub crop_x: u32,
+    pub crop_y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub pixel_aspect: f64,
+    pub orientation: i32,
+    pub filters: u32,
+    pub color_description: String,
+    pub bayer_at_crop_origin: String,
+    pub black_table: Vec<u32>,
+    pub black_table_complete: bool,
+    pub linear_max: [u32; 4],
+    pub white_level_source: String,
+    pub nonlinearity_state: String,
+    pub black_subtracted: bool,
+    pub scaled: bool,
+    pub white_balance_applied: bool,
+    pub demosaic_applied: bool,
+    pub rotation_applied: bool,
+    pub bin: u32,
+    pub unpack_options: u32,
+    pub unpack_specials: Option<u32>,
+    pub shot_select: u32,
+}
+
+impl RawDecodeMetadata {
+    fn validate(&self, info: &RawInfo) -> Result<()> {
+        ensure!(
+            self.schema_version == 1
+                && self.processing_version == "achernar-libraw-unpack-v1"
+                && self.sample_domain == "libraw_unpack_output_adu"
+                && !self.decoder_version.is_empty(),
+            "Unsupported or incomplete RAW decoder metadata"
+        );
+        ensure!(
+            !self.black_subtracted
+                && !self.scaled
+                && !self.white_balance_applied
+                && !self.demosaic_applied
+                && !self.rotation_applied
+                && self.bin == 1,
+            "RAW decoder applied an incompatible transformation"
+        );
+        let x1 = self.crop_x as u64 + self.width as u64;
+        let y1 = self.crop_y as u64 + self.height as u64;
+        ensure!(
+            self.width == info.width
+                && self.height == info.height
+                && self.width > 0
+                && self.height > 0
+                && self.visible_width > 0
+                && self.visible_height > 0
+                && self.left_margin as u64 + self.visible_width as u64 <= self.raw_width as u64
+                && self.top_margin as u64 + self.visible_height as u64 <= self.raw_height as u64
+                && self.crop_x >= self.left_margin
+                && self.crop_y >= self.top_margin
+                && x1 <= self.left_margin as u64 + self.visible_width as u64
+                && y1 <= self.top_margin as u64 + self.visible_height as u64
+                && self.source_pitch_bytes as u64 >= self.raw_width as u64 * 2
+                && self.pixel_aspect.is_finite()
+                && self.pixel_aspect > 0.0,
+            "RAW decoder geometry is inconsistent"
+        );
+        let expected_pattern = match info.bayer {
+            ols_ffi::OlsBayerType::Rg => "RGGB",
+            ols_ffi::OlsBayerType::Bg => "BGGR",
+            ols_ffi::OlsBayerType::Gr => "GRBG",
+            ols_ffi::OlsBayerType::Gb => "GBRG",
+            ols_ffi::OlsBayerType::Na => "",
+        };
+        ensure!(
+            self.bayer_at_crop_origin == expected_pattern,
+            "RAW CFA metadata disagrees with the plane"
+        );
+        ensure!(
+            info.bits_per_sample == 16 && (0..=65535).contains(&info.white_level),
+            "RAW sample/white metadata exceeds the unpack domain"
+        );
+        ensure!(
+            self.white_level_source == "libraw_unpack_declared_maximum"
+                && self.nonlinearity_state == "not_measured",
+            "Unsupported RAW threshold provenance"
+        );
+        ensure!(
+            self.black_table_complete && info.black_table_dimensions_match(self.black_table.len()),
+            "Incomplete or malformed RAW black table"
+        );
+        Ok(())
+    }
+}
+
 /// What the decode deliberately did not apply.
 #[derive(Debug, Clone)]
 pub struct RawInfo {
     pub width: u32,
     pub height: u32,
     pub bayer: ols_ffi::OlsBayerType,
-    /// Storage depth: always 16. Use [`RawInfo::white_level`] for the sensor's
-    /// real range — a 14-bit body tops out at 16383, and a saturation test
-    /// against 65535 can never fire.
+    /// Storage depth: always 16. Container capacity is separate from the
+    /// declared unpack-domain white code and measured detector linearity.
     pub bits_per_sample: u32,
     /// Global black pedestal in ADU. Not subtracted from the pixels.
     pub black_level: i32,
     /// Per-CFA-channel black offsets, added to `black_level`.
     pub cblack: [i32; 4],
     /// Dimensions of LibRaw's 2-D black table; `[0, 0]` when there is none.
-    /// Anything past 2x2 is not captured by `cblack`, so a non-trivial value
-    /// means the recorded black level is incomplete and calibration should come
-    /// from bias frames.
+    /// Spatial entries are separate from per-channel offsets, even at 2x2.
+    /// Complete table values are carried in decoder_metadata.
     pub cblack_pattern: [i32; 2],
-    /// Saturation point in ADU. Not normalised to.
+    /// Declared unpack-domain maximum; not a measured nonlinearity threshold.
     pub white_level: i32,
     /// As-shot white balance multipliers. Recorded, never applied.
     pub cam_mul: [f32; 4],
     pub make: String,
     pub model: String,
+    pub decoder_metadata: Option<RawDecodeMetadata>,
 }
 
 impl RawInfo {
-    /// Whether `cblack` fully describes this body's black level.
+    fn black_table_dimensions_match(&self, count: usize) -> bool {
+        let [rows, cols] = self.cblack_pattern;
+        rows >= 0
+            && cols >= 0
+            && ((rows == 0) == (cols == 0))
+            && (rows as usize).checked_mul(cols as usize) == Some(count)
+    }
+    /// Complete metadata means both per-channel offsets and all spatial entries.
     pub fn black_level_is_complete(&self) -> bool {
-        let cells = self.cblack_pattern[0].saturating_mul(self.cblack_pattern[1]);
-        cells <= 4
+        match &self.decoder_metadata {
+            Some(metadata) => {
+                metadata.black_table_complete
+                    && self.black_table_dimensions_match(metadata.black_table.len())
+            }
+            None => self.cblack_pattern == [0, 0],
+        }
     }
 }
 
@@ -111,7 +228,9 @@ impl Drop for RawImage {
 
 impl std::fmt::Debug for RawImage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RawImage").field("info", &self.info).finish()
+        f.debug_struct("RawImage")
+            .field("info", &self.info)
+            .finish()
     }
 }
 
@@ -144,9 +263,8 @@ pub fn decode_region(bytes: &[u8], region: Option<(u32, u32)>) -> Result<RawImag
     let mut handle: *mut ols_ffi::OlsRawImage = std::ptr::null_mut();
     // bin is 1: binning raw ADU would change saturation semantics the metadata
     // cannot express. Bin after calibration.
-    let code = unsafe {
-        ols_ffi::ols_decode_raw(bytes.as_ptr(), bytes.len(), w, h, 1, &mut handle)
-    };
+    let code =
+        unsafe { ols_ffi::ols_decode_raw(bytes.as_ptr(), bytes.len(), w, h, 1, &mut handle) };
     check(code)?;
     if handle.is_null() {
         return Err(anyhow!(
@@ -171,6 +289,7 @@ pub fn decode_region(bytes: &[u8], region: Option<(u32, u32)>) -> Result<RawImag
             cam_mul: [0.0; 4],
             make: String::new(),
             model: String::new(),
+            decoder_metadata: None,
         },
     };
 
@@ -198,12 +317,23 @@ pub fn decode_region(bytes: &[u8], region: Option<(u32, u32)>) -> Result<RawImag
         cam_mul: raw_info.cam_mul,
         make: cstr(raw_info.make),
         model: cstr(raw_info.model),
+        decoder_metadata: None,
     };
+
+    let metadata_ptr = unsafe { ols_ffi::ols_rawimage_metadata_json(image.handle) };
+    ensure!(!metadata_ptr.is_null(), "RAW decoder metadata missing");
+    let metadata: RawDecodeMetadata =
+        serde_json::from_slice(unsafe { CStr::from_ptr(metadata_ptr) }.to_bytes())?;
+    metadata.validate(&image.info)?;
+    image.info.decoder_metadata = Some(metadata);
 
     // The bridge promises a tightly-packed plane. Check it here rather than
     // trusting it: every consumer indexes this buffer as width*height*2, and a
     // short buffer is an out-of-bounds read rather than a wrong picture.
-    let expected = image.info.width as usize * image.info.height as usize * 2;
+    let expected = (image.info.width as usize)
+        .checked_mul(image.info.height as usize)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| anyhow!("RAW sample dimensions overflow"))?;
     let actual = image.pixels().len();
     if actual != expected {
         return Err(anyhow!(
@@ -247,15 +377,54 @@ mod tests {
             cam_mul: [1.0; 4],
             make: "Canon".into(),
             model: "EOS R5".into(),
+            decoder_metadata: None,
         };
         assert!(info.black_level_is_complete());
 
-        // A 2x2 table folds into cblack[0..4].
+        // A 2x2 spatial table is not represented by four channel offsets.
         info.cblack_pattern = [2, 2];
-        assert!(info.black_level_is_complete());
+        assert!(!info.black_level_is_complete());
 
         // Anything larger does not, and must be recorded as incomplete.
         info.cblack_pattern = [6, 6];
         assert!(!info.black_level_is_complete());
+    }
+
+    #[test]
+    #[ignore = "set ACHERNAR_RAW_FIXTURE to an existing RAW; no camera access"]
+    fn existing_raw_decoder_metadata_rejects_contradictions() {
+        let bytes = std::fs::read(std::env::var("ACHERNAR_RAW_FIXTURE").unwrap()).unwrap();
+        let image = decode_region(&bytes, Some((128, 128))).unwrap();
+        let info = image.info();
+        let metadata = info.decoder_metadata.as_ref().unwrap();
+        metadata.validate(info).unwrap();
+        let mut modified = metadata.clone();
+        modified.scaled = true;
+        assert!(modified.validate(info).is_err());
+        let mut modified = metadata.clone();
+        modified.source_pitch_bytes = 1;
+        assert!(modified.validate(info).is_err());
+        let mut modified = metadata.clone();
+        modified.crop_x = modified.raw_width;
+        assert!(modified.validate(info).is_err());
+        let mut modified = metadata.clone();
+        modified.bayer_at_crop_origin = "unknown".into();
+        assert!(modified.validate(info).is_err());
+        let mut modified = metadata.clone();
+        modified.white_level_source = "container_capacity".into();
+        assert!(modified.validate(info).is_err());
+        let mut modified = metadata.clone();
+        let mut info = info.clone();
+        info.cblack_pattern = [2, 2];
+        modified.black_table = vec![10, 11, 12, 13];
+        modified.validate(&info).unwrap();
+        info.decoder_metadata = Some(modified.clone());
+        assert!(info.black_level_is_complete());
+        modified.black_table.pop();
+        assert!(modified.validate(&info).is_err());
+        info.decoder_metadata = Some(modified);
+        assert!(!info.black_level_is_complete());
+        info.white_level = 65536;
+        assert!(metadata.validate(&info).is_err());
     }
 }

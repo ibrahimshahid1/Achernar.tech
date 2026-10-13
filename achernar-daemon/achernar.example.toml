@@ -60,7 +60,14 @@ compensation_steps = 0
 # always_approach_from = "in"   # "in" | "out"
 
 [focus.models]               # Edge ONNX models (Section 7.6.10 layout)
-# quality_model_path = "../models/focus_quality/1.0.0/model.onnx"
+# Current FQE path: batched 64x64 grayscale star crops, default CPU provider,
+# shadow telemetry only. Classical HFR remains the autofocus authority.
+# Automatic discovery uses ACHERNAR_MODELS_DIR (set it to ../models when the
+# daemon runs from this directory), filtering eligibility and hashes before
+# choosing the newest version. The checked-in 1.0.0 graph has random reference
+# weights and is excluded from automatic selection.
+# quality_model_path = "../models/focus_quality/<validated-version>/model.onnx"
+# Explicit paths are development overrides; they do not enable control.
 #
 # offset_model_path has no bundle to point at yet. The Focus Offset Predictor
 # cannot be trained until a focuser reports absolute position (defect D3), and
@@ -72,6 +79,20 @@ compensation_steps = 0
 # There is deliberately no drift_model_path. The focus-drift forecaster is a
 # 3-state Kalman filter, not a neural network — there is no ONNX file to point
 # at and there should not be. Its tuning lives in [focus.drift] below.
+
+# Planned v5 configuration (DESIGN EXAMPLE ONLY; not parsed by src/config.rs).
+# See ../achernar_v5.tex and ../docs/adr/compute-aware-model-runtime.md.
+# Keep these lines commented until the runtime and parser are implemented.
+#
+# [ai]
+# model_selection = "auto"
+# compute_budget = "balanced"  # efficient | balanced | quality
+#
+# The initial FQE implementation remains shadow-only. Selection/pinning does
+# not grant control authority: promotion, calibration, local qualification and
+# existing focus autonomy/safety gates apply independently.
+# Proposed status APIs: GET /api/v1/ai/models and GET /api/v1/ai/runtime.
+# These routes are planned; no compute-aware selection is enabled by this file.
 
 [focus.drift]                # Focus-drift forecaster (Section 7.6.3)
 # Advisory only: it publishes a prediction on /focus/drift, it never moves the

@@ -77,6 +77,3 @@ SECURE_HSTS_PRELOAD = True
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_STORAGE = 'django.contrib.staticfiles.storage.ManifestStaticFilesStorage'
 
-# Celery — always Redis in production
-CELERY_BROKER_URL = os.environ.get('REDIS_URL', 'redis://redis:6379/0')
-CELERY_RESULT_BACKEND = os.environ.get('REDIS_URL', 'redis://redis:6379/0')

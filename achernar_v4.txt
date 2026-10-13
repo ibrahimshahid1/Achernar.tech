@@ -3173,9 +3173,7 @@ GBTs
 Planner / ILP
 
 Subsystem Control Architecture: Filter Wheel, Mount, and
-Shared Perception
-
-The focuser is the first subsystem to receive closed-loop AI control, but the control architecture
+Shared PerceptioThe focuser is the first subsystem to receive closed-loop AI control, but the control architecture
 is explicitly designed to generalise. This section specifies the vision perception bus shared
 across all subsystems, and the concrete models and safety contracts for the filter wheel and
 mount controllers.

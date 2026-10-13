@@ -4,6 +4,8 @@
 pub mod background;
 pub mod background_estimator;
 pub mod coc_runner;
+pub mod coc_shadow_runner;
+pub mod coc_shadow;
 pub mod fqe_runner;
 pub mod observed_frame;
 pub mod preprocess;

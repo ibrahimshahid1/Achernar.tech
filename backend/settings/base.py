@@ -33,32 +33,15 @@ INSTALLED_APPS = [
     'corsheaders',
     'channels',
 
-    # Achernar core
+    # Achernar. Every app below has models, views or both. Apps that were
+    # `startapp` scaffolds with no models, migrations or URLs were removed —
+    # INSTALLED_APPS is a claim about what exists, and it should stay true.
+    # Re-create with `startapp` when there is something to put in one.
     'apps.core',           # Shared utilities and base models
-    'apps.accounts',       # User management
-
-    # Equipment & Observatory
-    'apps.equipment',      # Equipment database
-    'apps.observatory',    # Single-user equipment profiles
-
-    # Imaging & Sessions
-    'apps.imaging',        # Session sync and frame metadata
-
-    # Planning & AI
-    'apps.planning',       # Target ranking and scheduling
-    'apps.atlas',          # Celestial catalogs (Messier/NGC/IC)
-    'apps.ai_engine',      # AI/ML cloud services (embeddings, recommender, quality, anomaly)
-
-    # Processing & Communication
-    'apps.processing',     # Celery tasks, sync engine, backup
+    'apps.equipment',      # Equipment database and daemon command relay
     'apps.realtime',       # WebSocket/IoT relay for daemon connections
-
-    # Community & Data
-    'apps.community',      # Social features and sharing
-    'apps.data_management',  # Data lifecycle and archival
-
-    # New apps (spec compliance)
     'apps.sessions.apps.SessionsConfig',  # Imaging session/frame sync from daemon
+    'apps.ai_engine',      # Cloud AI services (AstroM3 embeddings)
     'apps.ml',             # ML model serving and active learning
     'apps.sync',           # Daemon ↔ cloud sync
 ]
@@ -136,13 +119,11 @@ STATIC_URL = 'static/'
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# Celery Configuration
-CELERY_BROKER_URL = os.getenv('REDIS_URL', 'memory://')
-CELERY_RESULT_BACKEND = os.getenv('REDIS_URL', 'db+sqlite:///results.sqlite')
-CELERY_ACCEPT_CONTENT = ['json']
-CELERY_TASK_SERIALIZER = 'json'
-CELERY_RESULT_SERIALIZER = 'json'
-CELERY_TIMEZONE = 'UTC'
+# Celery was removed: it was configured and running a worker, but every task
+# in backend/tasks raised NotImplementedError and no @shared_task existed
+# anywhere in the repo. Re-add it when there is a job that genuinely must run
+# out-of-band. Note that model distribution is better as a daemon-side pull
+# via GET /api/sync/available-models/ than as a cloud-side push.
 
 # Django REST Framework
 REST_FRAMEWORK = {

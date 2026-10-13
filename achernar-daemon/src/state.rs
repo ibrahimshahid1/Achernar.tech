@@ -160,6 +160,15 @@ pub struct AppState {
     /// Human-readable focuser name/driver for status reporting
     pub focuser_name: Arc<Mutex<Option<String>>>,
 
+    /// Filter-wheel drivers are not implemented yet. The lifecycle slot still
+    /// participates in the same null-inclusive status/health protocol.
+    pub filter_wheel: Arc<Mutex<Option<crate::hardware::filter_wheel::FilterWheel>>>,
+
+    /// Passive liveness and cached auxiliary-device measurements. Telemetry
+    /// never enters a vendor SDK or waits for an unresponsive device.
+    pub devices: Arc<RwLock<crate::hardware::health::DeviceRegistry>>,
+    pub device_updates: tokio::sync::broadcast::Sender<()>,
+
     /// Latest frame received from the camera stream
     pub latest_frame: Arc<Mutex<Option<FrameData>>>,
 
@@ -254,6 +263,10 @@ pub struct AppState {
     /// shutter produced goes here.
     pub capture_store: crate::storage::capture_store::CaptureStore,
 
+    /// Owns submitted exposure bundles independently of request lifetimes.
+    /// Acquisition must reserve a slot before issuing new science commands.
+    pub capture_archive: crate::storage::capture_archive::CaptureArchive,
+
     /// Identifies this rig in the archive. Every capture is filed under it, and
     /// dataset splits group by it, so a wrong value silently merges two rigs'
     /// data into one training set.
@@ -263,6 +276,8 @@ pub struct AppState {
     /// or the newest `models/focus_quality/<semver>/model.onnx`; disabled when
     /// neither exists. The classical measurement stays the control authority.
     pub fqe_runner: Arc<crate::vision::fqe_runner::FqeRunner>,
+    /// Rendered-preview research diagnostics; never supplies control observations.
+    pub coc_shadow: Arc<crate::vision::coc_shadow::CocShadowService>,
 }
 
 impl AppState {
@@ -284,6 +299,12 @@ impl AppState {
         rig_optics: Option<crate::config::RigOptics>,
     ) -> Self {
         let (vision_updates, _) = tokio::sync::broadcast::channel(64);
+        let (device_updates, _) = tokio::sync::broadcast::channel(16);
+        let capture_archive = crate::storage::capture_archive::CaptureArchive::spawn(
+            capture_store.clone(),
+            local_store.pool().clone(),
+            2,
+        );
 
         // Resolve the FQE shadow model: explicit config path wins; otherwise the
         // newest semver under <models_root>/focus_quality/. Any load failure
@@ -306,6 +327,7 @@ impl AppState {
         // nobody chose produces refocus advice nobody can interpret.
         let (focus_drift, focus_drift_state_path) =
             Self::build_focus_drift(&focus_config.drift, rig_optics.as_ref(), &data_dir);
+        let coc_shadow = Arc::new(crate::vision::coc_shadow::CocShadowService::from_env(&data_dir));
 
         Self {
             acquisition: Arc::new(tokio::sync::Mutex::new(())),
@@ -315,6 +337,9 @@ impl AppState {
             mount_name: Arc::new(Mutex::new(None)),
             focuser: Arc::new(Mutex::new(None)),
             focuser_name: Arc::new(Mutex::new(None)),
+            filter_wheel: Arc::new(Mutex::new(None)),
+            devices: Arc::new(RwLock::new(crate::hardware::health::DeviceRegistry::default())),
+            device_updates,
             latest_frame: Arc::new(Mutex::new(None)),
             camera_generation: Arc::new(AtomicU64::new(0)),
             camera_observation_barrier: Arc::new(Mutex::new(())),
@@ -334,8 +359,10 @@ impl AppState {
             local_store,
             frame_store,
             capture_store,
+            capture_archive,
             rig_id,
             fqe_runner,
+            coc_shadow,
         }
     }
 
@@ -355,6 +382,24 @@ impl AppState {
 
     pub fn current_camera_generation(&self) -> u64 {
         self.camera_generation.load(Ordering::Acquire)
+    }
+
+    /// Native callbacks receive only these publication signals, never an
+    /// owning camera handle. They may invalidate state but never join or free
+    /// their own SDK worker.
+    pub fn camera_loss_signals(&self) -> crate::hardware::health::CameraLossSignals {
+        crate::hardware::health::CameraLossSignals {
+            runtime: self.camera_runtime.clone(),
+            generation: self.camera_generation.clone(),
+            barrier: self.camera_observation_barrier.clone(),
+            latest_frame: self.latest_frame.clone(),
+            observation: self.vision_observation.clone(),
+            observed_frame: self.last_observed_frame.clone(),
+            streaming: self.streaming.clone(),
+            focus_abort: self.focus_abort_requested.clone(),
+            devices: self.devices.clone(),
+            updates: self.device_updates.clone(),
+        }
     }
 
     /// Construct the drift forecaster from config, restoring any snapshot.

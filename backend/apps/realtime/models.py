@@ -38,6 +38,7 @@ class DaemonConnection(models.Model):
     connected_at = models.DateTimeField(null=True, blank=True)
     disconnected_at = models.DateTimeField(null=True, blank=True)
     last_heartbeat = models.DateTimeField(null=True, blank=True)
+    gateway_channel_name = models.CharField(max_length=255, blank=True)
     
     # Location info (optional)
     site_name = models.CharField(max_length=255, blank=True)
@@ -59,11 +60,12 @@ class DaemonConnection(models.Model):
         owner = self.user.username if self.user else "dev-relay"
         return f"{owner} - {self.hardware_id} ({status})"
     
-    def mark_connected(self):
+    def mark_connected(self, channel_name=''):
         """Mark daemon as connected"""
         self.is_connected = True
         self.connected_at = timezone.now()
         self.last_heartbeat = timezone.now()
+        self.gateway_channel_name = channel_name
         self.save()
     
     def mark_disconnected(self):
@@ -120,6 +122,8 @@ class TelemetrySnapshot(models.Model):
     mount_state = models.JSONField(default=dict, blank=True)
     camera_state = models.JSONField(default=dict, blank=True)
     focuser_state = models.JSONField(default=dict, blank=True)
+    filter_wheel_state = models.JSONField(default=dict, blank=True)
+    device_health = models.JSONField(default=dict, blank=True)
     guiding_state = models.JSONField(default=dict, blank=True)
     ai_metrics = models.JSONField(default=dict, blank=True)
     

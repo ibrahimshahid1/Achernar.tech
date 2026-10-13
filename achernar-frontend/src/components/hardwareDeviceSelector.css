@@ -1,0 +1,32 @@
+.hardware-status-list {
+    display: grid;
+    gap: 12px;
+    margin: 18px 0;
+}
+
+.hardware-device-selector {
+    display: grid;
+    grid-template-columns: minmax(115px, 0.7fr) minmax(180px, 2fr) auto;
+    gap: 8px 14px;
+    align-items: center;
+    padding: 12px;
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 10px;
+    background: rgba(15, 23, 42, 0.3);
+}
+
+.hardware-device-heading { display: grid; gap: 3px; }
+.hardware-device-heading strong { font-size: 0.76rem; color: var(--text-soft, #cbd5e1); }
+.hardware-device-choice { width: 100%; min-width: 0; }
+.hardware-device-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.hardware-device-endpoint, .hardware-device-detail, .hardware-device-discovery { grid-column: 2 / -1; min-width: 0; }
+.hardware-device-endpoint { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 0.8rem; }
+.hardware-device-endpoint input { width: min(100%, 260px); }
+.hardware-device-detail, .hardware-device-endpoint span, .hardware-device-discovery { font-size: 0.76rem; color: var(--text-soft, #cbd5e1); overflow-wrap: anywhere; }
+.hardware-device-discovery summary { cursor: pointer; }
+.hardware-device-discovery p { margin: 5px 0; }
+
+@media (max-width: 700px) {
+    .hardware-device-selector { grid-template-columns: 1fr; }
+    .hardware-device-endpoint, .hardware-device-detail, .hardware-device-discovery { grid-column: 1; }
+}

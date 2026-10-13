@@ -116,7 +116,19 @@ sdks/
 # Downloaded model weights (artifacts, not source) — fetch with
 # scripts/download_astrom3.sh / ml/astrom3/download.py
 ml/checkpoints/
-OpenLiveStacker_Drivers/
+OpenLiveStacker_Drivers/*
+!OpenLiveStacker_Drivers/OpenLiveStacker/
+OpenLiveStacker_Drivers/OpenLiveStacker/*
+!OpenLiveStacker_Drivers/OpenLiveStacker/include/
+OpenLiveStacker_Drivers/OpenLiveStacker/include/*
+!OpenLiveStacker_Drivers/OpenLiveStacker/include/untouched_raw.h
+!OpenLiveStacker_Drivers/OpenLiveStacker/include/alpaca_selection.h
+!OpenLiveStacker_Drivers/OpenLiveStacker/test/
+OpenLiveStacker_Drivers/OpenLiveStacker/test/*
+!OpenLiveStacker_Drivers/OpenLiveStacker/test/test_gphoto_retention.cpp
+!OpenLiveStacker_Drivers/OpenLiveStacker/test/test_gphoto_controls.cpp
+!OpenLiveStacker_Drivers/OpenLiveStacker/test/test_gphoto_preview_timing.cpp
+!OpenLiveStacker_Drivers/OpenLiveStacker/test/test_alpaca_selection.cpp
 AstroM3-main/
 astronomy_texts/
 tmp/
@@ -129,3 +141,24 @@ tmp/
 *.out
 *.toc
 *.synctex.gz
+
+
+/docs 
+
+# Z114 GoTo retrofit working notes (CAD measurements, fit analysis, plans) — local only, never committed.
+mount_cad/
+
+# Standalone XPS sky capture utility and its local observations (not application code).
+/ml/data/raws/cloud_capture_local/
+
+# Reproducible public intake: source downloads and derived tensors stay local.
+/ml/data/public/
+/ml/data/raws/clouds
+node_modules/
+
+# COC research checkpoints and immutable exported bundles are generated locally.
+/ml/artifacts/coc/
+
+# Private local COC camera review samples and operator notes.
+/achernar-daemon/coc-shadow/
+/coc-shadow/

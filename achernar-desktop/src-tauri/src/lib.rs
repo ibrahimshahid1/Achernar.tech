@@ -145,6 +145,25 @@ impl DaemonManager {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
 
+        // Local development app: give sidecar config/data stable repository
+        // paths, and make the accepted COC research bundles discoverable when
+        // this native app is opened outside the shell launcher. Loading never
+        // enables shadow inference or grants control authority.
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent().and_then(|p| p.parent()).map(PathBuf::from);
+        if let Some(root) = repo_root.filter(|root| root.join("achernar-daemon/Cargo.toml").is_file()) {
+            command.current_dir(root.join("achernar-daemon"));
+            for (key, relative) in [
+                ("ACHERNAR_COC_BUNDLE", "ml/artifacts/coc/human-teacher-tiny-v1"),
+                ("ACHERNAR_COC_BASELINE_BUNDLE", "ml/artifacts/coc/human-tiny-v1"),
+            ] {
+                let bundle=root.join(relative);
+                if std::env::var_os(key).is_none() && bundle.join("manifest.json").is_file() {
+                    command.env(key,bundle);
+                }
+            }
+        }
+
         for key in [
             "ACHERNAR_CLOUD_HTTP",
             "ACHERNAR_CLOUD_WS",

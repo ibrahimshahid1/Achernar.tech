@@ -1,9 +1,10 @@
 import { useNavigate } from "react-router-dom";
-import { getHardwareTransport } from "../lib/runtime";
+import { usesDjangoRelay } from "../api/achernar";
+import { useDaemonStatus } from "../hooks/useDaemonStatus";
 
 export default function TopNav() {
     const navigate = useNavigate();
-    const hardwareTransport = getHardwareTransport();
+    const status = useDaemonStatus();
 
     return (
         <div className="top-nav system-bar">
@@ -11,16 +12,14 @@ export default function TopNav() {
                 <div className="brand-orbit" />
                 <div>
                     <div className="brand-title">Achernar Control</div>
-                    <div className="brand-subtitle">Observatory hardware console</div>
+                    <div className="brand-subtitle">Hardware test console</div>
                 </div>
             </div>
 
             <div className="system-readouts" aria-label="System status">
-                <div className="status-pill"><span /> Daemon status live</div>
-                <div className="status-pill neutral">{hardwareTransport === "django" ? "Django relay" : "Direct daemon"}</div>
-                <div className="user-avatar">AL</div>
+                <div className={`status-pill ${status.online ? "" : "neutral"}`} role="status">{status.online ? "Daemon reachable" : status.isLoading ? "Checking daemon" : "Daemon unavailable"}</div>
+                <div className="status-pill neutral">{usesDjangoRelay() ? "Django relay" : "Direct daemon"}</div>
             </div>
         </div>
     );
 }
-

@@ -4,6 +4,23 @@ project(achernar_daemon_index LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# opencv@4 is keg-only on Homebrew; same probe as ols-bridge/CMakeLists.txt.
+if(APPLE)
+    find_program(BREW_EXECUTABLE brew)
+    if(BREW_EXECUTABLE)
+        foreach(KEG_FORMULA "opencv@4" "libtiff")
+            execute_process(
+                COMMAND ${BREW_EXECUTABLE} --prefix ${KEG_FORMULA}
+                OUTPUT_VARIABLE KEG_PREFIX
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+            if(KEG_PREFIX AND EXISTS "${KEG_PREFIX}/lib/pkgconfig")
+                set(ENV{PKG_CONFIG_PATH} "${KEG_PREFIX}/lib/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+            endif()
+        endforeach()
+    endif()
+endif()
+
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(OPENCV REQUIRED opencv4)
 pkg_check_modules(TIFF REQUIRED libtiff-4)
@@ -21,12 +38,6 @@ include_directories(ols-bridge/shims/cppcms)
 include_directories(${OLS_INC})
 include_directories(${OPENCV_INCLUDE_DIRS})
 include_directories(${TIFF_INCLUDE_DIRS})
-include_directories(target)
-include_directories(target/debug)
-include_directories(target/debug/build)
-include_directories(target/debug/build/libusb1-sys-33457c577c407448)
-include_directories(target/debug/build/libusb1-sys-33457c577c407448/out)
-include_directories(target/debug/build/libusb1-sys-33457c577c407448/out/include)
 
 add_library(achernar_daemon_ols_bridge_index STATIC
         ols-bridge/external/json.hpp
@@ -37,6 +48,4 @@ add_library(achernar_daemon_ols_bridge_index STATIC
         ols-bridge/shims/booster/regex.h
         ols-bridge/shims/cppcms/json.h
         ols-bridge/src/camera_base.cpp
-        ols-bridge/src/ols_bridge.cpp
-        target/debug/build/libusb1-sys-33457c577c407448/out/include/config.h
-        target/debug/build/libusb1-sys-33457c577c407448/out/include/libusb.h)
+        ols-bridge/src/ols_bridge.cpp)

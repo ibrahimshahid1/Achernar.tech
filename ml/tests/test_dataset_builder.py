@@ -53,6 +53,39 @@ def _make_schema(db_path):
 
 
 class TestDatasetBuilder(unittest.TestCase):
+    def test_acquisition_ineligibility_cannot_be_overridden_by_permissive_saturation(self):
+        rng = np.random.default_rng(4)
+        with tempfile.TemporaryDirectory() as d:
+            db_path = str(Path(d) / "achernar.db")
+            con = _make_schema(db_path)
+            con.execute("INSERT INTO focus_runs (id, rig_id) VALUES ('run', 'rig')")
+            for i, markers in enumerate((
+                {"training_label_eligible": False},
+                {"acquisition_domain": "simulation"},
+                {"acquisition_domain": "preview"},
+                {},
+            )):
+                path = Path(d) / f"frame-{i}.png"
+                _write_frame_png(path, 3.0, rng)
+                quality = {"saturation_adu": 16383, "saturation_gate_applied": True, **markers}
+                con.execute(
+                    "INSERT INTO frames (id, local_path, checksum_sha256, quality_json) VALUES (?, ?, ?, ?)",
+                    (f"frame-{i}", str(path), hashlib.sha256(path.read_bytes()).hexdigest(), json.dumps(quality)),
+                )
+                con.execute(
+                    "INSERT INTO focus_samples (run_id, position, hfr, frame_id) VALUES ('run', ?, 3.0, ?)",
+                    (1000 + i * 100, f"frame-{i}"),
+                )
+            con.commit()
+            con.close()
+
+            for permissive in (False, True):
+                output = str(Path(d) / f"dataset-{permissive}.npz")
+                dataset = build_dataset(db_path, output, allow_missing_saturation=permissive)
+                self.assertEqual(set(dataset["frame_id"]), {"frame-3"})
+                manifest = json.loads(Path(output).with_suffix(".manifest.json").read_text())
+                self.assertEqual(manifest["frames_skipped_ineligible"], 3)
+
     def test_builds_labeled_crops_from_fixture(self):
         rng = np.random.default_rng(0)
         with tempfile.TemporaryDirectory() as d:

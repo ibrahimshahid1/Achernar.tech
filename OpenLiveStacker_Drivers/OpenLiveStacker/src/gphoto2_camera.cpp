@@ -13,7 +13,6 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
-#include <queue>
 #include <cmath>
 #include <cstdlib>
 #include <opencv2/imgcodecs.hpp>
@@ -192,6 +191,111 @@ namespace ols {
         return best;
     }
 
+    // Read JPEG SOF dimensions without decoding every video frame to RGB.
+    // This also handles a body changing its EVF geometry during the session.
+    static bool preview_dimensions(std::vector<unsigned char> const &jpeg,
+                                   std::pair<int,int> &dims)
+    {
+        if(jpeg.size() < 4 || jpeg[0] != 0xff || jpeg[1] != 0xd8)
+            return false;
+        size_t at = 2;
+        while(at < jpeg.size()) {
+            if(jpeg[at++] != 0xff)
+                return false;
+            while(at < jpeg.size() && jpeg[at] == 0xff) ++at;
+            if(at >= jpeg.size()) return false;
+            unsigned marker = jpeg[at++];
+            if(marker == 0xd9 || marker == 0xda || marker == 0) return false;
+            if(marker == 0x01 || (marker >= 0xd0 && marker <= 0xd8)) continue;
+            if(jpeg.size() - at < 2) return false;
+            size_t length = (size_t(jpeg[at]) << 8) | jpeg[at+1];
+            if(length < 2 || length > jpeg.size() - at) return false;
+            bool sof = marker >= 0xc0 && marker <= 0xcf &&
+                       marker != 0xc4 && marker != 0xc8 && marker != 0xcc;
+            if(sof) {
+                if(length < 8) return false;
+                int height = (int(jpeg[at+3]) << 8) | jpeg[at+4];
+                int width = (int(jpeg[at+5]) << 8) | jpeg[at+6];
+                if(width == 0 || height == 0) return false;
+                dims = std::make_pair(width,height);
+                return true;
+            }
+            at += length;
+        }
+        return false;
+    }
+
+    // Opt-in stage timing for real camera previews. Aggregate outside the SDK
+    // mutex instead of logging per frame; normal acquisition adds no clocks.
+    // SDK time includes libgphoto2's own event polls, retries and USB transfers.
+    struct PreviewPullTiming {
+        double lock_wait_ms = 0;
+        double sdk_ms = 0;
+        double payload_ms = 0;
+    };
+
+    static double preview_milliseconds(std::chrono::steady_clock::duration elapsed)
+    {
+        return std::chrono::duration<double,std::milli>(elapsed).count();
+    }
+
+    struct PreviewTimingMetric {
+        double sum = 0;
+        double maximum = 0;
+        void add(double value) {
+            sum += value;
+            maximum = std::max(maximum,value);
+        }
+    };
+
+    struct PreviewTimingWindow {
+        std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+        unsigned long long attempts = 0;
+        unsigned long long frames = 0;
+        unsigned long long bytes = 0;
+        PreviewTimingMetric lock_wait, sdk, payload, callback, pacing;
+
+        void add(PreviewPullTiming const &pull, bool delivered, size_t payload_bytes,
+                 double callback_ms, double pacing_ms)
+        {
+            ++attempts;
+            frames += delivered ? 1 : 0;
+            bytes += delivered ? payload_bytes : 0;
+            lock_wait.add(pull.lock_wait_ms);
+            sdk.add(pull.sdk_ms);
+            payload.add(pull.payload_ms);
+            if(delivered) callback.add(callback_ms);
+            pacing.add(pacing_ms);
+        }
+
+        // Mean pull/pacing times use attempts; callback mean uses delivered
+        // frames. Pauses and SDK error backoff remain in wall-clock FPS.
+        void write(FILE *sink, int frame_counter, int width, int height,
+                   double requested_fps,
+                   std::chrono::steady_clock::time_point now) const
+        {
+            if(attempts == 0) return;
+            double elapsed_s = std::chrono::duration<double>(now-started).count();
+            double mean_callback = frames ? callback.sum / frames : 0;
+            fprintf(sink,
+                "[gphoto2-preview-timing] {\"version\":1,\"attempts\":%llu,"
+                "\"frames\":%llu,\"elapsed_s\":%.6f,\"fps\":%.6f,"
+                "\"frame_counter\":%d,\"width\":%d,\"height\":%d,"
+                "\"requested_fps\":%.3f,\"mean_jpeg_bytes\":%.3f,"
+                "\"mean_lock_wait_ms\":%.6f,\"max_lock_wait_ms\":%.6f,"
+                "\"mean_sdk_ms\":%.6f,\"max_sdk_ms\":%.6f,"
+                "\"mean_payload_ms\":%.6f,\"max_payload_ms\":%.6f,"
+                "\"mean_callback_ms\":%.6f,\"max_callback_ms\":%.6f,"
+                "\"mean_pacing_ms\":%.6f,\"max_pacing_ms\":%.6f}\n",
+                attempts,frames,elapsed_s,elapsed_s > 0 ? frames / elapsed_s : 0,
+                frame_counter,width,height,requested_fps,frames ? double(bytes) / frames : 0,
+                lock_wait.sum / attempts,lock_wait.maximum,sdk.sum / attempts,sdk.maximum,
+                payload.sum / attempts,payload.maximum,mean_callback,callback.maximum,
+                pacing.sum / attempts,pacing.maximum);
+            fflush(sink);
+        }
+    };
+
     class GPWidget {
     public:
         GPWidget( ::Camera *c,GPContext *ct,std::string const &key) :
@@ -204,6 +308,11 @@ namespace ols {
         {
             load();
             int res;
+            int read_only = 0;
+            res = gp_widget_get_readonly(widget_,&read_only);
+            check(res,"get_widget_readonly");
+            if(read_only)
+                throw GPError("Camera control '" + key_ + "' is read-only");
             CameraWidgetType type;
             res = gp_widget_get_type(widget_,&type);
             check(res,"get_widget_type");
@@ -241,6 +350,10 @@ namespace ols {
             int res;
             res = gp_widget_get_type(widget_,&type);
             check(res,"get_widget_type");
+            int read_only = 0;
+            res = gp_widget_get_readonly(widget_,&read_only);
+            check(res,"get_widget_readonly");
+            r.read_only = read_only != 0;
             switch(type) {
             case GP_WIDGET_TOGGLE:
                 {
@@ -258,19 +371,27 @@ namespace ols {
             case GP_WIDGET_MENU:
                 {
                     int N = gp_widget_count_choices(widget_);
+                    if(N <= 0)
+                        throw GPError("Camera control '" + key_ + "' has no selectable choices");
                     char const *val = nullptr;
                     for(int i=0;i<N;i++) {
                         res = gp_widget_get_choice(widget_,i,&val);
                         check(res,"widget_get_choice");
                         r.names.push_back(val);
                     }
-                    gp_widget_get_value(widget_,&val);
+                    res = gp_widget_get_value(widget_,&val);
                     check(res,"widget_get_value");
-                    
+                    if(!val)
+                        throw GPError("Camera control '" + key_ + "' returned no current choice");
+                    auto current = std::find(r.names.begin(),r.names.end(),std::string(val));
+                    if(current == r.names.end())
+                        throw GPError("Camera control '" + key_ + "' returned an unadvertised current choice: " + val);
+
                     r.type = type_selection;
+                    r.step_size = 1;
                     r.min_val = 0;
                     r.max_val = N-1;
-                    r.cur_val = std::find(r.names.begin(),r.names.end(),std::string(val)) - r.names.begin();
+                    r.cur_val = current - r.names.begin();
                     r.def_val = r.cur_val;
                 }
                 break;
@@ -335,26 +456,38 @@ namespace ols {
         {
             return path_.folder + std::string("/") + path_.name;
         }
-        void del()
-        {
-            LOG("Deleting file %s/%s\n",path_.folder,path_.name);
-            int status = gp_camera_file_delete(cam_,path_.folder,path_.name,ctx_);
-            check(status,"delete");
-        }
         bool loaded()
         {
             return data_ != nullptr;
         }
+        // A failed transfer may leave useful bytes in CameraFile. Read them
+        // even on a gphoto error so capture_still can preserve the partial file.
+        std::string download_preserving_bytes()
+        {
+            free();
+            int status = gp_file_new(&file_);
+            if(status < GP_OK || !file_)
+                return std::string("new file: ") + gp_result_as_string(status);
+            int transfer_status = gp_camera_file_get(
+                cam_,path_.folder,path_.name,GP_FILE_TYPE_NORMAL,file_,ctx_);
+            int data_status = gp_file_get_data_and_size(file_,&data_,&size_);
+            if(data_status < GP_OK) {
+                data_ = nullptr;
+                size_ = 0;
+            }
+            if(transfer_status < GP_OK)
+                return std::string("get file: ") + gp_result_as_string(transfer_status);
+            if(data_status < GP_OK)
+                return std::string("get data: ") + gp_result_as_string(data_status);
+            if(!data_ || size_ == 0)
+                return "Camera returned an empty native file";
+            return std::string();
+        }
         void get()
         {
-            int status = 0;
-            free();
-            status = gp_file_new(&file_);
-            check(status,"new file");
-            status = gp_camera_file_get(cam_,path_.folder,path_.name,GP_FILE_TYPE_NORMAL,file_,ctx_);
-            check(status,"get file");
-            status = gp_file_get_data_and_size(file_,&data_,&size_);
-            check(status,"get data");
+            std::string error = download_preserving_bytes();
+            if(!error.empty())
+                throw GPError(error);
         }
 
         std::pair<cv::Mat,CamBayerType> to_mat(int w=-1,int h=-1,int bin=1)
@@ -447,6 +580,25 @@ namespace ols {
             return "Camera";
         }
 
+        virtual bool check_connection(CamErrorCode &e) override
+        {
+            std::unique_lock<std::recursive_mutex> guard(clock_);
+            CameraWidget *widget = nullptr;
+            // EOS config reads perform a keep-alive/event transaction even
+            // when the property's value is cached. Never use name/formats:
+            // they are cached, and format enumeration can trigger a still.
+            int status = gp_camera_get_single_config(cam_,"iso",&widget,ctx_);
+            if(widget)
+                gp_widget_free(widget);
+            if(status == GP_ERROR_NOT_SUPPORTED)
+                return false;
+            // A busy response is still evidence that the device answered.
+            if(status == GP_ERROR_CAMERA_BUSY)
+                return true;
+            check(status,"Camera presence check",e);
+            return true;
+        }
+
         /// True when the body can deliver a live-view (mirror-up / EVF) stream.
         /// Probed once and cached; failure is not an error, only a capability.
         bool liveview_supported()
@@ -474,7 +626,8 @@ namespace ols {
         /// Pull one live-view frame. Returns false when the body has no
         /// live-view at all (a plain "not supported" from libgphoto2), throws
         /// only on genuine I/O failure. `out` receives the JPEG bytes verbatim.
-        bool grab_preview(std::vector<unsigned char> &out,std::pair<int,int> &dims)
+        bool grab_preview(std::vector<unsigned char> &out,std::pair<int,int> &dims,
+                          PreviewPullTiming *timing = nullptr)
         {
             CameraFile *file = nullptr;
             int status = gp_file_new(&file);
@@ -484,17 +637,30 @@ namespace ols {
                 ~Guard() { if(f) gp_file_free(f); }
             } guard_file{file};
 
+            auto lock_requested = timing ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point();
             {
                 std::unique_lock<std::recursive_mutex> guard(clock_);
+                auto acquired = timing ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point();
                 status = gp_camera_capture_preview(cam_,file,ctx_);
+                if(timing) {
+                    auto completed = std::chrono::steady_clock::now();
+                    timing->lock_wait_ms = preview_milliseconds(acquired-lock_requested);
+                    timing->sdk_ms = preview_milliseconds(completed-acquired);
+                }
             }
             if(status == GP_ERROR_NOT_SUPPORTED)
                 return false;
-            if(status < GP_OK) {
-                LOG("capture_preview failed: %s\n",gp_result_as_string(status));
+            if(status == GP_ERROR_CAMERA_BUSY || status == GP_ERROR_TIMEOUT)
                 return false;
-            }
+            // A broken transport cannot be repaired by replaying the last
+            // image or repeatedly fetching frames. The outer worker reports
+            // this error to Rust and exits; Rust retires the connection.
+            check(status,"capture preview");
 
+            auto payload_started = timing ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point();
             char const *data = nullptr;
             unsigned long size = 0;
             status = gp_file_get_data_and_size(file,&data,&size);
@@ -505,15 +671,11 @@ namespace ols {
             out.assign(reinterpret_cast<unsigned char const*>(data),
                        reinterpret_cast<unsigned char const*>(data) + size);
 
-            // Decode once, during the probe only, to learn the exact live-view
-            // geometry. At stream time the payload is forwarded untouched as
-            // MJPEG and never decoded here.
-            cv::Mat buffer(1,int(out.size()),CV_8UC1,out.data());
-            cv::Mat img = cv::imdecode(buffer,cv::IMREAD_COLOR);
-            if(img.empty())
-                return false;
-            dims = std::make_pair(img.cols,img.rows);
-            return true;
+            bool valid = preview_dimensions(out,dims);
+            if(timing)
+                timing->payload_ms = preview_milliseconds(
+                    std::chrono::steady_clock::now()-payload_started);
+            return valid;
         }
 
         /// Return list of suppored video formats
@@ -573,38 +735,45 @@ namespace ols {
             return fno;
         }
 
-        /// Collect every file produced by ONE exposure.
-        ///
-        /// `wait_event()` above returns as soon as the first FILE_ADDED
-        /// arrives. On a body set to RAW+JPEG that is only half the exposure:
-        /// the companion is still in flight, and the caller — which triggers
-        /// the next exposure immediately — sees it attributed to the *next*
-        /// shot. The companion is never selected by the format filter, so it
-        /// is never deleted either, and the card fills with orphans while the
-        /// event queue runs a shot behind.
-        ///
-        /// This drains to GP_EVENT_CAPTURE_COMPLETE and then keeps listening
-        /// through a short grace window, because several bodies emit the
-        /// second FILE_ADDED *after* the completion event.
-        std::vector<CameraFilePath> drain_exposure(double timeout_s,bool &saw_complete)
+        struct ExposureDrainResult {
+            std::vector<CameraFilePath> files;
+            bool event_complete = false;
+            bool completion_grace_complete = false;
+            std::string termination = "not_started";
+            std::string error;
+        };
+
+        /// Collect the observed files for one exposure, retaining discoveries
+        /// even if event collection fails. A completion event followed by the
+        /// full grace is evidence for the observed set, not a predicted count.
+        ExposureDrainResult drain_exposure(double timeout_s)
         {
             using clock = std::chrono::steady_clock;
-            std::vector<CameraFilePath> files;
-            saw_complete = false;
-
+            ExposureDrainResult result;
             auto deadline = clock::now() +
                 std::chrono::milliseconds(static_cast<long long>(timeout_s * 1000.0));
             const auto grace = std::chrono::milliseconds(2000);
-            bool grace_started = false;
             clock::time_point grace_until;
-            int consecutive_timeouts = 0;
+            clock::time_point last_file_at;
 
             while(!stop_) {
                 auto now = clock::now();
-                if(now > deadline)
-                    break;
-                if(grace_started && now > grace_until)
-                    break;
+                if(result.event_complete && now >= grace_until) {
+                    result.completion_grace_complete = true;
+                    result.termination = "capture_complete_grace_elapsed";
+                    return result;
+                }
+                if(now >= deadline) {
+                    result.termination = "deadline";
+                    result.error = "Exposure event drain reached its deadline";
+                    return result;
+                }
+                if(!result.event_complete && !result.files.empty() &&
+                   now - last_file_at >= grace) {
+                    result.termination = "quiet_without_completion";
+                    result.error = "Files arrived without a capture-complete event";
+                    return result;
+                }
 
                 CameraEventType ev = GP_EVENT_UNKNOWN;
                 void *ptr = nullptr;
@@ -615,45 +784,41 @@ namespace ols {
                 }
                 if(status < GP_OK) {
                     free(ptr);
-                    throw GPError("wait_for_event",status);
+                    result.termination = "event_error";
+                    result.error = std::string("wait_for_event: ") + gp_result_as_string(status);
+                    return result;
                 }
-
                 switch(ev) {
                 case GP_EVENT_FILE_ADDED:
                     {
                         CameraFilePath *fp = static_cast<CameraFilePath*>(ptr);
                         if(fp) {
-                            files.push_back(*fp);
+                            auto existing = std::find_if(result.files.begin(),result.files.end(),
+                                [fp](CameraFilePath const &file) {
+                                    return strcmp(file.folder,fp->folder) == 0 &&
+                                           strcmp(file.name,fp->name) == 0;
+                                });
+                            if(existing == result.files.end())
+                                result.files.push_back(*fp);
+                            last_file_at = clock::now();
                             LOG("Exposure produced %s/%s\n",fp->folder,fp->name);
                         }
-                        consecutive_timeouts = 0;
                     }
                     break;
                 case GP_EVENT_CAPTURE_COMPLETE:
-                    LOG("EV:Capture Done (%zu file(s) so far)\n",files.size());
-                    saw_complete = true;
-                    if(!grace_started) {
-                        grace_started = true;
+                    LOG("EV:Capture Done (%zu file(s) so far)\n",result.files.size());
+                    if(!result.event_complete)
                         grace_until = clock::now() + grace;
-                    }
-                    consecutive_timeouts = 0;
-                    break;
-                case GP_EVENT_TIMEOUT:
-                    // Not every body emits CAPTURE_COMPLETE. Once files have
-                    // arrived and the bus has gone quiet twice, the exposure
-                    // is over.
-                    consecutive_timeouts++;
-                    if(!files.empty() && consecutive_timeouts >= 2) {
-                        free(ptr);
-                        return files;
-                    }
+                    result.event_complete = true;
                     break;
                 default:
                     break;
                 }
                 free(ptr);
             }
-            return files;
+            result.termination = "stopped";
+            result.error = "Exposure event drain was stopped before completion";
+            return result;
         }
 
         /// Ask the running stream thread to stand down, and wait until it
@@ -686,7 +851,12 @@ namespace ols {
         /// stream thread parked forever.
         struct StreamPause {
             GP2Camera *cam;
-            explicit StreamPause(GP2Camera *c) : cam(c) { cam->pause_stream(); }
+            explicit StreamPause(GP2Camera *c) : cam(c) {
+                if(!cam->pause_stream()) {
+                    cam->resume_stream();
+                    throw GPError("Preview did not become idle; refusing a competing still event consumer");
+                }
+            }
             ~StreamPause() { cam->resume_stream(); }
         };
 
@@ -695,113 +865,22 @@ namespace ols {
             if(!formats_.empty())
                 return formats_;
             try {
-                // ─── 1. Live view, first in the list ───
-                //
-                // Index 0 is what every caller that does not specify a format
-                // ends up streaming, so it must be the mode that costs nothing.
-                // Live view is a mirror-up/EVF video feed: no shutter
-                // actuation, no card write, no download of a 30 MB file per
-                // frame. Framing, focusing and polar alignment all belong here.
-                //
-                // The full-resolution still formats below remain available at
-                // higher indices and are the correct choice for science frames
-                // — the point is that you now opt *into* wearing out the
-                // shutter rather than doing it by default.
+                // Format discovery must not take a photograph. Enumerate only
+                // nonactuating live view; dedicated capture_still() discovers
+                // native asset geometry from the explicitly requested exposure.
                 if(liveview_supported()) {
                     CamStreamFormat fmt;
                     fmt.format = stream_mjpeg;
                     fmt.width  = liveview_width_;
                     fmt.height = liveview_height_;
                     fmt.bin = 1;
-                    fmt.framerate = 15.0f;
+                    // Request ceiling, not a measured/vendor FPS promise. Camera
+                    // preview cadence and PTP transport determine actual FPS.
+                    fmt.framerate = 60.0f;
                     formats_.push_back(fmt);
                     liveview_format_index_ = 0;
                 }
 
-                // ─── 2. Still formats ───
-                //
-                // Determining the sensor geometry requires exactly one probe
-                // exposure; libgphoto2 offers no reliable cross-vendor way to
-                // read it from the config tree. This costs one actuation per
-                // session, not one per frame.
-                trigger();
-                CameraFilePath files[MAX_FILES];
-                int N = wait_event(files,true);
-                if(N == 0) {
-                    if(!formats_.empty()) {
-                        // Live view works even though the still probe did not.
-                        // Usable for framing; do not fail the whole open.
-                        LOG("Still probe produced no file; live view only\n");
-                        return formats_;
-                    }
-                    e="Failed to capture images";
-                    return formats_;
-                }
-                // A body set to RAW+JPEG emits two files per actuation. Both
-                // are enumerated: the JPEG contributes an MJPEG still format,
-                // the RAW contributes the raw16/rgb48 ladder, and the capture
-                // loop already picks whichever file matches the selected
-                // format. Rejecting this combination (as this driver used to)
-                // forces the operator to reconfigure the camera for no reason
-                // — RAW+JPEG is the shipping default on the R50 and M50.
-                for(int i=0;i<N;i++) {
-                    std::unique_lock<std::recursive_mutex> guard(clock_);
-                    GPFile file(files[i],cam_,ctx_);
-                    file.get();
-                    if(!keep_images_)
-                        file.del();
-                    if(file.is_jpeg()) {
-                        CamStreamFormat fmt;
-                        fmt.format = stream_mjpeg;
-                        std::pair<cv::Mat,CamBayerType> res = file.to_mat();
-                        fmt.width = res.first.cols;
-                        fmt.height = res.first.rows;
-                        formats_.push_back(fmt);
-                    }
-                    else {
-                        #ifdef WITH_LIBRAW
-                        std::pair<cv::Mat,CamBayerType> res = file.to_mat();
-                        for(int is_rgb=0;is_rgb <=1;is_rgb++) {
-                            for(int bin=1;bin<=3;bin++) {
-                                for(int scale = 0;scale < 8;scale++) {
-                                    int num,den;
-                                    switch(scale) {
-                                    case  0: num=1; den=1; break;
-                                    case  1: num=2; den=3; break;
-                                    default: num=1; den=scale;
-                                    }
-                                    int w = num * res.first.cols / den / (2*bin) * 2; // make sure round of 2
-                                    int h = num * res.first.rows / den / (2*bin) * 2; // make sure round of 2
-
-                                    if(std::min(w,h) < 480)
-                                        break;
-                                    
-                                    CamStreamFormat fmt;
-                                    fmt.format = is_rgb ? stream_rgb48 : stream_raw16;
-                                    fmt.width = w;
-                                    fmt.height = h;
-                                    fmt.bin = bin;
-                                    fmt.roi_num = num;
-                                    fmt.roi_den = den;
-                                    formats_.push_back(fmt);
-                                }
-                            }
-                        }
-                        #else
-                        // Reached only when the bridge was built without
-                        // LibRaw. The body is shooting RAW and we have no
-                        // decoder, so no still format can be offered. Say so
-                        // explicitly instead of returning an empty list that
-                        // looks like a dead camera.
-                        LOG("RAW file %s ignored: built without LibRaw\n",file.name().c_str());
-                        if(formats_.empty())
-                            e = "Camera produced a RAW file (" + file.ext() +
-                                ") but this build has no LibRaw support. "
-                                "Install LibRaw and rebuild, or set the camera to JPEG.";
-                        continue;
-                        #endif
-                    }
-                }
             }
             catch(std::exception const &err)  {
                 e = err.what();
@@ -925,6 +1004,12 @@ namespace ols {
         /// Start a video stream with provided callback 
         virtual void start_stream(CamStreamFormat format,frame_callback_type callback,CamErrorCode &e) 
         {
+            // Refuse still formats before enumeration: enumeration can perform
+            // a probe on bodies without cached dimensions (A18).
+            if(!std::isfinite(format.framerate) || format.framerate <= 0) {
+                e = "DSLR still streams cannot archive complete bundles; use dedicated still capture (A02)";
+                return;
+            }
             if(stream_active_ != 0) {
                 stop_stream(e);
                 if(e)
@@ -940,6 +1025,10 @@ namespace ols {
             }
             int idx = find_format_index(format);
             streaming_liveview_ = (idx >= 0 && idx == liveview_format_index_);
+            if(!streaming_liveview_) {
+                e = "DSLR still streams cannot archive complete bundles; use dedicated still capture (A02)";
+                return;
+            }
             LOG("start_stream: format index %d, mode=%s\n",
                 idx,streaming_liveview_ ? "liveview" : "still");
 
@@ -952,21 +1041,6 @@ namespace ols {
             thread_ = std::thread([=]() {
                 capture_thread();
             });
-        }
-        void handle_cmd_queue()
-        {
-            std::unique_lock<std::recursive_mutex> guard(clock_);
-            while(!cmd_queue_.empty()){
-                auto cmd = cmd_queue_.front();
-                cmd_queue_.pop();
-                CamErrorCode e;
-                set_parameter_internal(cmd.first,cmd.second,e);
-                if(e) {
-                    printf("%s\n",e.message().c_str());
-                    handle_error(e.message().c_str());
-                }
-            }
-            
         }
         void capture_thread()
         {
@@ -998,13 +1072,24 @@ namespace ols {
             // Pace the loop to the advertised framerate. Without this the loop
             // saturates the USB bus and starves the config traffic that
             // set_parameter() needs to get through.
-            double target_fps = format_.framerate > 0 ? format_.framerate : 15.0;
+            double target_fps = format_.framerate > 0 ? format_.framerate : 60.0;
             auto frame_interval = std::chrono::microseconds(
                 static_cast<long long>(1e6 / std::max(1.0,target_fps)));
 
             std::vector<unsigned char> jpeg;
             std::pair<int,int> dims;
             int consecutive_failures = 0;
+            const char *timing_env = std::getenv("ACHERNAR_GPHOTO_PREVIEW_TIMING");
+            const bool timing_enabled = timing_env && std::strcmp(timing_env,"1") == 0;
+            PreviewTimingWindow timing_window;
+            auto report_timing = [&](bool force) {
+                if(!timing_enabled || timing_window.attempts == 0) return;
+                auto now = std::chrono::steady_clock::now();
+                if(!force && now-timing_window.started < std::chrono::seconds(5)) return;
+                timing_window.write(stderr,frame_counter_,format_.width,format_.height,
+                                    target_fps,now);
+                timing_window = PreviewTimingWindow();
+            };
 
             while(!stop_) {
                 // Stand down while a still capture owns the camera.
@@ -1016,20 +1101,25 @@ namespace ols {
                 stream_idle_ = false;
 
                 auto started = std::chrono::steady_clock::now();
-                handle_cmd_queue();
                 if(stop_)
                     break;
 
-                bool ok = false;
+                PreviewPullTiming pull_timing;
+                bool ok;
                 try {
-                    ok = grab_preview(jpeg,dims);
+                    ok = grab_preview(jpeg,dims,timing_enabled ? &pull_timing : nullptr);
                 }
-                catch(std::exception const &e) {
-                    LOG("liveview grab failed: %s\n",e.what());
-                    ok = false;
+                catch(...) {
+                    if(timing_enabled) {
+                        timing_window.add(pull_timing,false,0,0,0);
+                        report_timing(true);
+                    }
+                    throw;
                 }
 
                 if(!ok) {
+                    if(timing_enabled) timing_window.add(pull_timing,false,0,0,0);
+                    report_timing(false);
                     // Tolerate transient hiccups — a body that is busy writing
                     // to its card will refuse previews for a moment — but do
                     // not spin forever on a camera that has gone away.
@@ -1041,13 +1131,28 @@ namespace ols {
                     continue;
                 }
                 consecutive_failures = 0;
+                format_.width = dims.first;
+                format_.height = dims.second;
+                auto callback_started = timing_enabled ? std::chrono::steady_clock::now()
+                                                       : std::chrono::steady_clock::time_point();
                 handle_preview_frame(jpeg);
+                auto callback_completed = std::chrono::steady_clock::now();
+                double callback_ms = timing_enabled
+                    ? preview_milliseconds(callback_completed-callback_started) : 0;
 
-                auto elapsed = std::chrono::steady_clock::now() - started;
-                if(elapsed < frame_interval)
+                auto elapsed = callback_completed - started;
+                double pacing_ms = 0;
+                if(elapsed < frame_interval) {
                     std::this_thread::sleep_for(frame_interval - elapsed);
+                    if(timing_enabled) pacing_ms = preview_milliseconds(
+                        std::chrono::steady_clock::now()-callback_completed);
+                }
+                if(timing_enabled)
+                    timing_window.add(pull_timing,true,jpeg.size(),callback_ms,pacing_ms);
+                report_timing(false);
             }
 
+            report_timing(true);
             set_viewfinder(0);
         }
 
@@ -1070,24 +1175,18 @@ namespace ols {
                 }
                 stream_idle_ = false;
 
-                // Drain the WHOLE exposure before doing anything else. The old
-                // code took the first FILE_ADDED and immediately re-triggered,
-                // so on a RAW+JPEG body the companion arrived during the next
-                // exposure, was never selected by the format filter, and was
-                // therefore never deleted — the event queue ran a shot behind
-                // and the card filled with orphans.
-                bool saw_complete = false;
-                std::vector<CameraFilePath> files;
-                try {
-                    files = drain_exposure(120.0,saw_complete);
-                }
-                catch(std::exception const &err) {
-                    handle_error(err.what());
+                // Drain the WHOLE exposure before doing anything else so a
+                // RAW+JPEG companion cannot be mistaken for the next exposure.
+                // Every file remains on the camera regardless of which one
+                // this preview consumer selects.
+                ExposureDrainResult drained = drain_exposure(120.0);
+                std::vector<CameraFilePath> files = std::move(drained.files);
+                if(!drained.error.empty()) {
+                    handle_error(drained.error.c_str());
                     break;
                 }
                 if(stop_)
                     break;
-                handle_cmd_queue();
 
                 bool delay_enabled = capture_delay_ > 0;
                 auto time_before_downloading_files = std::chrono::steady_clock::now();
@@ -1099,19 +1198,9 @@ namespace ols {
                     std::unique_lock<std::recursive_mutex> guard(clock_);
                     GPFile f(files[i],cam_,ctx_);
 
-                    // Three outcomes per file, and they need different
-                    // handling. `delivered` = decoded and handed to the
-                    // consumer. `companion` = a valid file from this exposure
-                    // that simply is not the selected format (the JPEG when
-                    // streaming RAW, or vice versa). `failed` = we tried and
-                    // could not.
-                    //
-                    // The old code deleted everything unconditionally,
-                    // including files whose decode threw — and since the
-                    // camera's copy was the only copy, one LibRaw hiccup
-                    // silently destroyed the exposure.
-                    bool delivered = false;
-                    bool failed = false;
+                    // A preview callback is not a durable archive receipt.
+                    // Decode the selected format while retaining every file,
+                    // including ignored companions and decode failures.
                     bool selected =
                         (format_.format == stream_mjpeg) ? f.is_jpeg() : !f.is_jpeg();
 
@@ -1122,15 +1211,12 @@ namespace ols {
                                 // pass data as is
                                 cv::Mat buffer(1,f.size(),CV_8UC1,const_cast<char*>(f.data()));
                                 handle_frame(std::make_pair(buffer,bayer_na),&f);
-                                delivered = true;
                             }
                             else if(format_.format == stream_raw16) {
                                 handle_frame(f.to_mat(format_.width,format_.height,format_.bin),&f);
-                                delivered = true;
                             }
                             else if(format_.format == stream_rgb48) {
                                 handle_frame(to_rgb(f.to_mat(format_.width * format_.bin, format_.height * format_.bin)),&f);
-                                delivered = true;
                             }
                         }
                         catch(std::exception const &err) {
@@ -1138,27 +1224,9 @@ namespace ols {
                             // frame is recoverable by hand.
                             LOG("Failed to handle %s: %s\n",f.name().c_str(),err.what());
                             handle_error(err.what());
-                            failed = true;
                         }
                     }
 
-                    if(keep_images_)
-                        continue;
-
-                    // Delete the frame we delivered, and delete companions we
-                    // deliberately ignored — they belong to an exposure we
-                    // have already consumed, and leaving them behind is what
-                    // fills the card. Only a *failed* decode is preserved,
-                    // because that is the case where the camera holds the
-                    // sole copy of data we could not read.
-                    if(delivered || (!selected && !failed)) {
-                        try {
-                            f.del();
-                        }
-                        catch(std::exception const &err) {
-                            LOG("Failed to delete %s: %s\n",f.name().c_str(),err.what());
-                        }
-                    }
                 }
 
                 if (delay_enabled) {
@@ -1293,11 +1361,9 @@ namespace ols {
                 //    anything below throws.
                 StreamPause pause(this);
 
-                // 2) Apply and read back shutter and ISO, synchronously. Note
-                //    this bypasses the command queue used by set_parameter()
-                //    during streaming: a queued write is acknowledged before
-                //    it reaches the camera, which is precisely the failure we
-                //    are avoiding here.
+                // 2) Apply and read back shutter and ISO synchronously, just
+                //    like manual control writes. A request is not evidence of
+                //    a setting until the camera has accepted it and read back.
                 double applied_exposure = -1;
                 double applied_iso = -1;
                 result.shutter_label =
@@ -1323,88 +1389,92 @@ namespace ols {
                     std::unique_lock<std::recursive_mutex> guard(clock_);
                     int status = gp_camera_trigger_capture(cam_,ctx_);
                     check(status,"trigger capture");
+                    result.triggered = true;
                 }
 
                 // 4) Collect every file this exposure produced. Budget for the
                 //    exposure itself plus download of multiple large files.
-                bool saw_complete = false;
                 double budget = result.applied_exposure * 2.0 + 60.0;
-                std::vector<CameraFilePath> paths = drain_exposure(budget,saw_complete);
+                ExposureDrainResult drained = drain_exposure(budget);
+                result.event_complete = drained.event_complete;
+                result.completion_grace_complete = drained.completion_grace_complete;
+                result.drain_termination = drained.termination;
                 result.completed_at = now_unix();
+                if(!drained.error.empty())
+                    result.errors.push_back(drained.error);
 
-                if(paths.empty()) {
-                    e = saw_complete
-                        ? "Exposure completed but the camera produced no file — "
-                          "check that it is not set to a card-less or automatic mode"
-                        : "Timed out waiting for the exposure to produce a file";
-                    return StillCaptureResult();
-                }
-
-                // 5) Download everything: RAW, JPEG, or both. Nothing is
-                //    filtered by stream format here — a still capture returns
-                //    what the camera actually made.
-                for(size_t i=0;i<paths.size();i++) {
-                    std::unique_lock<std::recursive_mutex> guard(clock_);
-                    GPFile f(paths[i],cam_,ctx_);
-                    f.get();
-                    if(!f.data() || f.size() == 0) {
-                        LOG("Empty download for %s\n",f.name().c_str());
-                        continue;
+                // Attempt every discovered file independently. A missing or
+                // broken companion must not discard already downloaded bytes.
+                for(auto const &path : drained.files) {
+                    std::string full = path.folder + std::string("/") + path.name;
+                    result.discovered_paths.push_back(full);
+                    CaptureDownloadEvidence evidence;
+                    evidence.camera_path = full;
+                    try {
+                        std::unique_lock<std::recursive_mutex> guard(clock_);
+                        GPFile file(path,cam_,ctx_);
+                        evidence.error = file.download_preserving_bytes();
+                        evidence.byte_length = file.data() ? file.size() : 0;
+                        evidence.download_complete = evidence.error.empty() &&
+                                                     evidence.byte_length > 0;
+                        if(evidence.byte_length > 0) {
+                            CapturedAsset asset;
+                            asset.camera_path = full;
+                            asset.extension = file.ext();
+                            asset.download_complete = evidence.download_complete;
+                            unsigned char const *begin =
+                                reinterpret_cast<unsigned char const*>(file.data());
+                            asset.bytes.assign(begin,begin + file.size());
+                            result.assets.push_back(std::move(asset));
+                        }
                     }
-                    CapturedAsset asset;
-                    asset.camera_path = f.name();
-                    asset.extension = f.ext();
-                    unsigned char const *begin =
-                        reinterpret_cast<unsigned char const*>(f.data());
-                    asset.bytes.assign(begin,begin + f.size());
-                    result.assets.push_back(std::move(asset));
+                    catch(std::exception const &error) {
+                        evidence.download_complete = false;
+                        evidence.error = error.what();
+                    }
+                    if(!evidence.error.empty())
+                        result.errors.push_back(full + ": " + evidence.error);
+                    result.downloads.push_back(std::move(evidence));
+                }
+                if(result.discovered_paths.empty())
+                    result.errors.push_back("The exposure produced no discovered native file");
+                result.bundle_complete = result.triggered && result.event_complete &&
+                    result.completion_grace_complete && result.errors.empty() &&
+                    !result.discovered_paths.empty() &&
+                    result.assets.size() == result.discovered_paths.size() &&
+                    std::all_of(result.assets.begin(),result.assets.end(),
+                        [](CapturedAsset const &asset) {
+                            return asset.download_complete && !asset.bytes.empty();
+                        });
+                if(!result.bundle_complete) {
+                    if(result.errors.empty())
+                        result.errors.push_back("Native exposure bundle completeness is unconfirmed");
+                    e = result.errors.front();
                 }
 
-                if(result.assets.empty()) {
-                    e = "The camera reported files but none could be downloaded";
-                    return StillCaptureResult();
-                }
-
-                // Deliberately NOT deleting from the camera here. The caller
-                // deletes via delete_captured() once the bytes are durably
-                // persisted; a crash between here and that commit would
-                // otherwise destroy the only copy of the exposure.
+                // Retain every original on the camera. A local commit alone
+                // cannot authorize deleting the retained second copy; deletion
+                // stays disabled pending verified persistence and recovery (A12).
                 return result;
             }
             catch(std::exception const &err) {
                 e = err.what();
-                return StillCaptureResult();
+                result.errors.push_back(err.what());
+                result.bundle_complete = false;
+                if(result.triggered)
+                    result.completed_at = now_unix();
+                return result;
             }
         }
 
         virtual void delete_captured(std::vector<CapturedAsset> const &assets,
                                      CamErrorCode &e) override
         {
-            try {
-                std::unique_lock<std::recursive_mutex> guard(clock_);
-                for(size_t i=0;i<assets.size();i++) {
-                    std::string const &full = assets[i].camera_path;
-                    size_t slash = full.rfind('/');
-                    if(slash == std::string::npos)
-                        continue;
-                    std::string folder = full.substr(0,slash);
-                    std::string name = full.substr(slash+1);
-                    if(folder.empty())
-                        folder = "/";
-                    LOG("Deleting %s/%s\n",folder.c_str(),name.c_str());
-                    int status = gp_camera_file_delete(cam_,folder.c_str(),name.c_str(),ctx_);
-                    if(status != GP_OK) {
-                        // Report, but keep going: a card that refuses one
-                        // delete should not strand the rest.
-                        LOG("Delete failed for %s: %s\n",full.c_str(),gp_result_as_string(status));
-                        e = std::string("Failed to delete ") + full + ": " +
-                            gp_result_as_string(status);
-                    }
-                }
-            }
-            catch(std::exception const &err) {
-                e = err.what();
-            }
+            (void)assets;
+            // Also reject direct native callers; no local commit or boolean
+            // setting substitutes for the future verified deletion receipt.
+            e = "Camera deletion is disabled until verified capture persistence "
+                "and recovery are qualified (A12)";
         }
 
         /// list of camera controls that the camera supports
@@ -1433,7 +1503,9 @@ namespace ols {
                     opts.push_back(opt_capturetarget);
             }
             opts.push_back(opt_keep_images);
-            opts.push_back(opt_capture_delay);
+            // Legacy capture_delay access remains available, but it only
+            // paced the retired still-stream loop. Dedicated captures and
+            // live view do not use it, so do not advertise an inert control.
             return opts;
         }
         std::string opt_to_name(CamOptionId id)
@@ -1473,11 +1545,12 @@ namespace ols {
                         CamParam r;
                         r.option = id;
                         r.type = type_bool;
+                        r.read_only = true;
                         r.min_val = 0;
                         r.max_val = 1;
                         r.step_size = 1;
                         r.cur_val = keep_images_;
-                        r.def_val = 0;
+                        r.def_val = 1;
                         return r;
                     }
                     break;
@@ -1510,14 +1583,20 @@ namespace ols {
         /// set camera control
         virtual void set_parameter(CamOptionId id,double value,CamErrorCode &e)
         {
-            if(stream_active_) {
-                std::unique_lock<std::recursive_mutex> guard(clock_);
-                cmd_queue_.push(std::make_pair(id,value));
+            // Preserve the retention policy even for native callers that do
+            // not inspect the read-only descriptor first.
+            if(id == opt_keep_images && (!std::isfinite(value) || value != 1.0)) {
+                e = "Keep images must remain enabled; camera deletion is disabled "
+                    "until verified capture persistence and recovery are qualified (A12)";
+                return;
             }
-            else {
-                std::unique_lock<std::recursive_mutex> guard(clock_);
-                set_parameter_internal(id,value,e);
-            }
+            // Every PTP preview/config/capture call uses this same mutex.
+            // Wait for any in-flight preview, then complete the write here so
+            // callers can read back the applied setting and receive SDK errors.
+            // Queueing used to acknowledge the request before the camera saw
+            // it, making immediate readback return the previous ISO/shutter.
+            std::unique_lock<std::recursive_mutex> guard(clock_);
+            set_parameter_internal(id,value,e);
         }
         void set_parameter_internal(CamOptionId id,double value,CamErrorCode &e)
         {
@@ -1525,7 +1604,14 @@ namespace ols {
                 switch(id) {
                 case opt_keep_images:
                     {
-                        keep_images_ = !!value;
+                        // Enforce retention here too, including commands from
+                        // any future internal caller that bypasses the queue.
+                        if(!std::isfinite(value) || value != 1.0) {
+                            e = "Keep images must remain enabled; camera deletion is disabled "
+                                "until verified capture persistence and recovery are qualified (A12)";
+                            return;
+                        }
+                        keep_images_ = 1;
                     }
                     break;
                 case opt_capture_delay:
@@ -1546,14 +1632,16 @@ namespace ols {
             }
         }
     private:
-        std::queue<std::pair<CamOptionId,double>> cmd_queue_;
         ::Camera *cam_;
         GPContext *ctx_;
         std::atomic<int> stream_active_;
         std::vector<CamStreamFormat> formats_;
         CamStreamFormat format_;
         int frame_counter_ = 0;
-        int keep_images_ = 0;
+        // Preserve originals during probes and still streaming. Legacy false
+        // values are not deletion consent; enabling deletion requires the
+        // separately acknowledged, verified persistence policy in the daemon.
+        int keep_images_ = 1;
         int capture_delay_ = 0;
 
         // ─── Live view state ───

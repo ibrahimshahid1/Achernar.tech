@@ -4,8 +4,8 @@
   "version": "0.1.0",
   "identifier": "tech.achernar.desktop",
   "build": {
-    "devUrl": "http://localhost:5173",
-    "beforeDevCommand": "pnpm --dir ../achernar-frontend dev",
+    "devUrl": "http://127.0.0.1:5173",
+    "beforeDevCommand": "pnpm --dir ../achernar-frontend dev --host 127.0.0.1",
     "beforeBuildCommand": "pnpm --dir ../achernar-frontend build",
     "frontendDist": "../../achernar-frontend/dist"
   },

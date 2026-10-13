@@ -1,0 +1,197 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Achernar Daemon configuration (achernar.toml)
+#
+# Copy this file to `achernar.toml` (loaded automatically from the daemon's
+# working directory) or point ACHERNAR_CONFIG at it:
+#
+#     cp achernar.example.toml achernar.toml
+#     ACHERNAR_CONFIG=/path/to/achernar.toml cargo run
+#
+# Every section is optional; omitted keys fall back to the defaults shown.
+# Environment variables (ACHERNAR_PORT, ACHERNAR_HOST, ...) still override the
+# daemon bind address at runtime. Parsed by src/config.rs (spec Section 5.4).
+# ─────────────────────────────────────────────────────────────────────────────
+
+[daemon]
+port = 3030
+log_level = "info"
+# data_dir = "/var/lib/achernar"
+
+[focus]                       # Autofocus sweep (Section 7.3)
+initial_step_size = 50
+samples_per_position = 3
+settle_ms = 500
+
+# Positions either side of the start: the sweep visits 2*N+1 of them.
+# 3 gives the 7-point sweep, which is enough to fit a curve. Campaign nights
+# want 12 (25 points) — more positions means more rows per run and, at the
+# extremes, the large |delta| samples the Focus Offset Predictor's balanced
+# sampler buckets out to 120+ steps. Still truncated by
+# safety.max_total_travel_per_run, so raising it cannot overrun the budget.
+sweep_radius_points = 3
+
+# Visit order: "monotonic" (default) or "reversal".
+#
+# Monotonic approaches every position from the same direction, so backlash
+# enters each measurement identically — the right default for focusing.
+# Reversal deliberately changes direction once mid-run. It is slightly worse
+# for the curve fit and it is the only way to collect the FOP's History and
+# Direction features, which are 9 of its 38 inputs and are constant in a
+# monotone sweep.
+#
+# Usually set per run instead, via `POST /focus/run {"sweep_pattern":
+# "reversal"}` — the observing plan wants roughly one run in three to reverse,
+# which is a decision a night's script makes rather than a file does.
+sweep_pattern = "monotonic"
+
+[focus.safety]                # Hard limits enforced by safety_guard.rs (7.3.3)
+min_position = 0
+max_position = 50000
+max_step_single = 500
+max_total_travel_per_run = 5000
+min_confidence_to_act = 0.6
+max_failed_improvements = 3
+settle_ms = 500
+backlash_steps = 0
+
+[focus.backlash]              # Backlash compensation (7.3.5)
+enabled = false
+compensation_steps = 0
+# always_approach_from = "in"   # "in" | "out"
+
+[focus.models]               # Edge ONNX models (Section 7.6.10 layout)
+# Current FQE path: batched 64x64 grayscale star crops, default CPU provider,
+# shadow telemetry only. Classical HFR remains the autofocus authority.
+# Automatic discovery uses ACHERNAR_MODELS_DIR (set it to ../models when the
+# daemon runs from this directory), filtering eligibility and hashes before
+# choosing the newest version. The checked-in 1.0.0 graph has random reference
+# weights and is excluded from automatic selection.
+# quality_model_path = "../models/focus_quality/<validated-version>/model.onnx"
+# Explicit paths are development overrides; they do not enable control.
+#
+# offset_model_path has no bundle to point at yet. The Focus Offset Predictor
+# cannot be trained until a focuser reports absolute position (defect D3), and
+# the placeholder that used to sit at models/focus_offset/0.3.0/ was deleted for
+# declaring a 10-feature input against a 38-feature specification. The real
+# input contract is ml/contracts/fop_features.py.
+# offset_model_path  = "../models/focus_offset/<version>/model.onnx"
+#
+# There is deliberately no drift_model_path. The focus-drift forecaster is a
+# 3-state Kalman filter, not a neural network — there is no ONNX file to point
+# at and there should not be. Its tuning lives in [focus.drift] below.
+
+# Planned v5 configuration (DESIGN EXAMPLE ONLY; not parsed by src/config.rs).
+# See ../achernar_v5.tex and ../docs/adr/compute-aware-model-runtime.md.
+# Keep these lines commented until the runtime and parser are implemented.
+#
+# [ai]
+# model_selection = "auto"
+# compute_budget = "balanced"  # efficient | balanced | quality
+#
+# The initial FQE implementation remains shadow-only. Selection/pinning does
+# not grant control authority: promotion, calibration, local qualification and
+# existing focus autonomy/safety gates apply independently.
+# Proposed status APIs: GET /api/v1/ai/models and GET /api/v1/ai/runtime.
+# These routes are planned; no compute-aware selection is enabled by this file.
+
+[focus.drift]                # Focus-drift forecaster (Section 7.6.3)
+# Advisory only: it publishes a prediction on /focus/drift, it never moves the
+# focuser.
+#
+# Turning this on is enough. The forecaster does two separable jobs, and only
+# the second needs to know anything about your optics:
+#
+#   Estimation — learn this rig's focus drift rate and temperature coefficient
+#                from converged autofocus runs. Needs NO optical constants.
+#   Decision   — turn a predicted drift into "refocus now?". Needs a threshold,
+#                which is half the critical focus zone, which needs the optics.
+#
+# So with nothing below filled in you still get a drift estimate and its
+# uncertainty; /focus/drift reports the refocus advice as unavailable and says
+# what to enter. Estimation is the expensive half — the temperature coefficient
+# is only identifiable across varied thermal conditions over several sessions —
+# so it starts learning tonight rather than waiting for you.
+enabled = false
+
+# ── Refocus threshold ───────────────────────────────────────────────────────
+# Half the critical focus zone, CFZ = 4*lambda*N^2. There is no default: a fixed
+# step count is several times the CFZ on a fast scope and a fraction of it on a
+# slow one, so any placeholder produces advice nobody can interpret.
+#
+# Resolved in this order, first hit wins:
+#   1. refocus_threshold_steps below
+#   2. f_ratio + steps_per_micron below
+#   3. rigs.focal_ratio (already in your database) + steps_per_micron below
+#   4. measured from an autofocus V-curve — see below
+#
+# f_ratio         = 5.6      # falls back to rigs.focal_ratio
+# steps_per_micron = 2.5     # your focuser's mechanical resolution
+# wavelength_nm   = 550      # default: 550 (visual peak)
+# refocus_threshold_steps = 86   # direct override, skips the CFZ calculation
+
+# ── Measuring steps_per_micron instead of looking it up ─────────────────────
+# Few people know their focuser's steps-per-micron, and requiring it by hand is
+# what keeps this feature switched off. Every autofocus run already measures it:
+# the slope of a V-curve wing, against the focal ratio and the sensor pixel
+# pitch, gives it directly.
+#
+# To enable that, set `pixel_size_um` (and ideally `focal_ratio`) on your row in
+# the `rigs` table. The next converged autofocus run then measures the scale,
+# derives a threshold, records it against your focuser, and starts giving
+# advice — with `threshold_source: "measured_v_curve"` so you can see it was
+# inferred rather than declared. Anything you set above always overrides it.
+
+# min_confidence_to_act = 0.7    # P(|drift| > threshold) before recommending
+
+# Process/measurement noise. Defaults are in focus_drift.rs::DriftConfig, whose
+# doc comments carry the physical justification for each — in particular why the
+# prior on the temperature coefficient is sigma = 20 steps/degC and not ~0.
+# sigma_accel_steps_per_s2 = 1e-4
+# sigma_temp_coeff         = 1e-3
+# sigma_measurement_steps  = 10.0
+
+# Learned filter state, relative to the data directory. This is per-rig and
+# changes every night — it is NOT a model artefact and must not be committed.
+state_path = "focus_drift_state.json"
+
+[mount]                       # Mount control (Section 8.3)
+guide_rate = 0.5
+max_slew_rate = 8.0
+
+[mount.safety]
+min_altitude = 0.0
+max_hour_angle = 5.5
+park_on_safety_violation = true
+# horizon_model_path = "../models/horizon/1.0.0/model.onnx"
+
+[filter_wheel]               # Filter wheel (Section 8.2)
+filter_names = ["L", "R", "G", "B", "Ha", "OIII", "SII"]
+focus_offsets = [0, 12, 8, 15, 120, 118, 122]
+
+[camera]
+# default_gain = 100
+# default_offset = 30
+# cooling_target = -10.0
+
+# Linear saturation point of your sensor, in the ADU of the stream it produces.
+# This is the SENSOR's depth, not the container's: a 14-bit body sends 16-bit
+# samples that top out at 16383.
+#
+#   14-bit (most Canon/Nikon/Sony bodies) -> 16383
+#   12-bit (older bodies, many in silent/electronic shutter modes) -> 4095
+#   16-bit (cooled astro cameras) -> 65535
+#
+# Leave it commented if you do not know it. The saturation gate is then reported
+# as "not performed" rather than quietly passing every star, and any dataset
+# exported from those frames can be filtered on that. Setting a wrong value is
+# worse than setting none.
+# saturation_adu = 16383
+
+[storage]
+database_path = "achernar.db"
+# frames_dir = "/var/lib/achernar/frames"
+
+[telemetry]
+level = "info"
+json_output = false
+# log_dir = "/var/log/achernar"

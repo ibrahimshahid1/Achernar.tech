@@ -202,10 +202,12 @@ fn main() {
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/indigo_camera.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/camera.h",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/alpaca_client.h",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/include/alpaca_selection.h",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/os_util.h",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/util.h",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/tiffmat.h",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/libraw_wrapper.h",
+        "../OpenLiveStacker_Drivers/OpenLiveStacker/include/untouched_raw.h",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/include/sw_bin.h",
     ] {
         println!("cargo:rerun-if-changed={path}");
@@ -530,6 +532,12 @@ fn link_optional_pkg(name: &str) -> bool {
         if let Some(path) = flag.strip_prefix("-L") {
             println!("cargo:rustc-link-search=native={path}");
         } else if let Some(lib) = flag.strip_prefix("-l") {
+            // Some LibRaw pkg-config files advertise GNU's C++ runtime even
+            // on macOS. The bridge uses Apple clang/libc++, already linked by
+            // this build script; modern macOS has no libstdc++ to resolve.
+            if lib == "stdc++" && env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+                continue;
+            }
             println!("cargo:rustc-link-lib=dylib={lib}");
         }
     }

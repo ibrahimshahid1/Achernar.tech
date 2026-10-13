@@ -226,14 +226,22 @@ namespace ols {
     /// RAW+JPEG produces two of these per actuation.
     struct CapturedAsset {
         /// Path on the camera's storage, e.g.
-        /// "/store_00020001/DCIM/100CANON/IMG_0042.CR3". Retained so the file
-        /// can be deleted later — after the bytes are durably persisted, not
-        /// before.
+        /// "/store_00020001/DCIM/100CANON/IMG_0042.CR3". Retained for
+        /// provenance; a local commit does not authorize deleting this copy.
         std::string camera_path;
         /// Lowercase extension without the dot: "cr3", "cr2", "rw2", "jpg".
         std::string extension;
-        /// The file's bytes, verbatim.
+        /// The downloaded bytes, verbatim. May be partial when a native
+        /// transfer failed; incomplete bytes still need archival preservation.
         std::vector<unsigned char> bytes;
+        bool download_complete = true;
+    };
+
+    struct CaptureDownloadEvidence {
+        std::string camera_path;
+        size_t byte_length = 0;
+        bool download_complete = false;
+        std::string error;
     };
 
     struct StillCaptureRequest {
@@ -260,8 +268,16 @@ namespace ols {
         /// The camera's own labels for those settings ("1/125", "800").
         std::string shutter_label;
         std::string iso_label;
-        /// Every file this one exposure produced.
+        /// Every nonempty native buffer recovered, including partial transfers.
         std::vector<CapturedAsset> assets;
+        bool triggered = false;
+        bool event_complete = false;
+        bool completion_grace_complete = false;
+        bool bundle_complete = false;
+        std::string drain_termination = "not_started";
+        std::vector<std::string> discovered_paths;
+        std::vector<CaptureDownloadEvidence> downloads;
+        std::vector<std::string> errors;
     };
 
 
@@ -295,6 +311,11 @@ namespace ols {
         /// stop the stream - once function ends callback will not be called any more
         virtual void stop_stream(CamErrorCode &e) = 0;
 
+        /// Passive presence probe. True means the driver performed a real
+        /// device transaction (with errors reported in e); false is unsupported.
+        /// It must never capture, move hardware, or modify camera settings.
+        virtual bool check_connection(CamErrorCode &e) { (void)e; return false; }
+
         /// True when this driver implements capture_still(). Callers should
         /// check rather than relying on the error, so a UI can offer a real
         /// still-capture button only where it means something.
@@ -319,10 +340,11 @@ namespace ols {
 
         /// Delete the given files from the camera's storage.
         ///
-        /// Separate from capture_still() on purpose. The caller deletes only
-        /// after the bytes are durably persisted; deleting inside the capture
-        /// would mean a crash between download and commit destroys the only
-        /// copy of the exposure.
+        /// Separate from capture_still() on purpose. Achernar currently
+        /// blocks this operation pending verified persistence and recovery
+        /// qualification (A12). A future deletion policy must also acknowledge
+        /// removal of the retained camera copy; a local commit alone is not
+        /// permission to delete.
         virtual void delete_captured(std::vector<CapturedAsset> const &assets,
                                      CamErrorCode &e)
         {

@@ -59,6 +59,19 @@ pub enum ConnectedFocuser {
 }
 
 impl ConnectedFocuser {
+    /// Position is a passive transaction. Require its success instead of
+    /// treating a loaded native pointer as proof the device is still present.
+    pub fn health_status(&self) -> crate::error::Result<FocuserStatus> {
+        let position = self.position()?;
+        Ok(FocuserStatus {
+            connected: true,
+            position: Some(position),
+            is_moving: self.is_moving().unwrap_or(false),
+            is_absolute: self.is_absolute().unwrap_or(false),
+            max_range: self.max_range().ok(),
+        })
+    }
+
     pub fn position(&self) -> crate::error::Result<i32> {
         match self {
             Self::Hardware(focuser) => focuser.position(),

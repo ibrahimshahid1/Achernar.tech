@@ -20,22 +20,26 @@
 //!
 //! 1. stage every file under `.<frame-id>.partial`, hashing while writing
 //! 2. write `manifest.v1.json` describing what should be there
-//! 3. fsync the files and the staging directory
+//! 3. fsync the files and attempt to sync the staging directory
 //! 4. open the SQLite transaction and insert frames + frame_assets + outbox
 //! 5. rename the staging directory into place
 //! 6. commit
 //!
-//! A crash before step 5 leaves a `.partial` directory and no database rows.
-//! A crash between 5 and 6 leaves a complete, self-describing bundle with no
-//! rows — recoverable from its manifest. What cannot happen is a committed row
-//! pointing at a file that was never finished. [`reconcile`] handles both
-//! leftovers at startup.
+//! An interruption before step 5 can leave a `.partial` directory without
+//! database rows; an interruption between 5 and 6 can leave a final directory
+//! without rows. The manifest records the intended contents. This ordering is
+//! a local commit protocol, not a qualified power-loss durability guarantee:
+//! checked directory/rename-parent synchronization and orphan reconstruction
+//! remain A12 work. Startup reconciliation currently removes partial staging
+//! and checks catalogued asset existence/length; it does not reconstruct
+//! orphan bundles or verify their content hashes.
 //!
 //! # Native success is the success that counts
 //!
-//! For a DSLR, a durably saved CR3 *is* the exposure. FITS conversion and luma
-//! extraction are derivations that can be redone later, so a failure to derive
-//! must never discard a valid native asset.
+//! For a DSLR, the camera-authored CR3 is the canonical exposure asset. FITS
+//! conversion and luma extraction are derivations that can be redone later,
+//! so a failure to derive must never discard a valid native asset. Successful
+//! local persistence alone cannot authorize deleting camera originals.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -72,6 +76,12 @@ pub enum AssetRole {
     SensorFits,
     /// 16-bit luma used by the vision/FQE pipeline.
     AnalysisLuma,
+    /// Canonical float32 linear analysis plane; never an integer preview.
+    AnalysisFits,
+    /// One binary mask plane identified by the analysis descriptor.
+    AnalysisMask,
+    /// Versioned JSON analysis recipe, geometry and content hashes.
+    AnalysisDescriptor,
     /// Small preview for the UI.
     Thumbnail,
     /// Calibrated FITS produced by a later reprocessing pass.
@@ -85,6 +95,9 @@ impl AssetRole {
             AssetRole::CameraJpeg => "camera_jpeg",
             AssetRole::SensorFits => "sensor_fits",
             AssetRole::AnalysisLuma => "analysis_luma",
+            AssetRole::AnalysisFits => "analysis_fits",
+            AssetRole::AnalysisMask => "analysis_mask",
+            AssetRole::AnalysisDescriptor => "analysis_descriptor",
             AssetRole::Thumbnail => "thumbnail",
             AssetRole::CalibratedFits => "calibrated_fits",
         }
@@ -96,6 +109,9 @@ impl AssetRole {
             "camera_jpeg" => AssetRole::CameraJpeg,
             "sensor_fits" => AssetRole::SensorFits,
             "analysis_luma" => AssetRole::AnalysisLuma,
+            "analysis_fits" => AssetRole::AnalysisFits,
+            "analysis_mask" => AssetRole::AnalysisMask,
+            "analysis_descriptor" => AssetRole::AnalysisDescriptor,
             "thumbnail" => AssetRole::Thumbnail,
             "calibrated_fits" => AssetRole::CalibratedFits,
             _ => return None,
@@ -106,7 +122,10 @@ impl AssetRole {
         match self {
             AssetRole::NativeRaw | AssetRole::CameraJpeg => "native",
             AssetRole::SensorFits | AssetRole::CalibratedFits => "derived",
-            AssetRole::AnalysisLuma => "analysis",
+            AssetRole::AnalysisLuma
+            | AssetRole::AnalysisFits
+            | AssetRole::AnalysisMask
+            | AssetRole::AnalysisDescriptor => "analysis",
             AssetRole::Thumbnail => "preview",
         }
     }
@@ -133,6 +152,9 @@ pub struct PendingAsset {
     pub bit_depth: Option<i64>,
     /// Role this was derived from, recorded as lineage.
     pub derived_from: Option<AssetRole>,
+    /// Parent filename within `derived_from`'s role. Required when that role
+    /// occurs more than once; role alone cannot identify the source exposure.
+    pub derived_from_filename: Option<String>,
     pub provenance: serde_json::Value,
 }
 
@@ -153,6 +175,7 @@ impl PendingAsset {
             height: None,
             bit_depth: None,
             derived_from: None,
+            derived_from_filename: None,
             provenance: serde_json::json!({}),
         }
     }
@@ -166,6 +189,15 @@ impl PendingAsset {
 
     pub fn derived_from(mut self, role: AssetRole) -> Self {
         self.derived_from = Some(role);
+        self.derived_from_filename = None;
+        self
+    }
+
+    /// Name the exact source asset. Parents must precede derivatives in a
+    /// bundle so SQLite can enforce the immutable lineage foreign key.
+    pub fn derived_from_asset(mut self, role: AssetRole, filename: impl Into<String>) -> Self {
+        self.derived_from = Some(role);
+        self.derived_from_filename = Some(filename.into());
         self
     }
 
@@ -244,6 +276,16 @@ pub struct PendingCapture {
     pub assets: Vec<PendingAsset>,
 }
 
+impl PendingCapture {
+    fn archive_status(&self) -> &'static str {
+        if self.acquisition["bundle"]["bundle_complete"] == false {
+            "native_incomplete"
+        } else {
+            "committed"
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════
 //  Output types
 // ═══════════════════════════════════════════════════════════════════
@@ -252,11 +294,17 @@ pub struct PendingCapture {
 pub struct CommittedAsset {
     pub id: String,
     pub role: String,
+    /// Per-role ordinal in this immutable bundle. Old manifests had one asset
+    /// per role and therefore imply variant zero.
+    #[serde(default)]
+    pub variant: i64,
     pub media_type: String,
     /// Relative to the capture root, so the archive can be moved wholesale.
     pub relative_path: String,
     pub byte_length: i64,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from_asset_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -358,8 +406,9 @@ impl CaptureStore {
 
     /// Persist one exposure: files first, then the catalogue, then the rename.
     ///
-    /// Returns only after SQLite has committed. The caller may delete the
-    /// originals from the camera at that point, and not before.
+    /// Returns only after SQLite has committed. This is not authorization to
+    /// delete camera originals; retention policy and archive durability/recovery
+    /// qualification remain independent requirements.
     pub async fn persist_capture(
         &self,
         pool: &SqlitePool,
@@ -379,6 +428,18 @@ impl CaptureStore {
             )
             .into());
         }
+        let mut filenames = std::collections::BTreeSet::new();
+        for asset in &capture.assets {
+            let relative = (asset.role.subdir(), sanitize_filename(&asset.filename));
+            if asset.bytes.is_empty() || !filenames.insert(relative) {
+                return Err(StorageError::Database(
+                    "Refusing empty assets or duplicate archive filenames".to_string(),
+                )
+                .into());
+            }
+        }
+        let parents = resolve_asset_parents(&capture.assets)?;
+        let archive_status = capture.archive_status();
 
         let started_at = unix_to_rfc3339(capture.exposure_started_at);
         let completed_at = unix_to_rfc3339(capture.exposure_completed_at);
@@ -426,6 +487,7 @@ impl CaptureStore {
                 &staging_for_io,
                 &relative_dir_for_io,
                 &assets,
+                &parents,
                 manifest_seed,
             )
         })
@@ -444,7 +506,7 @@ impl CaptureStore {
             )
             .await;
 
-        let mut tx = match commit {
+        let tx = match commit {
             Ok(tx) => tx,
             Err(e) => {
                 // Nothing was committed and nothing was renamed; drop the
@@ -486,7 +548,7 @@ impl CaptureStore {
             capture_id: capture.capture_id,
             frame_id: capture.frame_id,
             session_id: capture.session_id,
-            status: "committed",
+            status: archive_status,
             relative_dir: relative_dir.to_string_lossy().into_owned(),
             assets: staged,
         })
@@ -540,8 +602,8 @@ impl CaptureStore {
                    offset_val, binning, focuser_position,
                    temperature_source, temperature_state,
                    software_version, driver_name, acquisition_json
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '{}', ?, ?,
-                         ?, ?, ?, ?, 'committed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&capture.frame_id)
         .bind(&capture.session_id)
@@ -553,6 +615,16 @@ impl CaptureStore {
         .bind(capture.iso.or(capture.requested_gain))
         .bind(&capture.filter_name)
         .bind(capture.temperature)
+        // Keep the immutable observation and its source bundle in the same
+        // transaction; focus must not commit a frame then patch its label.
+        .bind(
+            capture
+                .acquisition
+                .get("quality")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}))
+                .to_string(),
+        )
         .bind(started_at)
         .bind(crate::storage::night::night_id(unix_to_datetime(
             capture.exposure_started_at,
@@ -561,6 +633,7 @@ impl CaptureStore {
         .bind(&capture.rig_id)
         .bind(&capture.camera_name)
         .bind(&capture.capture_type)
+        .bind(capture.archive_status())
         .bind(started_at)
         .bind(completed_at)
         .bind(capture.requested_exposure_s)
@@ -579,27 +652,18 @@ impl CaptureStore {
         .await
         .map_err(|e| StorageError::Database(format!("insert frame: {e}")))?;
 
-        // Resolve lineage by role so `derived_from_asset_id` points at a real
-        // row rather than a name we hope exists.
-        let by_role: BTreeMap<&str, &CommittedAsset> =
-            staged.iter().map(|a| (a.role.as_str(), a)).collect();
-
         for (asset, staged_asset) in capture.assets.iter().zip(staged.iter()) {
-            let derived_from = asset
-                .derived_from
-                .and_then(|r| by_role.get(r.as_str()))
-                .map(|a| a.id.clone());
-
             sqlx::query(
                 r#"INSERT INTO frame_assets (
                        id, frame_id, role, variant, original_filename, relative_path,
                        media_type, byte_length, checksum_sha256, width, height, bit_depth,
                        derived_from_asset_id, provenance_json, upload_policy, created_at
-                   ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
             )
             .bind(&staged_asset.id)
             .bind(&capture.frame_id)
             .bind(&staged_asset.role)
+            .bind(staged_asset.variant)
             .bind(&asset.original_filename)
             .bind(&staged_asset.relative_path)
             .bind(&staged_asset.media_type)
@@ -608,7 +672,7 @@ impl CaptureStore {
             .bind(asset.width)
             .bind(asset.height)
             .bind(asset.bit_depth)
-            .bind(derived_from)
+            .bind(&staged_asset.derived_from_asset_id)
             .bind(asset.provenance.to_string())
             .bind(if asset.role.is_native() {
                 "metadata_only"
@@ -643,9 +707,10 @@ impl CaptureStore {
 
         sqlx::query(
             r#"UPDATE capture_attempts
-                  SET status = 'committed', frame_id = ?, finished_at = ?
+                  SET status = ?, frame_id = ?, finished_at = ?
                 WHERE capture_id = ?"#,
         )
+        .bind(capture.archive_status())
         .bind(&capture.frame_id)
         .bind(chrono::Utc::now().to_rfc3339())
         .bind(&capture.capture_id)
@@ -662,8 +727,8 @@ impl CaptureStore {
     /// turns the archive into something you cannot trust:
     ///
     /// * `.partial` directories — an interrupted stage. Removed.
-    /// * committed rows whose files are missing or whose checksum no longer
-    ///   matches — marked `corrupt` rather than left looking healthy.
+    /// * committed rows whose files are missing or whose recorded byte length
+    ///   no longer matches — marked `corrupt` rather than left looking healthy.
     /// * `started` attempts with no frame — marked `failed`.
     ///
     /// Returns a human-readable summary for the startup log.
@@ -678,12 +743,13 @@ impl CaptureStore {
             report.partials_removed = removed;
         }
 
-        // Verify every committed asset still exists with the recorded digest.
+        // Check existence and length. Content-hash verification and recovery
+        // of uncatalogued final bundles remain A12 qualification work.
         let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
             r#"SELECT fa.frame_id, fa.id, fa.relative_path, fa.byte_length
                  FROM frame_assets fa
                  JOIN frames f ON f.id = fa.frame_id
-                WHERE f.capture_status = 'committed'"#,
+                WHERE f.capture_status IN ('committed', 'native_incomplete')"#,
         )
         .fetch_all(pool)
         .await
@@ -770,14 +836,65 @@ struct ManifestSeed {
     acquisition: serde_json::Value,
 }
 
-/// Write every asset plus a manifest under `staging_dir`, hashing as we go,
-/// and fsync the lot. Returns the catalogue entries in the same order as
-/// `assets`, so the caller can zip them together.
+/// Resolve immutable lineage before touching the filesystem. Legacy callers
+/// may identify a sole parent by role; repeated roles require its filename.
+/// Parents precede derivatives so both the manifest and immediate SQLite
+/// foreign-key checks describe the same already-present source.
+fn resolve_asset_parents(assets: &[PendingAsset]) -> Result<Vec<Option<usize>>> {
+    assets
+        .iter()
+        .enumerate()
+        .map(|(index, asset)| {
+            let Some(role) = asset.derived_from else {
+                if asset.derived_from_filename.is_some() {
+                    return Err(StorageError::Database(
+                        "An asset parent filename requires its role".to_string(),
+                    )
+                    .into());
+                }
+                return Ok(None);
+            };
+            let candidates: Vec<usize> = assets
+                .iter()
+                .enumerate()
+                .filter(|(_, parent)| {
+                    parent.role == role
+                        && asset
+                            .derived_from_filename
+                            .as_ref()
+                            .is_none_or(|name| parent.filename == *name)
+                })
+                .map(|(parent, _)| parent)
+                .collect();
+            if candidates.len() != 1 {
+                return Err(StorageError::Database(format!(
+                    "Asset {} has missing or ambiguous {} parent; identify its exact filename",
+                    asset.filename,
+                    role.as_str()
+                ))
+                .into());
+            }
+            let parent = candidates[0];
+            if parent >= index {
+                return Err(StorageError::Database(format!(
+                    "Parent asset must precede derivative {} in the capture bundle",
+                    asset.filename
+                ))
+                .into());
+            }
+            Ok(Some(parent))
+        })
+        .collect()
+}
+
+/// Write every asset and its manifest, hash and sync file contents, and attempt
+/// staging-directory synchronization. Entries retain the input asset order.
 fn stage_bundle(
     parent: &Path,
     staging_dir: &Path,
     relative_dir: &Path,
     assets: &[PendingAsset],
+    parents: &[Option<usize>],
     seed: ManifestSeed,
 ) -> Result<Vec<CommittedAsset>> {
     std::fs::create_dir_all(parent)?;
@@ -787,20 +904,13 @@ fn stage_bundle(
     }
     std::fs::create_dir_all(staging_dir)?;
 
-    let mut committed = Vec::with_capacity(assets.len());
-    let mut seen: BTreeMap<&str, ()> = BTreeMap::new();
+    let mut committed: Vec<CommittedAsset> = Vec::with_capacity(assets.len());
+    let mut variants: BTreeMap<&str, i64> = BTreeMap::new();
 
-    for asset in assets {
-        if seen.insert(asset.role.as_str(), ()).is_some() {
-            // frame_assets has UNIQUE(frame_id, role, variant); catching it
-            // here gives a comprehensible error instead of a constraint
-            // violation after the files are already on disk.
-            return Err(StorageError::Database(format!(
-                "duplicate asset role {} in one capture",
-                asset.role.as_str()
-            ))
-            .into());
-        }
+    for (index, asset) in assets.iter().enumerate() {
+        let next_variant = variants.entry(asset.role.as_str()).or_default();
+        let variant = *next_variant;
+        *next_variant += 1;
 
         let subdir = staging_dir.join(asset.role.subdir());
         std::fs::create_dir_all(&subdir)?;
@@ -819,6 +929,7 @@ fn stage_bundle(
         committed.push(CommittedAsset {
             id: uuid::Uuid::new_v4().to_string(),
             role: asset.role.as_str().to_string(),
+            variant,
             media_type: asset.media_type.clone(),
             relative_path: relative_dir
                 .join(asset.role.subdir())
@@ -827,6 +938,7 @@ fn stage_bundle(
                 .into_owned(),
             byte_length: asset.bytes.len() as i64,
             sha256: format!("{:x}", hasher.finalize()),
+            derived_from_asset_id: parents[index].map(|parent| committed[parent].id.clone()),
         });
     }
 
@@ -855,9 +967,9 @@ fn stage_bundle(
         file.sync_all()?;
     }
 
-    // fsync the directory so the entries themselves are durable, not just the
-    // file contents. Without this a power loss can leave a renamed directory
-    // whose children have not landed.
+    // Best-effort staging-directory synchronization. This deliberately does
+    // not claim a durability receipt: checked subdirectory/rename-parent sync
+    // and platform failure qualification remain A12 work.
     if let Ok(dir) = std::fs::File::open(staging_dir) {
         let _ = dir.sync_all();
     }
@@ -1017,6 +1129,265 @@ mod tests {
                 .with_dimensions(6000, 4000, 16),
             ],
         }
+    }
+
+    #[tokio::test]
+    async fn incomplete_native_bytes_commit_with_ineligible_quality_and_explicit_status() {
+        let dir =
+            std::env::temp_dir().join(format!("achernar-incomplete-{}", uuid::Uuid::new_v4()));
+        let store = CaptureStore::new(&dir);
+        let pool = test_pool().await;
+        let mut capture = sample("partial-frame");
+        capture.assets.truncate(1);
+        capture.acquisition["bundle"] = serde_json::json!({
+            "bundle_complete": false, "event_complete": true,
+            "expected_asset_count": null, "discovered_paths": ["IMG_0042.CR3", "IMG_0042.JPG"],
+            "downloaded_count": 1, "missing_count": 1,
+        });
+        capture.acquisition["quality"] = serde_json::json!({"training_label_eligible": false});
+        store
+            .begin_attempt(
+                &pool,
+                &capture.capture_id,
+                Some("sess-1"),
+                "rig-1",
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        let committed = store.persist_capture(&pool, capture).await.unwrap();
+        assert_eq!(committed.status, "native_incomplete");
+        assert_eq!(
+            std::fs::read(dir.join(&committed.assets[0].relative_path)).unwrap(),
+            b"RAWBYTES"
+        );
+        let (status, quality): (String, String) =
+            sqlx::query_as("SELECT capture_status, quality_json FROM frames WHERE id = ?")
+                .bind(&committed.frame_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "native_incomplete");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&quality).unwrap()["training_label_eligible"],
+            false
+        );
+        let (attempt_status,): (String,) =
+            sqlx::query_as("SELECT status FROM capture_attempts WHERE capture_id = ?")
+                .bind(&committed.capture_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(attempt_status, "native_incomplete");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_native_filenames_cannot_silently_overwrite_downloads() {
+        let dir = std::env::temp_dir().join(format!("achernar-duplicate-{}", uuid::Uuid::new_v4()));
+        let store = CaptureStore::new(&dir);
+        let pool = test_pool().await;
+        let mut capture = sample("duplicate-frame");
+        capture.assets.push(capture.assets[0].clone());
+        let error = store.persist_capture(&pool, capture).await.unwrap_err();
+        assert!(error.to_string().contains("duplicate archive filenames"));
+        assert!(!dir.exists());
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM frames")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_native_roles_preserve_every_file_and_exact_derivation_parent() {
+        let dir = std::env::temp_dir().join(format!("achernar-variants-{}", uuid::Uuid::new_v4()));
+        let store = CaptureStore::new(&dir);
+        let pool = test_pool().await;
+        let mut capture = sample("multiple-native-files");
+        capture.assets = vec![
+            PendingAsset::new(
+                AssetRole::NativeRaw,
+                "image-0.cr3",
+                "image/x-canon-cr3",
+                b"FIRST RAW".to_vec(),
+            ),
+            PendingAsset::new(
+                AssetRole::NativeRaw,
+                "image-1.cr3",
+                "image/x-canon-cr3",
+                b"SECOND RAW".to_vec(),
+            ),
+            PendingAsset::new(
+                AssetRole::CameraJpeg,
+                "image-2.jpg",
+                "image/jpeg",
+                b"LARGE JPEG".to_vec(),
+            ),
+            PendingAsset::new(
+                AssetRole::CameraJpeg,
+                "image-3.jpg",
+                "image/jpeg",
+                b"SMALL JPEG".to_vec(),
+            ),
+            PendingAsset::new(
+                AssetRole::SensorFits,
+                "image.fits",
+                "application/fits",
+                b"FITS FROM FIRST RAW".to_vec(),
+            )
+            .derived_from_asset(AssetRole::NativeRaw, "image-0.cr3"),
+        ];
+        let expected = capture.assets.clone();
+        let committed = store.persist_capture(&pool, capture).await.unwrap();
+        assert_eq!(committed.assets.len(), 5);
+        assert_eq!(
+            committed
+                .assets
+                .iter()
+                .map(|asset| asset.variant)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 0, 1, 0],
+        );
+        let rows: Vec<(String, i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT role, variant, relative_path, checksum_sha256, derived_from_asset_id FROM frame_assets WHERE frame_id = ? ORDER BY role, variant",
+        )
+        .bind(&committed.frame_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 5);
+        for (asset, original) in committed.assets.iter().zip(&expected) {
+            assert_eq!(
+                std::fs::read(dir.join(&asset.relative_path)).unwrap(),
+                original.bytes
+            );
+            assert_eq!(
+                asset.sha256,
+                format!("{:x}", Sha256::digest(&original.bytes))
+            );
+            let row = rows
+                .iter()
+                .find(|row| row.0 == asset.role && row.1 == asset.variant)
+                .unwrap();
+            assert_eq!(row.2, asset.relative_path);
+            assert_eq!(row.3, asset.sha256);
+            assert_eq!(row.4, asset.derived_from_asset_id);
+        }
+        assert_eq!(
+            committed.assets[4].derived_from_asset_id.as_deref(),
+            Some(committed.assets[0].id.as_str())
+        );
+        assert_ne!(
+            committed.assets[4].derived_from_asset_id.as_deref(),
+            Some(committed.assets[1].id.as_str())
+        );
+        let manifest: CaptureManifest = serde_json::from_slice(
+            &std::fs::read(dir.join(&committed.relative_dir).join(MANIFEST_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.assets[1].variant, 1);
+        assert_eq!(
+            manifest.assets[4].derived_from_asset_id,
+            committed.assets[4].derived_from_asset_id
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_or_missing_derivation_parent_is_rejected_before_writing() {
+        let dir = std::env::temp_dir().join(format!("achernar-lineage-{}", uuid::Uuid::new_v4()));
+        let store = CaptureStore::new(&dir);
+        let pool = test_pool().await;
+        let mut capture = sample("ambiguous-parent");
+        capture.assets.insert(
+            1,
+            PendingAsset::new(
+                AssetRole::NativeRaw,
+                "another.cr3",
+                "image/x-canon-cr3",
+                b"OTHER RAW".to_vec(),
+            ),
+        );
+        // The old role-only declaration is safe only for one source per role.
+        let error = store
+            .persist_capture(&pool, capture.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("ambiguous"), "{error}");
+        capture.assets[2] = capture.assets[2]
+            .clone()
+            .derived_from_asset(AssetRole::NativeRaw, "missing.cr3");
+        let error = store.persist_capture(&pool, capture).await.unwrap_err();
+        assert!(error.to_string().contains("missing"), "{error}");
+        assert!(
+            !dir.exists(),
+            "invalid lineage must fail before filesystem writes"
+        );
+        let (count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM frame_assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn retention_evidence_survives_attempt_catalogue_and_manifest() {
+        use crate::storage::capture_retention::RetentionDecision;
+
+        let dir = std::env::temp_dir().join(format!("achernar-retention-{}", uuid::Uuid::new_v4()));
+        let store = CaptureStore::new(&dir);
+        let pool = test_pool().await;
+        let retention = serde_json::to_value(RetentionDecision::retaining(true)).unwrap();
+        let mut capture = sample("retained-frame");
+        capture.acquisition["retention"] = retention.clone();
+        let requested = serde_json::json!({"retention": retention});
+        store
+            .begin_attempt(
+                &pool,
+                &capture.capture_id,
+                Some("sess-1"),
+                "rig-1",
+                &requested,
+            )
+            .await
+            .unwrap();
+        let committed = store.persist_capture(&pool, capture).await.unwrap();
+
+        let (attempt_json,): (String,) =
+            sqlx::query_as("SELECT requested_json FROM capture_attempts WHERE capture_id = ?")
+                .bind(&committed.capture_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let (acquisition_json,): (String,) =
+            sqlx::query_as("SELECT acquisition_json FROM frames WHERE id = ?")
+                .bind(&committed.frame_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let manifest: CaptureManifest = serde_json::from_slice(
+            &std::fs::read(dir.join(&committed.relative_dir).join(MANIFEST_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&attempt_json).unwrap()["retention"],
+            requested["retention"]
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&acquisition_json).unwrap()["retention"],
+            requested["retention"]
+        );
+        assert_eq!(manifest.acquisition["retention"], requested["retention"]);
+        assert_eq!(
+            manifest.acquisition["retention"]["deletion_eligible"],
+            false
+        );
+        assert_eq!(
+            manifest.acquisition["retention"]["camera_copy_state"],
+            "unknown"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

@@ -1,18 +1,23 @@
 pub mod api_error;
 pub mod camera;
+pub mod coc;
 pub mod focus;
 pub mod focuser;
 pub mod mount;
 pub mod websocket;
 
-use axum::{extract::State, http::StatusCode, Json};
+#[cfg(test)]
+mod capture_preflight_tests;
+
+use axum::{body::Bytes, extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 
 use crate::hardware::{
     camera::OlsCameraDriver,
     capabilities::{driver_capability_report, DriverCapabilityReport},
-    discovery::{discover_cameras, DiscoveryReport},
+    discovery::{discover_equipment, DiscoveryReport, DiscoveryRequest},
     focuser::{ConnectedFocuser, Focuser, FocuserDriver, SimFocuser},
+    health::{self, DeviceKind},
     mount::{Mount, MountDriver},
 };
 use crate::state::AppState;
@@ -46,17 +51,30 @@ pub struct CameraStatus {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MountStatus {
     pub name: String,
-    pub ra: f64,
-    pub dec: f64,
-    pub tracking: bool,
-    pub parked: bool,
+    pub connected: bool,
+    /// `None` when the mount has not reported a position. RA 0h / Dec +0deg
+    /// is a real coordinate in Pisces, so it cannot stand in for "unknown" —
+    /// these were `f64` and the non-nullable type is what forced the
+    /// `unwrap_or((0.0, 0.0))` that produced a plausible wrong pointing.
+    pub ra: Option<f64>,
+    pub dec: Option<f64>,
+    pub tracking: Option<bool>,
+    /// `None` always, for now: MountStatus carries no park field from the
+    /// hardware layer, so the honest answer is "not measured" rather than
+    /// asserting the mount is unparked.
+    pub parked: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FocuserStatus {
     pub name: String,
-    pub position: i32,
+    pub connected: bool,
+    /// `None` when the encoder has not been read. Step 0 is a legitimate
+    /// focuser position.
+    pub position: Option<i32>,
     pub moving: bool,
+    pub absolute: bool,
+    pub max_range: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,80 +106,30 @@ pub struct DisconnectRequest {
 
 pub async fn get_status(
     State(state): State<AppState>,
-) -> Result<Json<EquipmentStatus>, StatusCode> {
-    let camera_status = {
-        // Status must never wait behind a vendor SDK call. Camera telemetry is
-        // cached when controls/descriptors are read and unknown values remain
-        // null rather than becoming a plausible-looking -10 C.
-        let runtime = state.camera_runtime.read().unwrap().clone();
-        runtime.connection_id.as_ref().map(|_| CameraStatus {
-            name: runtime
-                .camera_name
-                .clone()
-                .unwrap_or_else(|| "Unknown camera".to_string()),
-            connected: true,
-            status: runtime.activity,
-            temperature: runtime.temperature_c,
-            cooling: runtime.cooler_on,
-            exposing: runtime.activity == CameraActivity::Exposing,
-            streaming: runtime.streaming,
-            progress: runtime.exposure_progress(chrono::Utc::now()),
-            driver_id: runtime.driver_id.clone(),
-            device_index: runtime.device_index,
-            connection_id: runtime.connection_id.clone(),
-            last_error: runtime.last_error.clone(),
-        })
-    };
-
-    let mount_status = {
-        let mount_name = state.mount_name.lock().unwrap().clone();
-        let mount = state.mount.lock().unwrap();
-        mount.as_ref().map(|m| {
-            let hw = m.status();
-            let (ra, dec) = hw
-                .position
-                .map(|pos| (pos.ra, pos.dec))
-                .unwrap_or((0.0, 0.0));
-            MountStatus {
-                name: mount_name.unwrap_or_else(|| "OpenLiveStacker mount".to_string()),
-                ra,
-                dec,
-                tracking: hw.tracking.unwrap_or(false),
-                parked: false,
-            }
-        })
-    };
-
-    let focuser_status = {
-        let focuser_name = state.focuser_name.lock().unwrap().clone();
-        let focuser = state.focuser.lock().unwrap();
-        focuser.as_ref().map(|f| {
-            let hw = f.status();
-            FocuserStatus {
-                name: focuser_name.unwrap_or_else(|| "OpenLiveStacker focuser".to_string()),
-                position: hw.position.unwrap_or(0),
-                moving: hw.is_moving,
-            }
-        })
-    };
-
-    let connected = camera_status.is_some() || mount_status.is_some() || focuser_status.is_some();
-
-    let status = EquipmentStatus {
-        connected,
-        camera: camera_status,
-        mount: mount_status,
-        focuser: focuser_status,
-    };
-
-    Ok(Json(status))
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    // The direct endpoint and Django command relay consume one full snapshot.
+    // Neither path performs blocking vendor calls while reporting status.
+    Ok(Json(crate::telemetry::equipment_status(&state)))
 }
 
 pub async fn get_driver_capabilities() -> Json<DriverCapabilityReport> {
     Json(driver_capability_report())
 }
 
-/// Scan locally-attached buses for cameras — the "Scan for devices" button.
+/// GET /api/v1/commands — the daemon's own command registry.
+///
+/// The same pattern as `GET /drivers`: rather than every client hard-coding
+/// what this build can do, the build says so. Django can relay anything on
+/// this list without a whitelist, and the frontend can map an action to a
+/// direct route without a hand-written table.
+///
+/// Generated from the single declaration in `relay_commands.rs` that the
+/// dispatcher also matches on, so it cannot drift from what actually runs.
+pub async fn get_commands() -> Json<&'static [crate::relay_commands::CommandSpec]> {
+    Json(crate::relay_commands::COMMANDS)
+}
+
+/// Scan local cameras or list devices on one explicitly addressed Alpaca server.
 ///
 /// POST rather than GET: this instantiates vendor SDK drivers and touches real
 /// hardware, so it must never be prefetched, cached, or retried automatically
@@ -169,15 +137,40 @@ pub async fn get_driver_capabilities() -> Json<DriverCapabilityReport> {
 ///
 /// Returns every device found plus a per-driver outcome, so the UI can
 /// distinguish "no ZWO camera attached" from "the ZWO probe failed".
-pub async fn discover_devices(State(state): State<AppState>) -> Json<DiscoveryReport> {
+pub async fn discover_devices(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<DiscoveryReport>, ApiError> {
+    // Bodyless requests retain the original camera-discovery API. Malformed
+    // JSON must fail before discovery, never silently fall back to a USB scan.
+    if body.len() > 16 * 1024 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_discovery_request",
+            "Discovery request exceeds 16 KiB",
+        ));
+    }
+    let request = if body.is_empty() {
+        DiscoveryRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_discovery_request",
+                error.to_string(),
+            )
+        })?
+    };
     tracing::info!("Device discovery scan requested");
-    let report = discover_cameras(&state).await;
+    let report = discover_equipment(&state, request).await.map_err(|message| {
+        ApiError::new(StatusCode::BAD_REQUEST, "invalid_discovery_request", message)
+    })?;
     tracing::info!(
         "Device discovery complete: {} camera(s) across {} probe(s)",
         report.cameras.len(),
         report.probes.len()
     );
-    Json(report)
+    Ok(Json(report))
 }
 
 pub async fn connect_equipment(
@@ -333,7 +326,7 @@ pub(crate) async fn connect_camera(
         )),
     };
 
-    let (driver, camera, camera_name, cameras, index) = match connect_result {
+    let (driver, mut camera, camera_name, cameras, index) = match connect_result {
         Ok(connected) => connected,
         Err((status, message)) => {
             tracing::error!("{message}");
@@ -345,11 +338,16 @@ pub(crate) async fn connect_camera(
     };
 
     tracing::info!("Found cameras: {:?}", cameras);
+    let connection_id = uuid::Uuid::new_v4().to_string();
+    let signals = state.camera_loss_signals();
+    let callback_connection_id = connection_id.clone();
+    camera.set_fault_handler(std::sync::Arc::new(move |reason| {
+        signals.invalidate(&callback_connection_id, reason);
+    }));
     *state.camera_driver.lock().unwrap() = Some(driver);
     *state.camera_name.lock().unwrap() = Some(camera_name.clone());
     *state.camera.lock().unwrap() = Some(camera);
     *state.streaming.lock().unwrap() = false;
-    let connection_id = uuid::Uuid::new_v4().to_string();
     {
         let mut runtime = state.camera_runtime.write().unwrap();
         runtime.connection_id = Some(connection_id.clone());
@@ -360,6 +358,12 @@ pub(crate) async fn connect_camera(
         runtime.device_index = Some(index);
         runtime.last_error = None;
     }
+    state
+        .devices
+        .write()
+        .unwrap()
+        .connected(DeviceKind::Camera, connection_id.clone(), None);
+    let _ = state.device_updates.send(());
 
     Ok(Json(serde_json::json!({
         "status": "connected",
@@ -405,8 +409,24 @@ async fn connect_mount(
     })?;
 
     let drivers = mount.list_drivers().unwrap_or_default();
-    *state.mount_name.lock().unwrap() = Some(format!("{driver_type:?} mount"));
-    *state.mount.lock().unwrap() = Some(mount);
+    let hw = mount.health_status().map_err(|error| {
+        tracing::error!("Mount did not answer passive status query after connect: {error}");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let snapshot = health::mount_snapshot(format!("{driver_type:?} mount"), &hw);
+    let retired = {
+        let mut slot = state.mount.lock().unwrap();
+        let retired = slot.replace(mount);
+        *state.mount_name.lock().unwrap() = Some(format!("{driver_type:?} mount"));
+        state.devices.write().unwrap().connected(
+            DeviceKind::Mount,
+            uuid::Uuid::new_v4().to_string(),
+            Some(snapshot),
+        );
+        retired
+    };
+    drop(retired);
+    let _ = state.device_updates.send(());
 
     Ok(Json(serde_json::json!({
         "status": "connected",
@@ -427,9 +447,24 @@ async fn connect_focuser(
             .as_deref()
             .and_then(|option| option.parse::<i32>().ok())
             .unwrap_or(10000);
-        *state.focuser_name.lock().unwrap() = Some("Simulator focuser".to_string());
-        *state.focuser.lock().unwrap() =
-            Some(ConnectedFocuser::Simulator(SimFocuser::new(position)));
+        let focuser = ConnectedFocuser::Simulator(SimFocuser::new(position));
+        let snapshot = health::focuser_snapshot(
+            "Simulator focuser".into(),
+            &focuser.health_status().unwrap(),
+        );
+        let retired = {
+            let mut slot = state.focuser.lock().unwrap();
+            let retired = slot.replace(focuser);
+            *state.focuser_name.lock().unwrap() = Some("Simulator focuser".into());
+            state.devices.write().unwrap().connected(
+                DeviceKind::Focuser,
+                uuid::Uuid::new_v4().to_string(),
+                Some(snapshot),
+            );
+            retired
+        };
+        drop(retired);
+        let _ = state.device_updates.send(());
 
         return Ok(Json(serde_json::json!({
             "status": "connected",
@@ -462,8 +497,25 @@ async fn connect_focuser(
     })?;
 
     let drivers = focuser.list_drivers().unwrap_or_default();
-    *state.focuser_name.lock().unwrap() = Some(format!("{driver_type:?} focuser"));
-    *state.focuser.lock().unwrap() = Some(ConnectedFocuser::Hardware(focuser));
+    let focuser = ConnectedFocuser::Hardware(focuser);
+    let hw = focuser.health_status().map_err(|error| {
+        tracing::error!("Focuser did not answer passive position query after connect: {error}");
+        StatusCode::BAD_GATEWAY
+    })?;
+    let snapshot = health::focuser_snapshot(format!("{driver_type:?} focuser"), &hw);
+    let retired = {
+        let mut slot = state.focuser.lock().unwrap();
+        let retired = slot.replace(focuser);
+        *state.focuser_name.lock().unwrap() = Some(format!("{driver_type:?} focuser"));
+        state.devices.write().unwrap().connected(
+            DeviceKind::Focuser,
+            uuid::Uuid::new_v4().to_string(),
+            Some(snapshot),
+        );
+        retired
+    };
+    drop(retired);
+    let _ = state.device_updates.send(());
 
     Ok(Json(serde_json::json!({
         "status": "connected",
@@ -475,28 +527,53 @@ async fn connect_focuser(
 }
 
 pub(crate) async fn disconnect_camera(state: &AppState) -> Result<(), ApiError> {
-    let _acquisition = state.acquisition.lock().await;
-    let has_camera = state.camera.lock().unwrap().is_some();
-    if has_camera {
-        state.camera_runtime.write().unwrap().activity = CameraActivity::Disconnecting;
+    let ownership = state.acquisition.clone().lock_owned().await;
+    let id = state.camera_runtime.read().unwrap().connection_id.clone();
+    if let Some(id) = id {
+        state
+            .camera_loss_signals()
+            .invalidate(&id, "Disconnected by request".into());
     }
-
-    let was_streaming = *state.streaming.lock().unwrap();
-    if was_streaming {
-        let mut cam = state.camera.lock().unwrap();
-        if let Some(camera) = cam.as_mut() {
-            if let Err(e) = camera.stop_stream() {
-                tracing::warn!("Camera stream did not stop cleanly during disconnect: {e}");
-            }
-        }
-    }
-
     *state.streaming.lock().unwrap() = false;
-    *state.camera.lock().unwrap() = None;
-    *state.camera_name.lock().unwrap() = None;
-    *state.camera_driver.lock().unwrap() = None;
     state.clear_camera_observations();
     *state.camera_runtime.write().unwrap() = crate::state::CameraRuntimeState::default();
+    state
+        .devices
+        .write()
+        .unwrap()
+        .disconnected(DeviceKind::Camera, None, None);
+    let _ = state.device_updates.send(());
+    let worker_state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ownership = ownership;
+        health::retire_camera(&worker_state);
+    })
+    .await
+    .map_err(|error| ApiError::hardware(format!("Camera disconnect worker failed: {error}")))?;
+    Ok(())
+}
+
+async fn disconnect_auxiliary(state: &AppState, kind: DeviceKind) -> Result<(), ApiError> {
+    let id = state.devices.read().unwrap().connection_id(kind);
+    if let Some(id) = id {
+        state
+            .devices
+            .write()
+            .unwrap()
+            .disconnected(kind, Some(&id), None);
+    }
+    if kind == DeviceKind::Focuser {
+        state
+            .focus_abort_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    let _ = state.device_updates.send(());
+    let worker_state = state.clone();
+    tokio::task::spawn_blocking(move || health::retire_auxiliary(&worker_state, kind))
+        .await
+        .map_err(|error| {
+            ApiError::hardware(format!("{kind:?} disconnect worker failed: {error}"))
+        })?;
     Ok(())
 }
 
@@ -514,16 +591,17 @@ pub async fn disconnect_equipment(
         disconnect_camera(&state).await?;
     }
     if matches!(equipment_type.as_str(), "mount" | "all") {
-        *state.mount.lock().unwrap() = None;
-        *state.mount_name.lock().unwrap() = None;
+        disconnect_auxiliary(&state, DeviceKind::Mount).await?;
     }
     if matches!(equipment_type.as_str(), "focuser" | "all") {
-        *state.focuser.lock().unwrap() = None;
-        *state.focuser_name.lock().unwrap() = None;
+        disconnect_auxiliary(&state, DeviceKind::Focuser).await?;
+    }
+    if matches!(equipment_type.as_str(), "filter_wheel" | "all") {
+        disconnect_auxiliary(&state, DeviceKind::FilterWheel).await?;
     }
     if !matches!(
         equipment_type.as_str(),
-        "camera" | "mount" | "focuser" | "all"
+        "camera" | "mount" | "focuser" | "filter_wheel" | "all"
     ) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -531,6 +609,7 @@ pub async fn disconnect_equipment(
             format!("Unsupported equipment type '{equipment_type}'"),
         ));
     }
+    let _ = state.device_updates.send(());
 
     Ok(Json(serde_json::json!({
         "status": "disconnected",

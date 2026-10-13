@@ -26,11 +26,11 @@
 namespace ols {
     AlpacaClient::AlpacaClient(std::string const &url,std::string const &type)
     {
-        std::string addr;
-        if(url == "auto")
+        selection_ = parse_alpaca_selection(url);
+        if(selection_.base_url == "auto")
             base_url_ = discover(type);
         else
-            base_url_ = url;
+            base_url_ = selection_.base_url;
         client_.reset(new httplib::Client(base_url_));
 		client_->set_connection_timeout(2,0);
 		client_->set_read_timeout(2,0);
@@ -53,7 +53,10 @@ namespace ols {
         for(cppcms::json::value const &item : items) {
             if(to_lower(item.get<std::string>("DeviceType")) != device_type_)
                 continue;
-            result.push_back(std::make_pair(item.get<std::string>("DeviceName"),item.get<int>("DeviceNumber")));
+            int number = item.get<int>("DeviceNumber");
+            if(!matches_alpaca_device(selection_, number))
+                continue;
+            result.push_back(std::make_pair(item.get<std::string>("DeviceName"),number));
         }
         return result;
     }

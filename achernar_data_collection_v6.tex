@@ -1,0 +1,562 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern,microtype,amsmath,amssymb}
+\usepackage[a4paper,margin=25mm,headheight=15pt]{geometry}
+\usepackage[table]{xcolor}
+\usepackage{booktabs,longtable,array,enumitem,fancyhdr,titlesec,needspace,etoolbox}
+\usepackage{xurl,hyperref}
+\definecolor{navy}{HTML}{1F2A44}
+\definecolor{blue}{HTML}{2D6CDF}
+\definecolor{teal}{HTML}{0E7C7B}
+\definecolor{muted}{HTML}{5B6472}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=teal,pdftitle={Achernar v6: Minimum Necessary Data Collection},pdfauthor={Ibrahim Shahid}}
+\pagestyle{fancy}\fancyhf{}
+\lhead{\small\textcolor{muted}{Achernar / Collection Plan v6}}
+\rhead{\small\textcolor{muted}{October 12, 2026}}
+\rfoot{\thepage}
+\titleformat{\section}{\Large\bfseries\color{navy}}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\large\bfseries\color{blue}}{\thesubsection}{0.6em}{}
+\pretocmd{\section}{\Needspace{10\baselineskip}}{}{}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\pathref}[1]{\texttt{\path{#1}}}
+\setlength{\parindent}{0pt}\setlength{\parskip}{6pt}
+\setlength{\emergencystretch}{3em}
+\renewcommand{\arraystretch}{1.18}
+\setlist{nosep,leftmargin=1.5em,topsep=4pt}
+\setcounter{tocdepth}{2}
+\begin{document}
+\begin{titlepage}
+\vspace*{18mm}
+{\color{navy}\rule{\linewidth}{1.5pt}}\par
+{\Huge\bfseries\color{navy}Achernar}\par
+\vspace{6mm}
+{\LARGE\color{blue}Minimum Necessary Data Collection}\par
+{\Large Public-data-first development / v6}\par
+\vspace{12mm}
+\begin{tabular}{@{}ll@{}}
+Revision & October 12, 2026\\
+Status & Research-backed plan; implementation and fieldwork pending\\
+Architecture & \code{achernar_v6.tex}\\
+Evidence & \code{docs/public-dataset-audit-2026-10-12/}\\
+Historical procedure source & \code{achernar_data_collection.tex}
+\end{tabular}\par
+\vspace{12mm}
+\textbf{Decision}\par
+Use public human labels, suitable approved archive products and controlled
+simulation for broad perception development. Collect locally only the camera
+calibration, independent transfer examples and measured hardware outcomes that
+public data cannot provide. Reuse existing observations first. Expand a campaign
+only when an experiment identifies the missing evidence.
+\vfill
+\textcolor{muted}{This plan replaces the original campaign quotas as prerequisites.
+It does not claim that any fixed smaller quota is sufficient for deployment.
+No training, camera calibration, hardware actuation or model promotion was
+performed by the source audit. Earlier documents remain dated evidence.}
+\end{titlepage}
+\tableofcontents\clearpage
+
+\section{Scope, priorities and standing decisions}
+The purpose is to minimize wasted acquisition while preserving honest
+scientific and operational evaluation. Begin with one actual camera/optical
+configuration and the modes intended for use. A supported one-rig prototype
+does not need a rented second rig; an unseen-rig claim does.
+
+The original FQE 20/60/150-run tiers, COC thousands-per-class collection,
+TED 3,600-frame campaign, five-body calibration inventory and 10,000 local
+plate-solved-frame adapter trigger are no longer required starting conditions.
+They were planning envelopes, not empirical sample-size proofs. Their
+replacement is a sequence of small, decision-driven experiments.
+
+\begin{enumerate}
+\item Freeze the task, intended use, supported inputs and a baseline.
+\item Inspect a small real payload and its rights/metadata before bulk intake.
+\item Reproduce classical measurements and synthetic stress tests.
+\item Run one public-trained candidate where it addresses a measured need.
+\item Acquire/adjudicate only local development and independent evaluation gaps.
+\item Check deployment parity, then observe in shadow mode before considering
+any additional control authority.
+\end{enumerate}
+
+Native AstroM3 catalog research can proceed independently. FOP, learned
+exposure/filter/guiding policies and AstroM3Edge do not block useful cloud,
+focus-width, background or trailing measurements. No deadline or trained-model
+count is an acceptance criterion.
+
+\subsection{What remains authoritative}
+Code and migrations determine executable behavior. V6 defines proposed data
+contracts and decisions, not implemented ingestion or trained models. Classical
+HFR controls current autofocus; neural FQE is shadow output. BGE and TED retain
+classical baselines. Model lifecycle, integrity, runtime qualification,
+activation and controller authority remain separate.
+
+No new hardware purchases, rentals, cloud forecasts or dedicated multimodal
+field campaigns are justified solely by this plan. A public source is admitted
+only for the task and intended use its evidence supports.
+
+\section{Verified starting point and remaining engineering work}
+\begin{longtable}{@{}L{0.23\linewidth}L{0.68\linewidth}@{}}
+\toprule Area & Current evidence and consequence\\\midrule\endhead
+Local clouds & October 11 audit: 533 distinct readable R50 CR3s, 508 sky
+candidates, 200 provisional class candidates, 308 unknowns and 25 invalid
+ordinary-cloud examples. Labels are not approved truth; no reliable full-frame
+clear/thin set was established. Clock is unreliable and five gap groups are
+not five independent nights. Review before collecting more.\\
+FQE & Actual 64-pixel grayscale shadow inference and a checksum/eligibility-aware
+SQLite-linked builder exist. Public FITS are not directly accepted; create an
+archive adapter without fake positions or focus-run records.\\
+Splitting & Temporal grouped splitting already exists. Enforce night/rig/ancestor
+constraints for the claim being evaluated; do not repeat the old absent-tool claim.\\
+CFA analysis & RAW16 is read as grayscale; debayer module is a stub. Native CFA,
+validated color planes and display luminance are different measurement domains.\\
+COC & Python model/trainer, metadata and Rust heuristic disagree on shape/task.
+Freeze a versioned input/label contract before training. No trained production
+cloud path is established.\\
+TED / BGE & TED CNN entry delegates to classical moments. BGE uses robust global
+statistics; a SEP-style mesh background is not established by its wrapper name.\\
+FOP / FDF & FOP dataset builder raises \code{NotImplementedError}. FDF is an
+implemented three-state CPU estimator, not a neural training task.\\
+\bottomrule
+\end{longtable}
+Source pointers and the limits of this targeted inspection are in the audit
+memos. Older capture/import defects must be rechecked before field use; the
+historical audit is not proof they all persist. In particular, existing import
+code is not evidence of correct CR3 metadata or wrong-clock label handling.
+
+\subsection{Implementation gates before new acquisition}
+\begin{enumerate}
+\item Freeze analytics versus preview transforms, clipping units, source masks,
+crop geometry, missingness and label semantics. If R50 deployment uses JPEG
+preview, raw-only training does not establish preview-domain parity.
+\item Add source manifests and task adapters. Preserve raw bytes, masks,
+calibration level, native units and original exposure identities.
+\item Add reviewed cloud partial-label conversion and an explicit ignore mask.
+Do not silently fill unannotated areas or misspelled annotation classes.
+\item Validate grouping/derivative ancestry before training. Freeze independent
+calibration/validation and final-test roles.
+\item Confirm the field logger records actual settings, clock quality, position
+validity and disturbances. A schema field is not proof the hardware fills it.
+\end{enumerate}
+
+\clearpage
+\section{Public-source intake: small, reversible and task-specific}
+\subsection{First source choices}
+\begin{longtable}{@{}L{0.22\linewidth}L{0.39\linewidth}L{0.30\linewidth}@{}}
+\toprule Source & Initial useful intake & Decision boundary\\\midrule\endhead
+Lenghu human regions & 22.1 MB ZIP, 1,111 embedded 512-pixel images and LabelMe
+regions. Inspect overlays and label corrections. & Primary COC pilot. Unknown
+pixels remain ignore; source split does not establish R50 transfer.\\
+Lenghu bulk logits & None initially; later a stratified subset only if needed &
+Teacher predictions are weak supervision; exclude holdout ancestors and nights.\\
+GalSim & Version-pinned analytic optical/atmospheric/detector scenes &
+Generator parameters are not measured real HFR or focuser steps.\\
+MAST selected imaging & A named public mission/instrument/product with units,
+SCI/ERR/DQ where applicable & Prefer explicit public-domain product evidence;
+raw DN, electrons and electrons/s remain distinct.\\
+MILAN / HSC / LCO & Bounded metadata/header research, then selected pixels only
+if useful and permitted & Separate noncommercial research lineage. No product
+eligibility by public-access inference.\\
+AstroM3 native & One compatible full configuration/checkpoint; initially
+100--1,000 objects for inference & Existing encoders; no local observations.
+Resolve identity/terms before a new image match.\\
+MMU & At most one approved image subset and a small matched-object pilot &
+Optional after task utility/identifiability. Do not bulk-fetch the collection.\\
+SWIN / Almeria & Optional external/night or daylight diagnostic & Shared SWIN
+ancestors stay out of training if SWINSEG is a test. Track separate terms.\\
+DeepSpaceYolo / BTSbot / Trailblazer & Optional task-specific challenge examples &
+Object boxes/transients/satellites are not focus or tracking truth.\\
+DeepSky / WOANC & No initial dependency & Daytime/unreleased or request-only;
+do not delay a useful experiment for extra sources.\\
+\bottomrule
+\end{longtable}
+
+\subsection{Admission checklist and transfer caps}
+For imaging archives, start with metadata for 10--20 exposures from 3--5
+sessions where available, and a proposed 2 GB total pilot transfer cap. The cap
+bounds effort, not training adequacy. Choose a smaller individual-product
+route when one archive bundle exceeds it. Do not expand solely to fill a row
+counter. Full cloud logits, the year of MILAN, a multi-year Rubin database and
+100 TB MMU are not initial requirements.
+
+Before admitting each product, record: exact release/revision and URL;
+license for data/code/weights separately; checksum; instrument/site/session;
+HDU or array meaning; native units and scale; masks/variance; processing state;
+CFA/black/white/clipping evidence; timestamp reliability; duplicate ancestors;
+and available labels with their actual meaning. If clipping cannot be
+established, exclude it from strict FQE labels while optionally retaining an
+explicit robustness-only example.
+
+A suitable image is not automatically a suitable outcome label. A processed
+variance map is an independent pipeline estimate, not measured sensor noise
+truth. A PSF model is a fitted source, not an independent exposure. A saturated
+or cloudy archive frame is useful for failure behavior only when its validity
+and label evidence are retained.
+
+\subsection{Rights and reproducibility}
+Lenghu has an Apache-2.0 dataset tag; teacher/backbone terms are separate.
+SWIN's original hosts link CC BY-NC 4.0. MILAN/DeepSpaceYolo are CC BY-NC-ND;
+HSC archive terms are noncommercial scientific/educational; LCO states CC BY-NC
+2.0. AstroM3 source, processed-data listings and pretrained checkpoints have
+different terms; MMU preserves subset restrictions. A source-code license does
+not settle a downloaded database or user-log license.
+
+Maintain a separately identifiable research lineage and an intended-use-cleared
+lineage. Retain permissions, citations and downstream source ancestry. This
+plan makes no blanket legal assertion about whether a particular weight is an
+adaptation. Additional permission may be recorded later without silently
+rewriting the provenance of an existing artifact.
+
+\section{Scientific labels and evaluation groups}
+\subsection{Labels that must remain distinct}
+\begin{longtable}{@{}L{0.28\linewidth}L{0.63\linewidth}@{}}
+\toprule Label type & Meaning and limitation\\\midrule\endhead
+Human cloud region & Conservative source annotation. Unannotated pixels are
+unknown. Cloud coverage is not transparency or observing loss.\\
+Measured HFR & Named background/aperture/source-gate reference in pixels.
+Agreement with its labeler alone does not establish better focus.\\
+Fitted PSF or uncertainty map & A named pipeline/model product, with its own
+measurement assumptions and calibration level.\\
+Teacher logits & Versioned model output; confidence is not independently
+verified correctness or local probability calibration.\\
+Latent simulation parameter & Defocus waves, motion path/length, true flux and
+noise parameters defined within the generator. Not motor steps or noisy moments.\\
+Noisy estimated label & HFR/ellipticity from a named estimator after sampling,
+noise, clipping and masking; retain failed/invalid results.\\
+Focus optimum/outcome & Position-referenced converged run and verified final
+image/move. Neither one crop nor minimum sampled HFR alone supplies it.\\
+Policy reward & Attributable measured result of an executed action under a
+versioned objective; unchosen-action rewards remain absent.\\
+\bottomrule
+\end{longtable}
+
+For FQE retain \code{log(HFR_px)}, uncertainty and accepted-source coverage.
+Position is provenance, not a pixels-only FQE input. Disable real within-run
+ranking on unrelated archive exposures. Maintain a separate simulated-sequence
+flag if ranking synthetic curves.
+
+For TED retain latent trail length/axial angle, noiseless reference shape and
+noisy estimated ellipticity separately. Angle is modulo 180 degrees; almost
+round sources need an undefined/low-confidence angle, not arbitrary direction.
+Single-crop shape cannot identify tracking versus coma or wind. Use WCS before
+claiming sky-coordinate RA/Dec axes.
+
+\subsection{Split hierarchy and adaptive collection}
+All derivatives of a source exposure or latent scene family stay together;
+all modalities/repeated observations of an object stay together. Split before
+augmentation. FQE/FOP runs are nested within nights and rigs; use the coarser
+level needed for the claim. COC needs whole-night/weather-episode/camera-era
+separation. Similar sky frames separated by minutes are not independent
+conditions. Unknown dates require conservative group families.
+
+Use development data for transforms and training; independent validation for
+selection/calibration; an untouched final set for a final claim. Never tune
+thresholds on the final test. If its failures guide new training, record that
+the test has been consumed and obtain fresh final evidence. Public benchmark
+labels already seen during development are not an independent local test.
+
+Report source exclusions, usable frame coverage and independent group counts.
+A million crops are not a million observing outcomes. Confidence intervals
+must respect night/run/episode clustering. Fix the failure event and tolerance
+before choosing sample size. With zero failures in independent stationary
+trials, the one-sided 95\% upper bound is $1-0.05^{1/n}$; 59 such trials are
+needed for a bound below 5\%. This is an illustration, not a demand for 59
+adjacent images or an assertion that 59 sessions settle every use.
+
+\section{Model-by-model acquisition decision}
+\begin{longtable}{@{}L{0.15\linewidth}L{0.39\linewidth}L{0.37\linewidth}@{}}
+\toprule Model & First experiment / reuse & Additional local evidence only if needed\\\midrule\endhead
+FQE & Classical benchmark, approved public stars, analytic PSF/noise scenes,
+one compact candidate & Supported-input bias/coverage and independently
+verified focus outcomes. Begin with a 6--10-sweep effort cap, not a release minimum.\\
+FOP & Test canonical 38 features and synthetic/asymmetric/backlash curves
+against robust classical fitting & Readable position, sign/scale, reversals,
+validated optima and final outcomes. Missing position defers the model.\\
+FDF & Existing $[p,v,k]$ estimator and simulated identification/failure tests &
+Harvest autofocus plus ambient-temperature records. Acquire extra thermal
+trajectories only if held-out forecasts or identifiability require them.\\
+COC & Lenghu human regions and existing R50 adjudication & Missing fully
+clear/thin, moon/glow/contamination or independent held-out episodes. No class
+thousands before a transfer result.\\
+TED & Classical moments with simulated motions/aberrations & One compact
+ambiguous-range untracked ladder plus round and confounder cases; expand only
+for residuals. Tracked-domain claims require real tracked evidence.\\
+BGE & Classical full-frame benchmark and known-unit calibration products &
+Bench characterization of actual enabled mode, not every possible body/ISO.
+Neural noise map has no initial acquisition entitlement.\\
+Exposure & Physics/rules baseline and passive action/outcome logs & Calibrated
+settings, safe support and known logging probabilities for randomized
+comparisons; no speculative exposure campaign.\\
+FOR & Deterministic target/filter constraints and optional simulation & Only
+actual filter hardware/response/overhead and outcome logs. Keep deferred.\\
+TME & Native encoders, approved configuration and original object identities &
+No dedicated field collection. Edge waits for identifiable stellar matches and
+image-only/catalog baselines.\\
+\bottomrule
+\end{longtable}
+Every cap in this table is an engineering proposal. Retaining the classical
+method after a negative model comparison is a valid decision. Collecting the
+cap does not confer shadow eligibility, promotion or motion authority.
+
+\section{Compact local runbooks}
+\subsection{RB-A: adjudicate existing clouds before collecting more}
+\begin{enumerate}
+\item Preserve original CR3s and existing provisional ledgers. Choose one
+reproducible RAW/preview transform, crop/sky mask and deployed resolution.
+\item Review a diverse panel from all capture groups, including star-bearing
+openings, soft/low-signal images, foreground and bright/transient contamination.
+Compare native detail with the actual model input; do not label from a view
+the model cannot see without recording that difference.
+\item Record cloud presence/region, visible-sky coverage if supportable,
+attenuation evidence, contamination and validity separately. Preserve legacy
+0--4 candidates and alternates; leave ambiguity unknown. No-stars alone is
+not overcast. Nearby weather is context, not a substitute for frame truth.
+\item Adjudicate useful existing examples before new photographs. Keep uncertain
+clock/session groups conservative; never infer exact UTC from file mtime.
+\item Freeze development and independent prospective-test roles before local
+adaptation. The current burst collection does not establish all five classes.
+\end{enumerate}
+
+\subsection{RB-B: targeted cloud transfer episodes}
+Only start after RB-A and a source-trained inference/input check name a gap.
+Fix camera clock/timezone, lens/pointing, manual focus, exposure recipe and RAW
+preservation. Log site, true time anchor, field/sky mask, camera settings,
+moon/illumination when computable, and observer evidence.
+
+For a first tranche, cap effort at approximately 3--5 additional independent
+nights or weather episodes, not a compulsory campaign. Prioritize clear versus
+thin/star-attenuation transitions and one missing glow/obstruction contrast.
+A regular sparse cadence such as 30--60 seconds can preserve transitions;
+choose approximately 50--150 diverse keyframes per night after thinning if that
+many add information. These are workload bounds, not independence assumptions.
+Record short cloud transitions contemporaneously rather than spreading one
+10-minute label across a changing field. Independent reference photos can
+help adjudicate but do not measure optical depth automatically.
+
+Keep at least one untouched episode for each condition claimed and separate
+validation/calibration groups. If a condition appears in only one episode,
+report exploratory transfer rather than an independent performance estimate.
+Stop an uninformative uniform burst; further examples should answer a named
+error or uncertainty. Do not deliberately expose equipment to rain or damage
+to manufacture a challenge case; existing invalids and safe simulations suffice.
+
+\subsection{RB-C: supported-mode camera characterization}
+Start with one actual acquisition mode/ISO/gain and a locked decoder version.
+Record camera, lens/optics, firmware, compression/bit depth, sensor temperature
+when measured, exposure, CFA/black/white metadata and processing state. For a
+JPEG/video mode, characterize that transformed path separately; native RAW
+constants do not automatically describe it.
+
+A proposed small bench starting budget is roughly 20 shortest dark/bias-like
+RAWs and 8--12 stable illumination levels with at least a pair at each level.
+Use paired differences to separate fixed spatial structure from temporal
+variance; record means after appropriate black correction and inspect clipping
+and nonlinearity. More repeats are justified if pair consistency or confidence
+is poor. Cameras without a true bias mode need a valid short-dark protocol;
+compressed SV105 video is not interchangeable with linear sensor RAW.
+
+Characterize dark behavior only over exposure/temperature regimes intended for
+use; ordinary imaging darks can supply it passively. Do not build every ISO and
+exposure library before a task requires it. Flat-field calibration for science
+and PTC illumination measurements are related but distinct products. Preserve
+all originals and units. Document gain/read-noise fit assumptions and residuals;
+a single mean--variance slope is not proof of ideal Poisson behavior.
+
+The gate is reproducible black/clipping/linearity evidence and a calibration
+bundle for the supported mode. Unknown values remain unknown; drop strict
+labels dependent on missing thresholds. Expand modes only when enabled in the
+product or a measured error points to the missing characterization.
+
+\subsection{RB-D: compact focus-width and outcome experiment}
+Confirm safe travel/focus reach and acquisition first; this plan does not
+assert the R50 reaches prime focus on the Z114. Use a configuration that actually
+produces resolved, unsaturated stars. Reuse any ordinary verified autofocus
+runs. If manual focus lacks readable position, record ordered settings for
+width research; do not claim signed-step FOP labels or autonomous verification.
+
+Begin with a 6--10-run effort cap over approximately 2--3 distinct sessions
+when available. This can diagnose transfer, not qualify a general release.
+Use enough positions on both sides of an interior minimum, dense near focus;
+a starting 9--15 positions with 2--3 repeated frames can reveal scatter before
+expanding to the historical 21-by-5 procedure. Adjust sampling to actual curve
+resolution and repeatability, not a universal step count.
+
+For each sample log capture/position/move times, actual readable position and
+validity, direction/reversal, settling, settings, temperature provenance,
+source/asset checksum and disturbances. Keep central and edge stars; retain
+rejection/coverage statistics. Record failed/aborted runs without fake optima.
+An interior fitted optimum needs uncertainty and independent final-image
+verification after the commanded move; then log the observed result.
+
+Compare classical and neural estimates on matched accepted stars and full-frame
+coverage. Use held-out run/night groups for ranking, residuals and post-move
+outcome. No focus improvement means no expansion merely to train a larger net.
+Real control claims require reliable motor/sign/scale/backlash and actual final
+outcomes; external optical defocus in wavelengths cannot supply those steps.
+
+\subsection{RB-E: compact trailing/confounder experiment}
+Use the same useful local sessions where possible. Select central and edge
+stars; include short near-round exposures and denser steps where measured
+ellipticity approaches the existing ambiguous band. An initial one-session
+ladder across 2--3 fields and 6--10 exposure durations with a few repeats is a
+planning cap; record actual durations and source coverage.
+
+An ideal untracked sidereal displacement is approximately
+$15.041\cos\delta$ arcsec per second, converted through local image geometry.
+It does not exactly label observed ellipticity or identify wind versus tracking.
+Plate scale/WCS or another measured angular calibration is required for physical
+units; image-coordinate shape benchmarks can proceed without pretending those
+units are known. Alt-az tracking retains field rotation.
+
+Retain coma, defocus, saturation, blends, weak stars and real wind/disturbance
+flags as confounders. A windy session is an optional gap-filling observation,
+not a compulsory night. Compare estimated shape/axial angle and frame false
+alerts with the classical baseline. Round/low-SNR angles can be undefined. No
+neural benefit on the measured ambiguous cases means stop the CNN branch.
+
+\subsection{RB-F: passive thermal and decision logging}
+During necessary autofocus, record verified best position, ambient temperature
+and probe/time quality, optical train/filter, resets and actual move success.
+The current FDF state is position, independent drift rate and thermal
+coefficient. A monotonic temperature/time trajectory can confound the last two;
+seek independent cooling/warming behavior only if identification or forecasts
+remain poor. Do not prescribe a fixed degrees-C span as universally sufficient.
+Hold out nights and compare against recent-best/no-drift baselines and the
+rig's measured critical-focus threshold.
+
+For exposure/filter/guiding decisions retain predecision context and measurement
+ages; safe/available actions; policy/version; requested/chosen/executed action;
+probabilities when randomized; actual settings/ownership/overrides; frame/event
+lineage; realized reward components and attribution window; and interruptions.
+Do not invent propensities for deterministic past choices. A fitted after-the-fact
+propensity model does not create randomization or remove hidden confounding.
+Passive fixed-policy data is useful for simulator checks without claiming
+unbiased new-policy evaluation. No bandit exploration starts merely to fill a
+training table.
+
+\section{Minimal proposed manifest and field-log contract}
+Store source/example manifests separately from operational action records.
+Task adapters may leave inapplicable fields absent; they must not replace
+missing measurements with plausible zeroes. Record at least:
+\begin{longtable}{@{}L{0.24\linewidth}L{0.67\linewidth}@{}}
+\toprule Record & Required information\\\midrule\endhead
+Source release & Provider, release/revision, direct URL, data/code/weight terms,
+intended-use disposition and evidence, original checksum.\\
+Exposure & Source exposure ID, instrument/rig/mode, settings/units/calibration
+level, clock quality/time anchor, session/night family, masks and raw/derived links.\\
+Derived example & Parent exposure/object/scene family, crop/resize geometry,
+transform/calibration version, simulation seed/parameters, derivative checksum.\\
+Label & Type/method/version, value/units, uncertainty/validity, partial ignore
+mask or rejection, human/teacher provenance and correction ledger.\\
+Partition & Dataset revision, ancestor group, development/validation/calibration/
+final-test role, camera-era/object/night constraints and frozen assignment.\\
+Focus outcome & Run/sample, read position/sign/scale, direction/reversal,
+fit/optimum uncertainty, executed move and independent final verification.\\
+Decision & Predecision context, safe arms, policy/probabilities, requested and
+executed action, observed reward/overhead, interruption/override and parent assets.\\
+\bottomrule
+\end{longtable}
+A schema draft does not mean importers or SQL migrations support every field.
+Implement explicit adapters/validation and golden transform fixtures before
+creating training-ready datasets. Existing manually reviewed cloud CSVs are
+not automatically importer-compatible training input.
+
+\section{Stop, expand or proceed: acceptance gates}
+The matched comparisons and acquisition decision ledger are detailed in
+\pathref{docs/public-dataset-audit-2026-10-12/experiment-design.md}.
+For COC compare the current heuristic, public-human-only candidate and the same
+candidate with disjoint local adaptation on identical validation groups. For
+FQE compare classical measurement with one architecture under synthetic,
+approved public-real and mixed training. Do not enlarge architecture and data
+simultaneously and then attribute the result to a dataset. TED/BGE first test
+whether deterministic source/mask/background improvements resolve the error.
+
+Every additional tranche must name a gap, explain why existing/public/synthetic
+evidence cannot answer it, specify the comparison it will decide, freeze its
+group/partition role, and state an effort cap and next decision. Data-efficiency
+curves use nested training groups and fixed validation groups. Do not repeatedly
+peek at a final test or stop a reliability test at its first favorable result.
+
+\begin{longtable}{@{}L{0.23\linewidth}L{0.34\linewidth}L{0.34\linewidth}@{}}
+\toprule Gate & Stop or resolve first & Evidence allowing the next stage\\\midrule\endhead
+Intake & Unclear rights, units, labels, ancestors or clipping for strict labels &
+Small actual payload, reviewed metadata/terms and correct provenance.\\
+Baseline & No reproducible classical measurement or reference semantics &
+Known-unit benchmark, failures/coverage and independent synthetic checks.\\
+Candidate value & Only teacher agreement or simulator success; no operational
+need identified & Improved relevant error/coverage/latency tradeoff on frozen
+independent development/validation groups.\\
+Local transfer & Missing clear/thin or mode parity; correlated-only test &
+Named gap filled and separate independent target-domain evidence.\\
+Deployment & Unmatched preprocessing/export, uncalibrated uncertainty or
+unqualified runtime & Golden input/output parity, calibrated held-out behavior,
+resource qualification and inspectable shadow logs.\\
+Control & Unknown motion, unbounded action, no attributable outcomes or support &
+Controller-specific real outcome evidence and existing safety/ownership gates;
+artifact selection alone never grants authority.\\
+Expansion & Bigger corpus/rig list with no named decision benefit &
+Residual slice, missing supported condition or confidence interval justifies
+specific new data; freeze its role before collection.\\
+\bottomrule
+\end{longtable}
+
+For COC report local recall at a predeclared false-pause constraint, thin-cloud
+misses, contamination/unknown behavior and calibration; masks and whole-frame
+decisions need separate metrics. For FQE report accepted-cohort log-HFR error,
+uncertainty and full-frame coverage plus real focus outcomes. TED needs
+ellipticity/axial-angle errors and frame false alerts, including confounders.
+BGE needs calibrated unit/residual/gradient/crowding checks. FOP/FDF require
+actual convergence/forecast outcomes; policy learners require defensible policy
+comparison. Native TME needs held-out-object retrieval/missing-modality tests,
+not only matching embedding dimensions.
+
+\section{Additional algorithms and deliberate deferrals}
+FW-1 needs calibrated per-filter response, not a new generic ML corpus. FW-2
+is a policy with action/outcome requirements. FW-3 begins with explicit
+constraints/objectives and deterministic optimization scenarios. M-1/M-2 need
+actual guide/dither commands and attributable settle/science outcomes. M-3
+needs genuine solve-failure/recovery need, not a low-star-count proxy. M-4 needs
+this mount's solved residuals over held-out sky coverage, coordinates and
+mount/pier configuration. Public logs and simulated fields help software tests;
+they do not supply the missing local labels or usage rights.
+
+Do not start a separate campaign for any of these before supported hardware,
+truthful telemetry and a fixed baseline exist. Harvest during ordinary use.
+AstroM3Edge is deferred until object IDs, valid stellar matches, identifiable
+single-image information and an explicit alignment target exist. Neither a
+10,000-frame quota nor a large galaxy archive answers those questions.
+
+\section{Sources, revision and boundaries}
+The complete source/inspection ledger, version IDs, hashes, license differences,
+file defects and unresolved questions are in:
+\begin{itemize}
+\item \pathref{docs/public-dataset-audit-2026-10-12/cloud-datasets.md}
+\item \pathref{docs/public-dataset-audit-2026-10-12/imaging-datasets.md}
+\item \pathref{docs/public-dataset-audit-2026-10-12/control-multimodal.md}
+\item \pathref{docs/public-dataset-audit-2026-10-12/README.md}
+\item \pathref{docs/public-dataset-audit-2026-10-12/experiment-design.md}
+\end{itemize}
+Principal primary sources: Lenghu paper/release
+\url{https://arxiv.org/html/2603.16429v1},
+\url{https://huggingface.co/datasets/ruiyicheng/LenghuSky-8};
+MILAN \url{https://zenodo.org/records/6865830};
+HSC \url{https://hsc-release.mtk.nao.ac.jp/doc/index.php/faq__pdr3/};
+LCO \url{https://lco.global/observatory/termsofservice/};
+MAST \url{https://stdatu.stsci.edu/publishing/data-use};
+GalSim \url{https://github.com/GalSim-developers/GalSim};
+AstroM3 \url{https://github.com/MeriDK/AstroM3};
+MMU \url{https://github.com/MultimodalUniverse/MultimodalUniverse};
+NIST \url{https://itl.nist.gov/div898/software/dataplot/refman2/auxillar/exacbici.htm}.
+
+The follow-up AI synthesis supplies useful three-workstream framing and
+shared/per-rig separation. Its asserted counts, fixed session suggestions and
+simplified lifecycle are not adopted as evidence. V6 preserves explicit
+scientific units and v5's orthogonal approval/qualification/authority states.
+The historical manual procedures remain available when additional sampling is
+justified; obsolete quotas or defects must not silently become current gates.
+
+This is a plan and research result. Training, adapter implementation, camera
+calibration and hardware qualification are outstanding work. The first useful
+result is a small trustworthy experiment and a decision about what to retain,
+change or collect next.
+\end{document}

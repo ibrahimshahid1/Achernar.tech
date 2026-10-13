@@ -24,6 +24,11 @@ pub async fn move_relative(
 ) -> Result<StatusCode, StatusCode> {
     tracing::info!("Focuser move: {} steps", req.steps);
     let mut focuser = state.focuser.lock().unwrap();
+    crate::hardware::health::require_connected(
+        &state,
+        crate::hardware::health::DeviceKind::Focuser,
+    )
+    .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
     let focuser = focuser.as_mut().ok_or(StatusCode::PRECONDITION_FAILED)?;
     focuser.move_relative(req.steps).map_err(|e| {
         tracing::error!("Focuser relative move failed: {}", e);
@@ -38,6 +43,11 @@ pub async fn move_absolute(
 ) -> Result<StatusCode, StatusCode> {
     tracing::info!("Focuser move to: {}", req.position);
     let mut focuser = state.focuser.lock().unwrap();
+    crate::hardware::health::require_connected(
+        &state,
+        crate::hardware::health::DeviceKind::Focuser,
+    )
+    .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
     let focuser = focuser.as_mut().ok_or(StatusCode::PRECONDITION_FAILED)?;
     focuser.move_absolute(req.position).map_err(|e| {
         tracing::error!("Focuser absolute move failed: {}", e);
@@ -50,6 +60,11 @@ pub async fn get_position(
     State(state): State<AppState>,
 ) -> Result<Json<PositionResponse>, StatusCode> {
     let focuser = state.focuser.lock().unwrap();
+    crate::hardware::health::require_connected(
+        &state,
+        crate::hardware::health::DeviceKind::Focuser,
+    )
+    .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
     let focuser = focuser.as_ref().ok_or(StatusCode::PRECONDITION_FAILED)?;
     let position = focuser.position().map_err(|e| {
         tracing::error!("Focuser position failed: {}", e);
@@ -61,6 +76,11 @@ pub async fn get_position(
 pub async fn abort(State(state): State<AppState>) -> Result<StatusCode, StatusCode> {
     tracing::info!("Focuser abort requested");
     let mut focuser = state.focuser.lock().unwrap();
+    crate::hardware::health::require_connected(
+        &state,
+        crate::hardware::health::DeviceKind::Focuser,
+    )
+    .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
     let focuser = focuser.as_mut().ok_or(StatusCode::PRECONDITION_FAILED)?;
     focuser.abort().map_err(|e| {
         tracing::error!("Focuser abort failed: {}", e);

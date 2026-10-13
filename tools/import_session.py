@@ -218,17 +218,56 @@ def read_exif(path: Path) -> dict:
         return {}
 
 
-def exif_datetime(exif: dict) -> str | None:
+def parse_utc_offset(value) -> timezone | None:
+    """'-04:00' / '+0530' / 'Z' -> tzinfo, or None if absent or malformed."""
+    if value is None:
+        return None
+    text = str(value).strip().replace("\x00", "")
+    if text in ("Z", "z", "+00:00", "-00:00"):
+        return timezone.utc
+    try:
+        return datetime.strptime(text.replace(":", ""), "%z").tzinfo
+    except ValueError:
+        return None
+
+
+def exif_datetime(
+    exif: dict, camera_utc_offset: str | None = None
+) -> tuple[str | None, str | None]:
+    """Shutter time as an aware ISO timestamp, plus where its offset came from.
+
+    EXIF DateTimeOriginal is the camera's *wall clock* with no zone. Reading it
+    as UTC put an evening frame four hours away from the -04:00 sky labels on
+    the field card, so the 15-minute label match missed or hit the wrong frame.
+    Precedence, recorded as the second return value:
+
+    1. ``exif_offset`` — OffsetTimeOriginal/OffsetTime, which Canon EOS R
+       bodies write when the in-camera time zone is set.
+    2. ``declared`` — ``camera_utc_offset`` from the session log or CLI.
+    3. ``host_local_assumed`` — the importing machine's zone. A guess, and
+       labelled as one so it can be filtered out later.
+    """
+    exif_offset = None
+    for key in ("OffsetTimeOriginal", "OffsetTime", "36881", "36880"):
+        exif_offset = parse_utc_offset(exif.get(key))
+        if exif_offset is not None:
+            break
+    declared = parse_utc_offset(camera_utc_offset)
+
     for key in ("DateTimeOriginal", "DateTimeDigitized", "DateTime"):
         value = exif.get(key)
         if not value:
             continue
         try:
-            dt = datetime.strptime(str(value), "%Y:%m:%d %H:%M:%S")
-            return dt.replace(tzinfo=timezone.utc).isoformat()
+            dt = datetime.strptime(str(value).strip(), "%Y:%m:%d %H:%M:%S")
         except ValueError:
             continue
-    return None
+        if exif_offset is not None:
+            return dt.replace(tzinfo=exif_offset).isoformat(), "exif_offset"
+        if declared is not None:
+            return dt.replace(tzinfo=declared).isoformat(), "declared"
+        return dt.astimezone().isoformat(), "host_local_assumed"
+    return None, None
 
 
 def exif_number(exif: dict, key: str) -> float | None:
@@ -469,12 +508,14 @@ def quality_json_for(measurement: dict | None, declared_saturation: float | None
 def group_by_capture(files: list[Path]) -> dict[str, list[Path]]:
     """A RAW and its in-camera JPEG are one exposure, not two.
 
-    Grouped by filename stem, which is how every camera in the plan names a
-    RAW+JPEG pair (IMG_0001.CR3 / IMG_0001.JPG).
+    Grouped by directory plus filename stem, which is how every camera in the
+    plan names a RAW+JPEG pair (IMG_0001.CR3 / IMG_0001.JPG). The directory is
+    part of the key because card counters repeat: night1/IMG_0001 and
+    night2/IMG_0001 are different exposures and must not merge.
     """
     groups: dict[str, list[Path]] = defaultdict(list)
     for path in sorted(files):
-        groups[path.stem].append(path)
+        groups[str(path.with_suffix(""))].append(path)
     return dict(groups)
 
 
@@ -514,6 +555,7 @@ def import_session(
     migrations_dir: Path | None = None,
     position_unit_um: float = DEFAULT_POSITION_UNIT_UM,
     match_window_s: float = DEFAULT_MATCH_WINDOW_S,
+    camera_utc_offset: str | None = None,
 ) -> dict:
     if capture_type not in VALID_CAPTURE_TYPES:
         raise ValueError(
@@ -534,6 +576,11 @@ def import_session(
     # It is the difference between a frame the dataset builder will accept and
     # one it drops as ungated, so it is read here rather than guessed later.
     declared_saturation = session.get("saturation_adu")
+    # The camera clock's UTC offset when EXIF does not carry one (see
+    # exif_datetime). The CLI flag wins over the card.
+    camera_utc_offset = camera_utc_offset or session.get("camera_utc_offset")
+    if camera_utc_offset is not None and parse_utc_offset(camera_utc_offset) is None:
+        raise ValueError(f"camera_utc_offset must look like -04:00, got {camera_utc_offset!r}")
 
     candidates = [
         p for p in sorted(files_dir.rglob("*")) if p.is_file() and classify(p)
@@ -562,6 +609,7 @@ def import_session(
         "focus_samples_inserted": 0,
         "positions_unresolved": 0,
         "samples_unmeasurable": 0,
+        "timezone_assumed": 0,
     }
     staged: list[Path] = []
     # Original filename -> frame id, so the field card's `files` entries can be
@@ -579,7 +627,9 @@ def import_session(
                 if exif:
                     break
 
-            captured_at = exif_datetime(exif)
+            captured_at, timezone_source = exif_datetime(exif, camera_utc_offset)
+            if timezone_source == "host_local_assumed":
+                stats["timezone_assumed"] += 1
             metadata_source = "exif"
             if captured_at is None:
                 captured_at = session.get("captured_at")
@@ -655,7 +705,11 @@ def import_session(
                 "source_directory": str(files_dir),
                 "session_log": str(log_path) if log_path else None,
                 "exif_model": str(body) if body else None,
-                "group_stem": stem,
+                "group_stem": Path(stem).name,
+                "source_relative_path": str(Path(stem).relative_to(files_dir))
+                if Path(stem).is_relative_to(files_dir) else stem,
+                # Only meaningful when metadata_source == "exif"; None otherwise.
+                "timezone_source": timezone_source,
                 # `focus_samples.position` and `frames.focuser_position` are
                 # bare integers. A motorised run counts steps and a dial
                 # indicator counts displacement; nothing in the number says
@@ -1224,6 +1278,13 @@ def main() -> int:
             "position axis invisibly."
         ),
     )
+    parser.add_argument(
+        "--camera-utc-offset",
+        help=(
+            "UTC offset of the camera clock, e.g. -04:00 for EDT. Used only when "
+            "EXIF carries no OffsetTimeOriginal. Overrides session.camera_utc_offset."
+        ),
+    )
     args = parser.parse_args()
 
     stats = import_session(
@@ -1237,6 +1298,7 @@ def main() -> int:
         migrations_dir=args.migrations,
         position_unit_um=args.position_unit_um,
         match_window_s=args.match_window_s,
+        camera_utc_offset=args.camera_utc_offset,
     )
 
     prefix = "would import" if args.dry_run else "imported"
@@ -1248,6 +1310,12 @@ def main() -> int:
     ):
         if stats[key]:
             print(f"  {key.replace('_', ' ')}: {stats[key]}")
+
+    if stats["timezone_assumed"]:
+        print(
+            f"  ! {stats['timezone_assumed']} frame(s) had no EXIF UTC offset; assumed this "
+            "machine's time zone. Pass --camera-utc-offset or set the camera's time zone."
+        )
 
     if stats["focus_runs_inserted"]:
         print(

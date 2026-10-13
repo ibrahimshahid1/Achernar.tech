@@ -1,7 +1,16 @@
-import { useCallback, useEffect, useState } from "react";
-import { cloudApi } from "../api/cloud";
-import { daemonApi, type CamParam, type CamFormat, type DriverCapability, type DiscoveryReport } from "../api/daemon";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+    achernarApi,
+    usesDjangoRelay,
+    type CamParam,
+    type CameraDescriptor,
+    type DriverCapability,
+    type DiscoveryReport,
+} from "../api/achernar";
 import { getHardwareTransport } from "../lib/runtime";
+import { useDaemonStatus } from "../hooks/useDaemonStatus";
+import { captureRetentionSummary } from "./captureRetention";
+import { canStartCameraPreview, captureCameraBundle } from "./captureCameraBundle";
 
 /**
  * Manual camera control panel.
@@ -13,19 +22,6 @@ import { getHardwareTransport } from "../lib/runtime";
  * Transport-aware: browser mode uses Django relay, desktop mode talks to the
  * local daemon directly.
  */
-
-const DRIVERS: DriverCapability[] = [
-    { id: "sim", label: "Simulator", compiled: true, enabled: true },
-    { id: "alpaca", label: "Alpaca", compiled: true, enabled: true },
-    { id: "svb", label: "SVBony", compiled: true, enabled: true },
-    { id: "asi", label: "ZWO ASI", compiled: true, enabled: true },
-    { id: "toup", label: "ToupTek", compiled: true, enabled: true },
-    { id: "uvc", label: "UVC / Webcam", compiled: true, enabled: true },
-    { id: "gphoto2", label: "DSLR (gphoto2)", compiled: true, enabled: true },
-    { id: "indi", label: "INDI", compiled: true, enabled: true },
-    { id: "indigo", label: "INDIGO", compiled: true, enabled: true },
-    { id: "wdir", label: "Watch Folder", compiled: true, enabled: true },
-];
 
 function humanize(name: string): string {
     return name.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
@@ -41,79 +37,114 @@ function capabilityReason(driver: DriverCapability): string {
 
 export default function CameraControls() {
     const hardwareTransport = getHardwareTransport();
-    const cameraApi = hardwareTransport === "django" ? cloudApi : daemonApi;
-    const [params, setParams] = useState<CamParam[]>([]);
-    const [formats, setFormats] = useState<CamFormat[]>([]);
+    const liveStatus = useDaemonStatus();
+    const liveCamera = liveStatus.data?.camera;
+    const liveCameraRef = useRef(liveCamera);
+    const descriptorInFlight = useRef(false);
+    liveCameraRef.current = liveCamera;
+    const [camera, setCamera] = useState<CameraDescriptor | null>(null);
     const [selectedFormat, setSelectedFormat] = useState(0);
-    const [connected, setConnected] = useState(false);
-    const [driver, setDriver] = useState("sim");
+    const [driver, setDriver] = useState("");
     const [driverCapabilities, setDriverCapabilities] = useState<DriverCapability[] | null>(null);
+    const [driverReportFailed, setDriverReportFailed] = useState(false);
     const [discovery, setDiscovery] = useState<DiscoveryReport | null>(null);
-    const [streaming, setStreaming] = useState(false);
     const [message, setMessage] = useState("No camera connected.");
     const [busy, setBusy] = useState(false);
     const [exposure, setExposure] = useState(1);
     const [lastCapture, setLastCapture] = useState<string | null>(null);
     const [captureWarnings, setCaptureWarnings] = useState<string[]>([]);
+    const [captureRetention, setCaptureRetention] = useState<string | null>(null);
     /**
      * Which camera within the selected driver's enumeration. Set by picking a
      * device from a scan; 0 when the operator chose a driver by hand, which is
      * the right default for the single-camera case.
      */
     const [selectedCameraIndex, setSelectedCameraIndex] = useState(0);
+    const params = camera?.controls ?? [];
+    const formats = camera?.formats ?? [];
+    const connected = liveCamera?.connected === true;
+    const streaming = liveCamera?.streaming === true;
+    const selectedCameraFormat = formats.find((format) => format.index === selectedFormat);
+    const previewAvailable = canStartCameraPreview(camera, selectedCameraFormat);
 
     const refresh = useCallback(async () => {
+        if (descriptorInFlight.current) return;
+        descriptorInFlight.current = true;
         try {
-            const [p, f] = await Promise.all([
-                cameraApi.getCameraParameters(),
-                cameraApi.getCameraFormats(),
-            ]);
-            setParams(p);
-            setFormats(f);
-            setConnected(true);
-
-            // Default to a live-view format when the body has one. On a DSLR a
-            // `still` format is one mechanical shutter actuation per frame, so
-            // landing on index 0 and pressing Start can burn thousands of
-            // actuations just framing a target.
-            const liveview = f.find((fmt) => fmt.mode === "liveview");
-            setSelectedFormat(liveview ? liveview.index : (f[0]?.index ?? 0));
-
-            setMessage(`${p.length} controls available.`);
-        } catch {
-            setConnected(false);
-            setParams([]);
-            setFormats([]);
-            setMessage("No camera connected.");
+            const descriptor = await achernarApi.getCameraDescriptor();
+            const current = liveCameraRef.current;
+            if (current?.connected !== true || (current.connection_id && current.connection_id !== descriptor.connection_id)) {
+                setCamera(null);
+                return;
+            }
+            setCamera(descriptor);
+            const liveview = descriptor.formats.find((format) => format.mode === "liveview");
+            setSelectedFormat(descriptor.streaming && descriptor.active_format_index !== null
+                ? descriptor.active_format_index
+                : (liveview?.index ?? descriptor.formats[0]?.index ?? 0));
+            if (descriptor.connected) {
+                if (descriptor.driver_id) setDriver(descriptor.driver_id);
+                if (descriptor.device_index !== null) setSelectedCameraIndex(descriptor.device_index);
+            }
+            setMessage(descriptor.connected
+                ? `${descriptor.controls.length} controls available.`
+                : "No camera connected.");
+        } catch (error) {
+            setCamera(null);
+            setMessage(error instanceof Error ? error.message : "Camera descriptor unavailable.");
+        } finally {
+            descriptorInFlight.current = false;
         }
-    }, [cameraApi]);
+    }, []);
 
     useEffect(() => {
-        refresh();
-    }, [refresh]);
+        if (liveCamera?.connected !== true) {
+            setCamera(null);
+            setMessage(liveStatus.online ? "No camera connected." : "Camera state unavailable.");
+            return;
+        }
+        void refresh();
+    }, [refresh, liveCamera?.connected, liveCamera?.connection_id, liveStatus.online]);
+
+    // A passive health probe or a just-completed connect can briefly own the
+    // acquisition gate. Keep the authoritative connection visible and retry
+    // the optional controls descriptor instead of offering a second connect.
+    useEffect(() => {
+        if (!connected || camera || busy) return;
+        let cancelled = false;
+        let retry: number;
+        const attempt = async () => {
+            await refresh();
+            if (!cancelled) retry = window.setTimeout(attempt, 1000);
+        };
+        retry = window.setTimeout(attempt, 750);
+        return () => { cancelled = true; window.clearTimeout(retry); };
+    }, [connected, camera, busy, refresh]);
 
     useEffect(() => {
         let cancelled = false;
 
-        cameraApi
+        achernarApi
             .getDriverCapabilities()
             .then((report) => {
                 if (!cancelled) {
                     setDriverCapabilities(report.camera);
+                    setDriverReportFailed(false);
                 }
             })
             .catch(() => {
                 if (!cancelled) {
                     setDriverCapabilities(null);
+                    setDriverReportFailed(true);
                 }
             });
 
         return () => {
             cancelled = true;
         };
-    }, [cameraApi]);
+    }, []);
 
-    const driverOptions = driverCapabilities ?? DRIVERS;
+    const driverOptions = driverCapabilities ?? [];
     const selectedDriver = driverOptions.find((d) => d.id === driver);
     const selectedDriverEnabled = selectedDriver?.enabled ?? false;
     const unavailableDrivers = driverOptions.filter((d) => !d.enabled);
@@ -126,11 +157,7 @@ export default function CameraControls() {
         if (current?.enabled) {
             return;
         }
-        const firstEnabled = driverCapabilities.find((d) => d.enabled);
-        if (firstEnabled) {
-            setDriver(firstEnabled.id);
-            setMessage(`${current?.label ?? driver} is unavailable in this build; selected ${firstEnabled.label}.`);
-        }
+        if (driver) setDriver("");
     }, [driver, driverCapabilities]);
 
     const connect = async () => {
@@ -145,11 +172,25 @@ export default function CameraControls() {
             // always returned it and the UI has always dropped it, so with two
             // cameras attached both connects opened camera 0 — which is exactly
             // the guiding + imaging setup, failing silently.
-            const res = await cameraApi.connectCamera(driver, undefined, selectedCameraIndex);
+            const res = await achernarApi.connectCamera(driver, undefined, selectedCameraIndex);
             setMessage(`Connected: ${res.camera ?? driver}`);
-            await refresh();
+            await liveStatus.refetch();
         } catch (e) {
             setMessage(e instanceof Error ? e.message : "Connect failed.");
+        } finally {
+            setBusy(false);
+        }
+    };
+
+    const disconnect = async () => {
+        setBusy(true);
+        try {
+            await achernarApi.disconnect("camera");
+            setCamera(null);
+            setMessage("Camera disconnected.");
+            await liveStatus.refetch();
+        } catch (error) {
+            setMessage(error instanceof Error ? error.message : "Disconnect failed.");
         } finally {
             setBusy(false);
         }
@@ -168,7 +209,7 @@ export default function CameraControls() {
         setMessage("Scanning for devices...");
         setDiscovery(null);
         try {
-            const report = await daemonApi.discoverDevices();
+            const report = await achernarApi.discoverDevices();
             setDiscovery(report);
             if (report.cameras.length > 0) {
                 // Preselect the first found device as the likely choice — its
@@ -189,21 +230,48 @@ export default function CameraControls() {
     };
 
     const setParam = async (name: string, value: number) => {
-        // Optimistic update, then reconcile with the value the hardware applied.
-        setParams((prev) => prev.map((p) => (p.name === name ? { ...p, current: value } : p)));
+        setBusy(true);
+        setMessage(`Applying ${params.find((p) => p.name === name)?.label ?? humanize(name)}...`);
         try {
-            const res = await cameraApi.setCameraParameter(name, value);
-            setParams((prev) => prev.map((p) => (p.name === name ? { ...p, current: res.value } : p)));
-        } catch {
-            setMessage(`Failed to set ${name}.`);
+            const res = await achernarApi.setCameraParameter(name, value);
+            // Refresh the body's labels and restrictions too: changing one
+            // control can change the choices available for another.
+            const controls = await achernarApi.getCameraParameters();
+            setCamera((previous) => previous && {
+                ...previous,
+                controls,
+            });
+            const applied = controls.find((p) => p.name === name);
+            const label = applied?.kind === "selection"
+                ? applied.choices[Math.round(applied.current)]
+                : applied?.kind === "bool"
+                    ? applied.current > 0.5 ? "on" : "off"
+                    : fmtVal(applied?.current ?? res.value);
+            setMessage(`${applied?.label ?? humanize(name)}: ${label} (read back from camera).`);
+        } catch (error) {
+            // Restore camera-authored state after a refused write instead of
+            // leaving an optimistic value looking like it was accepted.
+            try {
+                const controls = await achernarApi.getCameraParameters();
+                setCamera((previous) => previous && { ...previous, controls });
+            } catch {
+                // Preserve the original setting failure if readback also fails.
+            }
+            setMessage(error instanceof Error ? error.message : `Failed to set ${name}.`);
+        } finally {
+            setBusy(false);
         }
     };
 
     const startStream = async () => {
+        if (!previewAvailable) {
+            setMessage("Select a live-view format for preview; dedicated still exposures use Capture bundle.");
+            return;
+        }
         setBusy(true);
         try {
-            const res = await cameraApi.startCameraStream(selectedFormat);
-            setStreaming(true);
+            const res = await achernarApi.startCameraStream(selectedFormat);
+            setCamera((previous) => previous && { ...previous, streaming: true, active_format_index: selectedFormat });
             setMessage(`Streaming ${res.width}x${res.height} ${res.format}`);
         } catch (e) {
             setMessage(e instanceof Error ? e.message : "Start failed.");
@@ -215,8 +283,8 @@ export default function CameraControls() {
     const stopStream = async () => {
         setBusy(true);
         try {
-            await cameraApi.stopCameraStream();
-            setStreaming(false);
+            await achernarApi.stopCameraStream();
+            setCamera((previous) => previous && { ...previous, streaming: false });
             setMessage("Stream stopped.");
         } catch (e) {
             setMessage(e instanceof Error ? e.message : "Stop failed.");
@@ -228,27 +296,42 @@ export default function CameraControls() {
     const capture = async () => {
         setBusy(true);
         setMessage("Capturing...");
+        setCaptureRetention(null);
         try {
-            // Capture reads from the active stream, so ensure it's running.
-            if (!streaming) {
-                await cameraApi.startCameraStream(selectedFormat);
-                setStreaming(true);
-            }
             // Send gain only if this body actually has a numeric `gain` option.
             // A DSLR exposes ISO instead, and the daemon reads `<= 0` as "leave
             // the operator's setting alone" — so sending 0 does not mean "no
             // opinion", it overrides whatever ISO they dialled in on the body.
             const gainParam = params.find((p) => p.name === "gain");
             const gain = gainParam ? Math.round(gainParam.current) : undefined;
-            const bin = formats[selectedFormat]?.bin ?? 1;
-            const res = await cameraApi.capture({ exposure, gain, binning: bin });
+            const res = await captureCameraBundle(
+                achernarApi,
+                camera,
+                selectedCameraFormat,
+                { exposure, gain },
+                () => setCamera((previous) => previous && {
+                    ...previous,
+                    streaming: true,
+                    active_format_index: selectedFormat,
+                }),
+            );
             setLastCapture(res.path ?? res.id);
+            setCaptureRetention(captureRetentionSummary(res.retention));
 
             // Surface whatever the daemon flagged. These are real conditions —
             // an exposure the body could not reach, files left on the card, a
             // FITS that could not be derived — and a warning nobody sees is
             // the same as no warning.
             setCaptureWarnings(res.metadata?.warnings ?? []);
+
+            // A dedicated capture applies its requested shutter/ISO on the
+            // body. Keep the manual controls aligned with those settings.
+            try {
+                const controls = await achernarApi.getCameraParameters();
+                setCamera((previous) => previous && { ...previous, controls });
+            } catch {
+                // A later status-read failure does not invalidate a saved capture.
+            }
 
             const applied = res.metadata?.exposure;
             const shutter = res.metadata?.shutter;
@@ -275,18 +358,31 @@ export default function CameraControls() {
 
             {!connected ? (
                 <div className="cam-connect">
-                    <select className="cam-select grow" value={driver} onChange={(e) => setDriver(e.target.value)}>
-                        {driverOptions.map((d) => (
-                            <option key={d.id} value={d.id} disabled={!d.enabled} title={d.reason}>
-                                {d.label}
-                                {d.enabled ? "" : " - unavailable"}
+                    <select
+                        className="cam-select grow"
+                        value={driver}
+                        onChange={(e) => setDriver(e.target.value)}
+                        disabled={driverOptions.length === 0 || !liveStatus.online}
+                    >
+                        {driverOptions.length === 0 ? (
+                            <option value="">
+                                {driverReportFailed
+                                    ? "Driver list unavailable - daemon unreachable"
+                                    : "Reading driver list from daemon..."}
                             </option>
-                        ))}
+                        ) : (
+                            <><option value="">Choose a camera driver</option>{driverOptions.map((d) => (
+                                <option key={d.id} value={d.id} disabled={!d.enabled} title={d.reason}>
+                                    {d.label}
+                                    {d.enabled ? "" : " - unavailable"}
+                                </option>
+                            ))}</>
+                        )}
                     </select>
-                    <button type="button" className="cam-btn primary" onClick={connect} disabled={busy || !selectedDriverEnabled}>
+                    <button type="button" className="cam-btn primary" onClick={connect} disabled={busy || !selectedDriverEnabled || !liveStatus.online}>
                         Connect
                     </button>
-                    {hardwareTransport !== "django" && (
+                    {!usesDjangoRelay() && (
                         <button
                             type="button"
                             className="cam-btn"
@@ -367,7 +463,10 @@ export default function CameraControls() {
                         >
                             {formats.map((f) => (
                                 <option key={f.index} value={f.index}>
-                                    {f.format} · {f.width}×{f.height} · bin{f.bin} · {f.framerate.toFixed(0)}fps
+                                    {f.format} · {f.width}×{f.height} · bin{f.bin}
+                                    {f.mode !== "still" && (camera?.driver_id === "gphoto2"
+                                        ? ` · preview cap ${f.framerate.toFixed(0)}fps`
+                                        : ` · ${f.framerate.toFixed(0)}fps`)}
                                     {f.mode === "still" ? " · still (1 shutter/frame)" : " · live view"}
                                 </option>
                             ))}
@@ -377,15 +476,26 @@ export default function CameraControls() {
                                 Stop
                             </button>
                         ) : (
-                            <button type="button" className="cam-btn primary" onClick={startStream} disabled={locked}>
+                            <button
+                                type="button"
+                                className="cam-btn primary"
+                                onClick={startStream}
+                                disabled={locked || !previewAvailable}
+                                title={previewAvailable ? "Start preview" : "Dedicated still exposures use Capture bundle; select live view for preview"}
+                            >
                                 Start
                             </button>
                         )}
                         <button type="button" className="cam-btn ghost" onClick={refresh} disabled={busy}>
                             Refresh
                         </button>
+                        <button type="button" className="cam-btn ghost" onClick={disconnect} disabled={busy}>Disconnect</button>
                     </div>
 
+                    {camera?.driver_id === "gphoto2" && <p className="cam-note">
+                        Live-view speed depends on camera shutter and lighting. A long shutter can slow the preview;
+                        try a shorter shutter for smoother framing, then restore your exposure settings before capture.
+                    </p>}
                     <div className="cam-row cam-capture">
                         <label className="cam-field">
                             <span>Exposure (s)</span>
@@ -400,13 +510,24 @@ export default function CameraControls() {
                             />
                         </label>
                         <button type="button" className="cam-btn primary" onClick={capture} disabled={locked}>
-                            Capture → FITS
+                            Capture bundle
                         </button>
+                    </div>
+
+                    <div className="cam-note" role="note" aria-label="Capture retention policy">
+                        <strong>Keep camera originals</strong>. Capture requests retain camera originals;
+                        automatic deletion is unavailable. A persistent camera copy must be verified separately.
                     </div>
 
                     {lastCapture && (
                         <div className="cam-saved" title={lastCapture}>
                             Saved: <code>{lastCapture}</code>
+                        </div>
+                    )}
+
+                    {captureRetention && (
+                        <div className="cam-note" role="status" aria-label="Capture retention outcome">
+                            {captureRetention}
                         </div>
                     )}
 
@@ -418,17 +539,16 @@ export default function CameraControls() {
                         </ul>
                     )}
 
-                    {formats[selectedFormat]?.mode === "still" && (
+                    {camera?.capabilities.supports_dedicated_still && selectedCameraFormat?.mode === "still" && (
                         <div className="cam-warnings" role="note">
-                            This format takes one shutter actuation per frame. Streaming it
-                            fires the mechanical shutter continuously — use a live-view
-                            format for framing and focusing if the body offers one.
+                            Capture bundle takes one dedicated still exposure and saves its native files.
+                            Select a live-view format to start a preview.
                         </div>
                     )}
 
                     {params.length > 0 && (
                         <div className="cam-params">
-                            {params.map((p) => (
+                            {params.filter((p) => p.name !== "keep_images").map((p) => (
                                 <ParamRow
                                     key={p.name}
                                     param={p}
@@ -455,12 +575,16 @@ function ParamRow({
     disabled: boolean;
     onChange: (value: number) => void;
 }) {
+    const label = param.label ?? humanize(param.name);
+    const [draft, setDraft] = useState(String(param.current));
+    useEffect(() => setDraft(String(param.current)), [param.current]);
     if (param.kind === "bool") {
         return (
             <label className="cam-param cam-param-bool">
-                <span className="cam-param-label">{humanize(param.name)}</span>
+                <span className="cam-param-label">{label}{param.read_only ? " · read-only" : ""}</span>
                 <input
                     className="cam-switch"
+                    aria-label={label}
                     type="checkbox"
                     checked={param.current > 0.5}
                     disabled={disabled}
@@ -480,7 +604,7 @@ function ParamRow({
             <div className="cam-param cam-param-selection">
                 <div className="cam-param-top">
                     <span className="cam-param-label">
-                        {humanize(param.name)}
+                        {label}
                         {param.read_only ? " · read-only" : ""}
                     </span>
                     <span className="cam-param-val">
@@ -489,12 +613,13 @@ function ParamRow({
                 </div>
                 <select
                     className="cam-select"
+                    aria-label={label}
                     value={index}
                     disabled={disabled}
                     onChange={(e) => onChange(Number(e.target.value))}
                 >
                     {param.choices.map((label, i) => (
-                        <option key={`${label}-${i}`} value={i}>
+                        <option key={`${label}-${i}`} value={i} disabled={/^unknown value\b/i.test(label)}>
                             {label}
                         </option>
                     ))}
@@ -504,12 +629,15 @@ function ParamRow({
     }
 
     const step = param.step > 0 ? param.step : 1;
+    const draftValue = Number(draft);
+    const canApply = !disabled && draft.trim() !== "" && Number.isFinite(draftValue)
+        && draftValue >= param.min && draftValue <= param.max && draftValue !== param.current;
 
     return (
         <div className="cam-param">
             <div className="cam-param-top">
                 <span className="cam-param-label">
-                    {humanize(param.name)}
+                    {label}{param.unit ? ` (${param.unit})` : ""}
                     {param.read_only ? " · read-only" : ""}
                 </span>
                 <span className="cam-param-val">{fmtVal(param.current)}</span>
@@ -518,24 +646,32 @@ function ParamRow({
                 <div className="cam-param-ctl">
                     <input
                         className="cam-slider"
+                        aria-label={`${label} slider`}
                         type="range"
                         min={param.min}
                         max={param.max}
                         step={step}
-                        value={param.current}
+                        value={Number.isFinite(draftValue) ? draftValue : param.current}
                         disabled={disabled}
-                        onChange={(e) => onChange(Number(e.target.value))}
+                        onChange={(e) => setDraft(e.target.value)}
                     />
                     <input
                         className="cam-num"
+                        aria-label={label}
                         type="number"
                         min={param.min}
                         max={param.max}
                         step={step}
-                        value={param.current}
+                        value={draft}
                         disabled={disabled}
-                        onChange={(e) => onChange(Number(e.target.value))}
+                        onChange={(e) => setDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                            if (e.key === "Enter" && canApply) onChange(draftValue);
+                        }}
                     />
+                    <button type="button" className="cam-btn" disabled={!canApply} onClick={() => onChange(draftValue)}>
+                        Apply
+                    </button>
                 </div>
             )}
         </div>

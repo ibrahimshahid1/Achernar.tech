@@ -374,6 +374,23 @@ impl Mount {
     }
 
     /// Get full mount status (combined query).
+    /// Unlike `status`, this read cannot silently convert lost communication
+    /// into an apparently connected mount with unknown coordinates.
+    pub fn health_status(&self) -> crate::error::Result<MountStatus> {
+        if !self.is_connected() {
+            return Err(crate::error::HardwareError::Communication("Mount is disconnected".into()).into());
+        }
+        let position = self.get_position()?;
+        Ok(MountStatus {
+            connected: true,
+            driver_loaded: true,
+            mount_loaded: true,
+            position: Some(position),
+            tracking: self.is_tracking().ok(),
+            tracking_mode: self.get_tracking_mode().ok(),
+        })
+    }
+
     pub fn status(&self) -> MountStatus {
         let connected = self.is_connected();
         let driver_loaded = unsafe { ols_ffi::ols_mount_driver_loaded(self.handle) != 0 };

@@ -37,10 +37,30 @@ impl FilterWheel {
     }
 
     pub async fn connect(&mut self) -> crate::error::Result<()> {
-        todo!("Connect to filter wheel via {:?}", self.driver)
+        if !matches!(self.driver, FilterWheelDriver::Simulator) {
+            return Err(crate::error::HardwareError::Communication(
+                "Physical filter-wheel drivers are not implemented".into()).into());
+        }
+        self.connected = true;
+        Ok(())
     }
 
-    pub async fn set_position(&mut self, _pos: u32) -> crate::error::Result<()> {
-        todo!("Move filter wheel to position")
+    pub async fn set_position(&mut self, pos: u32) -> crate::error::Result<()> {
+        if !self.connected || !matches!(self.driver, FilterWheelDriver::Simulator) {
+            return Err(crate::error::HardwareError::Communication("Filter wheel is disconnected".into()).into());
+        }
+        if pos >= self.filter_count {
+            return Err(crate::error::HardwareError::Communication("Filter position is out of range".into()).into());
+        }
+        self.position = pos;
+        Ok(())
+    }
+
+    pub fn health_status(&self) -> crate::error::Result<serde_json::Value> {
+        if !self.connected || !matches!(self.driver, FilterWheelDriver::Simulator) {
+            return Err(crate::error::HardwareError::Communication("Filter wheel is disconnected".into()).into());
+        }
+        Ok(serde_json::json!({"connected": true, "name": "Simulator filter wheel",
+            "position": self.position, "moving": self.is_moving, "filter_count": self.filter_count}))
     }
 }

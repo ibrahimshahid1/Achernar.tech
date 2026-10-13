@@ -1,0 +1,11 @@
+.coc-validation { border-top: 1px solid var(--border, #3d4858); padding-top: 1rem; margin-top: 1rem; grid-column: 1 / -1; }
+.coc-validation p { line-height: 1.5; overflow-wrap: anywhere; }
+.coc-images { display: flex; flex-wrap: wrap; gap: 1rem; }
+.coc-images figure { margin: 0; width: min(100%, 340px); }
+.coc-images figcaption { min-height: 3rem; line-height: 1.4; }
+.coc-images img { display: block; width: 100%; aspect-ratio: 1; image-rendering: auto; }
+.coc-roi-image { position: relative; touch-action: none; }
+.coc-roi-image.selecting { cursor: crosshair; }
+.coc-roi-box { position: absolute; border: 2px solid #7aff8e; box-sizing: border-box; pointer-events: none; }
+.coc-notes { display: flex; flex-direction: column; gap: .4rem; margin-block: 1rem; max-width: 690px; }
+.coc-notes textarea { min-height: 5rem; background: #111923; color: inherit; border: 1px solid #64748b; padding: .6rem; border-radius: .3rem; }

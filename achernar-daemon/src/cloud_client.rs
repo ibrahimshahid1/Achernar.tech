@@ -81,12 +81,24 @@ pub fn spawn_if_configured(state: AppState) {
 
 async fn run_forever(state: AppState, config: CloudClientConfig) {
     let mut backoff = Duration::from_secs(1);
+    // Accepted hardware operations survive a gateway disconnect. Keep their
+    // capacity bound across reconnects, rather than creating another allowance
+    // while old native operations are still running.
+    let command_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
     loop {
         match register(&config).await {
             Ok(registration) => {
                 let gateway_url = config.gateway_url(&registration);
                 tracing::info!(daemon_id = %registration.daemon_id, "Registered daemon with Django relay");
-                match run_gateway(state.clone(), config.clone(), registration, gateway_url).await {
+                match run_gateway(
+                    state.clone(),
+                    config.clone(),
+                    registration,
+                    gateway_url,
+                    command_slots.clone(),
+                )
+                .await
+                {
                     Ok(()) => backoff = Duration::from_secs(1),
                     Err(err) => {
                         tracing::warn!("Django gateway disconnected: {err}");
@@ -131,6 +143,7 @@ async fn run_gateway(
     config: CloudClientConfig,
     registration: RegisterResponse,
     gateway_url: String,
+    command_slots: std::sync::Arc<tokio::sync::Semaphore>,
 ) -> Result<(), String> {
     let (ws, _) = connect_async(&gateway_url)
         .await
@@ -150,6 +163,10 @@ async fn run_gateway(
 
     let mut heartbeat = interval(Duration::from_secs(10));
     let mut telemetry = interval(Duration::from_secs(1));
+    let mut device_rx = state.device_updates.subscribe();
+    // Hardware commands may take seconds. Their completion must not block
+    // disconnect events, telemetry or heartbeats on the gateway writer.
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<Value>(16);
 
     loop {
         tokio::select! {
@@ -164,12 +181,28 @@ async fn run_gateway(
                 let msg = crate::telemetry::telemetry_event(&state);
                 write.send(Message::Text(msg.to_string())).await.map_err(|e| e.to_string())?;
             }
+            device_result = device_rx.recv() => {
+                if matches!(device_result, Err(tokio::sync::broadcast::error::RecvError::Closed)) { return Ok(()); }
+                let msg=crate::telemetry::telemetry_event(&state);
+                write.send(Message::Text(msg.to_string())).await.map_err(|e|e.to_string())?;
+            }
+            Some(result) = result_rx.recv() => {
+                write.send(Message::Text(result.to_string())).await.map_err(|e|e.to_string())?;
+            }
             incoming = read.next() => {
                 let incoming = incoming.ok_or_else(|| "gateway stream ended".to_string())?;
                 match incoming.map_err(|e| e.to_string())? {
                     Message::Text(text) => {
-                        if let Some(result) = handle_gateway_text(state.clone(), &text).await {
-                            write.send(Message::Text(result.to_string())).await.map_err(|e| e.to_string())?;
+                        let command_state=state.clone();
+                        let command_text=text.clone();
+                        let accepted=spawn_bounded_command(&command_slots,result_tx.clone(),async move {
+                            handle_gateway_text(command_state,&command_text).await
+                        });
+                        if accepted.is_err() {
+                                let parsed=serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+                                let busy=json!({"type":"COMMAND_RESULT","command_id":parsed.get("command_id"),
+                                    "ok":false,"error":"Daemon command capacity is busy; retry after pending operations complete"});
+                                write.send(Message::Text(busy.to_string())).await.map_err(|e|e.to_string())?;
                         }
                     }
                     Message::Close(_) => return Ok(()),
@@ -178,6 +211,29 @@ async fn run_gateway(
             }
         }
     }
+}
+
+/// Relay arms include synchronous vendor calls and std mutex acquisition.
+/// Polling those futures on Tokio workers could starve health deadlines and
+/// telemetry. A blocking worker drives each accepted future while the gateway
+/// remains free to service device events. No receiver lifetime cancels hardware.
+fn spawn_bounded_command<F>(
+    slots: &std::sync::Arc<tokio::sync::Semaphore>,
+    completed: tokio::sync::mpsc::Sender<Value>,
+    command: F,
+) -> Result<(), ()>
+where
+    F: std::future::Future<Output = Option<Value>> + Send + 'static,
+{
+    let permit = slots.clone().try_acquire_owned().map_err(|_| ())?;
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        if let Some(result) = runtime.block_on(command) {
+            let _ = completed.blocking_send(result);
+        }
+    });
+    Ok(())
 }
 
 async fn handle_gateway_text(state: AppState, text: &str) -> Option<Value> {
@@ -227,4 +283,54 @@ fn local_hardware_id() -> String {
         .or_else(|_| std::env::var("COMPUTERNAME"))
         .unwrap_or_else(|_| "local".to_string());
     format!("achernar-{hostname}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_command_does_not_starve_runtime() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let (results, mut received) = tokio::sync::mpsc::channel(1);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        spawn_bounded_command(&slots, results, async move {
+            let _ = started.send(());
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(1));
+            Some(json!({"complete":true}))
+        }).unwrap();
+        ready.await.unwrap();
+        // A synchronous SDK call must leave even a single Tokio worker free.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(matches!(received.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+        release.send(()).unwrap();
+        assert_eq!(tokio::time::timeout(Duration::from_secs(2), received.recv()).await.unwrap(), Some(json!({"complete":true})));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnected_gateway_keeps_global_capacity_and_accepted_work() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let reconnect_slots = slots.clone();
+        let (results, received) = tokio::sync::mpsc::channel(1);
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed = finished.clone();
+        spawn_bounded_command(&slots, results, async move {
+            let _ = started.send(());
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(1));
+            completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Some(json!({"complete":true}))
+        }).unwrap();
+        ready.await.unwrap();
+        drop(received);
+        let (new_results, _new_received) = tokio::sync::mpsc::channel(1);
+        assert!(spawn_bounded_command(&reconnect_slots, new_results, async { None }).is_err());
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while slots.available_permits() == 0 { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    }
 }

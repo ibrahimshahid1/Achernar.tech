@@ -2,13 +2,15 @@
 //!
 //! `driver_capability_report()` answers "which drivers were compiled into this
 //! build?". This module answers the different question "what is actually
-//! plugged in *right now*?" by instantiating each locally-attached driver and
-//! calling its device enumeration.
+//! plugged in *right now*?" by instantiating each locally-attached camera driver
+//! and calling its device enumeration. For mounts/focusers, an operator may
+//! instead query the configured-device list of one explicitly addressed Alpaca
+//! server. Those entries are reported configuration, not confirmed hardware.
 //!
-//! # Deliberate scope: local buses only
+//! # Deliberate scope: local buses and explicit endpoints
 //!
 //! Only USB/SDK drivers are probed (ASI, SVBony, ToupTek, UVC, gphoto2).
-//! Network transports are **not** scanned here:
+//! Network transports are **not** automatically scanned here:
 //!
 //! * **Alpaca** has a real discovery standard (ASCOM Alpaca Discovery: a UDP
 //!   broadcast of `alpacadiscovery1` to port 32227, to which devices reply with
@@ -29,7 +31,7 @@
 //! connected — consistent with the manual-first principle: the daemon reports
 //! what it found and the operator chooses what to connect.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::camera::OlsCameraDriver;
 use super::ols_ffi;
@@ -76,13 +78,256 @@ pub struct ProbeOutcome {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct DiscoveryReport {
     pub cameras: Vec<DiscoveredCamera>,
     pub probes: Vec<ProbeOutcome>,
+    pub mounts: Vec<DiscoveredDevice>,
+    pub focusers: Vec<DiscoveredDevice>,
+    pub filter_wheels: Vec<DiscoveredDevice>,
+    pub device_probes: Vec<DeviceProbeOutcome>,
     pub scanned_at: chrono::DateTime<chrono::Utc>,
     /// Human-readable caveats (what was deliberately not scanned, and why).
     pub notes: Vec<String>,
+}
+
+/// A configured device reported by an explicitly addressed server. This does
+/// not certify that the device is physically attached or can connect.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveredDevice {
+    pub driver_id: &'static str,
+    pub driver_label: &'static str,
+    /// Alpaca DeviceNumber, not position in the management response array.
+    pub index: i32,
+    pub name: String,
+    pub selection_key: String,
+    pub hardware_id: Option<String>,
+    pub transport: &'static str,
+    pub availability: &'static str,
+    /// Round-trip unchanged to /connect. Includes the exact device selector.
+    pub option: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceProbeOutcome {
+    pub equipment_type: &'static str,
+    pub driver_id: &'static str,
+    pub status: &'static str,
+    pub device_count: usize,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscoveryRequest {
+    pub equipment_type: Option<String>,
+    pub driver: Option<String>,
+    /// Explicit Alpaca base URL. Never defaults to network discovery.
+    pub option: Option<String>,
+}
+
+/// Scan local cameras or query one explicitly supplied Alpaca server. Native
+/// mount/focuser driver lists contain driver definitions, not attached devices,
+/// and must never be presented as discovered hardware.
+pub async fn discover_equipment(
+    state: &AppState,
+    request: DiscoveryRequest,
+) -> Result<DiscoveryReport, String> {
+    let kind = request.equipment_type.as_deref().unwrap_or("all");
+    if !matches!(
+        kind,
+        "all" | "camera" | "mount" | "focuser" | "filter_wheel"
+    ) {
+        return Err("equipment_type must be all, camera, mount, focuser or filter_wheel".into());
+    }
+    if request
+        .driver
+        .as_deref()
+        .is_some_and(|driver| driver != "alpaca")
+    {
+        return Err("Only an explicit Alpaca endpoint supports auxiliary discovery; INDI and serial drivers require manual configuration".into());
+    }
+    let endpoint = request
+        .option
+        .as_deref()
+        .map(validate_alpaca_endpoint)
+        .transpose()?;
+    let mut report = if matches!(kind, "all" | "camera") {
+        discover_cameras(state).await
+    } else {
+        DiscoveryReport {
+            scanned_at: chrono::Utc::now(),
+            ..Default::default()
+        }
+    };
+    let wants_mount = matches!(kind, "all" | "mount");
+    let wants_focuser = matches!(kind, "all" | "focuser");
+    if wants_mount || wants_focuser {
+        let result = if let Some(base) = endpoint {
+            Some(
+                tokio::task::spawn_blocking(move || query_alpaca_devices(&base))
+                    .await
+                    .map_err(|_| "Alpaca enumeration worker failed".to_string())
+                    .and_then(|result| result),
+            )
+        } else {
+            None
+        };
+        for (wanted, equipment_type) in [(wants_mount, "mount"), (wants_focuser, "focuser")] {
+            if !wanted {
+                continue;
+            }
+            let (devices, status, detail) = match &result {
+                Some(Ok((mounts, focusers))) => {
+                    let devices = if equipment_type == "mount" { mounts.clone() } else { focusers.clone() };
+                    let status = if devices.is_empty() { "empty" } else { "reported" };
+                    (devices, status, "Configured devices reported by the addressed Alpaca server; physical availability is verified only on connect".to_string())
+                }
+                Some(Err(error)) => (Vec::new(), "failed", error.clone()),
+                None => (Vec::new(), "manual_required", "Supply an explicit Alpaca server URL to list its configured devices. INDI/serial devices require manual configuration; no network broadcast or port scan was run".into()),
+            };
+            report.device_probes.push(DeviceProbeOutcome {
+                equipment_type,
+                driver_id: "alpaca",
+                status,
+                device_count: devices.len(),
+                detail,
+            });
+            if equipment_type == "mount" {
+                report.mounts = devices;
+            } else {
+                report.focusers = devices;
+            }
+        }
+    }
+    if matches!(kind, "all" | "filter_wheel") {
+        report.device_probes.push(DeviceProbeOutcome {
+            equipment_type: "filter_wheel",
+            driver_id: "none",
+            status: "unavailable",
+            device_count: 0,
+            detail:
+                "Filter-wheel discovery and hardware connection are not implemented in this build"
+                    .into(),
+        });
+    }
+    Ok(report)
+}
+
+fn validate_alpaca_endpoint(value: &str) -> Result<String, String> {
+    let uri: axum::http::Uri = value
+        .trim()
+        .parse()
+        .map_err(|_| "Invalid Alpaca base URL")?;
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri.host().is_none()
+        || uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
+        || uri.path() != "/" && !uri.path().is_empty()
+        || uri.query().is_some()
+        || value.contains('#')
+    {
+        return Err("Supply an HTTP(S) Alpaca server base URL without credentials, path, query or device suffix".into());
+    }
+    Ok(format!(
+        "{}://{}",
+        uri.scheme_str().unwrap(),
+        uri.authority().unwrap()
+    ))
+}
+
+fn query_alpaca_devices(
+    base: &str,
+) -> Result<(Vec<DiscoveredDevice>, Vec<DiscoveredDevice>), String> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(PROBE_TIMEOUT))
+        .max_redirects(0)
+        .build()
+        .new_agent();
+    let mut response = agent
+        .get(&format!("{base}/management/v1/configureddevices"))
+        .call()
+        .map_err(|error| format!("Alpaca server query failed: {error}"))?;
+    let bytes = response
+        .body_mut()
+        .with_config()
+        .limit(1024 * 1024)
+        .read_to_vec()
+        .map_err(|error| format!("Could not read Alpaca device list: {error}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| "Alpaca server returned an invalid JSON device list".to_string())?;
+    parse_alpaca_devices(base, &value)
+}
+
+fn parse_alpaca_devices(
+    base: &str,
+    value: &serde_json::Value,
+) -> Result<(Vec<DiscoveredDevice>, Vec<DiscoveredDevice>), String> {
+    if let Some(code) = value.get("ErrorNumber") {
+        let code = code
+            .as_i64()
+            .ok_or("Alpaca server returned an invalid ErrorNumber")?;
+        if code != 0 {
+            return Err("Alpaca server reported an error while listing configured devices".into());
+        }
+    }
+    let items = value
+        .get("Value")
+        .and_then(|v| v.as_array())
+        .ok_or("Alpaca device list is missing its Value array")?;
+    let mut mounts = Vec::new();
+    let mut focusers = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in items {
+        let device_type = item
+            .get("DeviceType")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let kind = match device_type.as_str() {
+            "telescope" => "mount",
+            "focuser" => "focuser",
+            _ => continue,
+        };
+        let index = item
+            .get("DeviceNumber")
+            .and_then(|v| v.as_i64())
+            .and_then(|number| i32::try_from(number).ok())
+            .filter(|number| *number >= 0)
+            .ok_or("Alpaca server reported an invalid DeviceNumber")?;
+        if !seen.insert((kind, index)) {
+            return Err(
+                "Alpaca server reported duplicate device numbers for one device type".into(),
+            );
+        }
+        let name = item
+            .get("DeviceName")
+            .and_then(|v| v.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .ok_or("Alpaca server reported a device without a name")?
+            .to_string();
+        let device = DiscoveredDevice {
+            driver_id: "alpaca",
+            driver_label: "ASCOM Alpaca",
+            index,
+            name,
+            selection_key: format!("{kind}:alpaca:{base}:{index}"),
+            hardware_id: item
+                .get("UniqueID")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            transport: "alpaca",
+            availability: "reported",
+            option: format!("{base}#device={index}"),
+        };
+        if kind == "mount" {
+            mounts.push(device);
+        } else {
+            focusers.push(device);
+        }
+    }
+    Ok((mounts, focusers))
 }
 
 /// Locally-attached camera drivers worth probing, with the build-capability
@@ -157,6 +402,7 @@ pub async fn discover_cameras(state: &AppState) -> DiscoveryReport {
                     .collect(),
                 scanned_at: chrono::Utc::now(),
                 notes,
+                ..Default::default()
             };
         }
     };
@@ -187,6 +433,7 @@ pub async fn discover_cameras(state: &AppState) -> DiscoveryReport {
                 .collect(),
             scanned_at: chrono::Utc::now(),
             notes,
+            ..Default::default()
         };
     }
 
@@ -299,6 +546,7 @@ pub async fn discover_cameras(state: &AppState) -> DiscoveryReport {
                     probes,
                     scanned_at: chrono::Utc::now(),
                     notes,
+                    ..Default::default()
                 };
             }
         }
@@ -317,12 +565,154 @@ pub async fn discover_cameras(state: &AppState) -> DiscoveryReport {
         probes,
         scanned_at: chrono::Utc::now(),
         notes,
+        ..Default::default()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_endpoint_rejects_auto_paths_credentials_and_selectors() {
+        assert_eq!(
+            validate_alpaca_endpoint(" http://127.0.0.1:11111/ ").unwrap(),
+            "http://127.0.0.1:11111"
+        );
+        assert_eq!(
+            validate_alpaca_endpoint("https://[::1]:11111").unwrap(),
+            "https://[::1]:11111"
+        );
+        for endpoint in [
+            "auto",
+            "localhost:11111",
+            "ftp://localhost",
+            "http://user:secret@localhost",
+            "http://localhost/api/v1",
+            "http://localhost?scan=all",
+            "http://localhost#device=7",
+        ] {
+            assert!(validate_alpaca_endpoint(endpoint).is_err(), "{endpoint}");
+        }
+    }
+
+    #[test]
+    fn management_list_preserves_device_numbers_and_connection_options() {
+        let value = serde_json::json!({"Value": [
+            {"DeviceType":"Telescope", "DeviceName":"First mount", "DeviceNumber":3, "UniqueID":"mount-a"},
+            {"DeviceType":"Camera", "DeviceName":"Not an auxiliary device", "DeviceNumber":9},
+            {"DeviceType":"Focuser", "DeviceName":"Focus unit", "DeviceNumber":7},
+            {"DeviceType":"TELESCOPE", "DeviceName":"Second mount", "DeviceNumber":0}
+        ]});
+        let (mounts, focusers) = parse_alpaca_devices("http://localhost:11111", &value).unwrap();
+        assert_eq!(
+            mounts.iter().map(|device| device.index).collect::<Vec<_>>(),
+            vec![3, 0]
+        );
+        assert_eq!(focusers.len(), 1);
+        assert_eq!(focusers[0].index, 7);
+        assert_eq!(focusers[0].option, "http://localhost:11111#device=7");
+        assert_eq!(mounts[0].hardware_id.as_deref(), Some("mount-a"));
+        assert_eq!(mounts[0].availability, "reported");
+        assert_ne!(mounts[0].selection_key, mounts[1].selection_key);
+        let json = serde_json::to_value(&focusers[0]).unwrap();
+        assert_eq!(json["driver_id"], "alpaca");
+        assert_eq!(json["transport"], "alpaca");
+        assert_eq!(json["option"], "http://localhost:11111#device=7");
+    }
+
+    #[test]
+    fn management_list_rejects_ambiguous_or_invalid_device_numbers() {
+        for number in [
+            serde_json::json!(-1),
+            serde_json::json!(2147483648_i64),
+            serde_json::json!(1.5),
+            serde_json::json!("1"),
+            serde_json::Value::Null,
+        ] {
+            let value = serde_json::json!({"Value":[
+                {"DeviceType":"Telescope", "DeviceName":"Mount", "DeviceNumber":number}
+            ]});
+            assert!(parse_alpaca_devices("http://localhost", &value).is_err());
+        }
+        let duplicate = serde_json::json!({"Value":[
+            {"DeviceType":"Telescope", "DeviceName":"A", "DeviceNumber":2},
+            {"DeviceType":"Telescope", "DeviceName":"B", "DeviceNumber":2}
+        ]});
+        assert!(parse_alpaca_devices("http://localhost", &duplicate).is_err());
+        // Device numbers are scoped by type, so mount 2 and focuser 2 are valid.
+        let distinct_types = serde_json::json!({"Value":[
+            {"DeviceType":"Telescope", "DeviceName":"Mount", "DeviceNumber":2},
+            {"DeviceType":"Focuser", "DeviceName":"Focus", "DeviceNumber":2}
+        ]});
+        assert!(parse_alpaca_devices("http://localhost", &distinct_types).is_ok());
+    }
+
+    #[test]
+    fn management_list_never_fabricates_devices_from_bad_or_unrelated_responses() {
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"Value":{}}),
+            serde_json::json!({"ErrorNumber":1024,"Value":[]}),
+            serde_json::json!({"ErrorNumber":"invalid","Value":[]}),
+            serde_json::json!({"Value":[{"DeviceType":"Focuser","DeviceNumber":0}]}),
+        ] {
+            assert!(parse_alpaca_devices("http://localhost", &response).is_err());
+        }
+        let (mounts, focusers) = parse_alpaca_devices(
+            "http://localhost",
+            &serde_json::json!({"Value":[
+                {"DeviceType":"FilterWheel", "DeviceName":"Wheel", "DeviceNumber":0}
+            ]}),
+        )
+        .unwrap();
+        assert!(mounts.is_empty() && focusers.is_empty());
+    }
+
+    #[test]
+    fn discovery_request_rejects_unknown_fields_and_wrong_types() {
+        assert!(serde_json::from_value::<DiscoveryRequest>(serde_json::json!({})).is_ok());
+        assert!(serde_json::from_value::<DiscoveryRequest>(
+            serde_json::json!({"equipment_type":"mount", "option":"http://localhost"})
+        )
+        .is_ok());
+        assert!(
+            serde_json::from_value::<DiscoveryRequest>(serde_json::json!({"optino":"auto"}))
+                .is_err()
+        );
+        assert!(
+            serde_json::from_value::<DiscoveryRequest>(serde_json::json!({"option":123})).is_err()
+        );
+    }
+
+    #[test]
+    fn explicit_server_query_only_reads_its_management_endpoint() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0 && request.len() < 16 * 1024);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            assert!(String::from_utf8(request)
+                .unwrap()
+                .starts_with("GET /management/v1/configureddevices HTTP/1.1\r\n"));
+            let body = r#"{"Value":[{"DeviceType":"Telescope","DeviceName":"Reported mount","DeviceNumber":4}]}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let (mounts, focusers) = query_alpaca_devices(&format!("http://{address}")).unwrap();
+        server.join().unwrap();
+        assert_eq!(mounts[0].index, 4);
+        assert!(focusers.is_empty());
+    }
 
     #[test]
     fn rejects_non_local_drivers() {
@@ -379,6 +769,7 @@ mod tests {
             }],
             scanned_at: chrono::Utc::now(),
             notes: vec!["note".to_string()],
+            ..Default::default()
         };
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["cameras"][0]["driver_id"], "svb");

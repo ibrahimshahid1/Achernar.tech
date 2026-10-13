@@ -442,7 +442,7 @@ namespace ols {
                 if(client.list_devices().empty()) {
                     throw std::runtime_error("No Telescope Device Found");
                 }
-                conn_ = client.base_url();
+                conn_ = client.connection_option();
             }
             create_log_file();
             cached_mount_.reset(new AlpacaMount(conn_,log_));

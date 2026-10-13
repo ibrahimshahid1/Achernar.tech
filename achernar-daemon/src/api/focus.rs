@@ -1,10 +1,17 @@
 //! Focus API endpoints — Section 7.5.2–7.5.4.
 //! All /api/v1/focus/* endpoints.
 
+use crate::api::api_error::ApiError;
 use crate::control::safety_guard::{FocusSafetyGuard, SafetyVerdict};
 use crate::error::{AchernarError, FocusError, HardwareError};
 use crate::focus::focus_agent::{FocusRunContext, FocusRunState, FocusSample};
+use crate::hardware::focuser::ConnectedFocuser;
+use crate::hardware::ols_ffi::{OlsBayerType, OlsCamOptionId, OlsStreamType};
 use crate::state::{AppState, CameraActivity};
+use crate::storage::capture_archive::ArchiveReservation;
+use crate::storage::capture_store::{
+    AssetRole, CommittedCapture, PendingAsset, PendingCapture, TemperatureState,
+};
 use crate::storage::local_store::LocalStore;
 use crate::vision::observed_frame::ObservedFrame;
 use crate::vision::shared_observation::SharedObservation;
@@ -42,7 +49,7 @@ pub struct StartFocusRunRequest {
 pub async fn start_focus_run(
     State(state): State<AppState>,
     Json(req): Json<StartFocusRunRequest>,
-) -> Result<Json<FocusRunResponse>, StatusCode> {
+) -> Result<Json<FocusRunResponse>, ApiError> {
     // Like a camera exposure, an autofocus sweep is a hardware transaction,
     // not a browser-request lifetime. Closing the page must not drop the
     // acquisition guard halfway through a focuser move and let another camera
@@ -51,18 +58,26 @@ pub async fn start_focus_run(
         .await
         .map_err(|error| {
             tracing::error!("Autofocus task failed: {error}");
-            StatusCode::INTERNAL_SERVER_ERROR
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "focus_task_failed",
+                error.to_string(),
+            )
         })?
 }
 
 async fn start_focus_run_owned(
     state: AppState,
     req: StartFocusRunRequest,
-) -> Result<Json<FocusRunResponse>, StatusCode> {
+) -> Result<Json<FocusRunResponse>, ApiError> {
     let method = req.method.as_deref().unwrap_or("classical");
     if !matches!(method, "classical" | "deterministic" | "hfr") {
         tracing::warn!("Unsupported focus method requested: {method}");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_focus_method",
+            format!("Unsupported focus method: {method}"),
+        ));
     }
 
     let mut config = state.focus_config.clone();
@@ -81,7 +96,11 @@ async fn start_focus_run_owned(
             Some(pattern) => config.sweep_pattern = pattern,
             None => {
                 tracing::warn!("Unsupported sweep pattern requested: {requested}");
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_sweep_pattern",
+                    format!("Unsupported sweep pattern: {requested}"),
+                ));
             }
         }
     }
@@ -93,8 +112,9 @@ async fn start_focus_run_owned(
     let _acquisition = state.acquisition.lock().await;
     state.focus_abort_requested.store(false, Ordering::SeqCst);
 
-    ensure_streaming(&state).await.map_err(status_for_error)?;
-    let start_position = current_focuser_position(&state).map_err(status_for_error)?;
+    validate_simulation_focus_run(&state).map_err(focus_api_error)?;
+    ensure_streaming(&state).await.map_err(focus_api_error)?;
+    let start_position = current_focuser_position(&state).map_err(focus_api_error)?;
     let rig_id = connected_rig_id(&state);
     let filter_name = req.filter_name.clone();
 
@@ -135,8 +155,8 @@ async fn start_focus_run_owned(
         Ok(run) => run,
         Err(err) => {
             // Preserve the partial sweep and every sample collected before the
-            // failure. These are still scientifically useful labels and explain
-            // the failed run; dropping them creates survivorship bias in FQE data.
+            // failure. Simulator samples explain the failed run while remaining
+            // explicitly excluded from scientific training datasets.
             let failed_run = agent.current_run().cloned();
             drop(agent);
             if let Some(failed_run) = failed_run {
@@ -147,7 +167,7 @@ async fn start_focus_run_owned(
                     );
                 }
             }
-            return Err(status_for_error(err));
+            return Err(focus_api_error(err));
         }
     };
     drop(agent);
@@ -191,7 +211,7 @@ async fn start_focus_run_owned(
             {
                 tracing::error!("Failed to persist unsuccessful focus action: {store_err}");
             }
-            return Err(status_for_error(err));
+            return Err(focus_api_error(err));
         }
         if let Err(err) = persist_focus_action(
             &state.local_store,
@@ -205,11 +225,8 @@ async fn start_focus_run_owned(
             tracing::error!("Focused successfully but failed to persist focus action: {err}");
         }
 
-        // Fold the converged position into the drift filter. Only here, after
-        // the move succeeded: this is the one moment the daemon knows, by
-        // measurement rather than by model, where best focus is.
-        let (temperature, _, _) = crate::api::camera::read_temperature(&state);
-        record_drift_measurement(&state, best_position, temperature, &run.samples).await;
+        // This stage permits simulator sweeps only. Their curve fit must not
+        // update a real rig's drift model or focuser scale calibration.
     }
 
     Ok(Json(response_from_run(&run)))
@@ -223,8 +240,15 @@ pub async fn abort_focus_run(State(state): State<AppState>) -> Result<StatusCode
     }
 
     if let Ok(mut focuser) = state.focuser.lock() {
-        if let Some(focuser) = focuser.as_mut() {
-            let _ = focuser.abort();
+        if crate::hardware::health::require_connected(
+            &state,
+            crate::hardware::health::DeviceKind::Focuser,
+        )
+        .is_ok()
+        {
+            if let Some(focuser) = focuser.as_mut() {
+                let _ = focuser.abort();
+            }
         }
     }
 
@@ -293,7 +317,10 @@ pub async fn get_drift_prediction(
         })));
     };
 
-    let horizon_s = query.horizon_s.filter(|h| h.is_finite() && *h >= 0.0).unwrap_or(600.0);
+    let horizon_s = query
+        .horizon_s
+        .filter(|h| h.is_finite() && *h >= 0.0)
+        .unwrap_or(600.0);
 
     // Temperature drives the forecast, so its provenance travels with the
     // answer. A DSLR has no sensor thermometer: `missing` is reported as
@@ -586,11 +613,47 @@ fn response_from_run(run: &FocusRunContext) -> FocusRunResponse {
     }
 }
 
-async fn ensure_streaming(state: &AppState) -> crate::error::Result<()> {
-    if *state.streaming.lock().unwrap() {
-        return Ok(());
-    }
+/// Physical autofocus remains unavailable until the analysis, timing,
+/// settings, stellar-sweep and driver qualification gates have passed.
+fn simulation_focus_allowed(camera_driver: Option<&str>, simulator_focuser: bool) -> bool {
+    camera_driver == Some("sim") && simulator_focuser
+}
 
+fn validate_simulation_focus_run(state: &AppState) -> crate::error::Result<()> {
+    let simulator_focuser = {
+        let focuser = state.focuser.lock().unwrap();
+        match focuser.as_ref().ok_or(FocusError::NoFocuser)? {
+            ConnectedFocuser::Simulator(_) => true,
+            ConnectedFocuser::Hardware(_) => false,
+        }
+    };
+    let camera_driver = state.camera_runtime.read().unwrap().driver_id.clone();
+    if !simulation_focus_allowed(camera_driver.as_deref(), simulator_focuser) {
+        return Err(HardwareError::Unsupported(
+            "Automatic physical autofocus is unavailable pending A03/A06/A13/A15/A23 qualification; this stage permits a simulator camera with a simulator focuser only"
+                .to_string(),
+        )
+        .into());
+    }
+    let camera = state.camera.lock().unwrap();
+    let camera = camera.as_ref().ok_or_else(|| {
+        HardwareError::DeviceNotFound("No camera connected for autofocus".to_string())
+    })?;
+    if camera.supports_still_capture() {
+        return Err(HardwareError::Unsupported(
+            "DSLR focus requires a dedicated archived still exposure; live-view and still-stream callbacks cannot supply a complete focus bundle"
+                .to_string(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn is_focus_sensor_format(format: OlsStreamType) -> bool {
+    matches!(format, OlsStreamType::Mono8 | OlsStreamType::Mono16)
+}
+
+async fn ensure_streaming(state: &AppState) -> crate::error::Result<()> {
     let mut camera = state.camera.lock().unwrap();
     let camera = camera.as_mut().ok_or_else(|| {
         HardwareError::DeviceNotFound("No camera connected for autofocus".to_string())
@@ -598,9 +661,30 @@ async fn ensure_streaming(state: &AppState) -> crate::error::Result<()> {
     let formats = camera
         .formats()
         .map_err(|err| HardwareError::Communication(err.to_string()))?;
-    let format = formats.first().ok_or_else(|| {
-        HardwareError::Unsupported("Camera reports no stream formats".to_string())
-    })?;
+    if *state.streaming.lock().unwrap() {
+        let active = state.camera_runtime.read().unwrap().active_format_index;
+        if active
+            .and_then(|index| formats.get(index))
+            .is_some_and(|format| is_focus_sensor_format(format.format))
+        {
+            return Ok(());
+        }
+        return Err(HardwareError::Unsupported(
+            "Autofocus requires an exact mono sensor stream; preview, RGB and CFA analysis remain unqualified"
+                .to_string(),
+        )
+        .into());
+    }
+    let (format_index, format) = formats
+        .iter()
+        .enumerate()
+        .find(|(_, format)| is_focus_sensor_format(format.format))
+        .ok_or_else(|| {
+            HardwareError::Unsupported(
+                "Autofocus requires an exact mono sensor stream; preview, RGB and CFA analysis remain unqualified"
+                    .to_string(),
+            )
+        })?;
     state.clear_camera_observations();
     let generation = state.current_camera_generation();
     camera
@@ -617,7 +701,7 @@ async fn ensure_streaming(state: &AppState) -> crate::error::Result<()> {
         let mut runtime = state.camera_runtime.write().unwrap();
         runtime.activity = CameraActivity::Streaming;
         runtime.streaming = true;
-        runtime.active_format_index = Some(0);
+        runtime.active_format_index = Some(format_index);
         runtime.last_error = None;
     }
     Ok(())
@@ -625,6 +709,8 @@ async fn ensure_streaming(state: &AppState) -> crate::error::Result<()> {
 
 fn current_focuser_position(state: &AppState) -> crate::error::Result<i32> {
     let focuser = state.focuser.lock().unwrap();
+    crate::hardware::health::require_connected(state, crate::hardware::health::DeviceKind::Focuser)
+        .map_err(|_| FocusError::NoFocuser)?;
     let focuser = focuser.as_ref().ok_or(FocusError::NoFocuser)?;
     focuser
         .position()
@@ -640,6 +726,9 @@ async fn measure_at_position(
     filter_name: Option<&str>,
 ) -> crate::error::Result<Vec<FocusSample>> {
     abort_if_requested(state)?;
+    // Storage backpressure must be visible before even a simulator focuser
+    // moves. The reservation is released if movement or settling fails.
+    let mut first_archive = Some(state.capture_archive.reserve()?);
     move_focuser_to_position(state, config, focus_safety, position).await?;
     abort_if_requested(state)?;
     tokio::time::sleep(Duration::from_millis(
@@ -653,17 +742,18 @@ async fn measure_at_position(
     let samples_per_position = config.samples_per_position.max(1);
     let mut samples = Vec::with_capacity(samples_per_position as usize);
     for _ in 0..samples_per_position {
+        let archive = match first_archive.take() {
+            Some(archive) => archive,
+            None => state.capture_archive.reserve()?,
+        };
         let observed = wait_for_fresh_frame(state).await?;
-        let frame_id =
-            persist_observed_frame(state, position, rig_id, filter_name, &observed).await;
-        // Read the temperature next to the frame it belongs to, not once per
-        // run: a sweep takes minutes and a tube cooling through it is the very
-        // effect the drift filter is trying to learn.
-        let (temperature, _, _) = crate::api::camera::read_temperature(state);
+        let (committed, temperature) =
+            persist_observed_frame(state, archive, position, rig_id, filter_name, &observed)
+                .await?;
         samples.push(sample_from_observation(
             position,
             &observed.observation,
-            frame_id,
+            &committed,
             temperature,
         )?);
     }
@@ -671,28 +761,147 @@ async fn measure_at_position(
     Ok(samples)
 }
 
-/// Persist the exact frame that produced `observed.observation` (best effort) so
-/// the FQE dataset builder can recover (crop, HFR) training pairs from pixels
-/// that provably match the label. Returns the new `frames.id`, or `None` if the
-/// write failed — a provenance failure must never abort an autofocus run.
+/// Archive the exact simulator sensor buffer and its analysis derivative.
+/// A missing local commit aborts measurement before a sample is accepted.
 async fn persist_observed_frame(
     state: &AppState,
+    archive: ArchiveReservation,
     position: i32,
     rig_id: &str,
     filter_name: Option<&str>,
     observed: &ObservedFrame,
-) -> Option<String> {
-    let observation = &observed.observation;
-    let luma = match crate::vision::quality::luma_from_frame(&observed.frame) {
-        Ok(luma) => luma,
-        Err(err) => {
-            tracing::warn!("Skipping autofocus frame persistence: {err}");
-            return None;
+) -> crate::error::Result<(CommittedCapture, Option<f64>)> {
+    if observed.frame.stream_generation != state.current_camera_generation() {
+        return Err(FocusError::RunFailed(
+            "Autofocus observation belongs to an inactive camera stream".to_string(),
+        )
+        .into());
+    }
+    let (cadence_s, camera_name) = {
+        let camera = state.camera.lock().unwrap();
+        let camera = camera.as_ref().ok_or_else(|| {
+            HardwareError::DeviceNotFound("No camera connected for autofocus".to_string())
+        })?;
+        let parameter = camera
+            .get_parameter(OlsCamOptionId::Exp)
+            .map_err(|error| HardwareError::Communication(error.to_string()))?;
+        if parameter.option_type != crate::hardware::ols_ffi::OlsCamOptionType::Msec
+            || !parameter.cur_val.is_finite()
+            || parameter.cur_val <= 0.0
+        {
+            return Err(HardwareError::Unsupported(
+                "Simulator frame cadence could not be read back in milliseconds".to_string(),
+            )
+            .into());
         }
+        (
+            parameter.cur_val / 1000.0,
+            Some(
+                camera
+                    .name()
+                    .map_err(|error| HardwareError::Communication(error.to_string()))?,
+            ),
+        )
     };
-
-    let camera_name = state.camera_name.lock().ok().and_then(|name| name.clone());
     let focuser_name = state.focuser_name.lock().ok().and_then(|name| name.clone());
+    let (temperature, temperature_state, temperature_source) =
+        crate::api::camera::read_temperature(state);
+    let pending = simulation_focus_bundle(
+        observed,
+        SimulationFocusMetadata {
+            position,
+            rig_id: rig_id.to_string(),
+            filter_name: filter_name.map(str::to_string),
+            camera_name,
+            focuser_name,
+            cadence_s,
+            temperature,
+            temperature_state,
+            temperature_source,
+        },
+    )?;
+    let capture_id = pending.capture_id.clone();
+    let frame_id = pending.frame_id.clone();
+    state
+        .capture_store
+        .begin_attempt(
+            state.local_store.pool(),
+            &capture_id,
+            None,
+            rig_id,
+            &serde_json::json!({
+                "capture_type": "focus",
+                "acquisition_domain": "simulation",
+                "training_label_eligible": false,
+                "focuser_position": position,
+                "stream_generation": observed.frame.stream_generation,
+                "frame_counter": observed.frame_counter,
+            }),
+        )
+        .await?;
+    let committed = archive.persist(pending).await?;
+    if committed.capture_id != capture_id || committed.frame_id != frame_id {
+        return Err(FocusError::RunFailed(
+            "Autofocus archive acknowledgement belongs to a different capture".to_string(),
+        )
+        .into());
+    }
+    Ok((committed, temperature))
+}
+
+struct SimulationFocusMetadata {
+    position: i32,
+    rig_id: String,
+    filter_name: Option<String>,
+    camera_name: Option<String>,
+    focuser_name: Option<String>,
+    cadence_s: f64,
+    temperature: Option<f64>,
+    temperature_state: TemperatureState,
+    temperature_source: Option<String>,
+}
+
+/// The permitted analysis domain is deliberately small while A03 is pending:
+/// mono identity conversion from an exact, uncompressed simulator buffer.
+fn simulation_focus_bundle(
+    observed: &ObservedFrame,
+    meta: SimulationFocusMetadata,
+) -> crate::error::Result<PendingCapture> {
+    if !meta.cadence_s.is_finite() || meta.cadence_s <= 0.0 {
+        return Err(FocusError::RunFailed("Invalid simulator frame cadence".to_string()).into());
+    }
+    let frame = &observed.frame;
+    if !is_focus_sensor_format(frame.format)
+        || frame.bayer != OlsBayerType::Na
+        || frame.source.is_some()
+    {
+        return Err(HardwareError::Unsupported(
+            "Autofocus cannot accept preview, selected-file or CFA data as a complete qualified sensor exposure"
+                .to_string(),
+        )
+        .into());
+    }
+    let bit_depth = if frame.format == OlsStreamType::Mono8 {
+        8
+    } else {
+        16
+    };
+    let expected_bytes = usize::try_from(frame.width)
+        .ok()
+        .zip(usize::try_from(frame.height).ok())
+        .and_then(|(width, height)| width.checked_mul(height))
+        .and_then(|pixels| pixels.checked_mul(bit_depth as usize / 8));
+    if frame.width <= 0
+        || frame.height <= 0
+        || expected_bytes != Some(frame.data.len())
+        || observed.frame_counter != frame.frame_counter
+        || observed.capture_unix_time != frame.unix_timestamp
+    {
+        return Err(FocusError::RunFailed(
+            "Autofocus sensor buffer does not match its observation envelope".to_string(),
+        )
+        .into());
+    }
     let capture_micros = observed.capture_unix_time * 1_000_000.0;
     let captured_at = if capture_micros.is_finite()
         && capture_micros >= i64::MIN as f64
@@ -702,45 +911,159 @@ async fn persist_observed_frame(
     } else {
         None
     }
-    .unwrap_or(observation.timestamp);
-    // Temperature, with its provenance. The drift forecaster is trained from
-    // these rows, and it cannot tell a measured reading from an invented one
-    // once both are just a number in a column — so a body with no thermometer
-    // records NULL and says why, rather than a plausible-looking value.
-    let (temperature, temperature_state, temperature_source) =
-        crate::api::camera::read_temperature(state);
-
-    let meta = crate::storage::frames_repo::FrameMeta {
-        captured_at: Some(captured_at),
-        filter_name: filter_name.map(str::to_string),
-        temperature,
-        quality_json: autofocus_quality_json(
-            position,
-            rig_id,
-            filter_name,
-            camera_name.as_deref(),
-            focuser_name.as_deref(),
-            observed.frame_counter,
-            observed.capture_unix_time,
-            observation,
-            &luma,
-            temperature_state,
-            temperature_source,
-        ),
-        ..Default::default()
+    .ok_or_else(|| FocusError::RunFailed("Invalid simulator frame timestamp".to_string()))?;
+    let luma = crate::vision::quality::luma_from_frame(frame)?;
+    let quality = autofocus_quality_json(
+        meta.position,
+        &meta.rig_id,
+        meta.filter_name.as_deref(),
+        meta.camera_name.as_deref(),
+        meta.focuser_name.as_deref(),
+        observed.frame_counter,
+        observed.capture_unix_time,
+        &observed.observation,
+        &luma,
+        meta.temperature_state,
+        meta.temperature_source.clone(),
+    );
+    let fits_meta = crate::fits::FitsMeta {
+        exposure_s: meta.cadence_s,
+        gain: 0,
+        temperature_c: meta.temperature.unwrap_or(f64::NAN),
+        binning: 1,
+        instrument: meta
+            .camera_name
+            .clone()
+            .unwrap_or_else(|| "Simulation".into()),
+        date_obs: captured_at.to_rfc3339(),
+        iso: None,
+        shutter_label: None,
+        source_file: None,
+        calibration: None,
     };
-
-    match state
-        .frame_store
-        .persist_luma(state.local_store.pool(), &luma, meta)
-        .await
-    {
-        Ok(persisted) => Some(persisted.id),
-        Err(err) => {
-            tracing::warn!("Failed to persist autofocus frame: {err}");
-            None
-        }
+    let fits_bytes = crate::fits::encode_capture(frame, &fits_meta).map_err(|error| {
+        crate::error::StorageError::Database(format!("encode autofocus sensor FITS: {error}"))
+    })?;
+    let analysis_bytes = encode_simulation_luma(&luma)?;
+    let descriptor = frame.analysis_sensor_descriptor()?;
+    let linear = crate::processing::debayer::analyze(&crate::processing::debayer::SensorFrame {
+        descriptor,
+        data: &frame.data,
+        masks: Default::default(),
+    })
+    .map_err(|error| FocusError::RunFailed(format!("Simulation analysis failed: {error}")))?;
+    if observed.observation.analysis_descriptor.as_ref() != Some(&linear.descriptor) {
+        return Err(FocusError::RunFailed("Simulator focus label does not match the exact archived analysis source and configuration".into()).into());
     }
+    let linear_assets = crate::storage::analysis_assets::analysis_assets(
+        &linear,
+        "sensor.fits",
+        &fits_bytes,
+        &frame.data,
+    )
+    .map_err(|error| {
+        FocusError::RunFailed(format!("Simulation analysis archive failed: {error}"))
+    })?;
+    Ok(PendingCapture {
+        capture_id: uuid::Uuid::new_v4().to_string(),
+        frame_id: uuid::Uuid::new_v4().to_string(),
+        session_id: None,
+        rig_id: meta.rig_id,
+        camera_name: meta.camera_name,
+        driver_name: Some("sim".into()),
+        capture_type: "focus".into(),
+        // The simulator supplies a delivery timestamp, not a physical shutter
+        // bracket. Preserve it without manufacturing an earlier start time.
+        exposure_started_at: observed.capture_unix_time,
+        exposure_completed_at: observed.capture_unix_time,
+        requested_exposure_s: meta.cadence_s,
+        requested_gain: None,
+        applied_exposure_s: meta.cadence_s,
+        iso: None,
+        shutter_label: None,
+        offset_val: None,
+        binning: 1,
+        filter_name: meta.filter_name,
+        focuser_position: Some(meta.position as i64),
+        temperature: meta.temperature,
+        temperature_source: meta.temperature_source,
+        temperature_state: meta.temperature_state,
+        acquisition: serde_json::json!({
+            "acquisition_domain": "simulation",
+            "training_label_eligible": false,
+            "analysis_version": crate::processing::debayer::PROCESSING_VERSION,
+            "analysis_descriptor": "analysis/analysis.json",
+            "stream_generation": frame.stream_generation,
+            "frame_counter": frame.frame_counter,
+            "stream_format": format!("{:?}", frame.format),
+            "timing_state": "simulator_delivery_timestamp_only",
+            "exposure_state": "simulator_cadence_readback_without_settings_write",
+            "gain_state": "unavailable",
+            "retention": crate::storage::capture_retention::RetentionDecision::retaining(false),
+            "quality": quality,
+        }),
+        assets: {
+            let mut assets = vec![
+                PendingAsset::new(
+                    AssetRole::SensorFits,
+                    "sensor.fits",
+                    "application/fits",
+                    fits_bytes,
+                )
+                .with_dimensions(frame.width as i64, frame.height as i64, bit_depth)
+                .with_provenance(serde_json::json!({
+                    "source": "exact_simulator_sensor_buffer",
+                    "acquisition_domain": "simulation",
+                    "training_label_eligible": false,
+                    "stream_format": format!("{:?}", frame.format),
+                })),
+                PendingAsset::new(
+                    AssetRole::AnalysisLuma,
+                    "luma.png",
+                    "image/png",
+                    analysis_bytes,
+                )
+                .derived_from(AssetRole::SensorFits)
+                .with_dimensions(frame.width as i64, frame.height as i64, 16)
+                .with_provenance(serde_json::json!({
+                    "analysis_version": "mono_identity_v1",
+                    "encoding": "uint16 PNG; mono sample values preserved without scaling",
+                    "acquisition_domain": "simulation",
+                    "training_label_eligible": false,
+                })),
+            ];
+            assets.extend(linear_assets);
+            assets
+        },
+    })
+}
+
+fn encode_simulation_luma(
+    luma: &crate::vision::quality::LumaFrame,
+) -> crate::error::Result<Vec<u8>> {
+    let pixels: Option<Vec<u16>> = luma
+        .pixels
+        .iter()
+        .map(|value| {
+            (value.is_finite() && *value >= 0.0 && *value <= u16::MAX as f32)
+                .then(|| value.round() as u16)
+        })
+        .collect();
+    let buffer = image::ImageBuffer::<image::Luma<u16>, Vec<u16>>::from_raw(
+        luma.width as u32,
+        luma.height as u32,
+        pixels.ok_or_else(|| {
+            FocusError::RunFailed("Simulator luma contains invalid sample values".to_string())
+        })?,
+    )
+    .ok_or_else(|| FocusError::RunFailed("Invalid simulator luma dimensions".to_string()))?;
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageLuma16(buffer)
+        .write_to(&mut encoded, image::ImageOutputFormat::Png)
+        .map_err(|error| {
+            crate::error::StorageError::Database(format!("encode autofocus analysis PNG: {error}"))
+        })?;
+    Ok(encoded.into_inner())
 }
 
 /// Everything about an autofocus frame that is not a column of its own.
@@ -769,7 +1092,10 @@ fn autofocus_quality_json(
     temperature_source: Option<String>,
 ) -> serde_json::Value {
     serde_json::json!({
-            "source": "autofocus",
+            "source": "autofocus_simulation",
+            "acquisition_domain": "simulation",
+            "training_label_eligible": false,
+            "analysis": luma.analysis_descriptor,
             "rig_id": rig_id,
             "camera_id": camera_name,
             "focuser_id": focuser_name,
@@ -862,6 +1188,11 @@ async fn move_focuser_to_position(
         abort_if_requested(state)?;
         let delta = {
             let mut focuser = state.focuser.lock().unwrap();
+            crate::hardware::health::require_connected(
+                state,
+                crate::hardware::health::DeviceKind::Focuser,
+            )
+            .map_err(|_| FocusError::NoFocuser)?;
             let focuser = focuser.as_mut().ok_or(FocusError::NoFocuser)?;
             let current = focuser
                 .position()
@@ -958,9 +1289,23 @@ fn abort_if_requested(state: &AppState) -> crate::error::Result<()> {
 fn sample_from_observation(
     position: i32,
     observation: &SharedObservation,
-    frame_id: Option<String>,
+    committed: &CommittedCapture,
     temperature: Option<f64>,
 ) -> crate::error::Result<FocusSample> {
+    if committed.status != "committed"
+        || committed.capture_id.trim().is_empty()
+        || committed.frame_id.trim().is_empty()
+        || !committed
+            .assets
+            .iter()
+            .any(|asset| asset.role == "sensor_fits" && asset.byte_length > 0)
+    {
+        return Err(FocusError::RunFailed(
+            "Autofocus requires a committed native sensor bundle before accepting a sample"
+                .to_string(),
+        )
+        .into());
+    }
     let hfr = match observation.hfr_px {
         Some(hfr) if observation.observation_valid && (hfr as f64).is_finite() && hfr > 0.0 => {
             hfr as f64
@@ -984,7 +1329,7 @@ fn sample_from_observation(
         quality_score: None,
         temperature,
         timestamp: observation.timestamp,
-        frame_id,
+        frame_id: Some(committed.frame_id.clone()),
     })
 }
 
@@ -1102,20 +1447,33 @@ fn storage_error(err: sqlx::Error) -> AchernarError {
     crate::error::StorageError::Database(err.to_string()).into()
 }
 
-fn status_for_error(err: AchernarError) -> StatusCode {
-    match err {
-        AchernarError::Focus(FocusError::NoFocuser) => StatusCode::PRECONDITION_FAILED,
-        AchernarError::Focus(FocusError::SafetyViolation(_)) => StatusCode::BAD_REQUEST,
-        AchernarError::Focus(_) => StatusCode::UNPROCESSABLE_ENTITY,
-        AchernarError::Hardware(HardwareError::DeviceNotFound(_)) => {
-            StatusCode::PRECONDITION_FAILED
+fn focus_api_error(err: AchernarError) -> ApiError {
+    let (status, code) = match &err {
+        AchernarError::Focus(FocusError::NoFocuser) => {
+            (StatusCode::PRECONDITION_FAILED, "focuser_not_connected")
         }
-        AchernarError::Hardware(HardwareError::Unsupported(_)) => StatusCode::PRECONDITION_FAILED,
-        AchernarError::Hardware(HardwareError::Timeout(_)) => StatusCode::GATEWAY_TIMEOUT,
-        AchernarError::Hardware(_) => StatusCode::BAD_GATEWAY,
-        AchernarError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        _ => StatusCode::INTERNAL_SERVER_ERROR,
-    }
+        AchernarError::Focus(FocusError::SafetyViolation(_)) => {
+            (StatusCode::BAD_REQUEST, "focus_safety_violation")
+        }
+        AchernarError::Focus(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "focus_measurement_unavailable",
+        ),
+        AchernarError::Hardware(HardwareError::DeviceNotFound(_)) => (
+            StatusCode::PRECONDITION_FAILED,
+            "focus_device_not_connected",
+        ),
+        AchernarError::Hardware(HardwareError::Unsupported(_)) => {
+            (StatusCode::PRECONDITION_FAILED, "focus_unqualified")
+        }
+        AchernarError::Hardware(HardwareError::Timeout(_)) => {
+            (StatusCode::GATEWAY_TIMEOUT, "focus_timeout")
+        }
+        AchernarError::Hardware(_) => (StatusCode::BAD_GATEWAY, "focus_hardware_error"),
+        AchernarError::Storage(_) => (StatusCode::INTERNAL_SERVER_ERROR, "focus_archive_error"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "focus_internal_error"),
+    };
+    ApiError::new(status, code, err.to_string())
 }
 
 #[cfg(test)]
@@ -1124,6 +1482,276 @@ mod tests {
     use crate::storage::capture_store::TemperatureState;
     use crate::vision::quality::LumaFrame;
 
+    fn simulator_observation() -> ObservedFrame {
+        let mut observation = SharedObservation::empty_for_test();
+        observation.observation_valid = true;
+        observation.hfr_px = Some(3.0);
+        observation.star_count = 1;
+        let mut observed = ObservedFrame {
+            frame_counter: 7,
+            capture_unix_time: 1_785_636_000.0,
+            frame: Arc::new(crate::hardware::camera::FrameData {
+                stream_generation: 1,
+                format: OlsStreamType::Mono16,
+                bayer: OlsBayerType::Na,
+                frame_counter: 7,
+                unix_timestamp: 1_785_636_000.0,
+                width: 2,
+                height: 2,
+                data: [0u16, 128, 16383, 65535]
+                    .into_iter()
+                    .flat_map(u16::to_le_bytes)
+                    .collect(),
+                source: None,
+                saturation_adu: Some(16383.0),
+                sensor_descriptor: Some(crate::processing::debayer::SensorDescriptor {
+                    schema_version: 1,
+                    width: 2,
+                    height: 2,
+                    row_stride_bytes: 4,
+                    sample_type: crate::processing::debayer::SampleType::U16,
+                    byte_order: crate::processing::debayer::ByteOrder::Little,
+                    color: crate::processing::debayer::SensorColor::Mono,
+                    domain: crate::processing::debayer::SampleDomain::NativeAdu,
+                    geometry: crate::processing::debayer::PixelGeometry::identity(
+                        "simulator_sensor_plane",
+                    ),
+                    saturation: None,
+                    calibration_ids: Vec::new(),
+                }),
+            }),
+            observation,
+        };
+        let frame = &observed.frame;
+        observed.observation.analysis_descriptor = Some(
+            crate::processing::debayer::analyze(&crate::processing::debayer::SensorFrame {
+                descriptor: frame.sensor_descriptor.as_ref().unwrap(),
+                data: &frame.data,
+                masks: Default::default(),
+            })
+            .unwrap()
+            .descriptor,
+        );
+        observed
+    }
+
+    fn simulator_metadata() -> SimulationFocusMetadata {
+        SimulationFocusMetadata {
+            position: 1200,
+            rig_id: "sim-rig".into(),
+            filter_name: None,
+            camera_name: Some("Simulation".into()),
+            focuser_name: Some("SimFocuser".into()),
+            cadence_s: 1.0,
+            temperature: None,
+            temperature_state: TemperatureState::Missing,
+            temperature_source: None,
+        }
+    }
+
+    #[test]
+    fn physical_focus_cannot_use_the_simulation_gate() {
+        assert!(simulation_focus_allowed(Some("sim"), true));
+        for driver in [None, Some("gphoto2"), Some("asi"), Some("uvc")] {
+            assert!(!simulation_focus_allowed(driver, true));
+        }
+        assert!(!simulation_focus_allowed(Some("sim"), false));
+    }
+
+    #[test]
+    fn focus_qualification_failure_preserves_the_actionable_reason() {
+        let error = focus_api_error(HardwareError::Unsupported(
+            "Automatic physical autofocus is unavailable pending A03/A06/A13/A15/A23 qualification".into(),
+        ).into());
+        assert_eq!(error.status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(error.code, "focus_unqualified");
+        assert!(error.message.contains("A03/A06/A13/A15/A23"));
+    }
+
+    #[test]
+    fn simulation_bundle_preserves_exact_sensor_and_analysis_samples() {
+        let observed = simulator_observation();
+        let pending = simulation_focus_bundle(&observed, simulator_metadata()).unwrap();
+        let sensor = pending
+            .assets
+            .iter()
+            .find(|a| a.role == AssetRole::SensorFits)
+            .unwrap();
+        let luma = pending
+            .assets
+            .iter()
+            .find(|a| a.role == AssetRole::AnalysisLuma)
+            .unwrap();
+        let expected = [0u16, 128, 16383, 65535];
+        let data: Vec<u16> = sensor.bytes[2880..2888]
+            .chunks_exact(2)
+            .map(|pair| (i16::from_be_bytes([pair[0], pair[1]]) as i32 + 32768) as u16)
+            .collect();
+        assert_eq!(data, expected);
+        let linear = pending
+            .assets
+            .iter()
+            .find(|asset| asset.role == AssetRole::AnalysisFits)
+            .unwrap();
+        let linear_samples: Vec<f32> = linear.bytes[2880..2896]
+            .chunks_exact(4)
+            .map(|sample| f32::from_be_bytes(sample.try_into().unwrap()))
+            .collect();
+        assert_eq!(linear_samples, expected.map(|value| value as f32));
+        let descriptor = pending
+            .assets
+            .iter()
+            .find(|asset| asset.role == AssetRole::AnalysisDescriptor)
+            .unwrap();
+        let descriptor: serde_json::Value = serde_json::from_slice(&descriptor.bytes).unwrap();
+        assert_eq!(descriptor["parent"]["filename"], "sensor.fits");
+        assert_eq!(descriptor["masks"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            image::load_from_memory(&luma.bytes)
+                .unwrap()
+                .to_luma16()
+                .into_raw(),
+            expected
+        );
+        assert_eq!(
+            pending.acquisition["quality"]["training_label_eligible"],
+            false
+        );
+        assert_eq!(
+            pending.acquisition["quality"]["acquisition_domain"],
+            "simulation"
+        );
+    }
+
+    #[test]
+    fn preview_cfa_and_mismatched_envelopes_cannot_be_archived_as_focus_sensor_data() {
+        for format in [
+            OlsStreamType::Mjpeg,
+            OlsStreamType::Raw16,
+            OlsStreamType::Rgb48,
+        ] {
+            let mut observed = simulator_observation();
+            Arc::make_mut(&mut observed.frame).format = format;
+            assert!(simulation_focus_bundle(&observed, simulator_metadata()).is_err());
+        }
+        let mut observed = simulator_observation();
+        Arc::make_mut(&mut observed.frame).source = Some(crate::hardware::camera::SourceImage {
+            ext: "cr3".into(),
+            bytes: vec![1, 2, 3],
+        });
+        assert!(simulation_focus_bundle(&observed, simulator_metadata()).is_err());
+        let mut observed = simulator_observation();
+        observed.frame_counter += 1;
+        assert!(simulation_focus_bundle(&observed, simulator_metadata()).is_err());
+        let mut observed = simulator_observation();
+        Arc::make_mut(&mut observed.frame).data.pop();
+        assert!(simulation_focus_bundle(&observed, simulator_metadata()).is_err());
+    }
+
+    #[test]
+    fn simulator_label_requires_exact_analysis_source_and_configuration() {
+        let mut observed = simulator_observation();
+        observed.observation.analysis_descriptor = None;
+        assert!(simulation_focus_bundle(&observed, simulator_metadata()).is_err());
+        let mut observed = simulator_observation();
+        observed
+            .observation
+            .analysis_descriptor
+            .as_mut()
+            .unwrap()
+            .source_sha256 = "older-frame".into();
+        assert!(simulation_focus_bundle(&observed, simulator_metadata()).is_err());
+        let mut observed = simulator_observation();
+        observed
+            .observation
+            .analysis_descriptor
+            .as_mut()
+            .unwrap()
+            .config_sha256 = "older-pipeline".into();
+        assert!(simulation_focus_bundle(&observed, simulator_metadata()).is_err());
+    }
+
+    #[tokio::test]
+    async fn focus_samples_require_distinct_committed_sensor_bundles() {
+        let dir =
+            std::env::temp_dir().join(format!("achernar-focus-archive-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = LocalStore::open(dir.join("achernar.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let store = crate::storage::capture_store::CaptureStore::new(dir.join("captures"));
+        let archive = crate::storage::capture_archive::CaptureArchive::spawn(
+            store.clone(),
+            local.pool().clone(),
+            1,
+        );
+        let mut ids = std::collections::BTreeSet::new();
+        for counter in [7, 8] {
+            let mut observed = simulator_observation();
+            observed.frame_counter = counter;
+            Arc::make_mut(&mut observed.frame).frame_counter = counter;
+            let pending = simulation_focus_bundle(&observed, simulator_metadata()).unwrap();
+            let quality = pending.acquisition["quality"].clone();
+            store
+                .begin_attempt(
+                    local.pool(),
+                    &pending.capture_id,
+                    None,
+                    "sim-rig",
+                    &serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+            let committed = archive.reserve().unwrap().persist(pending).await.unwrap();
+            let sensor_asset = committed
+                .assets
+                .iter()
+                .find(|asset| asset.role == "sensor_fits")
+                .unwrap();
+            let canonical: Vec<_> = committed
+                .assets
+                .iter()
+                .filter(|asset| {
+                    matches!(
+                        asset.role.as_str(),
+                        "analysis_fits" | "analysis_mask" | "analysis_descriptor"
+                    )
+                })
+                .collect();
+            assert_eq!(canonical.len(), 6);
+            assert!(canonical
+                .iter()
+                .all(|asset| asset.derived_from_asset_id.as_deref()
+                    == Some(sensor_asset.id.as_str())));
+            assert!(ids.insert(committed.capture_id.clone()));
+            let sample =
+                sample_from_observation(1200, &observed.observation, &committed, None).unwrap();
+            assert_eq!(
+                sample.frame_id.as_deref(),
+                Some(committed.frame_id.as_str())
+            );
+            let (stored_quality,): (String,) =
+                sqlx::query_as("SELECT quality_json FROM frames WHERE id = ?")
+                    .bind(&committed.frame_id)
+                    .fetch_one(local.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&stored_quality).unwrap(),
+                quality
+            );
+            let mut invalid = committed.clone();
+            invalid.status = "native_incomplete";
+            assert!(sample_from_observation(1200, &observed.observation, &invalid, None).is_err());
+            invalid.status = "committed";
+            invalid.assets.retain(|a| a.role != "sensor_fits");
+            assert!(sample_from_observation(1200, &observed.observation, &invalid, None).is_err());
+        }
+        drop(archive);
+        local.pool().close().await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     fn luma() -> LumaFrame {
         LumaFrame {
             pixels: vec![100.0; 4],
@@ -1131,6 +1759,8 @@ mod tests {
             height: 2,
             max_adu: 65535.0,
             saturation_adu: Some(16383.0),
+            masks: crate::processing::debayer::AnalysisMasks::empty(0),
+            analysis_descriptor: None,
         }
     }
 
@@ -1243,11 +1873,10 @@ mod tests {
             let Some(rest) = source.strip_prefix("frames.quality_json -> ") else {
                 continue;
             };
-            for key in rest.split(", else ").map(|k| {
-                k.trim()
-                    .trim_end_matches(" (preferred)")
-                    .trim()
-            }) {
+            for key in rest
+                .split(", else ")
+                .map(|k| k.trim().trim_end_matches(" (preferred)").trim())
+            {
                 assert!(
                     json.get(key).is_some(),
                     "FOP contract feature {:?} reads frames.quality_json -> {key}, \

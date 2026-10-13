@@ -267,12 +267,23 @@ def build_dataset(
     }
     frames_read = 0
     frames_skipped_unknown_saturation = 0
+    frames_skipped_ineligible = 0
     stars_kept = 0
     sources_detected = 0
     sources_valid = 0
     db_dir = Path(db_path).resolve().parent
 
     for row in rows:
+        quality = _quality_dict(row["quality_json"])
+        # Simulation/preview archives exercise storage but do not supply
+        # scientific labels. The fixture-only saturation override must not
+        # override an explicit acquisition eligibility decision.
+        if (
+            quality.get("training_label_eligible") is False
+            or quality.get("acquisition_domain") in {"simulation", "preview"}
+        ):
+            frames_skipped_ineligible += 1
+            continue
         raw_path = row["local_path"]
         if not raw_path:
             continue
@@ -314,7 +325,6 @@ def build_dataset(
         sources_detected += len(sources)
         sources_valid += sum(source.valid for source in sources)
 
-        quality = _quality_dict(row["quality_json"])
         run_key = str(row["run_key"])
         rid = run_index.setdefault(run_key, len(run_index))
         rig_id_value = str(row["rig_id"] or quality.get("rig_id") or "unknown-rig")
@@ -378,6 +388,8 @@ def build_dataset(
                 "--allow-missing-saturation for synthetic fixtures only."
             )
         )
+        if frames_skipped_ineligible:
+            hint += f" {frames_skipped_ineligible} frame(s) were excluded by acquisition eligibility."
         raise RuntimeError(f"No usable star crops found in {db_path}. {hint}")
 
     dataset = {
@@ -412,6 +424,7 @@ def build_dataset(
         "label_method": "SEP mesh background + deblending + aperture-normalized flux_radius",
         "frames_read": frames_read,
         "frames_skipped_unknown_saturation": frames_skipped_unknown_saturation,
+        "frames_skipped_ineligible": frames_skipped_ineligible,
         "sources_detected": sources_detected,
         "sources_valid": sources_valid,
         "stars_kept": stars_kept,

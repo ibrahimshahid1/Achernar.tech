@@ -25,20 +25,20 @@ const BLOCK: usize = 2880;
 ///
 /// These cards travel together or not at all. Their presence is the file's
 /// assertion that nothing has been subtracted from or multiplied into the
-/// pixels — the numbers are what the ADC produced, and everything needed to
-/// calibrate them is here. Emitting `BLKLEVEL` on a frame that has already had
+/// pixels since LibRaw unpack. Camera/decoder transformations can precede
+/// unpack; these constants are metadata, not independently measured calibration. Emitting `BLKLEVEL` on a frame that has already had
 /// black subtracted would be worse than emitting nothing, because a downstream
 /// pipeline would subtract it twice.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct SensorCalibration {
     /// Black pedestal in ADU, **not** subtracted.
     pub black_level: i32,
     /// Per-CFA-channel black offsets, added to `black_level`. `[0; 4]` on
     /// bodies with a single pedestal.
     pub cblack: [i32; 4],
-    /// Saturation point in ADU. On a 14-bit body this is 16383, not 65535 —
-    /// which is the entire reason the card exists. A saturation test against
-    /// the container depth can never fire.
+    pub cblack_pattern: [i32; 2],
+    /// Declared unpack-domain white code in ADU; zero means unavailable.
+    /// It is separate from container capacity and measured nonlinearity.
     pub white_level: i32,
     /// Offset of the Bayer pattern origin from the image origin. Zero when the
     /// decoder's crop preserved the phase. Written explicitly rather than
@@ -46,6 +46,7 @@ pub struct SensorCalibration {
     /// considered the offset".
     pub bayer_x_offset: i32,
     pub bayer_y_offset: i32,
+    pub decoder_metadata: Option<crate::hardware::raw_decode::RawDecodeMetadata>,
 }
 
 /// Acquisition metadata recorded in the FITS header.
@@ -100,6 +101,222 @@ pub fn encode_capture(frame: &FrameData, meta: &FitsMeta) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Encode a canonical linear analysis plane without integer conversion,
+/// clipping, scaling or acquisition metadata inferred from a request.
+/// NaNs are retained; the analysis bundle must carry their invalid mask.
+pub fn encode_linear_analysis(
+    pixels: &[f32],
+    width: usize,
+    height: usize,
+    units: &str,
+    processing_version: &str,
+) -> Result<Vec<u8>> {
+    validate_analysis_shape(pixels.len(), width, height)?;
+    let mut out = analysis_header(-32, width, height, units, processing_version);
+    for value in pixels {
+        out.extend_from_slice(&value.to_be_bytes());
+    }
+    pad(&mut out, 0);
+    Ok(out)
+}
+
+/// A separate unsigned byte FITS plane: zero is clear, one is flagged.
+pub fn encode_analysis_mask(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    processing_version: &str,
+) -> Result<Vec<u8>> {
+    validate_analysis_shape(pixels.len(), width, height)?;
+    if pixels.iter().any(|value| *value > 1) {
+        return Err(anyhow!("Analysis masks must contain only zero or one"));
+    }
+    let mut out = analysis_header(8, width, height, "1", processing_version);
+    out.extend_from_slice(pixels);
+    pad(&mut out, 0);
+    Ok(out)
+}
+
+fn validate_analysis_shape(length: usize, width: usize, height: usize) -> Result<()> {
+    if width == 0 || height == 0 || width.checked_mul(height) != Some(length) {
+        return Err(anyhow!("Analysis FITS shape does not match its samples"));
+    }
+    Ok(())
+}
+
+fn analysis_header(
+    bitpix: i32,
+    width: usize,
+    height: usize,
+    units: &str,
+    processing_version: &str,
+) -> Vec<u8> {
+    // The JSON descriptor is authoritative for full configuration, masks and
+    // geometry; the FITS itself records enough to identify that descriptor.
+    let cards = [
+        card_logical("SIMPLE", true, "conforms to FITS standard"),
+        card_int("BITPIX", bitpix as i64, ""),
+        card_int("NAXIS", 2, ""),
+        card_int("NAXIS1", width as i64, ""),
+        card_int("NAXIS2", height as i64, ""),
+        card_string("BUNIT", units, "analysis units; see descriptor"),
+        card_string("ANALVER", processing_version, "processing version"),
+        card_string("GEOMREF", "analysis.json", "geometry and mask descriptor"),
+        "END".to_string(),
+    ];
+    let mut bytes = Vec::new();
+    for card in cards {
+        let mut card = card.into_bytes();
+        card.truncate(80);
+        card.resize(80, b' ');
+        bytes.extend_from_slice(&card);
+    }
+    pad(&mut bytes, b' ');
+    bytes
+}
+
+#[cfg(test)]
+mod analysis_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn float_fits_preserves_fraction_negative_and_nan_bits() {
+        let values = [-4.25f32, 0.125, 65535.0, f32::NAN];
+        let bytes = encode_linear_analysis(&values, 2, 2, "ADU", "linear_v1").unwrap();
+        let header = std::str::from_utf8(&bytes[..BLOCK]).unwrap();
+        assert!(header.contains("BITPIX  =                  -32"));
+        assert!(!header.contains("BZERO"));
+        assert!(!header.contains("EXPTIME"));
+        for (sample, encoded) in values.iter().zip(bytes[BLOCK..BLOCK + 16].chunks_exact(4)) {
+            assert_eq!(
+                sample.to_bits(),
+                u32::from_be_bytes(encoded.try_into().unwrap())
+            );
+        }
+        assert_eq!(bytes.len() % BLOCK, 0);
+    }
+
+    #[test]
+    fn mask_fits_keeps_binary_samples_and_refuses_bad_shape() {
+        let bytes = encode_analysis_mask(&[0, 1, 1, 0], 2, 2, "linear_v1").unwrap();
+        assert_eq!(&bytes[BLOCK..BLOCK + 4], &[0, 1, 1, 0]);
+        assert!(encode_analysis_mask(&[2], 1, 1, "linear_v1").is_err());
+        assert!(encode_linear_analysis(&[1.0], 0, 1, "ADU", "linear_v1").is_err());
+        assert!(encode_linear_analysis(&[1.0], 2, 1, "ADU", "linear_v1").is_err());
+    }
+
+    #[test]
+    fn camera_jpeg_can_archive_a_fits_without_claiming_linear_analysis() {
+        let image = image::DynamicImage::new_rgb8(2, 2);
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut jpeg, image::ImageOutputFormat::Jpeg(90))
+            .unwrap();
+        let meta = FitsMeta {
+            exposure_s: 1.0,
+            gain: 0,
+            temperature_c: f64::NAN,
+            binning: 1,
+            instrument: "fixture".into(),
+            date_obs: "2026-10-12T00:00:00Z".into(),
+            iso: None,
+            shutter_label: None,
+            source_file: None,
+            calibration: None,
+        };
+        let derived = fits_from_source(jpeg.get_ref(), "jpg", &meta)
+            .unwrap()
+            .unwrap();
+        assert!(!derived.bytes.is_empty());
+        assert!(derived.analysis_assets.is_empty());
+        assert!(derived
+            .analysis_pending_reason
+            .unwrap()
+            .contains("processed image domain"));
+    }
+
+    /// Explicit local file opt-in; never connects to or triggers a camera.
+    #[test]
+    #[ignore = "set ACHERNAR_RAW_FIXTURE to an existing RAW; optional ACHERNAR_RAW_FIXTURE_OUTPUT exports for Astropy"]
+    fn existing_raw_crop_exports_production_sensor_and_analysis_assets() {
+        let path = std::env::var("ACHERNAR_RAW_FIXTURE").expect("RAW fixture path required");
+        let bytes = fs::read(path).unwrap();
+        let image = crate::hardware::raw_decode::decode_region(&bytes, Some((128, 128))).unwrap();
+        let info = image.info();
+        assert!(info.black_level_is_complete());
+        let metadata = info.decoder_metadata.as_ref().unwrap();
+        let meta = FitsMeta {
+            exposure_s: f64::NAN,
+            gain: 0,
+            temperature_c: f64::NAN,
+            binning: 1,
+            instrument: format!("{} {}", info.make, info.model),
+            date_obs: String::new(),
+            iso: None,
+            shutter_label: None,
+            source_file: None,
+            calibration: Some(SensorCalibration {
+                black_level: info.black_level,
+                cblack: info.cblack,
+                cblack_pattern: info.cblack_pattern,
+                white_level: info.white_level,
+                bayer_x_offset: 0,
+                bayer_y_offset: 0,
+                decoder_metadata: Some(metadata.clone()),
+            }),
+        };
+        let sensor = encode_bayer_u16(
+            image.pixels(),
+            info.width,
+            info.height,
+            &meta,
+            bayer_pattern(info.bayer),
+        )
+        .unwrap();
+        let assets = raw_analysis_assets(info, image.pixels(), &sensor).unwrap();
+        assert_eq!(assets.len(), 6);
+        for asset in &assets {
+            assert_eq!(
+                asset.derived_from,
+                Some(crate::storage::capture_store::AssetRole::SensorFits)
+            );
+            assert_eq!(asset.derived_from_filename.as_deref(), Some("image.fits"));
+        }
+        if let Ok(directory) = std::env::var("ACHERNAR_RAW_FIXTURE_OUTPUT") {
+            let directory = PathBuf::from(directory);
+            fs::create_dir_all(directory.join("derived")).unwrap();
+            fs::create_dir_all(directory.join("analysis")).unwrap();
+            fs::write(directory.join("derived/image.fits"), sensor).unwrap();
+            fs::write(directory.join("sensor.u16"), image.pixels()).unwrap();
+            fs::write(
+                directory.join("raw_info.json"),
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "metadata": metadata, "black_level": info.black_level, "cblack": info.cblack,
+                    "cblack_pattern": info.cblack_pattern, "white_level": info.white_level,
+                    "cam_mul": info.cam_mul, "make": info.make, "model": info.model,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            for asset in assets {
+                fs::write(directory.join("analysis").join(asset.filename), asset.bytes).unwrap();
+            }
+            fs::write(
+                directory.join("negative.fits"),
+                encode_linear_analysis(
+                    &[-4.25, 0.125, 65535.0, f32::NAN],
+                    2,
+                    2,
+                    "adu",
+                    "encoding-fixture-v1",
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        }
+    }
+}
+
 /// Encode a 16-bit single-plane image straight from a borrowed buffer.
 ///
 /// `pixels` is `width * height * 2` bytes of row-major native-endian `u16` —
@@ -117,10 +334,13 @@ pub fn encode_bayer_u16(
     meta: &FitsMeta,
     bayer: Option<&str>,
 ) -> Result<Vec<u8>> {
-    let expected = width as usize * height as usize * 2;
-    if pixels.len() < expected {
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|count| count.checked_mul(2))
+        .ok_or_else(|| anyhow!("16-bit plane dimensions overflow"))?;
+    if width == 0 || height == 0 || pixels.len() != expected {
         return Err(anyhow!(
-            "16-bit buffer too small: {} < {}",
+            "16-bit buffer must exactly match a nonempty plane: {} != {}",
             pixels.len(),
             expected
         ));
@@ -162,6 +382,8 @@ pub struct DerivedFits {
     /// Present for RAW containers: what the decoder chose not to apply, for
     /// the asset's `acquisition_json`. Recorded, never applied.
     pub raw_info: Option<crate::hardware::raw_decode::RawInfo>,
+    pub analysis_assets: Vec<crate::storage::capture_store::PendingAsset>,
+    pub analysis_pending_reason: Option<String>,
 }
 
 /// Derive a FITS from the bytes the camera itself wrote.
@@ -201,6 +423,7 @@ pub fn fits_from_source(
             meta.calibration = Some(SensorCalibration {
                 black_level: info.black_level,
                 cblack: info.cblack,
+                cblack_pattern: info.cblack_pattern,
                 white_level: info.white_level,
                 // Zero, and not by luck: the bridge evaluates the CFA at the
                 // raw coordinates of the crop origin, so `info.bayer` already
@@ -209,12 +432,18 @@ pub fn fits_from_source(
                 // RGGB — which is the correct answer for this plane, not a bug.
                 bayer_x_offset: 0,
                 bayer_y_offset: 0,
+                decoder_metadata: info.decoder_metadata.clone(),
             });
 
             let bayer = bayer_pattern(info.bayer);
             // `pixels()` borrows the C++ buffer; nothing is copied on the way
             // into the encoder.
             let out = encode_bayer_u16(image.pixels(), info.width, info.height, &meta, bayer)?;
+            let analysis = raw_analysis_assets(&info, image.pixels(), &out);
+            let (analysis_assets, analysis_pending_reason) = match analysis {
+                Ok(assets) => (assets, None),
+                Err(error) => (Vec::new(), Some(error.to_string())),
+            };
 
             Ok(Some(DerivedFits {
                 bytes: out,
@@ -223,6 +452,8 @@ pub fn fits_from_source(
                 bit_depth: 16,
                 decoder: "libraw",
                 raw_info: Some(info),
+                analysis_assets,
+                analysis_pending_reason,
             }))
         }
         "jpg" | "jpeg" => {
@@ -241,10 +472,100 @@ pub fn fits_from_source(
                 bit_depth: 8,
                 decoder: "image-rs/jpeg",
                 raw_info: None,
+                analysis_assets: Vec::new(),
+                analysis_pending_reason: Some(
+                    "Camera JPEG is a processed image domain, not untouched linear sensor samples"
+                        .into(),
+                ),
             }))
         }
         _ => Ok(None),
     }
+}
+
+fn raw_analysis_assets(
+    info: &crate::hardware::raw_decode::RawInfo,
+    pixels: &[u8],
+    sensor_fits: &[u8],
+) -> Result<Vec<crate::storage::capture_store::PendingAsset>> {
+    use crate::processing::debayer::*;
+    // LibRaw reports phase at the crop origin. The affine mapping names its
+    // raw array, with unapplied orientation/aspect recorded as decoder evidence.
+    let pattern = match info.bayer {
+        OlsBayerType::Rg => CfaPattern::Rggb,
+        OlsBayerType::Bg => CfaPattern::Bggr,
+        OlsBayerType::Gr => CfaPattern::Grbg,
+        OlsBayerType::Gb => CfaPattern::Gbrg,
+        OlsBayerType::Na => {
+            return Err(anyhow!(
+                "RAW CFA is unknown; cannot infer monochrome from a missing pattern"
+            ))
+        }
+    };
+    let metadata = info
+        .decoder_metadata
+        .as_ref()
+        .ok_or_else(|| anyhow!("Missing untouched decoder metadata"))?;
+    if (metadata.pixel_aspect - 1.0).abs() > 1e-12 {
+        return Err(anyhow!(
+            "Non-square RAW pixels require qualified geometry/measurement handling"
+        ));
+    }
+    let descriptor = SensorDescriptor {
+        schema_version: 1,
+        width: info.width as usize,
+        height: info.height as usize,
+        row_stride_bytes: info.width as usize * 2,
+        sample_type: SampleType::U16,
+        byte_order: if cfg!(target_endian = "little") {
+            ByteOrder::Little
+        } else {
+            ByteOrder::Big
+        },
+        color: SensorColor::Bayer {
+            pattern,
+            origin_x: 0,
+            origin_y: 0,
+        },
+        domain: SampleDomain::NativeAdu,
+        geometry: PixelGeometry {
+            analysis_to_sensor: [
+                [1.0, 0.0, metadata.crop_x as f64],
+                [0.0, 1.0, metadata.crop_y as f64],
+            ],
+            coordinate_system: "libraw_raw_array".into(),
+        },
+        saturation: (info.white_level > 0).then(|| NativeThreshold {
+            adu: info.white_level as f32,
+            source: format!("{}; nonlinearity_not_measured", metadata.white_level_source),
+        }),
+        calibration_ids: Vec::new(),
+    };
+    let analysis = analyze(&SensorFrame {
+        descriptor: &descriptor,
+        data: pixels,
+        masks: NativeMasks::default(),
+    })?;
+    let mut assets = crate::storage::analysis_assets::analysis_assets(
+        &analysis,
+        "image.fits",
+        sensor_fits,
+        pixels,
+    )?;
+    for asset in &mut assets {
+        asset.provenance["decoder_metadata"] = serde_json::to_value(metadata)?;
+        if asset.role == crate::storage::capture_store::AssetRole::AnalysisDescriptor {
+            let mut descriptor: serde_json::Value = serde_json::from_slice(&asset.bytes)?;
+            descriptor["sensor_decode"] = serde_json::json!({
+                "metadata": metadata, "black_level": info.black_level,
+                "cblack": info.cblack, "cblack_pattern": info.cblack_pattern,
+                "white_level": info.white_level, "cam_mul": info.cam_mul,
+                "make": info.make, "model": info.model,
+            });
+            asset.bytes = serde_json::to_vec_pretty(&descriptor)?;
+        }
+    }
+    Ok(assets)
 }
 
 /// Write `frame` to `<frames_dir>/<id>.fits` and return the path.
@@ -373,7 +694,9 @@ fn build_header(bitpix: i32, naxes: &[i64], meta: &FitsMeta, bayer: Option<&str>
         cards.push(card_float("BZERO", 32768.0, "unsigned 16-bit offset"));
         cards.push(card_float("BSCALE", 1.0, ""));
     }
-    cards.push(card_float("EXPTIME", meta.exposure_s, "[s] exposure time"));
+    if meta.exposure_s.is_finite() && meta.exposure_s > 0.0 {
+        cards.push(card_float("EXPTIME", meta.exposure_s, "[s] exposure time"));
+    }
     cards.push(card_int("GAIN", meta.gain as i64, "sensor gain"));
     if let Some(iso) = meta.iso {
         // ISOSPEED is the conventional card for DSLR captures; GAIN alone is
@@ -404,18 +727,24 @@ fn build_header(bitpix: i32, naxes: &[i64], meta: &FitsMeta, bayer: Option<&str>
         "binning factor, Y axis",
     ));
     cards.push(card_string("INSTRUME", &meta.instrument, "camera"));
-    cards.push(card_string(
-        "DATE-OBS",
-        &meta.date_obs,
-        "UTC start of exposure",
-    ));
+    if !meta.date_obs.is_empty() {
+        cards.push(card_string(
+            "DATE-OBS",
+            &meta.date_obs,
+            "UTC start of exposure",
+        ));
+    }
     if let Some(b) = bayer {
         cards.push(card_string("BAYERPAT", b, "colour filter array pattern"));
     }
     if let Some(cal) = meta.calibration.as_ref() {
         // Raw ADU. Nothing below has been applied to the pixels — these cards
         // are what a calibration step needs in order to apply it correctly.
-        cards.push(card_string("BUNIT", "ADU", "raw sensor units, uncalibrated"));
+        cards.push(card_string(
+            "BUNIT",
+            "ADU",
+            "raw sensor units, uncalibrated",
+        ));
         cards.push(card_int(
             "BLKLEVEL",
             cal.black_level as i64,
@@ -434,11 +763,108 @@ fn build_header(bitpix: i32, naxes: &[i64], meta: &FitsMeta, bayer: Option<&str>
                 ));
             }
         }
-        cards.push(card_int(
-            "SATURATE",
-            cal.white_level as i64,
-            "[ADU] saturation level",
-        ));
+        if cal.white_level > 0 {
+            cards.push(card_int(
+                "SATURATE",
+                cal.white_level as i64,
+                "[ADU] declared white code; not measured linearity",
+            ));
+        }
+        if let Some(md) = &cal.decoder_metadata {
+            cards.push(card_string("RAWVER", &md.decoder_version, "LibRaw version"));
+            cards.push(card_string(
+                "RAWPROC",
+                &md.processing_version,
+                "unpack contract; no application calibration",
+            ));
+            cards.push(card_int(
+                "RAWOPT",
+                md.unpack_options as i64,
+                "LibRaw unpack option flags",
+            ));
+            if let Some(specials) = md.unpack_specials {
+                cards.push(card_int(
+                    "RAWSPEC",
+                    specials as i64,
+                    "LibRaw unpack specials",
+                ));
+            }
+            cards.push(card_int(
+                "RAWSHOT",
+                md.shot_select as i64,
+                "LibRaw image selection",
+            ));
+            for (key, value) in [
+                ("RAWW", md.raw_width),
+                ("RAWH", md.raw_height),
+                ("VISW", md.visible_width),
+                ("VISH", md.visible_height),
+                ("RAWX0", md.crop_x),
+                ("RAWY0", md.crop_y),
+            ] {
+                cards.push(card_int(
+                    key,
+                    value as i64,
+                    "unrotated LibRaw raw-array geometry",
+                ));
+            }
+            cards.push(card_int(
+                "RAWPITCH",
+                md.source_pitch_bytes as i64,
+                "source row stride in bytes",
+            ));
+            cards.push(card_int(
+                "RAWFLIP",
+                md.orientation as i64,
+                "LibRaw orientation; NOT applied",
+            ));
+            cards.push(card_float(
+                "PIXASPEC",
+                md.pixel_aspect,
+                "LibRaw pixel width/height ratio",
+            ));
+            cards.push(card_int(
+                "BLKROWS",
+                cal.cblack_pattern[0] as i64,
+                "spatial black table rows",
+            ));
+            cards.push(card_int(
+                "BLKCOLS",
+                cal.cblack_pattern[1] as i64,
+                "spatial black table columns",
+            ));
+            cards.push(card_int(
+                "BLKTABN",
+                md.black_table.len() as i64,
+                "spatial black entries; separate from CBLACK",
+            ));
+            for (i, value) in md.black_table.iter().enumerate() {
+                cards.push(card_int(
+                    &format!("BLKC{i:04}"),
+                    *value as i64,
+                    "[ADU] LibRaw spatial black table",
+                ));
+            }
+            for (i, value) in md.linear_max.iter().enumerate() {
+                if *value > 0 {
+                    cards.push(card_int(
+                        &format!("LINMAX{i}"),
+                        *value as i64,
+                        "[ADU] metadata linear maximum; unmeasured",
+                    ));
+                }
+            }
+            cards.push(card_string(
+                "NONLIN",
+                "UNMEAS",
+                "nonlinearity has not been measured",
+            ));
+            cards.push(card_string(
+                "WHITESRC",
+                "LIBRAW",
+                "declared unpack maximum, not container capacity",
+            ));
+        }
         if bayer.is_some() {
             cards.push(card_int(
                 "XBAYROFF",

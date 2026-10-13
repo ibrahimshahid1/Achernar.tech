@@ -23,6 +23,7 @@ mod hardware;
 mod models;
 mod mount;
 mod processing;
+mod preview;
 mod relay_commands;
 mod state;
 mod storage;
@@ -153,16 +154,23 @@ async fn main() -> anyhow::Result<()> {
         config.storage.data_dir(),
         rig_optics,
     );
+    hardware::health::spawn(app_state.clone());
     cloud_client::spawn_if_configured(app_state.clone());
     vision::vision_loop::spawn(app_state.clone(), 1.0);
+    vision::coc_shadow::spawn(app_state.clone());
 
     // Build API routes
     let api_v1 = Router::new()
         .route("/status", get(api::get_status))
         .route("/drivers", get(api::get_driver_capabilities))
+        .route("/commands", get(api::get_commands))
         .route("/discover", post(api::discover_devices))
         .route("/connect", post(api::connect_equipment))
         .route("/disconnect", post(api::disconnect_equipment))
+        .route("/coc/status", get(api::coc::status))
+        .route("/coc/configure", post(api::coc::configure))
+        .route("/coc/save-sample", post(api::coc::save))
+        .route("/coc/freeze-sample", post(api::coc::freeze))
         .nest("/camera", camera_routes())
         .nest("/mount", mount_routes())
         .nest("/focuser", focuser_routes())
@@ -251,6 +259,7 @@ async fn handle_telemetry_socket(mut socket: WebSocket, state: AppState) {
     info!("Telemetry stream started");
     let mut ticker = interval(Duration::from_millis(1000));
     let mut vision_rx = state.vision_updates.subscribe();
+    let mut device_rx = state.device_updates.subscribe();
 
     loop {
         tokio::select! {
@@ -261,6 +270,11 @@ async fn handle_telemetry_socket(mut socket: WebSocket, state: AppState) {
                     info!("Telemetry socket closed: {}", e);
                     break;
                 }
+            }
+            device_result = device_rx.recv() => {
+                if matches!(device_result, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; }
+                let event=crate::telemetry::telemetry_event(&state).to_string();
+                if socket.send(Message::Text(event)).await.is_err() { break; }
             }
             vision_result = vision_rx.recv() => {
                 match vision_result {
@@ -291,50 +305,79 @@ async fn camera_stream_ws(ws: WebSocketUpgrade, State(state): State<AppState>) -
 
 async fn handle_stream_socket(mut socket: WebSocket, state: AppState) {
     info!("Live view stream started");
-    let mut ticker = interval(Duration::from_millis(100)); // ~10 FPS
+    // Poll the latest slot at up to 60 Hz, sending each source frame once.
+    // Native USB/camera latency determines the actual delivery rate.
+    let mut ticker = interval(Duration::from_micros(16_667));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut cursor = preview::PreviewCursor::default();
 
     loop {
-        ticker.tick().await;
-
-        // Get latest frame
-        let frame_data = {
-            let frame = state.latest_frame.lock().unwrap();
-            frame.clone()
-        };
-
-        let frame_bytes = match frame_data {
-            // JPEG-encode the frame so the browser can render it directly as an
-            // image/jpeg blob, regardless of the camera's native pixel format.
-            Some(f) => match api::camera::encode_frame_jpeg(&f) {
-                Some(jpeg) => {
-                    // Packet: [width(4)][height(4)][timestamp(8)][format(4)=JPEG][jpeg...]
-                    let mut packet = Vec::with_capacity(20 + jpeg.len());
-                    packet.extend_from_slice(&(f.width as u32).to_le_bytes());
-                    packet.extend_from_slice(&(f.height as u32).to_le_bytes());
-                    let ts = (f.unix_timestamp * 1000.0) as u64;
-                    packet.extend_from_slice(&ts.to_le_bytes());
-                    // Payload is always JPEG now (OlsStreamType::Mjpeg == 1).
-                    packet.extend_from_slice(&1u32.to_le_bytes());
-                    packet.extend_from_slice(&jpeg);
-                    packet
-                }
-                // Format we don't preview-encode yet: signal "waiting".
-                None => vec![0u8; 20],
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                _ => continue,
             },
-            None => {
-                // No frame available yet, send empty packet
+            _ = ticker.tick() => {},
+        }
+
+        let runtime = state.camera_runtime.read().unwrap().clone();
+        let generation = state.current_camera_generation();
+        let available = runtime.connection_id.is_some() && runtime.streaming;
+        // Duplicate ticks do not copy image buffers or re-encode the same image.
+        let (update, frame) = {
+            let latest = state.latest_frame.lock().unwrap();
+            let update = cursor.next(latest.as_ref(), generation, available);
+            let frame = if update == preview::PreviewUpdate::Frame {
+                latest.clone()
+            } else {
+                None
+            };
+            (update, frame)
+        };
+        if update == preview::PreviewUpdate::Unchanged {
+            continue;
+        }
+
+        let packet = if let Some(frame) = frame {
+            let width = frame.width;
+            let height = frame.height;
+            let timestamp_ms = (frame.unix_timestamp * 1000.0) as u64;
+            let jpeg = tokio::task::spawn_blocking(move || api::camera::encode_frame_jpeg(&frame))
+                .await
+                .ok()
+                .flatten();
+            // A disconnect/reconnect may have happened during JPEG encoding.
+            let current = state.camera_runtime.read().unwrap().clone();
+            if state.current_camera_generation() != generation
+                || current.connection_id != runtime.connection_id
+                || !current.streaming
+            {
+                cursor.next(None, state.current_camera_generation(), false);
+                vec![0u8; 20]
+            } else if let Some(jpeg) = jpeg {
+                // [width:u32][height:u32][timestamp_ms:u64][format:u32=1][JPEG]
+                let mut packet = Vec::with_capacity(20 + jpeg.len());
+                packet.extend_from_slice(&(width as u32).to_le_bytes());
+                packet.extend_from_slice(&(height as u32).to_le_bytes());
+                packet.extend_from_slice(&timestamp_ms.to_le_bytes());
+                packet.extend_from_slice(&1u32.to_le_bytes());
+                packet.extend_from_slice(&jpeg);
+                packet
+            } else {
                 vec![0u8; 20]
             }
+        } else {
+            // One empty packet actively clears a retired/absent camera image.
+            vec![0u8; 20]
         };
 
-        match socket.send(Message::Binary(frame_bytes)).await {
-            Ok(_) => {}
-            Err(e) => {
-                info!("Stream connection closed: {}", e);
-                break;
-            }
+        // Slow consumers receive latest frames, never an unbounded image queue.
+        if !matches!(
+            tokio::time::timeout(Duration::from_secs(2), socket.send(Message::Binary(packet))).await,
+            Ok(Ok(()))
+        ) {
+            break;
         }
     }
-
     info!("Live view stream ended");
 }

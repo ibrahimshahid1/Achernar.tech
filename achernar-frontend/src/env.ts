@@ -17,4 +17,8 @@ export const env = {
     enableBrowserDirectDaemon: ["1", "true", "yes"].includes(
         String(import.meta.env.VITE_ENABLE_BROWSER_DIRECT_DAEMON || "").toLowerCase()
     ),
+
+    // Optional image-only socket for a remote rig. This never changes the
+    // command transport; same-machine browsers select the local socket automatically.
+    cameraPreviewWs: String(import.meta.env.VITE_CAMERA_PREVIEW_WS || ""),
 };

@@ -1,7 +1,15 @@
+import os
+from datetime import timedelta
+
 from django.db import models
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 
 User = get_user_model()
+
+# How long a synced equipment row stays trustworthy. Shared with the daemon
+# heartbeat window in views.py so "live" means the same thing everywhere.
+DAEMON_STALE_SECONDS = int(os.getenv('ACHERNAR_DAEMON_STALE_SECONDS', '30'))
 
 
 class EquipmentType(models.TextChoices):
@@ -61,6 +69,23 @@ class ConnectedEquipment(models.Model):
         verbose_name = 'Connected Equipment'
         verbose_name_plural = 'Connected Equipment'
     
+    @property
+    def is_fresh(self):
+        """Whether this row is recent enough to describe the present.
+
+        This table is a write-through cache fed by POST /api/equipment/sync,
+        and nothing expires it: the sweep that marks rows offline only runs
+        when sync is called, so a daemon that dies mid-session leaves
+        connected=True here forever. Rows in this database have been observed
+        six months stale and still claiming to be connected.
+
+        `connected` therefore cannot be trusted on its own — it is the last
+        value written, not the current state. Read it through this.
+        """
+        if not self.last_seen:
+            return False
+        return self.last_seen >= timezone.now() - timedelta(seconds=DAEMON_STALE_SECONDS)
+
     def __str__(self):
-        status_icon = '🟢' if self.connected else '🔴'
+        status_icon = '🟢' if (self.connected and self.is_fresh) else '🔴'
         return f"{status_icon} {self.name} ({self.equipment_type})"
