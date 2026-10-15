@@ -1184,9 +1184,16 @@ async fn move_focuser_to_position(
         .into());
     }
 
+    // Remaining distance after the previous completed move. On an absolute
+    // focuser, a completed move that makes no progress (missed steps reported
+    // by the device, a firmware clamp, a stall) fails instead of retrying
+    // forever. A relative focuser's position is OLS's accumulated command count,
+    // so arrival there is assumed, not verified.
+    let mut previous_remaining: Option<i32> = None;
+    let tolerance = config.safety.arrival_tolerance_steps.max(0);
     loop {
         abort_if_requested(state)?;
-        let delta = {
+        {
             let mut focuser = state.focuser.lock().unwrap();
             crate::hardware::health::require_connected(
                 state,
@@ -1198,9 +1205,16 @@ async fn move_focuser_to_position(
                 .position()
                 .map_err(|err| HardwareError::Communication(err.to_string()))?;
             let delta = target - current;
-            if delta == 0 {
+            if delta.abs() <= tolerance {
                 return Ok(());
             }
+            if previous_remaining.is_some_and(|previous| delta.abs() >= previous.abs()) {
+                return Err(HardwareError::Communication(format!(
+                    "Focuser stopped at {current} without progressing toward {target}"
+                ))
+                .into());
+            }
+            previous_remaining = Some(delta);
 
             let verdict = focus_safety
                 .lock()
@@ -1227,12 +1241,73 @@ async fn move_focuser_to_position(
                     .move_relative(step)
                     .map_err(|err| HardwareError::Communication(err.to_string()))?;
             }
-            target - (current + step)
-        };
+        }
 
+        // A sleep alone is not completion: a slow or belt-reduced focuser can
+        // still be moving, which would put the next exposure mid-move. Wait
+        // for the device to report stopped, then settle, then re-read the
+        // position at the top of the loop to check arrival.
+        let stopped = wait_until_stopped(
+            || abort_if_requested(state),
+            || {
+                let focuser = state.focuser.lock().unwrap();
+                let focuser = focuser.as_ref().ok_or(FocusError::NoFocuser)?;
+                focuser
+                    .is_moving()
+                    .map_err(|err| HardwareError::Communication(err.to_string()).into())
+            },
+            Duration::from_millis(config.safety.move_timeout_ms.max(100)),
+            Duration::from_millis(100),
+        )
+        .await;
+        if let Err(err) = stopped {
+            if let Some(focuser) = state.focuser.lock().unwrap().as_mut() {
+                let _ = focuser.abort();
+            }
+            return Err(err);
+        }
         tokio::time::sleep(Duration::from_millis(config.safety.settle_ms.max(50))).await;
-        if delta == 0 {
-            return Ok(());
+    }
+}
+
+/// Poll `is_moving` until it reports false, failing with a timeout after
+/// `timeout`. The first poll waits one interval so a driver that raises
+/// IsMoving just after accepting the move is not read as already stopped.
+/// `check_abort` errors propagate at once; up to `MAX_POLL_ERRORS`
+/// consecutive poll errors are tolerated (one dropped Wi-Fi request must not
+/// kill a sweep), after which the last error propagates.
+async fn wait_until_stopped<A, F>(
+    mut check_abort: A,
+    mut is_moving: F,
+    timeout: Duration,
+    poll_interval: Duration,
+) -> crate::error::Result<()>
+where
+    A: FnMut() -> crate::error::Result<()>,
+    F: FnMut() -> crate::error::Result<bool>,
+{
+    const MAX_POLL_ERRORS: u32 = 3;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut consecutive_errors = 0;
+    loop {
+        tokio::time::sleep(poll_interval).await;
+        check_abort()?;
+        match is_moving() {
+            Ok(false) => return Ok(()),
+            Ok(true) => consecutive_errors = 0,
+            Err(err) => {
+                consecutive_errors += 1;
+                if consecutive_errors >= MAX_POLL_ERRORS {
+                    return Err(err);
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(HardwareError::Timeout(format!(
+                "Focuser still moving after {} ms",
+                timeout.as_millis()
+            ))
+            .into());
         }
     }
 }
@@ -1937,5 +2012,182 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn wait_until_stopped_waits_for_the_device_to_report_stopped() {
+        let mut polls = 0;
+        wait_until_stopped(
+            || Ok(()),
+            || {
+                polls += 1;
+                Ok(polls < 4)
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(polls, 4, "returned before the focuser reported stopped");
+    }
+
+    #[tokio::test]
+    async fn wait_until_stopped_times_out_on_a_focuser_that_never_stops() {
+        let err = wait_until_stopped(
+            || Ok(()),
+            || Ok(true),
+            Duration::from_millis(20),
+            Duration::from_millis(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("still moving"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn wait_until_stopped_tolerates_transient_poll_errors_but_not_persistent_ones() {
+        let mut polls = 0;
+        wait_until_stopped(
+            || Ok(()),
+            || {
+                polls += 1;
+                match polls {
+                    1 | 2 => Err(HardwareError::Communication("dropped".into()).into()),
+                    3 => Ok(true),
+                    _ => Ok(false),
+                }
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        let err = wait_until_stopped(
+            || Ok(()),
+            || Err(HardwareError::Communication("link down".into()).into()),
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("link down"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn wait_until_stopped_propagates_abort_immediately() {
+        let mut polls = 0;
+        let err = wait_until_stopped(
+            || Err(FocusError::RunFailed("Autofocus aborted".to_string()).into()),
+            || {
+                polls += 1;
+                Ok(true)
+            },
+            Duration::from_secs(5),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("aborted"), "{err}");
+        assert_eq!(polls, 0);
+    }
+
+    async fn move_fixture(
+        focuser: crate::hardware::focuser::SimFocuser,
+    ) -> (
+        std::path::PathBuf,
+        AppState,
+        crate::config::FocusConfig,
+        Arc<Mutex<FocusSafetyGuard>>,
+    ) {
+        let directory =
+            std::env::temp_dir().join(format!("achernar-focus-move-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let store = LocalStore::open(directory.join("state.db").to_str().unwrap())
+            .await
+            .unwrap();
+        let mut focus = crate::config::FocusConfig::default();
+        focus.models.quality_model_path =
+            Some(directory.join("absent-fqe.onnx").to_string_lossy().into());
+        focus.safety.settle_ms = 0;
+        focus.safety.move_timeout_ms = 100;
+        let state = AppState::new(
+            focus.clone(),
+            crate::config::CameraConfig::default(),
+            store,
+            crate::storage::frames_repo::FrameStore::new(directory.join("previews")),
+            crate::storage::capture_store::CaptureStore::new(directory.join("captures")),
+            "move-fixture-rig".into(),
+            directory.join("data"),
+            None,
+        );
+        let connected = ConnectedFocuser::Simulator(focuser);
+        let snapshot = crate::hardware::health::focuser_snapshot(
+            "fixture focuser".into(),
+            &connected.health_status().unwrap(),
+        );
+        *state.focuser.lock().unwrap() = Some(connected);
+        state.devices.write().unwrap().connected(
+            crate::hardware::health::DeviceKind::Focuser,
+            "fixture".into(),
+            Some(snapshot),
+        );
+        let guard = Arc::new(Mutex::new(FocusSafetyGuard::new(focus.safety.clone())));
+        (directory, state, focus, guard)
+    }
+
+    fn sim_position(state: &AppState) -> i32 {
+        state
+            .focuser
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .position()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn move_reaches_a_distant_target_through_clamped_steps() {
+        let sim = crate::hardware::focuser::SimFocuser::new(0);
+        let (directory, state, config, guard) = move_fixture(sim).await;
+        move_focuser_to_position(&state, &config, &guard, 1_700)
+            .await
+            .unwrap();
+        assert_eq!(sim_position(&state), 1_700);
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn move_fails_when_the_focuser_stops_short_of_the_target() {
+        let sim = crate::hardware::focuser::SimFocuser::with_max_range(0, 1_000);
+        let (directory, state, config, guard) = move_fixture(sim).await;
+        let err = move_focuser_to_position(&state, &config, &guard, 2_000)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("without progressing"), "{err}");
+        assert_eq!(sim_position(&state), 1_000);
+        std::fs::remove_dir_all(directory).ok();
+    }
+
+    #[tokio::test]
+    async fn move_halts_a_focuser_that_never_reports_stopped() {
+        let mut sim = crate::hardware::focuser::SimFocuser::new(0);
+        sim.set_stuck_moving(true);
+        let (directory, state, config, guard) = move_fixture(sim).await;
+        let err = move_focuser_to_position(&state, &config, &guard, 300)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("still moving"), "{err}");
+        let moving = state
+            .focuser
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .is_moving()
+            .unwrap();
+        assert!(!moving, "the timed-out focuser must have been halted");
+        std::fs::remove_dir_all(directory).ok();
     }
 }

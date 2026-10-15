@@ -39,8 +39,13 @@ pub struct CocDiagnosticSummary {
     pub status: String,
     pub reason: Option<String>,
     pub valid_region_pixels: usize,
+    /// Predicted cloud pixels / all pixels in the independent image ROI.
     pub cloud_area_fraction_of_roi: Option<f64>,
+    /// Predicted cloud / (sky + cloud) in the ROI; absent on abstention.
+    /// Contamination is excluded, never counted as clear. No solid-angle weighting.
     pub cloud_fraction_of_classified_sky: Option<f64>,
+    /// Predicted contamination / all ROI pixels, excluded from the sky denominator.
+    /// This is a predicted class area, not a calibrated uncertainty fraction.
     pub contamination_area_fraction_of_roi: Option<f64>,
     pub mean_soft_cloud_share_of_sky: Option<f64>,
     pub probability_calibrated: bool,
@@ -645,6 +650,37 @@ mod tests {
         assert!(x[PIXELS..2 * PIXELS].iter().all(|v| *v == 20.0f32 / 255.0));
         assert!(x[2 * PIXELS..].iter().all(|v| *v == 1.0));
         assert!(resize_roi_nearest(&[2], 1, 1).is_err());
+    }
+
+    #[test]
+    fn coverage_uses_selected_image_pixels_and_excludes_contamination() {
+        // Every pixel outside the independent ten-pixel ROI predicts cloud.
+        // Only the first three sky, five cloud and two contamination count.
+        let mut logits = vec![-8.0f32; 3 * PIXELS];
+        logits[PIXELS..2 * PIXELS].fill(8.0);
+        let mut region = vec![false; PIXELS];
+        region[..10].fill(true);
+        for p in 0..10 {
+            logits[PIXELS + p] = -8.0;
+            let class = if p < 3 { 0 } else if p < 8 { 1 } else { 2 };
+            logits[class * PIXELS + p] = 8.0;
+        }
+        let (summary, _, _) = summarize_logits(&logits, Some(&region), 0.3).unwrap();
+        assert_eq!(summary.valid_region_pixels, 10);
+        assert_eq!(summary.cloud_area_fraction_of_roi, Some(0.5));
+        assert_eq!(summary.contamination_area_fraction_of_roi, Some(0.2));
+        assert_eq!(summary.cloud_fraction_of_classified_sky, Some(0.625));
+        assert_eq!(summary.status, "research_diagnostic");
+
+        // Contamination exactly at 30% is allowed; above 30% withholds
+        // classified-sky coverage instead of reinterpreting exclusions as clear.
+        for (p, expected) in [(2, Some(5.0 / 7.0)), (1, None)] {
+            logits[p] = -8.0;
+            logits[2 * PIXELS + p] = 8.0;
+            let (summary, _, _) = summarize_logits(&logits, Some(&region), 0.3).unwrap();
+            assert_eq!(summary.cloud_area_fraction_of_roi, Some(0.5));
+            assert_eq!(summary.cloud_fraction_of_classified_sky, expected);
+        }
     }
 
     #[test]

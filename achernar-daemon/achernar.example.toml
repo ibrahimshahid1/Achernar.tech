@@ -53,6 +53,8 @@ min_confidence_to_act = 0.6
 max_failed_improvements = 3
 settle_ms = 500
 backlash_steps = 0
+move_timeout_ms = 60000       # halt and fail a move that has not reported stopped
+arrival_tolerance_steps = 0   # steps from target that still count as arrived
 
 [focus.backlash]              # Backlash compensation (7.3.5)
 enabled = false

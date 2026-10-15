@@ -33,6 +33,14 @@ def load_region(path, size, original_size):
 
 
 def summarize_logits(logits, valid_region=None, max_contamination=0.3):
+    """Summarize argmax image area inside a prediction-independent boolean ROI.
+
+    ``cloud_area_fraction_of_roi`` is cloud / (sky + cloud + contamination).
+    ``cloud_fraction_of_classified_sky`` is cloud / (sky + cloud), withheld on
+    abstention. Contamination is excluded from that denominator, never treated
+    as clear sky. Fractions describe rendered image pixels, not transparency,
+    calibrated uncertainty, solid angle, or cloud cover outside the ROI.
+    """
     logits = np.asarray(logits)
     if logits.ndim != 3 or logits.shape[0] != 3 or min(logits.shape) < 1 or not np.isfinite(logits).all():
         raise ValueError("Expected finite logits [3,H,W]")

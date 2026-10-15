@@ -28,6 +28,10 @@ struct VisionTrendState {
     cloud_status: CloudStatus,
     consecutive_cloudy: u8,
     consecutive_clear: u8,
+    /// Camera frame counter last used to adapt the references and advance the
+    /// event counters. The loop re-analyses the latest frame on every tick, so
+    /// a slow camera would otherwise count one exposure several times.
+    last_frame_counter: Option<i32>,
 }
 
 impl Default for VisionTrendState {
@@ -38,6 +42,7 @@ impl Default for VisionTrendState {
             cloud_status: CloudStatus::Clear,
             consecutive_cloudy: 0,
             consecutive_clear: 0,
+            last_frame_counter: None,
         }
     }
 }
@@ -191,13 +196,20 @@ fn observation_from_frame_with_trends(
             }
         }
     }
+    let new_frame = trends.last_frame_counter != Some(frame.frame_counter);
+    trends.last_frame_counter = Some(frame.frame_counter);
     let cloud_probability = update_cloud_probability(
         trends,
         quality.star_count_detected,
         background.background_adu,
         quality.observation_valid(),
+        new_frame,
     );
-    let cloud_event = update_cloud_event(trends, cloud_probability);
+    let cloud_event = if new_frame {
+        update_cloud_event(trends, cloud_probability)
+    } else {
+        CloudEvent::None
+    };
 
     let observation_valid = quality.observation_valid();
     Ok(SharedObservation {
@@ -247,13 +259,33 @@ fn update_cloud_probability(
     star_count: u32,
     background_adu: f32,
     observation_valid: bool,
+    new_frame: bool,
 ) -> f32 {
+    // Clear-sky references adapt asymmetrically, once per distinct frame.
+    // - Clearer evidence (more stars; a darker background while stars also look
+    //   clear) is adopted quickly but by at most RECOVER_MAX_RATIO per frame, so
+    //   a cloudy start recovers within a few frames while one odd frame (a long
+    //   test exposure, a gain change) cannot inflate the reference much.
+    // - Worse evidence is adopted slowly while the frame looks clear, so
+    //   gradually thickening cloud cannot drag the reference down with it.
+    // - While the reading sits elevated without a declared cloud event, the
+    //   references relax very slowly, so no inflated reference can persist.
+    // Star counts alone cannot tell a cloudy start from a sparse field; a
+    // catalog-referenced transparency measurement is the intended successor.
+    const RECOVER_ALPHA: f32 = 0.5;
+    const RECOVER_MAX_RATIO: f32 = 1.5;
+    const DECAY_ALPHA: f32 = 0.02;
+    const RELAX_ALPHA: f32 = 0.005;
+    const CLEAR_STAR_DROP: f32 = 0.2;
+
     let stars = star_count as f32;
-    if trends.clear_star_baseline.is_none() && star_count > 0 {
-        trends.clear_star_baseline = Some(stars.max(1.0));
-    }
-    if trends.clear_background_baseline.is_none() && background_adu.is_finite() {
-        trends.clear_background_baseline = Some(background_adu.max(1.0));
+    if new_frame && observation_valid {
+        if trends.clear_star_baseline.is_none() && star_count > 0 {
+            trends.clear_star_baseline = Some(stars.max(1.0));
+        }
+        if trends.clear_background_baseline.is_none() && background_adu.is_finite() {
+            trends.clear_background_baseline = Some(background_adu.max(1.0));
+        }
     }
 
     let star_baseline = trends
@@ -271,13 +303,37 @@ fn update_cloud_probability(
     let invalid_penalty = if observation_valid { 0.0 } else { 0.15 };
     let probability = (0.70 * star_drop + 0.25 * background_rise + invalid_penalty).clamp(0.0, 1.0);
 
-    if probability < 0.40 && observation_valid && star_count > 0 {
-        trends.clear_star_baseline = Some(exp_smooth(star_baseline, stars, 0.05).max(1.0));
-        trends.clear_background_baseline = Some(exp_smooth(
-            background_baseline,
-            background_adu.max(1.0),
-            0.05,
-        ));
+    if !new_frame || !observation_valid {
+        return probability;
+    }
+    let looks_clear = probability < 0.40 && star_count > 0;
+    let elevated_without_event =
+        !looks_clear && star_count > 0 && trends.cloud_status == CloudStatus::Clear;
+
+    if star_count > 0 && stars > star_baseline {
+        trends.clear_star_baseline = Some(
+            exp_smooth(star_baseline, stars, RECOVER_ALPHA).min(star_baseline * RECOVER_MAX_RATIO),
+        );
+    } else if looks_clear {
+        trends.clear_star_baseline = Some(exp_smooth(star_baseline, stars, DECAY_ALPHA).max(1.0));
+    } else if elevated_without_event {
+        trends.clear_star_baseline = Some(exp_smooth(star_baseline, stars, RELAX_ALPHA).max(1.0));
+    }
+
+    if background_adu.is_finite() {
+        let background = background_adu.max(1.0);
+        if background < background_baseline && star_drop < CLEAR_STAR_DROP {
+            trends.clear_background_baseline = Some(
+                exp_smooth(background_baseline, background, RECOVER_ALPHA)
+                    .max(background_baseline / RECOVER_MAX_RATIO),
+            );
+        } else if looks_clear {
+            trends.clear_background_baseline =
+                Some(exp_smooth(background_baseline, background, DECAY_ALPHA));
+        } else if elevated_without_event && background > background_baseline {
+            trends.clear_background_baseline =
+                Some(exp_smooth(background_baseline, background, RELAX_ALPHA));
+        }
     }
 
     probability
@@ -435,5 +491,111 @@ mod analysis_domain_tests {
         assert!(!observation.observation_valid);
         assert!(trends.clear_star_baseline.is_none());
         assert!(observation.analysis_unavailable_reason.is_some());
+    }
+
+    fn feed(trends: &mut VisionTrendState, stars: u32, background: f32, frames: usize) -> f32 {
+        let mut probability = 0.0;
+        for _ in 0..frames {
+            probability = update_cloud_probability(trends, stars, background, true, true);
+        }
+        probability
+    }
+
+    #[test]
+    fn cloudy_start_recovers_quickly_once_the_sky_clears() {
+        let mut trends = VisionTrendState::default();
+        feed(&mut trends, 5, 100.0, 10);
+        assert_eq!(trends.clear_star_baseline, Some(5.0));
+        // The previous symmetric 5% smoothing needed about 42 frames here; the
+        // capped recovery climbs 5 -> 7.5 -> 11 -> 17 -> 25 -> 38 -> 44 -> 47.
+        feed(&mut trends, 50, 100.0, 7);
+        assert!(trends.clear_star_baseline.unwrap() >= 45.0);
+        // Losing those stars again is now recognised as cloud.
+        assert!(feed(&mut trends, 5, 100.0, 1) > 0.55);
+    }
+
+    #[test]
+    fn gradual_thickening_does_not_drag_the_clear_reference_down() {
+        let mut trends = VisionTrendState::default();
+        feed(&mut trends, 50, 100.0, 10);
+        let mut probability = 0.0;
+        for step in 0..=40 {
+            let stars = (50.0 - step as f32).round() as u32;
+            probability = feed(&mut trends, stars, 100.0, 1);
+        }
+        // Symmetric 5% smoothing let the reference sag to about 29 stars.
+        assert!(trends.clear_star_baseline.unwrap() > 40.0);
+        assert!(probability > 0.5);
+    }
+
+    #[test]
+    fn darker_background_is_adopted_and_invalid_frames_do_not_move_references() {
+        let mut trends = VisionTrendState::default();
+        // An invalid first frame must not seed either reference.
+        update_cloud_probability(&mut trends, 20, 400.0, false, true);
+        assert!(trends.clear_star_baseline.is_none());
+        assert!(trends.clear_background_baseline.is_none());
+
+        feed(&mut trends, 30, 400.0, 1);
+        feed(&mut trends, 30, 100.0, 6);
+        assert!(trends.clear_background_baseline.unwrap() < 125.0);
+
+        let star_before = trends.clear_star_baseline;
+        let background_before = trends.clear_background_baseline;
+        update_cloud_probability(&mut trends, 300, 10.0, false, true);
+        assert_eq!(trends.clear_star_baseline, star_before);
+        assert_eq!(trends.clear_background_baseline, background_before);
+    }
+    #[test]
+    fn one_inflated_frame_cannot_lock_in_a_false_cloud_reading() {
+        let mut trends = VisionTrendState::default();
+        feed(&mut trends, 50, 100.0, 20);
+        // One long test exposure: three times the stars, five times the sky.
+        feed(&mut trends, 150, 500.0, 1);
+        assert!(trends.clear_star_baseline.unwrap() <= 75.0 + 1e-3);
+        let back = feed(&mut trends, 50, 100.0, 1);
+        assert!(back < 0.40, "normal sky must still look clear, got {back}");
+        assert!(feed(&mut trends, 50, 100.0, 100) < 0.1);
+    }
+    #[test]
+    fn sustained_inflation_relaxes_instead_of_sticking_forever() {
+        let mut trends = VisionTrendState::default();
+        feed(&mut trends, 50, 100.0, 20);
+        feed(&mut trends, 150, 500.0, 10);
+        assert!(feed(&mut trends, 50, 100.0, 1) >= 0.40);
+        // A symmetric reference frozen above about 2.3x the normal count never
+        // recovered; the slow relaxation bounds how long it can persist.
+        assert!(feed(&mut trends, 50, 100.0, 300) < 0.1);
+    }
+
+    #[test]
+    fn dark_excursion_without_clear_stars_does_not_poison_the_background() {
+        let mut trends = VisionTrendState::default();
+        feed(&mut trends, 50, 100.0, 10);
+        // Short exposures to frame a bright star: few stars and a dark sky.
+        feed(&mut trends, 10, 25.0, 10);
+        assert!((trends.clear_background_baseline.unwrap() - 100.0).abs() < 1.0);
+        assert!(feed(&mut trends, 30, 100.0, 1) < 0.40);
+    }
+
+    #[test]
+    fn reanalysing_the_same_frame_neither_adapts_nor_advances_events() {
+        let mut trends = VisionTrendState::default();
+        feed(&mut trends, 50, 100.0, 10);
+        let before = trends.clear_star_baseline;
+        for _ in 0..10 {
+            update_cloud_probability(&mut trends, 150, 500.0, true, false);
+        }
+        assert_eq!(trends.clear_star_baseline, before);
+
+        let mut frame = mono_frame();
+        frame.frame_counter = 99;
+        let mut trends = VisionTrendState::default();
+        trends.cloud_status = CloudStatus::Clear;
+        for _ in 0..5 {
+            observation_from_frame_with_trends(&frame, &mut trends, None, None).unwrap();
+        }
+        assert_eq!(trends.last_frame_counter, Some(99));
+        assert!(trends.consecutive_cloudy <= 1);
     }
 }

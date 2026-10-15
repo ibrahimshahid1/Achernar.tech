@@ -134,6 +134,9 @@ pub struct SimFocuser {
     position: i32,
     max_range: i32,
     moving: bool,
+    /// Test hook: report moving until `abort`, like a stalled driver.
+    #[cfg(test)]
+    stuck_moving: bool,
 }
 
 impl SimFocuser {
@@ -143,7 +146,24 @@ impl SimFocuser {
             position: position.clamp(0, max_range),
             max_range,
             moving: false,
+            #[cfg(test)]
+            stuck_moving: false,
         }
+    }
+
+    /// Test hook: a device whose usable travel ends at `max_range`.
+    #[cfg(test)]
+    pub fn with_max_range(position: i32, max_range: i32) -> Self {
+        let mut focuser = Self::new(position);
+        focuser.max_range = max_range;
+        focuser.position = position.clamp(0, max_range);
+        focuser
+    }
+
+    /// Test hook: keep reporting `is_moving` until `abort` is called.
+    #[cfg(test)]
+    pub fn set_stuck_moving(&mut self, stuck: bool) {
+        self.stuck_moving = stuck;
     }
 
     pub fn position(&self) -> crate::error::Result<i32> {
@@ -151,6 +171,10 @@ impl SimFocuser {
     }
 
     pub fn is_moving(&self) -> crate::error::Result<bool> {
+        #[cfg(test)]
+        if self.stuck_moving {
+            return Ok(true);
+        }
         Ok(self.moving)
     }
 
@@ -175,6 +199,10 @@ impl SimFocuser {
 
     pub fn abort(&mut self) -> crate::error::Result<()> {
         self.moving = false;
+        #[cfg(test)]
+        {
+            self.stuck_moving = false;
+        }
         Ok(())
     }
 

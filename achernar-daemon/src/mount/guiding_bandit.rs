@@ -45,30 +45,45 @@ impl GuidingBandit {
         }
     }
 
-    pub fn update(&mut self, reward: f64, axis: &str, context: &[f64]) {
-        if context.is_empty() {
-            return;
+    /// Credit `reward` to the arm that was actually executed on `axis`.
+    ///
+    /// LinUCB must update the executed arm, never a recomputed greedy arm:
+    /// exploration deliberately runs non-greedy arms. Returns `false` and
+    /// leaves all state unchanged when the axis or executed aggressiveness is
+    /// not one of this bandit's arms, or the reward or context is not finite.
+    pub fn update(
+        &mut self,
+        axis: &str,
+        executed_aggressiveness: f64,
+        reward: f64,
+        context: &[f64],
+    ) -> bool {
+        if context.is_empty()
+            || !reward.is_finite()
+            || context.iter().any(|value| !value.is_finite())
+        {
+            return false;
         }
+        let is_ra = axis.eq_ignore_ascii_case("ra");
+        if !is_ra && !axis.eq_ignore_ascii_case("dec") {
+            return false;
+        }
+        let Some(arm_idx) = self
+            .arms
+            .iter()
+            .position(|arm| (arm - executed_aggressiveness).abs() <= 1e-9)
+        else {
+            return false;
+        };
 
         self.ensure_dimension(context.len());
-        let target = if axis.eq_ignore_ascii_case("ra") {
+        let target = if is_ra {
             &mut self.ra_state
-        } else if axis.eq_ignore_ascii_case("dec") {
-            &mut self.dec_state
         } else {
-            return;
+            &mut self.dec_state
         };
-        let arm_idx = target
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                axis_score(a, context, 0.0)
-                    .2
-                    .total_cmp(&axis_score(b, context, 0.0).2)
-            })
-            .map(|(idx, _)| idx)
-            .unwrap_or(0);
         target[arm_idx].update(context, reward.clamp(-5.0, 2.0));
+        true
     }
 
     fn ensure_dimension(&mut self, dimension: usize) {
@@ -181,4 +196,68 @@ fn solve_linear(matrix: &[Vec<f64>], rhs: &[f64]) -> Option<Vec<f64>> {
     }
 
     Some(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONTEXT: [f64; 6] = [1.0, 0.5, 0.2, 0.1, 0.8, 0.6];
+
+    fn updated_arms(states: &[AxisArmState]) -> Vec<usize> {
+        states
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| state.b.iter().any(|value| *value != 0.0))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    #[test]
+    fn update_credits_the_executed_arm_not_the_greedy_arm() {
+        let mut bandit = GuidingBandit::new(1.0);
+        // All arms tie before learning, so a greedy recomputation would pick
+        // the last arm (1.30). The executed arm here is the first (0.10).
+        assert!(bandit.update("ra", 0.10, 1.0, &CONTEXT));
+        assert_eq!(updated_arms(&bandit.ra_state), vec![0]);
+        assert!(updated_arms(&bandit.dec_state).is_empty());
+    }
+
+    #[test]
+    fn exploratory_selection_is_credited_to_that_arm() {
+        let mut bandit = GuidingBandit::new(1_000.0);
+        // Teach the 0.70 arm a strong positive reward so it is greedy-best.
+        for _ in 0..20 {
+            assert!(bandit.update("dec", 0.70, 2.0, &CONTEXT));
+        }
+        let selected = bandit.select_aggressiveness(&CONTEXT).dec_aggressiveness;
+        assert_ne!(selected, 0.70, "large alpha should explore an untried arm");
+
+        let before = bandit.dec_state[3].b.clone();
+        assert!(bandit.update("dec", selected, -1.0, &CONTEXT));
+        let explored = bandit.arms.iter().position(|arm| *arm == selected).unwrap();
+        assert!(bandit.dec_state[explored]
+            .b
+            .iter()
+            .any(|value| *value != 0.0));
+        assert_eq!(
+            bandit.dec_state[3].b, before,
+            "greedy arm must not absorb the reward"
+        );
+    }
+
+    #[test]
+    fn unknown_axis_or_arm_or_bad_reward_leaves_state_unchanged() {
+        let mut bandit = GuidingBandit::new(1.0);
+        assert!(!bandit.update("alt", 0.70, 1.0, &CONTEXT));
+        assert!(!bandit.update("ra", 0.42, 1.0, &CONTEXT));
+        assert!(!bandit.update("ra", 0.70, f64::NAN, &CONTEXT));
+        let mut poisoned = CONTEXT;
+        poisoned[4] = f64::NAN;
+        assert!(!bandit.update("ra", 0.70, 1.0, &poisoned));
+        assert!(!bandit.update("ra", 0.70, 1.0, &[]));
+        // No dimension reset happened either: states remain uninitialised.
+        assert!(bandit.ra_state.iter().all(|state| state.dimension() == 0));
+        assert!(bandit.dec_state.iter().all(|state| state.dimension() == 0));
+    }
 }

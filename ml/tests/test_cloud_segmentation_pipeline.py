@@ -104,6 +104,34 @@ def test_summary_separates_roi_coverage_classified_sky_and_contamination():
     assert summary["five_class_condition"] is None and summary["transparency"] is None
 
 
+def test_coverage_excludes_predictions_outside_independently_selected_region():
+    classes = np.array([[0, 0, 0, 1, 1, 1, 1, 1, 2, 2], [1] * 10])
+    region = np.zeros_like(classes, dtype=bool)
+    region[0] = True
+    summary, _, _ = summarize_logits(_logits_for(classes), region)
+    assert summary["valid_region_pixels"] == 10
+    assert summary["cloud_area_fraction_of_roi"] == 0.5
+    assert summary["contamination_area_fraction_of_roi"] == 0.2
+    assert summary["cloud_fraction_of_classified_sky"] == 0.625
+    # More cloud outside the camera's selected sky cannot increase its coverage.
+    classes[1] = 0
+    other, _, _ = summarize_logits(_logits_for(classes), region)
+    assert other == summary
+
+
+@pytest.mark.parametrize("contaminated,status,coverage", [
+    (3, "research_diagnostic", 5 / 7),
+    (4, "abstained", None),
+])
+def test_coverage_abstention_threshold_keeps_contamination_out_of_clear_sky(contaminated, status, coverage):
+    classes = [[1] * 5 + [2] * contaminated + [0] * (5 - contaminated)]
+    summary, _, _ = summarize_logits(_logits_for(classes), np.ones((1, 10), dtype=bool))
+    assert summary["status"] == status
+    assert summary["cloud_area_fraction_of_roi"] == 0.5
+    assert summary["contamination_area_fraction_of_roi"] == contaminated / 10
+    assert summary["cloud_fraction_of_classified_sky"] == coverage
+
+
 @pytest.mark.parametrize("classes,reason", [
     ([[2, 2], [1, 0]], "contamination_exceeds_diagnostic_threshold"),
     ([[2, 2], [2, 2]], "no_classified_sky"),

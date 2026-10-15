@@ -502,6 +502,14 @@ pub struct FocusSafetyConfig {
     pub settle_ms: u64,
     #[serde(default)]
     pub backlash_steps: i32,
+    /// Longest wait for a commanded focuser move to report stopped before the
+    /// move is halted and treated as failed.
+    #[serde(default = "default_move_timeout_ms")]
+    pub move_timeout_ms: u64,
+    /// A stopped focuser within this many steps of the target counts as
+    /// arrived. Zero requires an exact match.
+    #[serde(default)]
+    pub arrival_tolerance_steps: i32,
 }
 
 impl Default for FocusSafetyConfig {
@@ -515,6 +523,8 @@ impl Default for FocusSafetyConfig {
             max_failed_improvements: default_max_failed(),
             settle_ms: default_settle_ms(),
             backlash_steps: 0,
+            move_timeout_ms: default_move_timeout_ms(),
+            arrival_tolerance_steps: 0,
         }
     }
 }
@@ -759,6 +769,9 @@ fn default_sweep_radius_points() -> u32 {
 }
 fn default_settle_ms() -> u64 {
     500
+}
+fn default_move_timeout_ms() -> u64 {
+    60_000
 }
 fn default_max_position() -> i32 {
     50000

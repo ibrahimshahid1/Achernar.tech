@@ -2,9 +2,9 @@ import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { cocApi, freshCocSample, validRoi, type CocRoi, type CocSample } from "../api/coc";
 import { getHardwareTransport } from "../lib/runtime";
+import CocCoverageSummary from "./CocCoverageSummary";
 import "./cloudValidation.css";
 
-const percent = (value: number | null) => value === null ? "Unavailable" : `${(100 * value).toFixed(1)}%`;
 
 export default function CloudValidationPanel({ cameraConnectionId, streaming, currentFrame }: {
     cameraConnectionId: string | null; streaming: boolean; currentFrame?: {stream_generation?: number; width?: number; height?: number};
@@ -104,8 +104,7 @@ export default function CloudValidationPanel({ cameraConnectionId, streaming, cu
             <p>Select the region from the input image, independently of the prediction. Reselect after changing framing. Without a region, maps are available and coverage summaries abstain.</p>
             {showPrediction && <div>
                 <p>Diagnostic: {sample.summary.status}{sample.summary.reason ? ` · ${sample.summary.reason.replace(/_/g, " ")}` : ""}</p>
-                <p>Cloud area in region: {percent(sample.summary.cloud_area_fraction_of_roi)} · Contamination: {percent(sample.summary.contamination_area_fraction_of_roi)}</p>
-                <p>Scores are uncalibrated. These are not transparency classes or a weather safety assessment.</p>
+                <CocCoverageSummary summary={sample.summary} />
             </div>}
             <label className="coc-notes">Review notes <textarea disabled={!frozenValid} maxLength={1000} value={notes} onChange={(event) => setNotes(event.target.value)} placeholder="Visible clouds, uncertain regions, glow/foreground, camera settings or a framing change" /></label>
             <button className="btn" type="button" disabled={busy || !frozenValid} onClick={() => void save()}>Save frozen review sample</button>
