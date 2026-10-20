@@ -1,5 +1,8 @@
 # Achernar ML
 
+Training dataset locations and external-drive requirements are documented in
+[`docs/training-data-storage.md`](../docs/training-data-storage.md).
+
 Model development for Achernar's intelligence layer:
 
 - **AstroM3** — the tri-modal embedding (spec §7.6.9). This *is* AstroM3

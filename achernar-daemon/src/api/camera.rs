@@ -441,6 +441,14 @@ async fn perform_capture_owned(
     match run_capture(&state, &capture_id, &frame_id, &capture_type, &params).await {
         Ok(image) => {
             finish_capture_runtime(&state, None);
+            // Committed: the automatic plate-solve rules may want this frame.
+            // Any solve runs in its own task, after the capture has returned.
+            crate::mount::auto_solve::frame_archived(
+                &state,
+                &image.id,
+                &capture_type,
+                &image.metadata.timestamp,
+            );
             Ok(image)
         }
         Err(err) => {

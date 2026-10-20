@@ -898,6 +898,199 @@ fn build_header(bitpix: i32, naxes: &[i64], meta: &FitsMeta, bayer: Option<&str>
     bytes
 }
 
+// ── Reading a header back ──────────────────────────────────────────────────
+
+/// Shape of a FITS primary image, read from its header alone.
+///
+/// The plate solver needs the true image size — not the size a capture request
+/// asked for, and not a database column that older rows leave null — to turn a
+/// pixel scale into the field height ASTAP wants and to find the centre pixel.
+/// It also needs to know whether the plane is an undebayered mosaic: a solver
+/// that mistakes the Bayer grid for structure detects thousands of false stars.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct FitsImageGeometry {
+    pub width: u32,
+    pub height: u32,
+    /// `NAXIS3` for a colour cube, `1` for a single plane.
+    pub planes: u32,
+    pub bitpix: i32,
+    /// `BAYERPAT`, present when the single plane is a colour filter mosaic.
+    pub bayer_pattern: Option<String>,
+    /// `XBINNING`, when the writer recorded it.
+    pub binning: Option<u32>,
+}
+
+/// Read [`FitsImageGeometry`] from the primary header of `bytes`.
+///
+/// Only the header is parsed; the data unit is never touched. Anything that is
+/// not a two- or three-axis primary image is an error rather than a guess.
+pub fn image_geometry(bytes: &[u8]) -> Result<FitsImageGeometry> {
+    let mut simple = false;
+    let mut bitpix = None;
+    let mut naxis = None;
+    let mut axes: [Option<i64>; 3] = [None; 3];
+    let mut bayer_pattern = None;
+    let mut binning = None;
+    let mut ended = false;
+
+    for (index, card) in bytes.chunks_exact(80).enumerate() {
+        let key = std::str::from_utf8(&card[..8])
+            .map_err(|_| anyhow!("FITS card {index} has a non-ASCII keyword"))?
+            .trim_end();
+        if index == 0 && key != "SIMPLE" {
+            return Err(anyhow!("Not a FITS file: the first card is not SIMPLE"));
+        }
+        if key == "END" {
+            ended = true;
+            break;
+        }
+        let Some(value) = card_value(card) else {
+            continue;
+        };
+        match key {
+            "SIMPLE" => simple = value == "T",
+            "BITPIX" => bitpix = value.parse::<i32>().ok(),
+            "NAXIS" => naxis = value.parse::<i64>().ok(),
+            "NAXIS1" => axes[0] = value.parse().ok(),
+            "NAXIS2" => axes[1] = value.parse().ok(),
+            "NAXIS3" => axes[2] = value.parse().ok(),
+            "BAYERPAT" => bayer_pattern = Some(value).filter(|v| !v.is_empty()),
+            // Some writers record binning as a float ("2.0").
+            "XBINNING" => {
+                binning = value
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|v| v.is_finite() && *v >= 1.0 && v.fract() == 0.0)
+                    .map(|v| v as u32)
+            }
+            _ => {}
+        }
+    }
+
+    if !ended {
+        return Err(anyhow!("FITS header has no END card"));
+    }
+    if !simple {
+        return Err(anyhow!("SIMPLE is not T: not a standard FITS file"));
+    }
+    let bitpix = bitpix
+        .filter(|b| [8, 16, 32, 64, -32, -64].contains(b))
+        .ok_or_else(|| anyhow!("FITS BITPIX is missing or invalid"))?;
+    let axis = |n: Option<i64>, name: &str| -> Result<u32> {
+        n.filter(|v| *v > 0)
+            .and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| anyhow!("FITS {name} is missing or not a positive length"))
+    };
+    let planes = match naxis {
+        Some(2) => 1,
+        Some(3) => axis(axes[2], "NAXIS3")?,
+        other => {
+            return Err(anyhow!(
+                "Expected a 2- or 3-axis primary image, found NAXIS = {other:?}"
+            ))
+        }
+    };
+    Ok(FitsImageGeometry {
+        width: axis(axes[0], "NAXIS1")?,
+        height: axis(axes[1], "NAXIS2")?,
+        planes,
+        bitpix,
+        bayer_pattern,
+        binning,
+    })
+}
+
+/// The value field of a `KEYWORD = value / comment` card, unquoted. `None` for
+/// cards with no value indicator (COMMENT, HISTORY, blank).
+fn card_value(card: &[u8]) -> Option<String> {
+    if card.get(8..10) != Some(b"= ".as_slice()) {
+        return None;
+    }
+    let field = std::str::from_utf8(&card[10..]).ok()?.trim_start();
+    if let Some(rest) = field.strip_prefix('\'') {
+        // A quote inside a FITS string is written as two quotes.
+        let mut out = String::new();
+        let mut chars = rest.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\'' {
+                out.push(c);
+            } else if chars.peek() == Some(&'\'') {
+                out.push('\'');
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        return Some(out.trim_end().to_string());
+    }
+    Some(field.split('/').next()?.trim().to_string())
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    fn meta() -> FitsMeta {
+        FitsMeta {
+            exposure_s: 4.0,
+            gain: 100,
+            temperature_c: f64::NAN,
+            binning: 2,
+            instrument: "fixture".into(),
+            date_obs: String::new(),
+            iso: None,
+            shutter_label: None,
+            source_file: None,
+            calibration: None,
+        }
+    }
+
+    #[test]
+    fn reads_shape_mosaic_and_binning_from_a_capture_header() {
+        let pixels = vec![0u8; 6 * 4 * 2];
+        let bytes = encode_bayer_u16(&pixels, 6, 4, &meta(), Some("RGGB")).unwrap();
+        let geometry = image_geometry(&bytes).unwrap();
+        assert_eq!(
+            geometry,
+            FitsImageGeometry {
+                width: 6,
+                height: 4,
+                planes: 1,
+                bitpix: 16,
+                bayer_pattern: Some("RGGB".into()),
+                binning: Some(2),
+            }
+        );
+    }
+
+    #[test]
+    fn a_plane_without_bayerpat_is_not_called_a_mosaic() {
+        let bytes = encode_linear_analysis(&[0.0; 6], 3, 2, "ADU", "linear_v1").unwrap();
+        let geometry = image_geometry(&bytes).unwrap();
+        assert_eq!((geometry.width, geometry.height), (3, 2));
+        assert_eq!(geometry.bitpix, -32);
+        assert_eq!(geometry.bayer_pattern, None);
+        assert_eq!(geometry.binning, None);
+    }
+
+    #[test]
+    fn refuses_bytes_that_are_not_a_fits_image() {
+        assert!(image_geometry(b"not a fits file at all").is_err());
+        let mut truncated = encode_linear_analysis(&[0.0; 4], 2, 2, "ADU", "v").unwrap();
+        truncated.truncate(80 * 3);
+        assert!(image_geometry(&truncated).is_err(), "no END card");
+    }
+
+    #[test]
+    fn string_values_unescape_doubled_quotes_and_ignore_comments() {
+        let mut card = format!("{:<8}= {:<20} / note", "OBJECT", "'O''Brien''s'");
+        card.truncate(80);
+        let mut bytes = card.into_bytes();
+        bytes.resize(80, b' ');
+        assert_eq!(card_value(&bytes).as_deref(), Some("O'Brien's"));
+    }
+}
+
 // ── FITS card formatting (80 columns; "= " value indicator in cols 9-10) ──
 
 fn card_kv(key: &str, value: String, comment: &str) -> String {

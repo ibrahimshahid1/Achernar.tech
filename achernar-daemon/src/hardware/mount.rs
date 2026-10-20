@@ -32,7 +32,7 @@ impl MountDriver {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EqCoord {
     /// Right ascension in hours (0..24)
     pub ra: f64,

@@ -24,19 +24,26 @@ pub async fn slew(
     Json(req): Json<SlewRequest>,
 ) -> Result<StatusCode, StatusCode> {
     tracing::info!("Slew requested: RA={}, Dec={}", req.ra, req.dec);
-    let mount = state.mount.lock().unwrap();
-    crate::hardware::health::require_connected(&state, crate::hardware::health::DeviceKind::Mount)
+    let target = EqCoord {
+        ra: req.ra,
+        dec: req.dec,
+    };
+    {
+        let mount = state.mount.lock().unwrap();
+        crate::hardware::health::require_connected(
+            &state,
+            crate::hardware::health::DeviceKind::Mount,
+        )
         .map_err(|_| StatusCode::PRECONDITION_FAILED)?;
-    let mount = mount.as_ref().ok_or(StatusCode::PRECONDITION_FAILED)?;
-    mount
-        .goto(EqCoord {
-            ra: req.ra,
-            dec: req.dec,
-        })
-        .map_err(|e| {
+        let mount = mount.as_ref().ok_or(StatusCode::PRECONDITION_FAILED)?;
+        mount.goto(target).map_err(|e| {
             tracing::error!("Mount slew failed: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+    }
+    // GoTo returns once the mount accepts it. The post-slew plate solve waits
+    // for the mount to report arriving, not for this response.
+    crate::mount::auto_solve::slew_commanded(&state, target);
     Ok(StatusCode::OK)
 }
 

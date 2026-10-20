@@ -18,6 +18,8 @@ pub struct AchernarConfig {
     #[serde(default)]
     pub camera: CameraConfig,
     #[serde(default)]
+    pub plate_solve: PlateSolveConfig,
+    #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
@@ -652,6 +654,66 @@ pub struct CameraConfig {
     pub saturation_adu: Option<f32>,
 }
 
+/// Plate solving — Section 8.3. See `processing::plate_solver`.
+///
+/// Nothing here is required. With no `astap_path` the daemon probes the
+/// standard ASTAP install locations and reports what it found (or did not) on
+/// `GET /platesolve/status`; solving stays unavailable, never faked, until an
+/// executable is found.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlateSolveConfig {
+    /// ASTAP executable — `astap_cli` (preferred: no GUI libraries) or the
+    /// GUI `astap` binary, which accepts the same arguments.
+    #[serde(default)]
+    pub astap_path: Option<String>,
+    /// Star database directory (ASTAP `-d`). Unset: ASTAP's own default.
+    #[serde(default)]
+    pub database_dir: Option<String>,
+    /// Star database to use, e.g. "d50" (ASTAP `-D`). Unset: ASTAP picks.
+    #[serde(default)]
+    pub database: Option<String>,
+    /// Search radius around a pointing hint, degrees. 30 matches the ASTAP and
+    /// NINA defaults: generous enough for a mount that has lost alignment.
+    #[serde(default = "default_search_radius_deg")]
+    pub search_radius_deg: f64,
+    /// Downsample factor before solving (ASTAP `-z`). 0 lets ASTAP choose.
+    #[serde(default)]
+    pub downsample: u32,
+    /// Maximum stars used for the solution (ASTAP `-s`).
+    #[serde(default = "default_max_stars")]
+    pub max_stars: u32,
+    /// Longest a single solve may run before the process is killed. A hinted
+    /// solve with a known scale takes seconds; a blind solve with an unknown
+    /// scale can take minutes.
+    #[serde(default = "default_solve_timeout_s")]
+    pub timeout_s: u64,
+    /// Solve without being asked: the first light frame after startup, and
+    /// the first begun after each slew arrives (v6 §8.3.3 deterministic
+    /// rules). Does nothing while no solver is available.
+    #[serde(default = "default_auto_solve")]
+    pub auto_solve: bool,
+    /// After an automatic solve fails, the wait before trying another frame,
+    /// so a cloudy hour does not become a queue of minutes-long blind solves.
+    #[serde(default = "default_auto_solve_retry_s")]
+    pub auto_solve_retry_s: u64,
+}
+
+impl Default for PlateSolveConfig {
+    fn default() -> Self {
+        Self {
+            astap_path: None,
+            database_dir: None,
+            database: None,
+            search_radius_deg: default_search_radius_deg(),
+            downsample: 0,
+            max_stars: default_max_stars(),
+            timeout_s: default_solve_timeout_s(),
+            auto_solve: default_auto_solve(),
+            auto_solve_retry_s: default_auto_solve_retry_s(),
+        }
+    }
+}
+
 /// Storage configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
@@ -745,6 +807,7 @@ impl Default for AchernarConfig {
             mount: MountConfig::default(),
             filter_wheel: FilterWheelConfig::default(),
             camera: CameraConfig::default(),
+            plate_solve: PlateSolveConfig::default(),
             storage: StorageConfig::default(),
             telemetry: TelemetryConfig::default(),
         }
@@ -793,4 +856,34 @@ fn default_max_ha() -> f64 {
 }
 fn default_db_path() -> String {
     "achernar.db".to_string()
+}
+fn default_search_radius_deg() -> f64 {
+    30.0
+}
+
+#[cfg(test)]
+mod example_config_tests {
+    /// The example is what people copy; if it stops parsing, a new
+    /// installation's first experience is a config error.
+    #[test]
+    fn the_example_config_parses() {
+        let config: super::AchernarConfig =
+            toml::from_str(include_str!("../achernar.example.toml"))
+                .expect("achernar.example.toml must parse");
+        assert_eq!(config.plate_solve.search_radius_deg, 30.0);
+        assert_eq!(config.plate_solve.timeout_s, 300);
+        assert_eq!(config.plate_solve.astap_path, None);
+    }
+}
+fn default_max_stars() -> u32 {
+    500
+}
+fn default_solve_timeout_s() -> u64 {
+    300
+}
+fn default_auto_solve() -> bool {
+    true
+}
+fn default_auto_solve_retry_s() -> u64 {
+    120
 }

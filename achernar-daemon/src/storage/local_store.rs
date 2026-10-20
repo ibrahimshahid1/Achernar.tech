@@ -163,6 +163,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "grouping_keys",
         include_str!("../../migrations/007_grouping_keys.sql"),
     ),
+    (
+        8,
+        "plate_solve_provenance",
+        include_str!("../../migrations/008_plate_solve_provenance.sql"),
+    ),
 ];
 
 /// True for errors that mean "this statement's effect is already present".

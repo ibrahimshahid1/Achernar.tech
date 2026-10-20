@@ -189,6 +189,41 @@ focus_offsets = [0, 12, 8, 15, 120, 118, 122]
 # worse than setting none.
 # saturation_adu = 16383
 
+[plate_solve]                # ASTAP plate solving (Section 8.3)
+# Achernar calls ASTAP the same way NINA does; it ships no solver of its own.
+# Install ASTAP and a star database (D50 suits most fields under ~5 degrees)
+# from https://www.hnsky.org/astap.htm. With astap_path unset the daemon looks
+# in the standard install locations and on PATH; GET /api/v1/platesolve/status
+# reports what it found, or why solving is unavailable.
+#
+# astap_path   = "/opt/astap/astap_cli"   # astap_cli preferred: no GUI libraries
+# database_dir = "/opt/astap"             # ASTAP -d; default: ASTAP's own
+# database     = "d50"                    # ASTAP -D; default: ASTAP picks
+
+# Search radius around a pointing hint, degrees (ASTAP and NINA default: 30).
+search_radius_deg = 30
+# Downsample before solving; 0 lets ASTAP choose.
+downsample = 0
+max_stars = 500
+# A hinted solve with a known scale takes seconds. A blind solve that also has
+# to search for the scale can take minutes; the process is killed after this.
+timeout_s = 300
+#
+# The scale hint comes from the `rigs` row (focal_length_mm, pixel_size_um)
+# times the frame's binning. Fill those in and solves get much faster; leave
+# them empty and ASTAP searches field heights from 10 down to 0.3 degrees.
+
+# Solve without being asked (v6 Section 8.3.3 deterministic rules):
+#   startup   - the first light frame archived after the daemon starts
+#   post_slew - the first light frame begun after the mount reports arriving
+#               from a POST /mount/slew (never one exposed while it moved)
+# Each rule stays pending until a solve succeeds; GET /platesolve/status shows
+# what it is waiting for. Does nothing while no solver is available.
+auto_solve = true
+# After a failed automatic solve (cloud, lens cap), wait this long before
+# trying another frame, so a cloudy hour is not a queue of blind solves.
+auto_solve_retry_s = 120
+
 [storage]
 database_path = "achernar.db"
 # frames_dir = "/var/lib/achernar/frames"

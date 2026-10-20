@@ -21,7 +21,7 @@ The [v5 architecture specification](achernar_v5.tex) and [compute-aware runtime 
 - **Universal Hardware Support**: INDI, ASCOM Alpaca, direct USB/Serial control
 - **Real-Time Processing**: Hardware-accelerated debayering and H.264/MJPEG encoding
 - **Professional Calibration**: Automatic dark, flat, and dark-flat frame integration
-- **Plate Solving**: Local astrometry with blind solve capability
+- **Plate Solving**: Hinted and blind solves of archived frames through ASTAP, installed separately as it is for NINA (`POST /api/v1/platesolve/solve`). Solved automatically at startup and after each slew once the mount reports arriving; every attempt is recorded against its frame, including the ones that fail.
 
 ### AI/ML Intelligence
 

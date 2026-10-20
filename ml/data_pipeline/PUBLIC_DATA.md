@@ -57,7 +57,8 @@ python3.12 -m venv .venv-public-data
 .venv-public-data/bin/python -m ml.data_pipeline.validate_public_data --hashes --require-complete
 ```
 
-`--root /Volumes/AchernarData/public` is supported by each import entry point.
+`--root /Volumes/AchernarData/achernar_training_data/public` is supported by each
+import entry point.
 Keep all datasets under that one root so the bulk holdout exclusions can find
 the human records. The store is ignored by Git. Do not run two bulk downloaders
 against the same root. Downloaded complete files are checksum-verified and
@@ -155,13 +156,12 @@ calibration remains necessary. Existing R50 originals and provisional labels
 were left untouched. The full source assessments are in
 `docs/public-dataset-audit-2026-10-12/`.
 
-## External backup disk
+## External dataset storage
 
-`/Volumes/SEGATE_1TB` has an APFS Backup role and a root ACL denying folder/file
-creation. Its approximately 634 GB free space does not make the backup volume
-writable for dataset storage. A separate ordinary APFS volume can share the
-existing container's space, as described in
-[Apple's guidance](https://support.apple.com/guide/mac-help/types-of-disks-you-can-use-with-time-machine-mh15139/mac).
-No backup ACL, snapshot, partition or volume was changed during the probe.
-Adding `AchernarData` with a 400 GB quota was presented for approval. Downloads
-continue internally until a usable data volume is available.
+On October 17, 2026, the user approved creating the ordinary APFS volume
+`AchernarData` with a 400 GB quota on the same external drive. The verified
+training-data root is `/Volumes/AchernarData/achernar_training_data`, containing
+`public/` and `raws/`. The protected `SEGATE_1TB` Time Machine volume and its ACL
+are preserved. Migration status, verification receipts, compatibility paths
+and instructions for future agents are in
+[`docs/training-data-storage.md`](../../docs/training-data-storage.md).

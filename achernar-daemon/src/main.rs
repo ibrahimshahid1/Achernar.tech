@@ -144,6 +144,24 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
+    let plate_solver = processing::plate_solver::PlateSolver::from_config(&config.plate_solve);
+    match plate_solver.status() {
+        status if status.available => info!(
+            "Plate solver: ASTAP at {} ({})",
+            status.executable.unwrap_or_default(),
+            match status.executable_source {
+                Some(processing::plate_solver::ExecutableSource::Configured) => {
+                    "from [plate_solve] astap_path"
+                }
+                _ => "found at a standard install location",
+            }
+        ),
+        status => tracing::warn!(
+            "Plate solving unavailable: {}",
+            status.unavailable_reason.unwrap_or_default()
+        ),
+    }
+
     let app_state = AppState::new(
         config.focus.clone(),
         config.camera.clone(),
@@ -153,7 +171,9 @@ async fn main() -> anyhow::Result<()> {
         rig_id,
         config.storage.data_dir(),
         rig_optics,
-    );
+    )
+    .with_plate_solver(plate_solver)
+    .with_auto_solve(&config.plate_solve);
     hardware::health::spawn(app_state.clone());
     cloud_client::spawn_if_configured(app_state.clone());
     vision::vision_loop::spawn(app_state.clone(), 1.0);
@@ -174,7 +194,8 @@ async fn main() -> anyhow::Result<()> {
         .nest("/camera", camera_routes())
         .nest("/mount", mount_routes())
         .nest("/focuser", focuser_routes())
-        .nest("/focus", focus_routes());
+        .nest("/focus", focus_routes())
+        .nest("/platesolve", platesolve_routes());
 
     let app = Router::new()
         .route("/health", get(health_check))
@@ -248,6 +269,12 @@ fn focus_routes() -> Router<AppState> {
         .route("/history", get(api::focus::get_focus_history))
         .route("/drift", get(api::focus::get_drift_prediction))
         .route("/drift/history", get(api::focus::get_drift_history))
+}
+
+fn platesolve_routes() -> Router<AppState> {
+    Router::new()
+        .route("/status", get(api::plate_solve::status))
+        .route("/solve", post(api::plate_solve::solve_frame))
 }
 
 /// WebSocket handler for telemetry — now sends real hardware state

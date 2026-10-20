@@ -4,6 +4,7 @@ pub mod coc;
 pub mod focus;
 pub mod focuser;
 pub mod mount;
+pub mod plate_solve;
 pub mod websocket;
 
 #[cfg(test)]

@@ -250,7 +250,11 @@ impl FocusAgent {
             );
         }
 
+        // Every candidate passes the same bracketing and confidence gates; the
+        // best R² wins. The hyperbola is the physical model (linear blur growth
+        // over a seeing floor), the V and parabola its limiting shapes.
         let fit = [
+            ClassicalFocusSolver::fit_hyperbola(&positions, &hfr_values),
             ClassicalFocusSolver::fit_v_curve(&positions, &hfr_values),
             ClassicalFocusSolver::fit_parabola(&positions, &hfr_values),
         ]

@@ -394,12 +394,19 @@ fn mount_slew(state: AppState, payload: &Value) -> Result<Value, String> {
         ra: payload_f64(payload, "ra")?,
         dec: payload_f64(payload, "dec")?,
     };
-    let mount = state.mount.lock().unwrap();
-    crate::hardware::health::require_connected(&state, crate::hardware::health::DeviceKind::Mount)?;
-    let mount = mount
-        .as_ref()
-        .ok_or_else(|| "No mount connected".to_string())?;
-    mount.goto(target).map_err(|e| e.to_string())?;
+    {
+        let mount = state.mount.lock().unwrap();
+        crate::hardware::health::require_connected(
+            &state,
+            crate::hardware::health::DeviceKind::Mount,
+        )?;
+        let mount = mount
+            .as_ref()
+            .ok_or_else(|| "No mount connected".to_string())?;
+        mount.goto(target).map_err(|e| e.to_string())?;
+    }
+    // Same rule as the local route: the post-slew solve waits for arrival.
+    crate::mount::auto_solve::slew_commanded(&state, target);
     Ok(json!({ "status": "slewing", "ra": target.ra, "dec": target.dec }))
 }
 

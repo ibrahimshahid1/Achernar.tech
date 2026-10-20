@@ -120,6 +120,9 @@ impl CameraRuntimeState {
 /// position into the filter — satisfies the order without doing anything
 /// special.
 ///
+/// `plate_solve_trigger` is a leaf in the same sense: nothing is acquired
+/// while it is held, so it may be taken under any of the above.
+///
 /// This is not a style preference. `get_status` used to hold `camera_name` and
 /// `streaming` while reaching for `camera`, at the same time as `start_stream`
 /// held `camera` while reaching for `streaming` — a textbook ABBA deadlock that
@@ -278,6 +281,14 @@ pub struct AppState {
     pub fqe_runner: Arc<crate::vision::fqe_runner::FqeRunner>,
     /// Rendered-preview research diagnostics; never supplies control observations.
     pub coc_shadow: Arc<crate::vision::coc_shadow::CocShadowService>,
+
+    /// ASTAP plate solver for archived frames. Disabled until
+    /// [`AppState::with_plate_solver`] installs one built from `[plate_solve]`.
+    pub plate_solver: Arc<crate::processing::plate_solver::PlateSolver>,
+
+    /// Which archived frames get solved without being asked (startup and
+    /// post-slew rules). Disabled until [`AppState::with_auto_solve`].
+    pub plate_solve_trigger: Arc<Mutex<crate::mount::plate_solve_trigger::PlateSolveTrigger>>,
 }
 
 impl AppState {
@@ -363,7 +374,34 @@ impl AppState {
             rig_id,
             fqe_runner,
             coc_shadow,
+            plate_solver: Arc::new(crate::processing::plate_solver::PlateSolver::disabled(
+                "No plate solver was configured for this daemon instance",
+            )),
+            plate_solve_trigger: Arc::new(Mutex::new(
+                crate::mount::plate_solve_trigger::PlateSolveTrigger::disabled(),
+            )),
         }
+    }
+
+    /// Arm the automatic solve rules from `[plate_solve]`, with the startup
+    /// rule pending.
+    pub fn with_auto_solve(self, config: &crate::config::PlateSolveConfig) -> Self {
+        if config.auto_solve {
+            *self.plate_solve_trigger.lock().unwrap() =
+                crate::mount::plate_solve_trigger::PlateSolveTrigger::new(
+                    std::time::Duration::from_secs(config.auto_solve_retry_s),
+                );
+        }
+        self
+    }
+
+    /// Install the plate solver resolved from `[plate_solve]`.
+    pub fn with_plate_solver(
+        mut self,
+        solver: crate::processing::plate_solver::PlateSolver,
+    ) -> Self {
+        self.plate_solver = Arc::new(solver);
+        self
     }
 
     /// Remove every value derived from a previous stream generation.

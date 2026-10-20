@@ -143,7 +143,9 @@ tmp/
 *.synctex.gz
 
 
-/docs 
+# Keep working documents local except the shared dataset-location note.
+/docs/*
+!/docs/training-data-storage.md
 
 # Z114 GoTo retrofit working notes (CAD measurements, fit analysis, plans) — local only, never committed.
 mount_cad/
@@ -152,7 +154,8 @@ mount_cad/
 /ml/data/raws/cloud_capture_local/
 
 # Reproducible public intake: source downloads and derived tensors stay local.
-/ml/data/public/
+/ml/data/public
+/ml/data/raws
 /ml/data/raws/clouds
 node_modules/
 

@@ -1,5 +1,5 @@
 //! Classical focus solver — Section 7.3.4.
-//! HFD/HFR computation + parabola/V-curve fitting.
+//! HFD/HFR computation + hyperbola/parabola/V-curve fitting.
 
 use serde::{Deserialize, Serialize};
 
@@ -282,12 +282,222 @@ impl ClassicalFocusSolver {
     }
 
     /// Fit a hyperbola to position-HFR samples.
+    ///
+    /// `HFR(x) = sqrt(a² + c²(x − p)²)`: geometric blur grows linearly with
+    /// defocus (slope `c`, the asymptotes) and seeing, sampling and optics set a
+    /// floor `a` at best focus `p`. This is the curve ASTAP and NINA fit — NINA
+    /// writes it `a·cosh(asinh((p − x)/b))`, the same function with `b = a/c`.
+    /// Unlike a parabola it does not bend the wings of a wide sweep toward the
+    /// minimum, and unlike a V it does not put a corner where the seeing floor
+    /// is round. It has three parameters, one fewer than the V.
+    ///
+    /// An independent least-squares fit, not a port of NINA's grid search.
+    /// Squaring the model gives `HFR² = a² + c²(x − p)²`, a parabola in HFR²,
+    /// which supplies a closed-form start; Levenberg–Marquardt then minimises
+    /// the ordinary squared HFR residuals — the objective the parabola and V
+    /// fits use — so the three R² values stay comparable when the agent picks.
+    ///
+    /// `coefficients` are `[a, c, p]`: minimum HFR (px), asymptotic slope (px
+    /// per step) and best focus (steps).
     pub fn fit_hyperbola(positions: &[i32], hfr_values: &[f64]) -> Option<CurveFitResult> {
-        let _ = (positions, hfr_values);
-        // Do not relabel a different estimator as a hyperbola. A bounded nonlinear
-        // fit can be added once real sweeps justify its extra degrees of freedom.
-        None
+        if positions.len() != hfr_values.len() {
+            return None;
+        }
+        // HFR is a radius: zero or negative is a failed measurement, not a
+        // point on the curve.
+        let samples: Vec<(f64, f64)> = positions
+            .iter()
+            .zip(hfr_values.iter())
+            .filter_map(|(x, y)| (y.is_finite() && *y > 0.0).then_some((*x as f64, *y)))
+            .collect();
+        if samples.len() < 4 {
+            return None;
+        }
+
+        let n = samples.len() as f64;
+        let mean_y = samples.iter().map(|(_, y)| *y).sum::<f64>() / n;
+        let ss_tot = samples
+            .iter()
+            .map(|(_, y)| (y - mean_y).powi(2))
+            .sum::<f64>();
+        if ss_tot <= f64::EPSILON {
+            return None;
+        }
+
+        // Normalise positions so all three parameters are of order one; focuser
+        // steps run to tens of thousands while the slope is ~0.01 px/step.
+        let origin = samples.iter().map(|(x, _)| *x).sum::<f64>() / n;
+        let scale = samples
+            .iter()
+            .map(|(x, _)| (x - origin).abs())
+            .fold(0.0, f64::max);
+        if scale <= f64::EPSILON {
+            return None;
+        }
+        let normalised: Vec<(f64, f64)> = samples
+            .iter()
+            .map(|(x, y)| ((x - origin) / scale, *y))
+            .collect();
+
+        let start = hyperbola_start(&normalised)?;
+        let [p, a, c] = refine_hyperbola(&normalised, start)?;
+        let optimal_position = origin + p * scale;
+        let slope = c / scale;
+
+        let min_position = samples
+            .iter()
+            .map(|(x, _)| *x)
+            .fold(f64::INFINITY, f64::min);
+        let max_position = samples
+            .iter()
+            .map(|(x, _)| *x)
+            .fold(f64::NEG_INFINITY, f64::max);
+        if !(optimal_position.is_finite() && a.is_finite() && a > 0.0 && slope.is_finite())
+            || optimal_position <= min_position
+            || optimal_position >= max_position
+            || !has_two_sided_support(&samples, optimal_position)
+        {
+            return None;
+        }
+
+        let ss_res = normalised
+            .iter()
+            .map(|(x, y)| (y - hyperbola([p, a, c], *x)).powi(2))
+            .sum::<f64>();
+        Some(CurveFitResult {
+            optimal_position,
+            predicted_hfr: a,
+            r_squared: (1.0 - ss_res / ss_tot).clamp(0.0, 1.0),
+            coefficients: vec![a, slope, optimal_position],
+            method: CurveFitMethod::Hyperbola,
+        })
     }
+}
+
+/// `sqrt(a² + c²(x − p)²)` for `theta = [p, a, c]`.
+fn hyperbola(theta: [f64; 3], x: f64) -> f64 {
+    let [p, a, c] = theta;
+    (a * a + c * c * (x - p) * (x - p)).sqrt()
+}
+
+/// Closed-form start: least-squares parabola through `(x, HFR²)`.
+///
+/// `HFR² = c²x² − 2c²p·x + (c²p² + a²)`, so the parabola's curvature gives `c`,
+/// its vertex `p`, and its vertex height `a²`. Noise can push that height to or
+/// below zero on a sharp, V-like curve; the floor then starts at half the
+/// smallest measured HFR and the refinement finds the true value.
+fn hyperbola_start(samples: &[(f64, f64)]) -> Option<[f64; 3]> {
+    let (mut sx, mut sx2, mut sx3, mut sx4) = (0.0, 0.0, 0.0, 0.0);
+    let (mut sy, mut sxy, mut sx2y) = (0.0, 0.0, 0.0);
+    for (x, hfr) in samples {
+        let y = hfr * hfr;
+        let x2 = x * x;
+        sx += x;
+        sx2 += x2;
+        sx3 += x2 * x;
+        sx4 += x2 * x2;
+        sy += y;
+        sxy += x * y;
+        sx2y += x2 * y;
+    }
+    let n = samples.len() as f64;
+    let [curvature, linear, constant] = solve_3x3(
+        [[sx4, sx3, sx2], [sx3, sx2, sx], [sx2, sx, n]],
+        [sx2y, sxy, sy],
+    )?;
+    if !(curvature.is_finite() && curvature > 0.0) {
+        return None;
+    }
+    let p = -linear / (2.0 * curvature);
+    let floor_squared = constant - linear * linear / (4.0 * curvature);
+    let smallest = samples
+        .iter()
+        .map(|(_, y)| *y)
+        .fold(f64::INFINITY, f64::min);
+    let a = if floor_squared > 0.0 {
+        floor_squared.sqrt()
+    } else {
+        0.5 * smallest
+    };
+    Some([p, a, curvature.sqrt()])
+}
+
+/// Levenberg–Marquardt on the squared HFR residuals, keeping `a, c > 0`.
+fn refine_hyperbola(samples: &[(f64, f64)], start: [f64; 3]) -> Option<[f64; 3]> {
+    let cost = |theta: [f64; 3]| -> f64 {
+        samples
+            .iter()
+            .map(|(x, y)| (y - hyperbola(theta, *x)).powi(2))
+            .sum()
+    };
+    let mut theta = start;
+    let mut current = cost(theta);
+    if !current.is_finite() {
+        return None;
+    }
+    let mut lambda = 1e-3;
+
+    for _ in 0..200 {
+        let [p, a, c] = theta;
+        let mut jtj = [[0.0_f64; 3]; 3];
+        let mut jtr = [0.0_f64; 3];
+        for (x, y) in samples {
+            let u = x - p;
+            let f = hyperbola(theta, *x);
+            if !(f.is_finite() && f > 0.0) {
+                return None;
+            }
+            // d/dp, d/da, d/dc of sqrt(a² + c²u²).
+            let gradient = [-c * c * u / f, a / f, c * u * u / f];
+            let residual = y - f;
+            for i in 0..3 {
+                jtr[i] += gradient[i] * residual;
+                for k in 0..3 {
+                    jtj[i][k] += gradient[i] * gradient[k];
+                }
+            }
+        }
+
+        // Raise the damping until a step lowers the cost without leaving the
+        // physical region. If none does, the current point is the minimum.
+        let mut stepped = false;
+        while lambda < 1e12 {
+            let mut damped = jtj;
+            for (i, row) in damped.iter_mut().enumerate() {
+                row[i] += lambda * jtj[i][i].max(1e-12);
+            }
+            if let Some(delta) = solve_3x3(damped, jtr) {
+                let candidate = [
+                    theta[0] + delta[0],
+                    theta[1] + delta[1],
+                    theta[2] + delta[2],
+                ];
+                if candidate[1] > 0.0 && candidate[2] > 0.0 {
+                    let next = cost(candidate);
+                    if next.is_finite() && next <= current {
+                        let settled = current - next <= 1e-14 * current.max(f64::MIN_POSITIVE)
+                            || delta
+                                .iter()
+                                .zip(candidate.iter())
+                                .all(|(d, t)| d.abs() <= 1e-12 * t.abs().max(1.0));
+                        theta = candidate;
+                        current = next;
+                        lambda = (lambda * 0.3).max(1e-12);
+                        if settled {
+                            return Some(theta);
+                        }
+                        stepped = true;
+                        break;
+                    }
+                }
+            }
+            lambda *= 10.0;
+        }
+        if !stepped {
+            break;
+        }
+    }
+    Some(theta)
 }
 
 fn fit_line(samples: &[(f64, f64)]) -> Option<(f64, f64)> {
@@ -545,5 +755,112 @@ mod tests {
             &[5.0, 4.0, 3.0, 2.0, 1.0],
         )
         .is_none());
+    }
+
+    fn hyperbola_curve(positions: &[i32], best: f64, floor: f64, slope: f64) -> Vec<f64> {
+        positions
+            .iter()
+            .map(|x| (floor * floor + (slope * (*x as f64 - best)).powi(2)).sqrt())
+            .collect()
+    }
+
+    #[test]
+    fn hyperbola_recovers_a_known_curve() {
+        let positions: Vec<i32> = (0..10).map(|i| 9_800 + 100 * i).collect();
+        let hfr = hyperbola_curve(&positions, 10_237.0, 1.8, 0.02);
+
+        let fit = ClassicalFocusSolver::fit_hyperbola(&positions, &hfr).unwrap();
+
+        assert!(matches!(fit.method, CurveFitMethod::Hyperbola));
+        assert!(
+            (fit.optimal_position - 10_237.0).abs() < 1e-3,
+            "{}",
+            fit.optimal_position
+        );
+        assert!((fit.predicted_hfr - 1.8).abs() < 1e-6);
+        assert!((fit.coefficients[1] - 0.02).abs() < 1e-9);
+        assert!(fit.r_squared > 0.999_999);
+    }
+
+    #[test]
+    fn hyperbola_is_not_pulled_by_a_lopsided_wide_sweep() {
+        // A sweep starting just inside focus and running far out on one side.
+        // Far from focus the curve is a straight line, which a parabola can
+        // only follow by sliding its vertex toward the long arm.
+        let positions: Vec<i32> = (0..13).map(|i| 9_700 + 100 * i).collect();
+        let hfr = hyperbola_curve(&positions, 10_000.0, 2.0, 0.015);
+
+        let hyperbola = ClassicalFocusSolver::fit_hyperbola(&positions, &hfr).unwrap();
+        let parabola = ClassicalFocusSolver::fit_parabola(&positions, &hfr).unwrap();
+
+        assert!((hyperbola.optimal_position - 10_000.0).abs() < 0.5);
+        let parabola_error = (parabola.optimal_position - 10_000.0).abs();
+        assert!(parabola_error > 20.0, "parabola error {parabola_error}");
+        assert!(hyperbola.r_squared > parabola.r_squared);
+    }
+
+    #[test]
+    fn hyperbola_tolerates_measurement_noise() {
+        let positions: Vec<i32> = (0..11).map(|i| 9_500 + 100 * i).collect();
+        let mut seed = 11;
+        let hfr: Vec<f64> = hyperbola_curve(&positions, 10_020.0, 2.2, 0.012)
+            .iter()
+            .map(|y| y * (1.0 + 0.03 * lcg_noise(&mut seed) as f64))
+            .collect();
+
+        let fit = ClassicalFocusSolver::fit_hyperbola(&positions, &hfr).unwrap();
+
+        assert!(
+            (fit.optimal_position - 10_020.0).abs() < 25.0,
+            "{}",
+            fit.optimal_position
+        );
+        assert!(fit.r_squared > 0.98, "{}", fit.r_squared);
+    }
+
+    #[test]
+    fn hyperbola_agrees_with_nina_on_its_reference_curve() {
+        // NINA's HyperbolicFittingTest feeds HFR = 2 + (x - 5)² at x = 1..9 and
+        // expects best focus at 5. Symmetric samples must put it exactly there.
+        let positions: Vec<i32> = (1..=9).collect();
+        let hfr: Vec<f64> = positions
+            .iter()
+            .map(|x| 2.0 + ((*x - 5) as f64).powi(2))
+            .collect();
+
+        let fit = ClassicalFocusSolver::fit_hyperbola(&positions, &hfr).unwrap();
+
+        assert!(
+            (fit.optimal_position - 5.0).abs() < 1e-9,
+            "{}",
+            fit.optimal_position
+        );
+        assert!(fit.predicted_hfr > 0.0 && fit.predicted_hfr < 2.0);
+    }
+
+    #[test]
+    fn hyperbola_refuses_what_the_sweep_did_not_measure() {
+        let positions = [800, 900, 1000, 1100, 1200];
+        // Monotonic: no minimum inside the sweep.
+        assert!(
+            ClassicalFocusSolver::fit_hyperbola(&positions, &[5.0, 4.0, 3.0, 2.0, 1.5]).is_none()
+        );
+        // NINA's degenerate inputs: a zero HFR is a failed measurement, which
+        // leaves too few points to fit.
+        assert!(
+            ClassicalFocusSolver::fit_hyperbola(&[1000, 1100, 1200], &[18.0, 0.0, 0.0]).is_none()
+        );
+        assert!(ClassicalFocusSolver::fit_hyperbola(
+            &[900, 1000, 1000, 1100, 1200],
+            &[18.0, 18.0, 18.0, 0.0, 0.0]
+        )
+        .is_none());
+        // Flat: no curve to fit.
+        assert!(ClassicalFocusSolver::fit_hyperbola(&positions, &[3.0; 5]).is_none());
+        assert!(ClassicalFocusSolver::fit_hyperbola(&positions, &[3.0; 4]).is_none());
+        // An exact curve whose minimum has one sample beside it: an excellent
+        // fit, but not a bracketed one.
+        let hfr = hyperbola_curve(&positions, 840.0, 1.5, 0.02);
+        assert!(ClassicalFocusSolver::fit_hyperbola(&positions, &hfr).is_none());
     }
 }

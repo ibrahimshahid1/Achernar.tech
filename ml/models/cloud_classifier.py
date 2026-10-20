@@ -79,7 +79,7 @@ else:
                 nn.Conv2d(outgoing, outgoing, 3, padding=1, groups=outgoing, bias=False),
                 nn.Conv2d(outgoing, outgoing, 1, bias=False),
                 _norm(outgoing),
-                nn.ReLU(inplace=False),
+                nn.ReLU(inplace=False),"but"
             )
 
         def forward(self, image: torch.Tensor) -> torch.Tensor:
