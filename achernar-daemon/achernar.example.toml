@@ -157,6 +157,11 @@ enabled = false
 state_path = "focus_drift_state.json"
 
 [mount]                       # Mount control (Section 8.3)
+# Mounts are chosen when connecting, not in this file. Any ASCOM Alpaca telescope
+# (a commercial mount, ASCOM Remote, or a DIY Alpaca controller) uses driver "alpaca":
+#   POST /api/v1/discover {"equipment_type":"mount","driver":"alpaca","option":"http://<host>:11111"}
+#   POST /api/v1/connect  {"equipment_type":"mount","driver":"alpaca","option":"http://<host>:11111#device=0"}
+# guide_rate is a fraction of sidereal; keep it equal to the mount's own guide rate.
 guide_rate = 0.5
 max_slew_rate = 8.0
 

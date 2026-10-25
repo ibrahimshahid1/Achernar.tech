@@ -150,6 +150,9 @@ tmp/
 # Z114 GoTo retrofit working notes (CAD measurements, fit analysis, plans) — local only, never committed.
 mount_cad/
 
+# ESP32 mount firmware for the Z114 retrofit (flashed to the controller) — local only, never committed.
+/mount_cad_esp_32_firmware/
+
 # Standalone XPS sky capture utility and its local observations (not application code).
 /ml/data/raws/cloud_capture_local/
 

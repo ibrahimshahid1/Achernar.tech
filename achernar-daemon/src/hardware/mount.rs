@@ -23,11 +23,26 @@ pub enum MountDriver {
 
 impl MountDriver {
     /// Name string used by OLS driver loading.
+    ///
+    /// INDI mounts are reached through an indiserver (`indi:remote`), so any
+    /// INDI telescope driver works. OLS's other `indi:<name>` form loads a
+    /// bundled driver `.so` and exists only with `USE_INDI_AS_LIBRARY` (the
+    /// embedded-INDI Android variant), which the daemon's bridge never enables.
     pub fn ols_name(&self) -> &str {
         match self {
             MountDriver::Alpaca => "alpaca",
-            MountDriver::Indi => "indi:indi_simulator_telescope",
+            MountDriver::Indi => "indi:remote",
             MountDriver::Simulator => "alpaca",
+        }
+    }
+
+    /// OLS option for this driver. INDI takes an indiserver `host[:port]`.
+    pub fn ols_option(&self, option: &str) -> String {
+        match self {
+            MountDriver::Indi if option.is_empty() || option == "auto" => {
+                "localhost:7624".to_string()
+            }
+            _ => option.to_string(),
         }
     }
 }
@@ -184,7 +199,7 @@ impl Mount {
         let driver_name = CString::new(self.driver_type.ols_name()).map_err(|_| {
             crate::error::HardwareError::Communication("Invalid driver name".into())
         })?;
-        let option_c = CString::new(option).map_err(|_| {
+        let option_c = CString::new(self.driver_type.ols_option(option)).map_err(|_| {
             crate::error::HardwareError::Communication("Invalid option string".into())
         })?;
 
@@ -441,6 +456,45 @@ impl Drop for Mount {
                 ols_ffi::ols_mount_interface_destroy(self.handle);
             }
             self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MountDriver;
+
+    #[test]
+    fn indi_uses_remote_driver() {
+        assert_eq!(MountDriver::Indi.ols_name(), "indi:remote");
+    }
+
+    #[test]
+    fn indi_auto_option_defaults_to_local_indiserver() {
+        assert_eq!(MountDriver::Indi.ols_option("auto"), "localhost:7624");
+        assert_eq!(MountDriver::Indi.ols_option(""), "localhost:7624");
+        assert_eq!(
+            MountDriver::Indi.ols_option("observatory.local"),
+            "observatory.local"
+        );
+        assert_eq!(
+            MountDriver::Indi.ols_option("10.0.0.5:7625"),
+            "10.0.0.5:7625"
+        );
+    }
+
+    #[test]
+    fn alpaca_and_sim_options_unchanged() {
+        assert_eq!(MountDriver::Alpaca.ols_name(), "alpaca");
+        assert_eq!(MountDriver::Simulator.ols_name(), "alpaca");
+        for option in [
+            "auto",
+            "",
+            "http://127.0.0.1:11111#device=0",
+            "http://mount.local:11111",
+        ] {
+            assert_eq!(MountDriver::Alpaca.ols_option(option), option);
+            assert_eq!(MountDriver::Simulator.ols_option(option), option);
         }
     }
 }

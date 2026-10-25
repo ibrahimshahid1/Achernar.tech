@@ -114,7 +114,7 @@ pub fn driver_capability_report() -> DriverCapabilityReport {
                 "INDI",
                 indi,
                 "libindi support was not compiled into this daemon build.",
-                Some("INDI telescope device"),
+                Some("indiserver host:port (default localhost:7624)"),
             ),
         ],
         focuser: vec![

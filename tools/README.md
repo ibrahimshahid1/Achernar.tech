@@ -219,3 +219,41 @@ I couldn't verify these — this sandbox has no toolchain.
 | `tools/test_import_session.py` | **10/10 pass**, including applying migrations 001–006 to a fresh database |
 | `tools/test_photon_transfer.py` | **10/10 pass**, recovering gain, read noise, black level and saturation from simulated sensors with known ground truth |
 | `ml/tests/test_dataset_builder.py::TestSaturationGate` | 5/6 pass here; the sixth needs `sep`, which wouldn't install (sandbox disk full). **Run it on your Mac.** |
+
+---
+
+## `alpaca_pe_logger.py` — log a mount's RA drive while it tracks (PE bench)
+
+```bash
+uv run tools/alpaca_pe_logger.py --url http://achernar-mount.local:11111 --duration 4200 --csv PE_LOG.csv
+```
+
+On macOS, prefix the command with `caffeinate -i` so the laptop does not sleep
+during the run.
+
+Talks to **any** ASCOM Alpaca telescope (`--url http://host:port`, or
+`--discover` for Alpaca UDP discovery). It connects (which energises the motors
+on mounts that enable their drivers on connect), selects sidereal
+(`TrackingRate=0`), turns tracking on, and from then on only reads: no guiding,
+no rate changes, no slews. It samples at `--interval` (default 1 s) for
+`--duration` seconds and stops with exit 3 if tracking stops, the mount slews,
+or samples keep failing.
+
+- Every device: `<stem>_radec.csv` with
+  `host_unix_s,ra_hours,dec_deg,sidereal_time_hours,tracking,slewing`.
+- Devices that list the Action `achernar:telemetry` (the Achernar mount
+  firmware) additionally get the frozen step-counter CSV that
+  `analyze_pe_frames.py --pe-log` reads
+  (`host_unix_s,device_us,ra_usteps,dec_usteps,ra_rate_usteps_s,dec_rate_usteps_s,state`)
+  and its sidecar `<csv>.json` (`motor_full_steps`, `microsteps`, `ra_ratio`,
+  `dec_ratio`, `ra_invert`, `sidereal_rate_usteps_s`, `firmware_version`,
+  `start_host_unix_s`, `port`).
+
+At the end it prints the same health verdict as `pe_log_health`
+(`CONSTANT_RATE_OK` / `CHECK_LOG`: residual ≤ 1.5 µsteps, gaps ≤ 3 s, one step
+rate, within 50 ppm of sidereal) and the run's ppm resolution. Existing outputs
+are never overwritten without `--force`. Standard library only.
+
+Tests (`tools/test_alpaca_pe_logger.py`, about 40 s) use an in-process fake
+Alpaca telescope; one test also runs against the firmware's host simulator when
+`mount_cad_esp_32_firmware/achernar-mount-esp32/host_sim/build/achernar-mount-sim` is built.
