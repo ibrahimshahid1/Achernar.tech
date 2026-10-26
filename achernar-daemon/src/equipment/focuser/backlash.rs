@@ -14,7 +14,13 @@
 //! - `absolute{in, out}`: compensate only when the direction of travel
 //!   reverses. The extra steps accumulate in a virtual offset, and the
 //!   logical position is `raw - offset`, so the compensation never shows in
-//!   the position the operator, the models or the profile see.
+//!   the position the operator, the models or the profile see. The offset is
+//!   kept within `[-in, +out]`, so asymmetric amounts cannot drift, and the
+//!   raw target of **every** move is checked against the travel bounds: when
+//!   the compensated target would leave them the compensation is skipped,
+//!   and when even the current offset would, the offset is dropped (the move
+//!   goes to the plain logical target and the session reports a
+//!   `focuser_position_reset`).
 //! - `backlash_owner = firmware`: the device compensates internally and
 //!   Achernar applies none, whatever the model says.
 //!
@@ -88,6 +94,10 @@ pub struct BacklashPlan {
     /// either is unknown.
     pub reversal: Option<bool>,
     pub skipped: Option<SkipReason>,
+    /// `absolute` only: the offset this move removes because the raw target
+    /// would otherwise leave the travel bounds. The logical position then
+    /// re-baselines by this many steps.
+    pub offset_dropped: Option<i32>,
     /// The compensation state once every leg has completed.
     pub state_after: BacklashState,
 }
@@ -158,8 +168,9 @@ fn within(bounds: Option<(i32, i32)>, value: i64) -> bool {
 /// Plan one logical move.
 ///
 /// `bounds` are the raw travel bounds (`[0, MaxStep]` intersected with the
-/// profile and guard bounds) or `None` when they are unknown (a relative
-/// focuser whose origin is unknown).
+/// `FocusSafetyGuard` and profile bounds) or `None` when they are unknown (a
+/// relative focuser whose origin is unknown). Every leg's raw target lies
+/// within them whenever the logical target does.
 pub fn plan(
     model: BacklashModel,
     owner: BacklashOwner,
@@ -192,6 +203,7 @@ pub fn plan(
         direction: dir,
         reversal,
         skipped: None,
+        offset_dropped: None,
         state_after: BacklashState {
             offset,
             last_direction: dir.or(state.last_direction),
@@ -246,20 +258,38 @@ pub fn plan(
             in_steps,
             out_steps,
         } => {
-            if reversal == Some(true) {
-                let delta = match dir {
-                    FocusDirection::Out => i64::from(out_steps.max(0)),
-                    FocusDirection::In => -i64::from(in_steps.max(0)),
-                };
-                let new_offset = i64::from(offset) + delta;
-                let raw = i64::from(logical_target) + new_offset;
-                if delta != 0 && within(bounds, raw) && within(None, new_offset) {
-                    plan.state_after.offset = new_offset as i32;
-                    plan.raw_target = raw as i32;
-                } else if delta != 0 {
-                    plan.skipped = Some(SkipReason::OutsideTravelBounds);
+            let (in_steps, out_steps) = (i64::from(in_steps.max(0)), i64::from(out_steps.max(0)));
+            // The offset stays within one dead band, so unequal in and out
+            // amounts cannot make it (and the persisted state) drift.
+            let limit = |value: i64| value.clamp(-in_steps, out_steps);
+            let delta = match (reversal, dir) {
+                (Some(true), FocusDirection::Out) => out_steps,
+                (Some(true), FocusDirection::In) => -in_steps,
+                _ => 0,
+            };
+            let kept = limit(i64::from(offset));
+            let compensated = limit(kept + delta);
+            let raw_with = |offset: i64| i64::from(logical_target) + offset;
+            // Every move's raw target is checked, not just a reversal's: the
+            // offset alone can push a target near either end out of bounds.
+            let chosen = if within(bounds, raw_with(compensated)) {
+                compensated
+            } else if within(bounds, raw_with(kept)) {
+                plan.skipped = Some(SkipReason::OutsideTravelBounds);
+                kept
+            } else {
+                // The logical target is inside the bounds, so dropping the
+                // offset always yields a valid raw target.
+                plan.skipped = Some(SkipReason::OutsideTravelBounds);
+                if offset != 0 {
+                    plan.offset_dropped = Some(offset);
                 }
-            }
+                0
+            };
+            // `chosen` lies in [-in, +out] (or is zero) and `raw_with(chosen)`
+            // passed `within`, so both fit in an i32.
+            plan.state_after.offset = chosen as i32;
+            plan.raw_target = raw_with(chosen) as i32;
             plan.legs.push(Leg {
                 raw_target: plan.raw_target,
                 purpose: LegPurpose::Target,
@@ -431,6 +461,126 @@ mod tests {
         assert_eq!(p.skipped, Some(SkipReason::OutsideTravelBounds));
         assert_eq!(p.state_after.offset, 0);
         assert_eq!(p.state_after.last_direction, Some(FocusDirection::In));
+    }
+
+    #[test]
+    fn absolute_checks_every_raw_target_against_the_bounds() {
+        let model = BacklashModel::Absolute {
+            in_steps: 20,
+            out_steps: 20,
+        };
+        let bounds = Some((0, 50_000));
+        let after_in = BacklashState {
+            offset: -20,
+            last_direction: Some(FocusDirection::In),
+        };
+        // No reversal, but the offset alone would send Position -10: the
+        // offset is dropped and the move goes to the plain target.
+        let p = plan(model, BacklashOwner::Achernar, after_in, 500, 10, bounds);
+        assert_eq!(targets(&p), vec![10]);
+        assert_eq!(p.skipped, Some(SkipReason::OutsideTravelBounds));
+        assert_eq!(p.offset_dropped, Some(-20));
+        assert_eq!(
+            p.state_after,
+            BacklashState {
+                offset: 0,
+                last_direction: Some(FocusDirection::In)
+            }
+        );
+        // A reversal to 0 whose compensation would pass 0: skipped, raw 0.
+        let after_out = BacklashState {
+            offset: 0,
+            last_direction: Some(FocusDirection::Out),
+        };
+        let p = plan(model, BacklashOwner::Achernar, after_out, 500, 0, bounds);
+        assert_eq!((targets(&p), p.reversal), (vec![0], Some(true)));
+        assert_eq!(p.skipped, Some(SkipReason::OutsideTravelBounds));
+        assert_eq!(p.offset_dropped, None, "nothing to drop");
+        // The same at MaxStep, from either side of the dead band.
+        let p = plan(
+            model,
+            BacklashOwner::Achernar,
+            BacklashState {
+                offset: 0,
+                last_direction: Some(FocusDirection::In),
+            },
+            1_000,
+            50_000,
+            bounds,
+        );
+        assert_eq!(targets(&p), vec![50_000]);
+        assert_eq!(p.skipped, Some(SkipReason::OutsideTravelBounds));
+        let p = plan(
+            model,
+            BacklashOwner::Achernar,
+            after_in,
+            1_000,
+            50_000,
+            bounds,
+        );
+        assert_eq!(targets(&p), vec![50_000], "the reversal cancels the offset");
+        assert_eq!((p.skipped, p.state_after.offset), (None, 0));
+        let held_out = BacklashState {
+            offset: 20,
+            last_direction: Some(FocusDirection::Out),
+        };
+        let p = plan(
+            model,
+            BacklashOwner::Achernar,
+            held_out,
+            1_000,
+            50_000,
+            bounds,
+        );
+        assert_eq!(targets(&p), vec![50_000]);
+        assert_eq!(p.offset_dropped, Some(20));
+        // The FocusSafetyGuard minimum binds the raw target as well.
+        let p = plan(
+            model,
+            BacklashOwner::Achernar,
+            after_in,
+            5_000,
+            1_000,
+            Some((1_000, 50_000)),
+        );
+        assert_eq!(targets(&p), vec![1_000]);
+        assert_eq!(p.state_after.offset, 0);
+    }
+
+    #[test]
+    fn asymmetric_absolute_amounts_cannot_drift() {
+        let model = BacklashModel::Absolute {
+            in_steps: 20,
+            out_steps: 30,
+        };
+        let mut state = NO_STATE;
+        let mut at = 10_000;
+        let mut offsets = Vec::new();
+        for i in 0..20 {
+            let target = if i % 2 == 0 { at + 500 } else { at - 500 };
+            let p = plan(
+                model,
+                BacklashOwner::Achernar,
+                state,
+                at,
+                target,
+                Some((0, 50_000)),
+            );
+            assert_eq!(p.raw_target - p.state_after.offset, target);
+            state = p.state_after;
+            at = target;
+            offsets.push(state.offset);
+        }
+        assert!(
+            offsets.iter().all(|o| (-20..=30).contains(o)),
+            "{offsets:?}"
+        );
+        // It settles into one dead band instead of growing by 10 a cycle.
+        assert_eq!(offsets[..6], [0, -20, 10, -10, 20, 0]);
+        assert!(
+            offsets[6..].chunks(2).all(|pair| pair == [30, 10]),
+            "{offsets:?}"
+        );
     }
 
     #[test]

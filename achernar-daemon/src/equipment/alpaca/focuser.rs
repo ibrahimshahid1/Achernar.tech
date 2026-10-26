@@ -43,6 +43,7 @@ use std::time::Duration;
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
+use crate::equipment::clock::duration_ns;
 use crate::equipment::snapshot::{FocuserCapabilities, FocuserState};
 use crate::equipment::traits::{
     AbortPath, AlpacaTransport, Clock, ConnectPath, ConnectReport, Device, FocuserDriver,
@@ -319,13 +320,23 @@ impl AlpacaFocuser {
         }
     }
 
+    /// Poll `connecting` until it reads false. The budget is elapsed clock
+    /// time, request latency included: no GET starts once `timeout` has
+    /// passed. (One GET in flight can still run to its own `Connect`
+    /// timeout; the frozen transport takes a timeout class, not a budget.)
     fn wait_connecting(&self, timeout: Duration) -> DeviceResult<()> {
-        let attempts = if self.connect_poll.is_zero() {
+        let started = self.clock.now_mono_ns();
+        let budget = duration_ns(timeout);
+        // A backstop for a clock that does not advance (a test clock); with
+        // a real clock the elapsed time ends the wait first.
+        let max_attempts = if self.connect_poll.is_zero() {
             1_000
         } else {
-            (timeout.as_millis() / self.connect_poll.as_millis().max(1)).max(1)
+            timeout.as_millis() / self.connect_poll.as_millis().max(1) + 1
         };
-        for attempt in 0..attempts {
+        let mut attempts = 0u128;
+        loop {
+            attempts += 1;
             match self.get("connecting", TimeoutClass::Connect) {
                 Ok(value) if as_bool(&value) == Some(false) => return Ok(()),
                 Ok(_) => {}
@@ -334,14 +345,36 @@ impl AlpacaFocuser {
                 Err(err) if err.is_unknown_member() => return Ok(()),
                 Err(err) => return Err(err),
             }
-            if attempt + 1 < attempts && !self.connect_poll.is_zero() {
-                std::thread::sleep(self.connect_poll);
+            let elapsed = self.clock.now_mono_ns().saturating_sub(started);
+            if elapsed >= budget || attempts >= max_attempts {
+                break;
+            }
+            if !self.connect_poll.is_zero() {
+                let left = Duration::from_nanos(budget - elapsed);
+                std::thread::sleep(self.connect_poll.min(left));
             }
         }
         Err(DeviceError::timeout(format!(
             "the focuser was still connecting after {} s",
             timeout.as_secs()
         )))
+    }
+
+    /// §2.6: any failure after the device may have accepted the connect
+    /// disconnects it again (best effort), so no session is left dangling
+    /// for this ClientID (D16: per-ClientID firmware stops motion only when
+    /// its last client leaves). Returns `err`.
+    fn abandon_connect(&mut self, path: ConnectPath, err: DeviceError) -> DeviceError {
+        self.path = path;
+        self.connected = false;
+        self.caps = None;
+        if let Err(cleanup) = self.disconnect() {
+            tracing::warn!(
+                error = %cleanup,
+                "focuser disconnect after a failed connect failed"
+            );
+        }
+        err
     }
 
     fn probe_capabilities(&mut self, interface_version: i32) -> DeviceResult<FocuserCapabilities> {
@@ -522,31 +555,50 @@ impl Device for AlpacaFocuser {
         };
         self.identity.interface_version = Some(interface_version);
 
+        // A connect write that timed out may still have reached the device.
+        let unanswered = |err: &DeviceError| {
+            matches!(err.class, ErrorClass::Timeout | ErrorClass::OutcomeUnknown)
+        };
         let mut path = ConnectPath::Platform6;
         if interface_version >= PLATFORM7_INTERFACE {
             match self.put("connect", &[], TimeoutClass::Connect) {
                 Ok(_) => {
-                    self.wait_connecting(timeout)?;
                     path = ConnectPath::Platform7;
+                    if let Err(err) = self.wait_connecting(timeout) {
+                        return Err(self.abandon_connect(path, err));
+                    }
                 }
                 Err(err) if err.is_unknown_member() => warnings.push(format!(
                     "connect is not implemented ({err}); using Connected=True"
                 )),
+                Err(err) if unanswered(&err) => {
+                    return Err(self.abandon_connect(ConnectPath::Platform7, err))
+                }
                 Err(err) => return Err(err),
             }
         }
         if path == ConnectPath::Platform6 {
-            self.put(
+            if let Err(err) = self.put(
                 "connected",
                 &[("Connected", alpaca_bool(true))],
                 TimeoutClass::Connect,
-            )?;
+            ) {
+                return Err(if unanswered(&err) {
+                    self.abandon_connect(path, err)
+                } else {
+                    err
+                });
+            }
         }
-        let confirmed = self.get("connected", TimeoutClass::Connect)?;
+        let confirmed = match self.get("connected", TimeoutClass::Connect) {
+            Ok(value) => value,
+            Err(err) => return Err(self.abandon_connect(path, err)),
+        };
         if as_bool(&confirmed) != Some(true) {
-            return Err(DeviceError::not_connected(format!(
+            let err = DeviceError::not_connected(format!(
                 "the focuser reports connected = {confirmed} after connecting"
-            )));
+            ));
+            return Err(self.abandon_connect(path, err));
         }
 
         // Identity (§2.6 step 5). Failures leave the field unknown.
@@ -565,10 +617,7 @@ impl Device for AlpacaFocuser {
 
         let caps = match self.probe_capabilities(interface_version) {
             Ok(caps) => caps,
-            Err(err) => {
-                let _ = self.disconnect();
-                return Err(err);
-            }
+            Err(err) => return Err(self.abandon_connect(path, err)),
         };
         self.caps = Some(caps.clone());
         self.path = path;
@@ -1229,19 +1278,118 @@ mod tests {
         let err = drv.connect(Duration::from_secs(1)).unwrap_err();
         assert_eq!(err.class, ErrorClass::NotConnected);
         assert_eq!(drv.identity().interface_version, Some(1));
+        let connected_puts: Vec<_> = fake
+            .calls()
+            .into_iter()
+            .filter(|c| c.method == Method::Put && c.member == "connected")
+            .map(|c| c.params[0].1.clone())
+            .collect();
+        assert_eq!(connected_puts, vec!["True", "False"], "undone (§2.6)");
 
         let stuck = FakeAlpacaTransport::new().shared();
         stuck
             .on_get("interfaceversion", FakeReply::value(4))
             .on_put("connect", FakeReply::ok())
-            .on_get("connecting", FakeReply::value(true));
+            .on_get("connecting", FakeReply::value(true))
+            .on_put("disconnect", FakeReply::ok());
         let mut drv = AlpacaFocuser::new("http://h:1", 0, stuck.clone(), stuck.clone(), clock)
             .with_connect_poll_interval(Duration::from_millis(1))
             .with_unique_id(Some(" 7f1e-uid "));
         assert_eq!(drv.identity().identity_key, "alpaca:7f1e-uid");
         let err = drv.connect(Duration::from_millis(5)).unwrap_err();
         assert_eq!(err.class, ErrorClass::Timeout);
-        assert_eq!(stuck.calls_to(Method::Get, "connecting"), 5);
+        // The manual clock never advances, so the attempt backstop ends it.
+        assert_eq!(stuck.calls_to(Method::Get, "connecting"), 6);
+        assert_eq!(stuck.calls_to(Method::Put, "disconnect"), 1);
+    }
+
+    /// Every request takes `per_call` of clock time.
+    struct SlowTransport {
+        inner: Arc<FakeAlpacaTransport>,
+        clock: Arc<ManualClock>,
+        per_call: Duration,
+    }
+
+    impl AlpacaTransport for SlowTransport {
+        fn get(
+            &self,
+            member: &str,
+            query: &[(&str, String)],
+            class: TimeoutClass,
+        ) -> DeviceResult<Value> {
+            self.clock.advance(self.per_call);
+            self.inner.get(member, query, class)
+        }
+
+        fn put(
+            &self,
+            member: &str,
+            form: &[(&str, String)],
+            class: TimeoutClass,
+        ) -> DeviceResult<Value> {
+            self.clock.advance(self.per_call);
+            self.inner.put(member, form, class)
+        }
+    }
+
+    #[test]
+    fn a_failed_connect_disconnects_and_the_wait_is_bounded_by_elapsed_time() {
+        // Platform 7, `connecting` never clears, every request takes 2 s: a
+        // 30 s budget allows 15 GETs (request latency counts), then the
+        // accepted connect is undone with PUT disconnect.
+        let fake = FakeAlpacaTransport::new().shared();
+        fake.on_get("interfaceversion", FakeReply::value(4))
+            .on_put("connect", FakeReply::ok())
+            .on_get("connecting", FakeReply::value(true))
+            .on_put("disconnect", FakeReply::ok());
+        let clock = Arc::new(ManualClock::new());
+        let slow = Arc::new(SlowTransport {
+            inner: fake.clone(),
+            clock: clock.clone(),
+            per_call: Duration::from_secs(2),
+        });
+        let mut drv = AlpacaFocuser::new("http://h:1", 0, slow, fake.clone(), clock.clone())
+            .with_connect_poll_interval(Duration::ZERO);
+        let err = drv.connect(Duration::from_secs(30)).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Timeout);
+        assert_eq!(fake.calls_to(Method::Get, "connecting"), 15);
+        assert_eq!(fake.calls_to(Method::Put, "disconnect"), 1);
+        assert_eq!(fake.calls_to(Method::Put, "connected"), 0);
+        assert!(drv.poll(&plan(&[])).is_err(), "left disconnected");
+
+        // A link failure while probing capabilities on Platform 7 is undone
+        // with PUT disconnect, not Connected=False.
+        let fake = FakeAlpacaTransport::new().shared();
+        fake.on_get("interfaceversion", FakeReply::value(4))
+            .on_put("connect", FakeReply::ok())
+            .on_get("connecting", FakeReply::value(false))
+            .on_get("connected", FakeReply::value(true))
+            .on_get("absolute", FakeReply::Timeout)
+            .on_put("disconnect", FakeReply::ok());
+        let mut drv = driver(&fake, &clock);
+        assert_eq!(
+            drv.connect(Duration::from_secs(30)).unwrap_err().class,
+            ErrorClass::Timeout
+        );
+        assert_eq!(fake.calls_to(Method::Put, "disconnect"), 1);
+        assert_eq!(fake.calls_to(Method::Put, "connected"), 0);
+
+        // A connect write that timed out may have reached the device.
+        let fake = FakeAlpacaTransport::new().shared();
+        fake.on_get("interfaceversion", FakeReply::value(4))
+            .on_put("connect", FakeReply::Timeout)
+            .on_put("disconnect", FakeReply::ok());
+        let mut drv = driver(&fake, &clock);
+        assert!(drv.connect(Duration::from_secs(30)).is_err());
+        assert_eq!(fake.calls_to(Method::Put, "disconnect"), 1);
+
+        // A connect the device refused has nothing to undo.
+        let fake = FakeAlpacaTransport::new().shared();
+        fake.on_get("interfaceversion", FakeReply::value(3))
+            .on_put("connected", FakeReply::alpaca_error(0x500, "motor fault"));
+        let mut drv = driver(&fake, &clock);
+        assert!(drv.connect(Duration::from_secs(30)).is_err());
+        assert_eq!(fake.calls_to(Method::Put, "connected"), 1);
     }
 
     #[test]

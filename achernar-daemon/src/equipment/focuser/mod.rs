@@ -35,6 +35,15 @@
 //!    [`FocuserSession::on_disconnect`]. `GatedOp::FocuserSetPosition` is
 //!    executed with [`FocuserSession::set_position`] (profile only).
 //! 5. Register [`FocuserSafetyCheck`] with the gate once.
+//! 6. Autofocus (WP1B-2) runs with TempComp off for the whole run (F-d).
+//!    On the worker thread: [`FocuserSession::begin_autofocus_run`] before
+//!    the run's first exposure, [`FocuserSession::autofocus_operation`] for
+//!    every move of the run, and [`FocuserSession::end_autofocus_run`] once
+//!    the run ends on any path (success, failure, abort, and before a
+//!    disconnect, with `None` for whatever run is held). Moves of the run
+//!    never restore TempComp; the run end restores it exactly once. An
+//!    autofocus move without a `begin` starts the hold itself, and an
+//!    ordinary move after a run that was never ended takes over the restore.
 //!
 //! Events and ground-truth records (`focuser_moves`, `environment_log` probe
 //! rows, `device_profiles` patches) go to the session's
@@ -77,6 +86,7 @@ use crate::equipment::types::{
 };
 
 pub use backlash::BacklashState;
+use tempcomp::{TempCompGuard, TempCompRunHold};
 
 /// Idle cadence (§2.7: 0.5 Hz).
 pub const IDLE_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -360,6 +370,8 @@ struct LogicalState {
     /// Mono time and value of the last `focuser_temperature` event.
     temperature_event: Option<(u64, f64)>,
     environment_mono: Option<u64>,
+    /// The autofocus run holding TempComp off (F-d), if any.
+    autofocus: Option<TempCompRunHold>,
 }
 
 struct SessionInner {
@@ -416,6 +428,53 @@ impl SessionInner {
 
     fn travel_bounds(&self) -> Option<(i32, i32)> {
         self.settings.travel_bounds(&self.caps)
+    }
+
+    /// Make `run_id` the run holding TempComp off. A run that was never
+    /// ended is taken over, with the restore it owes. Returns true when the
+    /// hold was created by this call.
+    fn claim_autofocus_run(&self, run_id: &str) -> bool {
+        let mut s = self.lock();
+        match s.autofocus.as_mut() {
+            None => {
+                s.autofocus = Some(TempCompRunHold::new(run_id));
+                true
+            }
+            Some(hold) if hold.run_id() == run_id => false,
+            Some(hold) => {
+                tracing::warn!(
+                    previous = hold.run_id(),
+                    run_id,
+                    "an autofocus run starts while an earlier run was never ended; it takes \
+                     over the TempComp restore"
+                );
+                hold.rekey(run_id);
+                false
+            }
+        }
+    }
+
+    /// Hand an autofocus guard's switch-off to the run's hold.
+    fn absorb_autofocus_tempcomp(&self, run_id: &str, guard: &mut TempCompGuard) {
+        let mut s = self.lock();
+        s.autofocus
+            .get_or_insert_with(|| TempCompRunHold::new(run_id))
+            .absorb(guard);
+    }
+
+    fn take_autofocus_hold(&self) -> Option<TempCompRunHold> {
+        self.lock().autofocus.take()
+    }
+
+    fn tempcomp_event(&self, change: tempcomp::TempCompChange, command_id: Option<CommandId>) {
+        self.event(
+            EventKind::TempcompChanged {
+                from: change.from,
+                to: change.to,
+                reason: Some(change.reason.into()),
+            },
+            command_id,
+        );
     }
 
     /// A06 defence in depth: the gate already refused moves while exposing;
@@ -790,8 +849,11 @@ impl FocuserSession {
         self.build_operation(cmd, command_id, source, None)
     }
 
-    /// A move inside an autofocus run: TempComp is always off (F-d) and the
-    /// run id is recorded on the `focuser_moves` row.
+    /// A move inside an autofocus run: TempComp is off (F-d) and stays off
+    /// after the move, because the run's exposures come between its moves;
+    /// [`FocuserSession::end_autofocus_run`] restores it once. The run id is
+    /// recorded on the `focuser_moves` row. A run that was not begun is
+    /// begun by its first move.
     pub fn autofocus_operation(
         &self,
         cmd: &FocuserCmd,
@@ -805,6 +867,108 @@ impl FocuserSession {
             ));
         }
         self.build_operation(cmd, command_id, source, Some(run_id))
+    }
+
+    /// Start an autofocus run (F-d): switch TempComp off now, before the
+    /// run's first exposure, and hold it off until
+    /// [`FocuserSession::end_autofocus_run`]. Called on the worker thread
+    /// between operations. Beginning the same run again is harmless.
+    pub fn begin_autofocus_run(
+        &self,
+        drv: &mut dyn FocuserDriver,
+        run_id: &str,
+    ) -> DeviceResult<()> {
+        if !self.position_source().is_reliable() {
+            return Err(DeviceError::invalid_operation(
+                "autofocus is refused while the focuser origin is unknown",
+            ));
+        }
+        let inner = &self.inner;
+        if inner.lock().op_active {
+            return Err(DeviceError::invalid_operation(
+                "a focuser operation is active; an autofocus run begins between operations",
+            ));
+        }
+        let created = inner.claim_autofocus_run(run_id);
+        let current = drv
+            .state()
+            .ok()
+            .and_then(|state| state.temp_comp.known().copied());
+        let mut guard = TempCompGuard::for_autofocus_run();
+        let switched = guard.before_move(drv, inner.caps.temp_comp_available, current);
+        inner.absorb_autofocus_tempcomp(run_id, &mut guard);
+        match switched {
+            Ok(change) => {
+                if let Some(change) = change {
+                    inner.tempcomp_event(change, None);
+                }
+                Ok(())
+            }
+            Err(err) => {
+                // A run that never started holds nothing, unless the write
+                // may have applied.
+                let mut s = inner.lock();
+                if created && !s.autofocus.as_ref().is_some_and(|h| h.owes_restore()) {
+                    s.autofocus = None;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// End an autofocus run on any path (success, failure, abort, and before
+    /// a disconnect): restore TempComp once if the run switched it off, and
+    /// release the hold. `None` ends whatever run is held. Ending a run that
+    /// is not held does nothing. Called on the worker thread between
+    /// operations; a failed restore is reported and not retried.
+    pub fn end_autofocus_run(
+        &self,
+        drv: &mut dyn FocuserDriver,
+        run_id: Option<&str>,
+    ) -> DeviceResult<()> {
+        let inner = &self.inner;
+        let hold = {
+            let mut s = inner.lock();
+            if let Some(held) = s.autofocus.as_ref() {
+                if run_id.is_some_and(|id| id != held.run_id()) {
+                    tracing::debug!(
+                        held = held.run_id(),
+                        ended = run_id,
+                        "autofocus run end ignored: another run holds the focuser"
+                    );
+                    return Ok(());
+                }
+                if s.op_active {
+                    return Err(DeviceError::invalid_operation(
+                        "a focuser operation is active; cancel it before ending the autofocus run",
+                    ));
+                }
+            }
+            match s.autofocus.take() {
+                Some(hold) => hold,
+                None => return Ok(()),
+            }
+        };
+        match hold.restore(drv) {
+            Ok(Some(change)) => {
+                inner.tempcomp_event(change, None);
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(err) => {
+                tracing::warn!(error = %err, "TempComp restore after autofocus failed");
+                Err(err)
+            }
+        }
+    }
+
+    /// The autofocus run holding TempComp off, if any.
+    pub fn autofocus_run(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .autofocus
+            .as_ref()
+            .map(|hold| hold.run_id().to_string())
     }
 
     fn build_operation(
@@ -884,6 +1048,15 @@ impl FocuserSession {
     /// is active leaves the relative position unknown.
     pub fn on_disconnect(&self, end: ConnectionEnd) {
         let inner = &self.inner;
+        if let Some(hold) = inner.take_autofocus_hold() {
+            if hold.owes_restore() {
+                tracing::warn!(
+                    run_id = hold.run_id(),
+                    "the focuser disconnected with TempComp held off by an autofocus run; \
+                     end_autofocus_run must run before a disconnect"
+                );
+            }
+        }
         let s = inner.lock().clone();
         if inner.caps.absolute {
             inner.persist_backlash(s.backlash, s.last_idle_raw);
@@ -1158,7 +1331,7 @@ mod tests {
     };
     use crate::equipment::snapshot::{CameraSummary, ExposureRef, MoveMode};
     use crate::equipment::testing::fake_handles::{FakeCameraActivity, RecordingSink};
-    use crate::equipment::testing::fake_transport::{FakeAlpacaTransport, FakeReply};
+    use crate::equipment::testing::fake_transport::{FakeAlpacaTransport, FakeReply, Method};
     use crate::equipment::testing::manual_clock::ManualClock;
     use crate::equipment::types::{
         AutonomyMode, ErrorClass, ObsState, Observed, OpOutcome, Priority, Source,
@@ -1591,6 +1764,64 @@ mod tests {
     }
 
     #[test]
+    fn absolute_backlash_keeps_every_raw_target_inside_the_travel_bounds() {
+        let profile = json!({"backlash": {"model": "absolute", "in_steps": 20, "out_steps": 20}});
+        // Near 0: the offset alone would send a negative Position.
+        let mut rig = sim_rig(
+            SimFocuserConfig::absolute(),
+            &configs(|_| {}),
+            Some(profile.clone()),
+        );
+        for target in [25_400, 500, 10] {
+            assert_eq!(rig.run(FocuserCmd::MoveTo(target)), OpOutcome::Succeeded);
+        }
+        assert_eq!(
+            sim_moves(&rig),
+            vec![
+                SimCall::MoveAbsolute(25_400),
+                SimCall::MoveAbsolute(480),
+                SimCall::MoveAbsolute(10),
+            ]
+        );
+        assert_eq!(rig.session.logical_position(), Some(10));
+        assert_eq!(rig.session.backlash_state().offset, 0);
+        assert_eq!(
+            rig.resets(),
+            vec![(Some(30), Some(10), "backlash_offset_dropped".into())]
+        );
+        // Reversals at both ends: out to 400 (offset +20), in to 0 (offset
+        // back to 0, raw 0), then out to MaxStep, where the compensation
+        // would pass MaxStep and is skipped.
+        rig.run(FocuserCmd::MoveTo(400));
+        assert_eq!(rig.session.backlash_state().offset, 20);
+        rig.control().clear_calls();
+        assert_eq!(rig.run(FocuserCmd::MoveTo(0)), OpOutcome::Succeeded);
+        assert_eq!(sim_moves(&rig), vec![SimCall::MoveAbsolute(0)]);
+        assert_eq!(rig.session.logical_position(), Some(0));
+        rig.control().clear_calls();
+        assert_eq!(rig.run(FocuserCmd::MoveTo(50_000)), OpOutcome::Succeeded);
+        assert_eq!(sim_moves(&rig), vec![SimCall::MoveAbsolute(50_000)]);
+        assert_eq!(rig.session.logical_position(), Some(50_000));
+
+        // The FocusSafetyGuard minimum binds the raw position too.
+        let cfgs = configs(|c| c.focus_safety.min_position = 1_000);
+        let mut rig = sim_rig(SimFocuserConfig::absolute(), &cfgs, Some(profile));
+        for target in [25_400, 5_000, 1_000] {
+            assert_eq!(rig.run(FocuserCmd::MoveTo(target)), OpOutcome::Succeeded);
+        }
+        assert_eq!(
+            sim_moves(&rig),
+            vec![
+                SimCall::MoveAbsolute(25_400),
+                SimCall::MoveAbsolute(4_980),
+                SimCall::MoveAbsolute(1_000),
+            ]
+        );
+        assert!(rig.control().raw_position() >= 1_000);
+        assert_eq!(rig.session.logical_position(), Some(1_000));
+    }
+
+    #[test]
     fn firmware_owned_backlash_gets_no_compensation() {
         let cfgs = configs(|c| {
             c.focus_backlash.enabled = true;
@@ -1691,7 +1922,231 @@ mod tests {
             .unwrap();
         assert_eq!(rig.run_op(op), OpOutcome::Succeeded);
         assert_eq!(rig.control().calls()[0], SimCall::SetTempComp(false));
+        assert!(!rig.control().temp_comp(), "held off until the run ends");
         assert_eq!(rig.moves()[0].run_id.as_deref(), Some("run-7"));
+    }
+
+    fn tempcomp_writes(rig: &Rig) -> Vec<bool> {
+        rig.control()
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                SimCall::SetTempComp(on) => Some(on),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn tempcomp_reasons(rig: &Rig) -> Vec<String> {
+        rig.events()
+            .into_iter()
+            .filter_map(|e| match e {
+                EventKind::TempcompChanged { reason, .. } => reason,
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn af_move(rig: &mut Rig, target: i32, run_id: &str) -> OpOutcome {
+        let op = rig
+            .session
+            .autofocus_operation(
+                &FocuserCmd::MoveTo(target),
+                CommandId::new(),
+                operator(),
+                run_id.into(),
+            )
+            .unwrap();
+        rig.run_op(op)
+    }
+
+    #[test]
+    fn autofocus_runs_hold_tempcomp_off_between_moves_until_the_run_ends() {
+        let mut cfg = SimFocuserConfig::absolute();
+        cfg.temp_comp = true;
+        let mut rig = sim_rig(cfg, &configs(|_| {}), None);
+        rig.session
+            .begin_autofocus_run(rig.drv.as_mut(), "run-9")
+            .unwrap();
+        assert!(!rig.control().temp_comp(), "off before the first exposure");
+        assert_eq!(rig.session.autofocus_run().as_deref(), Some("run-9"));
+        let mut during_exposures = Vec::new();
+        for target in [25_300, 25_100, 25_200] {
+            assert_eq!(af_move(&mut rig, target, "run-9"), OpOutcome::Succeeded);
+            // The exposure taken after the move sees TempComp off.
+            rig.clock.advance_ms(5_000);
+            during_exposures.push(rig.poll(false).state.temp_comp.value);
+        }
+        assert_eq!(during_exposures, vec![Some(false); 3]);
+        assert_eq!(
+            tempcomp_writes(&rig),
+            vec![false],
+            "no restore between moves"
+        );
+        let moves = rig.moves();
+        assert!(moves
+            .iter()
+            .all(|m| m.tempcomp_after == Some(false) && m.run_id.as_deref() == Some("run-9")));
+
+        // The run end restores it exactly once.
+        rig.session
+            .end_autofocus_run(rig.drv.as_mut(), Some("run-9"))
+            .unwrap();
+        assert!(rig.control().temp_comp());
+        assert_eq!(rig.session.autofocus_run(), None);
+        rig.session
+            .end_autofocus_run(rig.drv.as_mut(), None)
+            .unwrap();
+        assert_eq!(tempcomp_writes(&rig), vec![false, true]);
+        assert_eq!(
+            tempcomp_reasons(&rig),
+            vec!["autofocus", "restore_after_autofocus"]
+        );
+        // An ordinary move afterwards is back to the per-move rule.
+        assert_eq!(rig.run(FocuserCmd::MoveTo(25_000)), OpOutcome::Succeeded);
+        assert_eq!(tempcomp_writes(&rig), vec![false, true, false, true]);
+    }
+
+    #[test]
+    fn an_autofocus_run_restores_tempcomp_once_on_abort_takeover_and_disconnect() {
+        let mut cfg = SimFocuserConfig::absolute();
+        cfg.temp_comp = true;
+        let cfgs = configs(|c| c.focuser.tempcomp_during_moves = TempCompDuringMoves::Leave);
+        let mut rig = sim_rig(cfg, &cfgs, None);
+
+        // Without a begin, the run's first move starts the hold.
+        assert_eq!(af_move(&mut rig, 25_200, "run-a"), OpOutcome::Succeeded);
+        assert_eq!(rig.session.autofocus_run().as_deref(), Some("run-a"));
+        // An aborted move of the run leaves it off; ending the run is refused
+        // while a move is in flight, and restores once it has resolved.
+        let mut op = rig
+            .session
+            .autofocus_operation(
+                &FocuserCmd::MoveTo(30_000),
+                CommandId::new(),
+                operator(),
+                "run-a".into(),
+            )
+            .unwrap();
+        rig.poll(false);
+        op.start(rig.drv.as_mut(), rig.clock.as_ref()).unwrap();
+        rig.clock.advance_ms(100);
+        rig.poll(true);
+        assert!(rig
+            .session
+            .end_autofocus_run(rig.drv.as_mut(), Some("run-a"))
+            .is_err());
+        op.cancel(rig.drv.as_mut()).unwrap();
+        assert!(!rig.control().temp_comp());
+        // Ending some other run leaves this one alone.
+        rig.session
+            .end_autofocus_run(rig.drv.as_mut(), Some("run-x"))
+            .unwrap();
+        assert!(!rig.control().temp_comp());
+        rig.session
+            .end_autofocus_run(rig.drv.as_mut(), Some("run-a"))
+            .unwrap();
+        assert!(rig.control().temp_comp());
+        assert_eq!(tempcomp_writes(&rig), vec![false, true]);
+
+        // A run that is never ended: the next run takes over its restore,
+        // and an ordinary move after it restores TempComp.
+        assert_eq!(af_move(&mut rig, 25_300, "run-b"), OpOutcome::Succeeded);
+        assert_eq!(af_move(&mut rig, 25_400, "run-c"), OpOutcome::Succeeded);
+        assert_eq!(rig.session.autofocus_run().as_deref(), Some("run-c"));
+        assert_eq!(tempcomp_writes(&rig), vec![false, true, false]);
+        assert_eq!(rig.run(FocuserCmd::MoveTo(25_000)), OpOutcome::Succeeded);
+        assert!(rig.control().temp_comp());
+        assert_eq!(rig.session.autofocus_run(), None);
+        let ordinary = rig.moves().last().cloned().unwrap();
+        assert_eq!(
+            (ordinary.tempcomp_before, ordinary.tempcomp_after),
+            (Some(false), Some(true))
+        );
+
+        // The operator's own TempComp write during a run wins.
+        assert_eq!(af_move(&mut rig, 25_100, "run-d"), OpOutcome::Succeeded);
+        assert_eq!(
+            rig.run(FocuserCmd::SetTempComp(false)),
+            OpOutcome::Succeeded
+        );
+        rig.session
+            .end_autofocus_run(rig.drv.as_mut(), Some("run-d"))
+            .unwrap();
+        assert!(!rig.control().temp_comp(), "not overridden by the run end");
+
+        // A disconnect drops a hold that was never ended.
+        assert_eq!(af_move(&mut rig, 25_200, "run-e"), OpOutcome::Succeeded);
+        rig.session.on_disconnect(ConnectionEnd::Operator);
+        assert_eq!(rig.session.autofocus_run(), None);
+
+        // The origin rule applies to the run start too.
+        let rig = sim_rig(SimFocuserConfig::relative(), &configs(|_| {}), None);
+        let mut rig = rig;
+        assert!(rig
+            .session
+            .begin_autofocus_run(rig.drv.as_mut(), "run-f")
+            .is_err());
+        assert_eq!(rig.session.autofocus_run(), None);
+    }
+
+    #[test]
+    fn a_tempcomp_switch_off_lost_in_transit_is_still_restored() {
+        let fake = FakeAlpacaTransport::new().shared();
+        fake.on_get("interfaceversion", FakeReply::value(3))
+            .on_put("connected", FakeReply::ok())
+            .on_get("connected", FakeReply::value(true))
+            .on_get("absolute", FakeReply::value(true))
+            .on_get("maxstep", FakeReply::value(40_000))
+            .on_get("maxincrement", FakeReply::value(40_000))
+            .on_get("tempcompavailable", FakeReply::value(true))
+            .on_get("tempcomp", FakeReply::value(true))
+            .on_get("temperature", FakeReply::value(6.0))
+            .on_get("ismoving", FakeReply::value(false))
+            .on_get("position", FakeReply::value(12_000))
+            .on_put("move", FakeReply::ok())
+            .queue_put("tempcomp", [FakeReply::Timeout])
+            .on_put("tempcomp", FakeReply::ok());
+        let clock = Arc::new(ManualClock::new());
+        let drv = AlpacaFocuser::new(
+            "http://esp32.local:80",
+            0,
+            fake.clone(),
+            fake.clone(),
+            clock.clone(),
+        )
+        .with_connect_poll_interval(Duration::ZERO);
+        let mut rig = rig_with(Box::new(drv), None, clock, &configs(|_| {}), None);
+        let outcome = rig.run(FocuserCmd::MoveTo(12_500));
+        assert!(
+            matches!(outcome, OpOutcome::Failed(ref e) if e.class == ErrorClass::Timeout),
+            "{outcome:?}"
+        );
+        let writes: Vec<_> = fake
+            .calls()
+            .into_iter()
+            .filter(|c| c.method == Method::Put && c.member == "tempcomp")
+            .map(|c| c.params)
+            .collect();
+        assert_eq!(
+            writes,
+            vec![
+                vec![("TempComp".to_string(), "False".to_string())],
+                vec![("TempComp".to_string(), "True".to_string())],
+            ],
+            "the possibly-applied switch-off is undone"
+        );
+        assert_eq!(fake.calls_to(Method::Put, "move"), 0, "nothing moved");
+        assert!(rig.events().iter().any(|e| matches!(
+            e,
+            EventKind::TempcompChanged { from: None, to: true, reason: Some(r) }
+                if r == "restore_after_move"
+        )));
+        let rec = &rig.moves()[0];
+        assert_eq!(
+            (rec.tempcomp_before, rec.tempcomp_after),
+            (Some(true), Some(true))
+        );
     }
 
     // ---- F-b and §2.15: relative emulation ----

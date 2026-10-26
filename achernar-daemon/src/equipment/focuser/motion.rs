@@ -12,7 +12,8 @@
 //! 4. plans the backlash legs (F-e) and splits each leg into chunks of at
 //!    most `MaxIncrement` steps, only when `MaxIncrement` is smaller than the
 //!    leg;
-//! 5. switches TempComp off when configured (F-d);
+//! 5. switches TempComp off when configured (F-d); an autofocus move hands
+//!    the restore to its run, so TempComp stays off until the run ends;
 //! 6. sends each chunk and waits for `IsMoving` false from a sample taken
 //!    after the chunk was sent: completion is never inferred from position
 //!    (C-5). While moving it watches for a stalled position on an absolute
@@ -21,8 +22,9 @@
 //! 7. settles (`settle_ms` from the profile or `[focus.safety]`), reads the
 //!    position from a poll taken after the settle, and re-issues an
 //!    off-target arrival at most `max_reissue` times;
-//! 8. restores TempComp, updates the logical position, persists a relative
-//!    focuser's position, and writes exactly one `focuser_moves` row.
+//! 8. restores TempComp (ordinary moves), updates the logical position,
+//!    persists a relative focuser's position, and writes exactly one
+//!    `focuser_moves` row.
 //!
 //! Cancel, abort, preemption and timeout all halt the hardware (F-c). An
 //! interrupted move of a relative focuser loses its origin.
@@ -196,7 +198,7 @@ impl FocuserMoveOp {
         run_id: Option<String>,
     ) -> Self {
         let tempcomp = if run_id.is_some() {
-            TempCompGuard::for_autofocus()
+            TempCompGuard::for_autofocus_run()
         } else {
             TempCompGuard::new(inner.settings.tempcomp_during_moves)
         };
@@ -398,17 +400,37 @@ impl FocuserMoveOp {
         self.segments = segments;
         self.plan = Some(plan);
 
-        // F-d.
-        if let Some(change) = self.tempcomp.before_move(
+        // F-d. An autofocus move hands its switch-off to the run's hold, so
+        // TempComp stays off between the run's moves and exposures. An
+        // ordinary move after a run that was never ended takes over the
+        // run's restore.
+        match self.run_id.as_deref() {
+            Some(run_id) => {
+                inner.claim_autofocus_run(run_id);
+            }
+            None => {
+                if let Some(hold) = inner.take_autofocus_hold() {
+                    if hold.owes_restore() {
+                        tracing::warn!(
+                            run_id = hold.run_id(),
+                            "an ordinary focuser move follows an autofocus run that was never \
+                             ended; TempComp is restored after this move"
+                        );
+                        self.tempcomp.inherit_restore(hold.unconfirmed());
+                    }
+                }
+            }
+        }
+        let switched = self.tempcomp.before_move(
             drv,
             inner.caps.temp_comp_available,
             state.temp_comp.known().copied(),
-        )? {
-            self.event(EventKind::TempcompChanged {
-                from: change.from,
-                to: change.to,
-                reason: Some(change.reason.into()),
-            });
+        );
+        if let Some(run_id) = self.run_id.as_deref() {
+            inner.absorb_autofocus_tempcomp(run_id, &mut self.tempcomp);
+        }
+        if let Some(change) = switched? {
+            inner.tempcomp_event(change, Some(self.command_id));
         }
 
         // A relative position is unclean from here until the move resolves.
@@ -648,11 +670,7 @@ impl FocuserMoveOp {
         let inner = Arc::clone(&self.inner);
         let now_utc = inner.clock.now_utc();
         match self.tempcomp.restore(drv) {
-            Ok(Some(change)) => self.event(EventKind::TempcompChanged {
-                from: change.from,
-                to: change.to,
-                reason: Some(change.reason.into()),
-            }),
+            Ok(Some(change)) => inner.tempcomp_event(change, Some(self.command_id)),
             Ok(None) => {}
             Err(err) => tracing::warn!(error = %err, "focuser TempComp restore failed"),
         }
@@ -743,6 +761,16 @@ impl FocuserMoveOp {
         }
         if let Some((backlash, raw)) = persist_backlash {
             inner.persist_backlash(backlash, raw);
+        }
+        // The `absolute` offset was dropped to keep the raw target inside
+        // the travel bounds: the logical position re-baselines (F-h).
+        let dropped = plan.as_ref().and_then(|p| p.offset_dropped);
+        if let (true, Some(dropped), Some(end)) = (success, dropped, logical_end) {
+            self.event(EventKind::FocuserPositionReset {
+                from: Some(end.saturating_sub(dropped)),
+                to: Some(end),
+                cause: "backlash_offset_dropped".into(),
+            });
         }
 
         self.event(EventKind::FocuserMoveStopped {
@@ -1013,6 +1041,11 @@ impl Operation<dyn FocuserDriver> for FocuserTempCompOp {
         let from = drv.state().ok().and_then(|s| s.temp_comp.known().copied());
         drv.set_temp_comp(self.on)?;
         self.sent_mono = clock.now_mono_ns();
+        // The operator's explicit choice wins over an autofocus run's
+        // pending restore.
+        if let Some(hold) = self.inner.lock().autofocus.as_mut() {
+            hold.forget_restore();
+        }
         self.inner.event(
             EventKind::TempcompChanged {
                 from,
