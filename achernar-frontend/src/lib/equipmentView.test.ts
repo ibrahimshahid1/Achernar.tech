@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { MountDescriptor } from "../api/achernar";
 import type { MountBlock, ResumeBlock } from "../types/achernar";
 import {
+    abortAvailable,
     ageText,
     busyLabels,
     dms,
@@ -10,6 +11,7 @@ import {
     healthDetail,
     hms,
     mountActionGates,
+    mountNativeFrame,
     num,
     operatorClears,
     parseDec,
@@ -119,6 +121,47 @@ describe("mount controls follow O10 and D19", () => {
 
     it("refuses a site write while the mount slews", () => {
         expect(mountActionGates(mount({ slewing: true }), null).siteSync.enabled).toBe(false);
+    });
+
+    it("refuses a J2000 GoTo, sync and center while the native frame is unknown, with the daemon's reason", () => {
+        // The interim OLS INDI adapter without an override, or an Alpaca
+        // mount below InterfaceVersion 2: the daemon cannot convert J2000.
+        const unknown = { ...descriptor({ can_slew_async: true, can_sync: true, native_frame: "unknown", frame_reason: "ols_legacy_frame_unknown" }), frame: "unknown" as const };
+        const gates = mountActionGates(mount({ frame: "unknown" }), unknown);
+        for (const gate of [gates.goto, gates.sync, gates.center, gates.frame]) {
+            expect(gate.enabled).toBe(false);
+            expect(gate.reason).toMatch(/native frame is unknown \(ols legacy frame unknown\)/);
+            expect(gate.reason).toMatch(/equatorial_system_override/);
+            expect(gate.reason).toMatch(/mount-native/);
+        }
+        // Nothing else is gated on the frame, abort least of all.
+        expect([gates.park, gates.home, gates.tracking, gates.siteSync, gates.abort].every((gate) => gate.enabled)).toBe(true);
+        // The operator's explicit mount-native choice passes unconverted.
+        const native = mountActionGates(mount({ frame: "unknown" }), unknown, "mount");
+        expect([native.goto, native.sync, native.center, native.frame].every((gate) => gate.enabled)).toBe(true);
+        // The live status alone is enough to know the frame is unknown.
+        expect(mountActionGates(mount({ frame: "unknown" }), null).goto.enabled).toBe(false);
+        // A known native frame converts; a frame never reported is left to the daemon.
+        expect(mountActionGates(mount({ frame: "jnow_apparent" }), descriptor({ can_slew_async: true })).goto.enabled).toBe(true);
+        expect(mountActionGates(mount(), null).goto.enabled).toBe(true);
+    });
+
+    it("takes the native frame from the live status, then the descriptor", () => {
+        const d = descriptor({ native_frame: "jnow_mean" });
+        expect(mountNativeFrame(mount({ frame: "j2000" }), d)).toBe("j2000");
+        expect(mountNativeFrame(mount({ frame: null }), d)).toBe("jnow_apparent");
+        expect(mountNativeFrame(mount(), { ...d, frame: undefined as unknown as MountDescriptor["frame"] })).toBe("jnow_mean");
+        expect(mountNativeFrame(null, null)).toBeNull();
+    });
+});
+
+describe("abort paths survive a failed status poll (D19)", () => {
+    it("offers the abort for a connected, lost or degraded device, from the last known status", () => {
+        expect(abortAvailable({ connected: true }, null)).toBe(true);
+        expect(abortAvailable(null, { connected: false, state: "lost" })).toBe(true);
+        expect(abortAvailable(undefined, { connected: false, state: "degraded" })).toBe(true);
+        expect(abortAvailable({ connected: false }, { connected: false, state: "disconnected" })).toBe(false);
+        expect(abortAvailable(null, null)).toBe(false);
     });
 });
 

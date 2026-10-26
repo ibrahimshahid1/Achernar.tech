@@ -25,13 +25,15 @@ function Row({ label, value, tone }: { label: string; value: string; tone?: stri
  * dither, and start, stop, pause, resume and dither (§2.12, §2.13).
  *
  * RMS in arcsec needs PHD2's pixel scale; without one it shows unknown and
- * the pixel RMS stays visible. Stop is the guider's abort (D19) and is never
- * disabled while the daemon is reachable.
+ * the pixel RMS stays visible. Stop is the guider's abort (D19): `abortable`
+ * comes from the console's last known status, not the live poll, so a failed
+ * or late poll never takes it away.
  */
-export default function GuiderPanel({ guiding, health, online, busy, run }: {
+export default function GuiderPanel({ guiding, health, online, abortable, busy, run }: {
     guiding: GuidingBlock | null | undefined;
     health?: DeviceHealthEntry | null;
     online: boolean;
+    abortable: boolean;
     busy: boolean;
     run: RunCommand;
 }) {
@@ -39,7 +41,6 @@ export default function GuiderPanel({ guiding, health, online, busy, run }: {
     const [amount, setAmount] = useState("");
     const [raOnly, setRaOnly] = useState(false);
     const connected = online && guiding?.connected === true;
-    const stoppable = online && (connected || health?.state === "lost" || health?.state === "degraded");
     const gates = guiderActionGates(guiding);
     const amountValue = amount.trim() === "" ? undefined : Number(amount);
     const amountValid = amountValue === undefined || (Number.isFinite(amountValue) && amountValue > 0);
@@ -49,10 +50,12 @@ export default function GuiderPanel({ guiding, health, online, busy, run }: {
         <div className="eq-toolbar">
             <span className={`eq-state tone-${guiderTone(guiding?.state)}`}>{connected ? guiderStateLabel(guiding?.state) : "not connected"}</span>
             {guiding?.qualification && <span className={`qual-badge tone-${qualificationTone(guiding.qualification)}`}>{qualificationLabel(guiding.qualification)}</span>}
-            <button type="button" className="btn eq-abort" disabled={!stoppable} title="stop_capture; never refused while PHD2 answers (D19)"
+            <button type="button" className="btn eq-abort" disabled={!abortable} title="stop_capture; never refused while PHD2 answers (D19)"
                 onClick={() => void run("guider.stop", () => achernarApi.stopGuiding())}>Stop guiding</button>
         </div>
-        {!connected && <p className="eq-empty">{health?.state === "lost" ? "PHD2 is unreachable; stop is still sent." : "No guider connected. Connect PHD2 by host and port above."}</p>}
+        {!connected && <p className="eq-empty">{!online
+            ? abortable ? "Live guider status is unavailable; stop is still sent to the daemon." : "Live guider status is unavailable."
+            : health?.state === "lost" ? "PHD2 is unreachable; stop is still sent." : "No guider connected. Connect PHD2 by host and port above."}</p>}
         {connected && <>
             <dl className="eq-grid">
                 <Row label="RMS total" value={num(guiding?.rms_total, 2, "\"")} />

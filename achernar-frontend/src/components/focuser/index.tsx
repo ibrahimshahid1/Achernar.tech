@@ -14,18 +14,21 @@ function Row({ label, value, tone }: { label: string; value: string; tone?: stri
  * Focuser readings and manual moves (§2.12, §2.13). Every move passes the
  * daemon's gate: travel bounds, the exposure guard (A06) and, while a
  * relative focuser's origin is unknown, relative-only moves.
+ *
+ * `abortable` comes from the console's last known status, not the live
+ * poll, so a failed or late poll never takes the halt away (D19).
  */
-export default function FocuserControls({ focuser, health, online, busy, run }: {
+export default function FocuserControls({ focuser, health, online, abortable, busy, run }: {
     focuser: FocuserBlock | null | undefined;
     health?: DeviceHealthEntry | null;
     online: boolean;
+    abortable: boolean;
     busy: boolean;
     run: RunCommand;
 }) {
     const [position, setPosition] = useState("");
     const [origin, setOrigin] = useState("");
     const connected = online && focuser?.connected === true;
-    const haltable = online && (connected || health?.state === "lost" || health?.state === "degraded");
     const locked = busy || !connected;
     const unknownOrigin = focuser?.position_source != null && UNRELIABLE_ORIGIN.has(focuser.position_source);
     const absolute = focuser?.absolute === true;
@@ -34,11 +37,13 @@ export default function FocuserControls({ focuser, health, online, busy, run }: 
     const originValid = origin.trim() !== "" && Number.isSafeInteger(Number(origin));
     return <div className="eq-panel" aria-label="Focuser">
         <div className="eq-toolbar">
-            <button type="button" className="btn eq-abort" disabled={!haltable} title="Halt out of band; never gated (D19)"
+            <button type="button" className="btn eq-abort" disabled={!abortable} title="Halt out of band; never gated (D19)"
                 onClick={() => void run("focuser.abort", () => achernarApi.abortFocuser())}>Halt focuser</button>
             {focuser?.qualification && <span className={`qual-badge tone-${qualificationTone(focuser.qualification)}`}>{qualificationLabel(focuser.qualification)}</span>}
         </div>
-        {!connected && <p className="eq-empty">{health?.state === "lost" ? "The focuser is lost; halt still reaches its abort path." : "No focuser connected."}</p>}
+        {!connected && <p className="eq-empty">{!online
+            ? abortable ? "Live focuser status is unavailable; halt is still sent to the daemon." : "Live focuser status is unavailable."
+            : health?.state === "lost" ? "The focuser is lost; halt still reaches its abort path." : "No focuser connected."}</p>}
         {connected && <>
             <dl className="eq-grid">
                 <Row label="Position" value={focuser?.position == null ? UNKNOWN : String(focuser.position)} />

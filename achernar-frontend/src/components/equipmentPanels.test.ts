@@ -40,16 +40,25 @@ const descriptor = (capabilities: MountDescriptor["capabilities"]): MountDescrip
 });
 
 describe("emergency stop", () => {
-    it("is one click, enabled whenever the daemon is reachable, and reports unconfirmed devices", () => {
-        const html = renderToStaticMarkup(createElement(EmergencyStopButton, { online: true, pending: true, abortExposure: false,
+    it("is one click, enabled whenever a transport is configured, and reports unconfirmed devices", () => {
+        const html = renderToStaticMarkup(createElement(EmergencyStopButton, { reachable: true, pending: true, abortExposure: false,
             onAbortExposureChange: noop, onStop: noop,
             report: { status: "partial", results: [{ kind: "mount", ok: true }, { kind: "focuser", ok: false }] } }));
         // Still enabled while a previous stop is pending: a second press sends again.
         expect(isDisabled(html, "STOPPING…")).toBe(false);
         expect(html).toContain("focuser NOT CONFIRMED");
-        const offline = renderToStaticMarkup(createElement(EmergencyStopButton, { online: false, pending: false, abortExposure: false,
+        const none = renderToStaticMarkup(createElement(EmergencyStopButton, { reachable: false, pending: false, abortExposure: false,
             onAbortExposureChange: noop, onStop: noop }));
-        expect(isDisabled(offline, "E-STOP")).toBe(true);
+        expect(isDisabled(none, "E-STOP")).toBe(true);
+    });
+
+    it("has no telemetry prop at all: a failed status poll cannot grey it out (D19)", () => {
+        // The console passes `reachable` from the configured transport, never
+        // from the status poll; a send that fails is shown as the error line.
+        const html = renderToStaticMarkup(createElement(EmergencyStopButton, { reachable: true, pending: false, abortExposure: false,
+            onAbortExposureChange: noop, onStop: noop, error: "Daemon command capacity is busy" }));
+        expect(isDisabled(html, "E-STOP")).toBe(false);
+        expect(html).toContain("Daemon command capacity is busy");
     });
 });
 
@@ -82,21 +91,49 @@ describe("mount panel", () => {
 
     it("disables GoTo without CanSlewAsync but keeps abort, and offers no jog or pulse control", () => {
         const html = renderToStaticMarkup(createElement(MountControls, { mount, descriptor: descriptor({ can_slew_async: false, can_park: true }),
-            online: true, busy: true, run }));
+            online: true, abortable: true, busy: true, run }));
         expect(isDisabled(html, "Slew")).toBe(true);
         // Abort is never gated, not even while another command is in flight.
         expect(isDisabled(html, "Abort mount motion")).toBe(false);
         expect(html).not.toMatch(/move-axis|Pulse guide<\/button>/);
         expect(html).toContain("send J2000");
+        expect(html).toContain("native frame, JNow (apparent).");
         expect(html).toContain("Driver setup page");
     });
 
+    it("refuses a J2000 slew, sync and center to a mount whose native frame is unknown, and says how to fix it", () => {
+        // The interim OLS INDI adapter (O3) under the default config.
+        const unknown = { ...descriptor({ can_slew_async: true, can_sync: true, native_frame: "unknown", frame_reason: "ols_legacy_frame_unknown" }), frame: "unknown" as const };
+        const html = renderToStaticMarkup(createElement(MountControls, { mount: { ...mount, frame: "unknown" as const }, descriptor: unknown,
+            online: true, abortable: true, busy: false, run }));
+        for (const label of ["Slew", "Sync", "Center"]) expect(isDisabled(html, label)).toBe(true);
+        expect(html).toContain("native frame is unknown (ols legacy frame unknown)");
+        expect(html).toContain("[mount] equatorial_system_override");
+        expect(html).toContain("Mount-native (unconverted)");
+        expect(html).not.toContain("unknown frame frame");
+        expect(isDisabled(html, "Abort mount motion")).toBe(false);
+    });
+
     it("keeps abort for a lost mount whose status block is gone (D19)", () => {
-        const html = renderToStaticMarkup(createElement(MountControls, { mount: null, health: { connected: false, state: "lost" }, online: true, busy: false, run }));
+        const html = renderToStaticMarkup(createElement(MountControls, { mount: null, health: { connected: false, state: "lost" }, online: true,
+            abortable: true, busy: false, run }));
         expect(isDisabled(html, "Abort mount motion")).toBe(false);
         expect(html).toContain("The mount is lost");
-        const absent = renderToStaticMarkup(createElement(MountControls, { mount: null, online: true, busy: false, run }));
+        const absent = renderToStaticMarkup(createElement(MountControls, { mount: null, online: true, abortable: false, busy: false, run }));
         expect(isDisabled(absent, "Abort mount motion")).toBe(true);
+    });
+
+    it("keeps every abort path while the status poll fails (D19)", () => {
+        const mountHtml = renderToStaticMarkup(createElement(MountControls, { mount: undefined, online: false, abortable: true, busy: false, run }));
+        expect(isDisabled(mountHtml, "Abort mount motion")).toBe(false);
+        expect(mountHtml).toContain("abort is still sent");
+        expect(mountHtml).not.toContain("No mount connected");
+        const focuser = renderToStaticMarkup(createElement(FocuserControls, { focuser: undefined, online: false, abortable: true, busy: false, run }));
+        expect(isDisabled(focuser, "Halt focuser")).toBe(false);
+        const guider = renderToStaticMarkup(createElement(GuiderPanel, { guiding: undefined, online: false, abortable: true, busy: false, run }));
+        expect(isDisabled(guider, "Stop guiding")).toBe(false);
+        const wheel = renderToStaticMarkup(createElement(FilterWheelControl, { wheel: undefined, online: false, abortable: true, busy: false, run }));
+        expect(isDisabled(wheel, "Abort change")).toBe(false);
     });
 
     it("shows both frames and unknown readings as unknown", () => {
@@ -113,7 +150,7 @@ describe("mount panel", () => {
 describe("guider panel", () => {
     it("shows RMS as unknown without a pixel scale, and keeps stop enabled", () => {
         const html = renderToStaticMarkup(createElement(GuiderPanel, { guiding: { connected: true, name: "PHD2", state: "looping", rms_total: null,
-            rms_total_px: 0.41, rms_ra_px: 0.3, rms_dec_px: 0.28, qualification: { state: "implemented_unqualified" } }, online: true, busy: true, run }));
+            rms_total_px: 0.41, rms_ra_px: 0.3, rms_dec_px: 0.28, qualification: { state: "implemented_unqualified" } }, online: true, abortable: true, busy: true, run }));
         expect(html).toMatch(/RMS total<\/dt><dd>--<\/dd>/);
         expect(html).toContain("0.41 (RA 0.30, Dec 0.28)");
         expect(isDisabled(html, "Stop guiding")).toBe(false);
@@ -123,7 +160,7 @@ describe("guider panel", () => {
 
     it("reports a failed dither settle", () => {
         const html = renderToStaticMarkup(createElement(GuiderPanel, { guiding: { connected: true, state: "guiding", rms_total: 0.6,
-            last_dither: { at: "2026-10-26T20:00:00Z", dx: 1.2, dy: -0.8, settle_status: 1 } }, online: true, busy: false, run }));
+            last_dither: { at: "2026-10-26T20:00:00Z", dx: 1.2, dy: -0.8, settle_status: 1 } }, online: true, abortable: true, busy: false, run }));
         expect(html).toContain("settle failed (1)");
         expect(isDisabled(html, "Dither")).toBe(false);
     });
@@ -133,7 +170,7 @@ describe("filter wheel, focuser and environment panels", () => {
     it("lists slots with profile offsets and marks the current one", () => {
         const html = renderToStaticMarkup(createElement(FilterWheelControl, { wheel: { connected: true, name: "Wheel", slot: 1, filter: "Ha",
             verified: true, slots: [{ index: 0, name: "L", offset: 0 }, { index: 1, name: "Ha", offset: 120 }, { index: 2, name: "OIII", offset: null }] },
-        online: true, busy: false, run }));
+        online: true, abortable: true, busy: false, run }));
         expect(html).toContain("slot 1 · Ha");
         expect(html).toContain("eq-current");
         expect(html).toMatch(/<td>OIII<\/td><td>--<\/td>/);
@@ -141,9 +178,19 @@ describe("filter wheel, focuser and environment panels", () => {
         expect(isDisabled(html, "Abort change")).toBe(false);
     });
 
+    it("keeps the filter abort for a lost wheel whose status block is gone (D19)", () => {
+        const lost = renderToStaticMarkup(createElement(FilterWheelControl, { wheel: null, health: { connected: false, state: "lost" }, online: true,
+            abortable: true, busy: false, run }));
+        expect(isDisabled(lost, "Abort change")).toBe(false);
+        expect(lost).toContain("The filter wheel is lost");
+        const absent = renderToStaticMarkup(createElement(FilterWheelControl, { wheel: null, online: true, abortable: false, busy: false, run }));
+        expect(absent).toContain("No filter wheel connected.");
+        expect(absent).not.toContain("Abort change");
+    });
+
     it("restricts an unknown-origin relative focuser and offers to declare its origin", () => {
         const html = renderToStaticMarkup(createElement(FocuserControls, { focuser: { connected: true, name: "ESP32 focuser", position: null, moving: null,
-            absolute: false, position_source: "emulated_origin_unknown", temperature: null }, online: true, busy: false, run }));
+            absolute: false, position_source: "emulated_origin_unknown", temperature: null }, online: true, abortable: true, busy: false, run }));
         expect(html).toContain("The origin is unknown");
         expect(html).toContain("Declare origin");
         expect(isDisabled(html, "Move to position")).toBe(true);

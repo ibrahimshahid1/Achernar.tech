@@ -16,12 +16,16 @@ import "../equipmentPanels.css";
  * Emergency stop (§2.9): every device's abort path in parallel, degraded and
  * lost devices included, then the `estop` resume block. It is not a park.
  *
- * The button is enabled whenever the daemon is reachable. It never waits for
- * another command to finish and never asks for confirmation: a stop that
- * needs a second click is a slower stop.
+ * The button is enabled whenever a hardware transport is configured, not
+ * only while the status poll succeeds: a relay whose command slots are all
+ * busy fails the poll but still runs the e-stop (D19), so a late or failed
+ * poll must never grey it out. A send that fails is reported here. It never
+ * waits for another command to finish and never asks for confirmation: a
+ * stop that needs a second click is a slower stop.
  */
-export function EmergencyStopButton({ online, pending, abortExposure, onAbortExposureChange, onStop, report, error }: {
-    online: boolean;
+export function EmergencyStopButton({ reachable, pending, abortExposure, onAbortExposureChange, onStop, report, error }: {
+    /** A transport to the daemon is configured (direct or relay). */
+    reachable: boolean;
     pending: boolean;
     abortExposure: boolean;
     onAbortExposureChange: (value: boolean) => void;
@@ -30,9 +34,9 @@ export function EmergencyStopButton({ online, pending, abortExposure, onAbortExp
     error?: string | null;
 }) {
     return <div className="eq-estop">
-        <button type="button" className="btn eq-estop-button" disabled={!online} onClick={onStop}
+        <button type="button" className="btn eq-estop-button" disabled={!reachable} onClick={onStop}
             aria-label="Emergency stop: abort every device">{pending ? "STOPPING…" : "E-STOP"}</button>
-        <label className="eq-inline"><input type="checkbox" checked={abortExposure} disabled={!online} onChange={(event) => onAbortExposureChange(event.target.checked)} /> also abort the exposure</label>
+        <label className="eq-inline"><input type="checkbox" checked={abortExposure} disabled={!reachable} onChange={(event) => onAbortExposureChange(event.target.checked)} /> also abort the exposure</label>
         {report && <small className={`eq-hint tone-${report.status === "stopped" ? "good" : "bad"}`} role="status">{estopSummary(report)}</small>}
         {error && <small className="eq-hint tone-bad" role="alert">{error}</small>}
     </div>;

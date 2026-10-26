@@ -12,18 +12,19 @@ function payloadText(payload: unknown): string {
 }
 
 /**
- * The equipment journal tail (§4.2), newest first. Guide steps are hidden by
- * the caller unless asked for: PHD2 sends one per guide exposure.
+ * The equipment journal tail (§4.2, `GET equipment/events`), newest first.
+ *
+ * Guide steps are not in this journal: the daemon keeps them in a separate
+ * ring and sends them only on the EQUIPMENT_EVENT stream, so this log never
+ * shows them and offers no switch for them.
  */
-export default function EquipmentEventLog({ events, error, showGuideSteps, onShowGuideSteps }: {
+export default function EquipmentEventLog({ events, error }: {
     events: EquipmentEvent[];
     error?: string | null;
-    showGuideSteps: boolean;
-    onShowGuideSteps: (value: boolean) => void;
 }) {
     return <div className="eq-panel" aria-label="Equipment events">
         <div className="eq-toolbar">
-            <label className="eq-inline"><input type="checkbox" checked={showGuideSteps} onChange={(event) => onShowGuideSteps(event.target.checked)} /> show guide steps</label>
+            <span className="eq-hint">Journal events, newest first. Guide steps are not journaled and are not listed here.</span>
             {error && <span className="eq-hint tone-bad">{error}</span>}
         </div>
         {events.length === 0 ? <p className="eq-empty">No equipment events yet.</p> : <table className="eq-table eq-events">

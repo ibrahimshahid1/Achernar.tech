@@ -4,8 +4,8 @@ import { achernarApi, usesDjangoRelay, type DiscoverableEquipment, type Discover
 import { useDaemonStatus } from "../hooks/useDaemonStatus";
 import { cardsFromDaemon } from "../hooks/useEquipment";
 import { getHardwareTransport } from "../lib/runtime";
-import { drainJournal, newestFirst } from "../lib/equipmentJournal";
-import type { RunCommand } from "../lib/equipmentView";
+import { drainJournal, journalContinues, newestFirst, type JournalAnchor } from "../lib/equipmentJournal";
+import { abortAvailable, type RunCommand } from "../lib/equipmentView";
 import type { EquipmentEvent, ResumeBlock } from "../types/achernar";
 import CameraControls from "./CameraControls";
 import EquipmentCard from "./EquipmentCard";
@@ -39,6 +39,8 @@ const EVENT_LIMIT = 200;
 /** The daemon's per-request cap on `equipment/events`. */
 const EVENT_PAGE = 500;
 const EVENT_CATCH_UP_PAGES = 40;
+/** How often an idle journal is checked for a restarted numbering. */
+const EVENT_CONTINUITY_MS = 10_000;
 
 function errorText(error: unknown, fallback: string): string {
     return error instanceof Error ? error.message : fallback;
@@ -62,14 +64,25 @@ export default function HardwareConsole() {
     const [estopError, setEstopError] = useState<string | null>(null);
     const [events, setEvents] = useState<EquipmentEvent[]>([]);
     const [eventsError, setEventsError] = useState<string | null>(null);
-    const [showGuideSteps, setShowGuideSteps] = useState(false);
     const eventSeq = useRef(0);
+    /** The newest journal event shown, for the restart check. */
+    const eventAnchor = useRef<JournalAnchor | null>(null);
+    /** Bumped on every journal reset; a poll from an older one is dropped. */
+    const journalGeneration = useRef(0);
+    const lastContinuityCheck = useRef(0);
     const discoveryGeneration = useRef(0);
     const discoveryPending = useRef(false);
     const onlineRef = useRef(status.online);
     onlineRef.current = status.online;
     const data = status.data;
     const online = status.online;
+    // The abort paths and the e-stop read the last status the daemon
+    // returned, not only a fresh one (D19): a failed or late poll (for
+    // example a relay with every command slot busy, which aborts bypass)
+    // must never take them away. A send that fails is logged.
+    const known = status.lastKnown;
+    const knownHealth = (key: string) => known?.device_health?.[key] ?? null;
+    const transportConfigured = transport === "daemon" || transport === "django";
     const connectionKey = hardwareConnectionKey(data, online);
     const connectionKeyRef = useRef(connectionKey);
     connectionKeyRef.current = connectionKey;
@@ -111,6 +124,25 @@ export default function HardwareConsole() {
         setDiscoveryErrors({});
     }, [connectionKey]);
 
+    // Forget the journal cursor and the shown events: another daemon, a
+    // daemon back from being offline, or a restarted numbering.
+    const resetJournal = useCallback(() => {
+        journalGeneration.current += 1;
+        eventSeq.current = 0;
+        eventAnchor.current = null;
+        lastContinuityCheck.current = 0;
+        setEvents([]);
+    }, []);
+    const journalKey = `${transport}:${known?.daemon_id ?? ""}`;
+    useEffect(() => {
+        resetJournal();
+    }, [journalKey, resetJournal]);
+    const wasOnline = useRef(online);
+    useEffect(() => {
+        if (online && !wasOnline.current) resetJournal();
+        wasOnline.current = online;
+    }, [online, resetJournal]);
+
     // The journal tail, polled only while the Events tab is open. The same
     // action works on both transports: the relay passes `since_seq` as the
     // payload, the direct route as a query parameter.
@@ -118,19 +150,36 @@ export default function HardwareConsole() {
         if (tab !== "events" || !online) return;
         let cancelled = false;
         let polling = false;
+        const fetchPage = (since_seq: number, limit: number) => achernarApi.getEquipmentEvents({ since_seq, limit });
         const poll = async () => {
             if (polling) return;
             polling = true;
+            const generation = journalGeneration.current;
+            const stale = () => cancelled || generation !== journalGeneration.current;
             try {
-                const drained = await drainJournal((since_seq, limit) => achernarApi.getEquipmentEvents({ since_seq, limit }),
-                    eventSeq.current, EVENT_PAGE, EVENT_CATCH_UP_PAGES);
-                if (cancelled) return;
+                const drained = await drainJournal(fetchPage, eventSeq.current, EVENT_PAGE, EVENT_CATCH_UP_PAGES);
+                if (stale()) return;
+                const anchor = eventAnchor.current;
+                if (!drained.events.length && anchor && Date.now() - lastContinuityCheck.current >= EVENT_CONTINUITY_MS) {
+                    // An idle journal may be a restarted one numbering below the cursor.
+                    lastContinuityCheck.current = Date.now();
+                    const continues = await journalContinues(fetchPage, anchor);
+                    if (stale()) return;
+                    if (!continues) {
+                        resetJournal();
+                        setEventsError(null);
+                        return;
+                    }
+                }
                 eventSeq.current = drained.nextSeq;
                 setEventsError(null);
-                if (drained.reset) setEvents([]);
-                else if (drained.events.length) setEvents((previous) => newestFirst(previous, drained.events, EVENT_LIMIT));
+                const newest = drained.events[drained.events.length - 1];
+                if (newest) {
+                    eventAnchor.current = { seq: newest.seq, event_id: newest.event_id };
+                    setEvents((previous) => newestFirst(previous, drained.events, EVENT_LIMIT));
+                }
             } catch (error) {
-                if (!cancelled) setEventsError(errorText(error, "The equipment journal is unavailable."));
+                if (!stale()) setEventsError(errorText(error, "The equipment journal is unavailable."));
             } finally {
                 polling = false;
             }
@@ -141,7 +190,7 @@ export default function HardwareConsole() {
             cancelled = true;
             window.clearInterval(timer);
         };
-    }, [tab, online]);
+    }, [tab, online, resetJournal]);
 
     const log = useCallback((text: string) => {
         setResults((previous) => [{ at: new Date().toLocaleTimeString(), text }, ...previous].slice(0, 20));
@@ -245,12 +294,11 @@ export default function HardwareConsole() {
     const clearBlock = (block: ResumeBlock) => void run("equipment.clear_resume_block", () => achernarApi.clearResumeBlock(block.id));
     const health = (key: string) => data?.device_health?.[key] ?? null;
     const planned = plannedKinds(drivers.data);
-    const shownEvents = showGuideSteps ? events : events.filter((event) => event.kind !== "guide_step");
 
     return (
         <main className="hardware-console">
             <section className="panel eq-safety-strip" aria-label="Emergency stop and resume blocks">
-                <EmergencyStopButton online={online} pending={estopPending} abortExposure={estopAbortExposure}
+                <EmergencyStopButton reachable={transportConfigured} pending={estopPending} abortExposure={estopAbortExposure}
                     onAbortExposureChange={setEstopAbortExposure} onStop={() => void estop()} report={estopReport} error={estopError} />
                 <ResumeBlockBanner blocks={data?.resume_blocks} online={online} busy={busy} onClear={clearBlock} />
                 <BusyFlags busy={data?.busy} />
@@ -295,21 +343,25 @@ export default function HardwareConsole() {
                 </div>}
                 {tab === "mount" && <>
                     <h2>Mount</h2>
-                    <MountControls mount={data?.mount} health={health("mount")} descriptor={mountDescriptor.data} online={online} busy={busy} run={run} />
+                    <MountControls mount={data?.mount} health={health("mount")} descriptor={mountDescriptor.data} online={online}
+                        abortable={abortAvailable(known?.mount, knownHealth("mount"))} busy={busy} run={run} />
                     {mountDescriptor.error && <p className="eq-hint tone-warn">Capabilities not read: {errorText(mountDescriptor.error, "request failed")}. The daemon still checks every command.</p>}
                     {data?.mount?.connected === true && <MountStatus mount={data.mount} descriptor={mountDescriptor.data} />}
                 </>}
                 {tab === "focuser" && <>
                     <h2>Focuser</h2>
-                    <FocuserControls focuser={data?.focuser} health={health("focuser")} online={online} busy={busy} run={run} />
+                    <FocuserControls focuser={data?.focuser} health={health("focuser")} online={online}
+                        abortable={abortAvailable(known?.focuser, knownHealth("focuser"))} busy={busy} run={run} />
                 </>}
                 {tab === "filter" && <>
                     <h2>Filter wheel</h2>
-                    <FilterWheelControl wheel={data?.filter_wheel} online={online} busy={busy} run={run} />
+                    <FilterWheelControl wheel={data?.filter_wheel} health={health("filter_wheel")} online={online}
+                        abortable={abortAvailable(known?.filter_wheel, knownHealth("filter_wheel"))} busy={busy} run={run} />
                 </>}
                 {tab === "guider" && <>
                     <h2>Guider</h2>
-                    <GuiderPanel guiding={data?.guiding ?? data?.guider} health={health("guider")} online={online} busy={busy} run={run} />
+                    <GuiderPanel guiding={data?.guiding ?? data?.guider} health={health("guider")} online={online}
+                        abortable={abortAvailable(known?.guiding ?? known?.guider, knownHealth("guider"))} busy={busy} run={run} />
                 </>}
                 {tab === "environment" && <>
                     <h2>Safety</h2>
@@ -320,7 +372,7 @@ export default function HardwareConsole() {
                 </>}
                 {tab === "events" && <>
                     <h2>Equipment events</h2>
-                    <EquipmentEventLog events={shownEvents} error={eventsError} showGuideSteps={showGuideSteps} onShowGuideSteps={setShowGuideSteps} />
+                    <EquipmentEventLog events={events} error={eventsError} />
                 </>}
             </section>
             {results.length > 0 && <section className="panel hardware-action-results" aria-label="Command results">

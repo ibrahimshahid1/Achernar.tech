@@ -10,6 +10,7 @@ import type { MountCapabilities, MountDescriptor } from "../api/achernar";
 import type {
     BusySet,
     DeviceHealthEntry,
+    EqFrame,
     GuiderAppState,
     GuidingBlock,
     LinkState,
@@ -167,12 +168,32 @@ export function healthDetail(health: DeviceHealthEntry | null | undefined): stri
     return parts.length ? parts.join(" · ") : null;
 }
 
+/**
+ * Whether a device's abort path (mount abort, focuser halt, guider stop,
+ * filter abort) is offered (D19).
+ *
+ * Pass the last status the daemon returned, not only a fresh one: a failed
+ * or late status poll (for example a relay whose 16 command slots are all
+ * busy, which aborts bypass) must not take the abort away. A device that is
+ * connected, lost or degraded keeps it; a send that fails is reported.
+ */
+export function abortAvailable(block: { connected?: boolean | null } | null | undefined, health: DeviceHealthEntry | null | undefined): boolean {
+    return block?.connected === true || health?.state === "lost" || health?.state === "degraded";
+}
+
 // ── Mount ─────────────────────────────────────────────────────────────────
 
 export interface ActionGate {
     enabled: boolean;
     reason?: string;
 }
+
+/**
+ * The frame the operator's GoTo, sync and center coordinates are sent in:
+ * `j2000` (converted by the daemon) or `mount` (taken as mount-native and
+ * passed unconverted, the legacy semantics).
+ */
+export type TargetFrame = "j2000" | "mount";
 
 export interface MountActionGates {
     goto: ActionGate;
@@ -183,8 +204,32 @@ export interface MountActionGates {
     home: ActionGate;
     tracking: ActionGate;
     siteSync: ActionGate;
+    /** Whether a target in the chosen frame can reach the mount at all. */
+    frame: ActionGate;
     /** Never gated (O10, D19). */
     abort: ActionGate;
+}
+
+/**
+ * The mount's native frame: the live status first, then the descriptor.
+ * Null when neither reported one (not read yet, not a refusal).
+ */
+export function mountNativeFrame(mount: MountBlock | null | undefined, descriptor: MountDescriptor | null | undefined): EqFrame | null {
+    return mount?.frame ?? descriptor?.frame ?? descriptor?.capabilities?.native_frame ?? null;
+}
+
+/**
+ * A J2000 target needs a known native frame to convert into: the daemon
+ * refuses it otherwise (M-a). Mount-native coordinates pass unconverted.
+ */
+function frameGate(native: EqFrame | null, reason: string | null | undefined, targetFrame: TargetFrame): ActionGate {
+    if (targetFrame === "mount" || native !== "unknown") return { enabled: true };
+    const why = reason?.trim() ? ` (${reason.trim().replace(/_/g, " ")})` : "";
+    return {
+        enabled: false,
+        reason: `The mount's native frame is unknown${why}, so a J2000 target cannot be converted. `
+            + "Set [mount] equatorial_system_override in the daemon config, or send the target as mount-native coordinates.",
+    };
 }
 
 function capability(caps: MountCapabilities | undefined, key: keyof MountCapabilities, what: string): ActionGate {
@@ -206,23 +251,35 @@ function both(a: ActionGate, b: ActionGate): ActionGate {
  * mount being parked, slewing or even lost (D19). Commands are otherwise
  * left to the daemon's gate, so a capability that was never read does not
  * disable a control.
+ *
+ * GoTo, sync and center with a J2000 target are disabled, with the
+ * daemon's frame reason, while the native frame is unknown (an Alpaca mount
+ * below InterfaceVersion 2 or with an unreadable EquatorialSystem, or the
+ * interim OLS INDI adapter without an override); the operator may instead
+ * send mount-native coordinates.
  */
-export function mountActionGates(mount: MountBlock | null | undefined, descriptor: MountDescriptor | null | undefined): MountActionGates {
+export function mountActionGates(
+    mount: MountBlock | null | undefined,
+    descriptor: MountDescriptor | null | undefined,
+    targetFrame: TargetFrame = "j2000",
+): MountActionGates {
     const caps = descriptor?.capabilities;
     const parked = mount?.parked === true;
     const slewing = mount?.slewing === true;
     const parkedGate: ActionGate = parked ? { enabled: false, reason: "The mount is parked; unpark it first." } : { enabled: true };
     const slewingGate: ActionGate = slewing ? { enabled: false, reason: "The mount is slewing; wait or abort." } : { enabled: true };
-    const goto = both(parkedGate, capability(caps, "can_slew_async", "asynchronous GoTo (CanSlewAsync)"));
+    const frame = frameGate(mountNativeFrame(mount, descriptor), caps?.frame_reason, targetFrame);
+    const goto = both(parkedGate, both(capability(caps, "can_slew_async", "asynchronous GoTo (CanSlewAsync)"), frame));
     return {
         goto,
-        sync: both(parkedGate, capability(caps, "can_sync", "sync (CanSync)")),
+        sync: both(parkedGate, both(capability(caps, "can_sync", "sync (CanSync)"), frame)),
         center: goto,
         park: both(parked ? { enabled: false, reason: "The mount is already parked." } : { enabled: true }, capability(caps, "can_park", "park (CanPark)")),
         unpark: both(mount?.parked === false ? { enabled: false, reason: "The mount is not parked." } : { enabled: true }, capability(caps, "can_unpark", "unpark (CanUnpark)")),
         home: both(parkedGate, capability(caps, "can_find_home", "find home (CanFindHome)")),
         tracking: both(parkedGate, capability(caps, "can_set_tracking", "tracking control (CanSetTracking)")),
         siteSync: slewingGate,
+        frame,
         abort: { enabled: true },
     };
 }
