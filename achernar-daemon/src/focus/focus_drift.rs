@@ -71,6 +71,11 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Position variance after a reset of unknown size (steps²): (10⁶ steps)²,
+/// far beyond any focuser's travel, so the next measurement's position gain
+/// is 1 to within rounding.
+const POSITION_UNKNOWN_VARIANCE: f64 = 1.0e12;
+
 /// Row-major 3×3 matrix.
 type Mat3 = [f64; 9];
 /// 3-vector.
@@ -839,6 +844,43 @@ impl FocusDriftForecaster {
         })
     }
 
+    /// When the last measurement was folded in, if ever.
+    pub fn last_update(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.last_update
+    }
+
+    /// The focuser's position counter was reset or synced (equipment spec
+    /// F-h, `focuser_position_reset`): the coordinate frame of the learned
+    /// best-focus position moved, while what the filter knows about thermal
+    /// drift did not.
+    ///
+    /// * `Some(shift)` — the reset reported where the counter went from and
+    ///   to, so the position is translated by `to - from` exactly.
+    /// * `None` — the new origin is unknown. The position becomes unknown in
+    ///   the filter's own terms: its variance is made effectively infinite
+    ///   and decoupled from `v` and `k`, so the next verified measurement
+    ///   re-seeds the position (gain ≈ 1) without teaching the drift rate or
+    ///   the temperature coefficient anything from the jump. The covariance is
+    ///   persisted, so this survives a restart.
+    ///
+    /// Forecasts are unaffected: a drift is a change, and position drops out
+    /// of it.
+    pub fn rebaseline(&mut self, shift_steps: Option<f64>) {
+        if self.update_count == 0 {
+            return;
+        }
+        match shift_steps {
+            Some(shift) if shift.is_finite() => self.state[0] += shift,
+            _ => {
+                self.covariance[0] = POSITION_UNKNOWN_VARIANCE;
+                for i in [1, 2] {
+                    self.covariance[i] = 0.0;
+                    self.covariance[i * 3] = 0.0;
+                }
+            }
+        }
+    }
+
     /// Reset the filter state (new rig, new night, or numerical failure).
     ///
     /// Keeps the threshold. It describes the optics, not the thermal history —
@@ -1201,5 +1243,65 @@ mod tests {
             ..fdf.to_state()
         };
         assert!(FocusDriftForecaster::from_state(bad, DriftConfig::default()).is_err());
+    }
+
+    /// A filter that has learned 0.5 steps/s of drift at constant
+    /// temperature, then sees the focuser's counter jump.
+    fn trained_on_drift() -> FocusDriftForecaster {
+        let mut fdf = FocusDriftForecaster::new();
+        for i in 0..40 {
+            let t = i as i64 * 30;
+            fdf.update(1000.0 + 0.5 * t as f64, 10.0, at(t));
+        }
+        fdf
+    }
+
+    #[test]
+    fn a_known_reset_translates_the_position_and_keeps_the_rate() {
+        let mut fdf = trained_on_drift();
+        let rate = fdf.drift_rate();
+        let before = fdf.position();
+        fdf.rebaseline(Some(-5_000.0));
+        assert!((fdf.position() - (before - 5_000.0)).abs() < 1e-9);
+        // The next measurement continues in the new frame: no jump learned.
+        fdf.update(1000.0 + 0.5 * 1_200.0 - 5_000.0, 10.0, at(1_200));
+        assert!((fdf.drift_rate() - rate).abs() < 0.01);
+    }
+
+    #[test]
+    fn an_unknown_reset_reseeds_the_position_without_learning_the_jump() {
+        let mut fdf = trained_on_drift();
+        let rate = fdf.drift_rate();
+        let (k, _) = fdf.temperature_coefficient();
+        fdf.rebaseline(None);
+        // Forecasts are changes, so they survive the reset.
+        let forecast = fdf.predict(10.0, 600.0);
+        assert!(forecast.initialized);
+        assert!((forecast.predicted_drift_steps - 600.0 * rate).abs() < 1e-6);
+        // A measurement 20 000 steps away re-seeds the position...
+        fdf.update(21_000.0, 10.0, at(1_200));
+        assert!((fdf.position() - 21_000.0).abs() < 1.0);
+        // ...and teaches the rate and coefficient nothing from the jump.
+        assert!(
+            (fdf.drift_rate() - rate).abs() < 1e-3,
+            "{}",
+            fdf.drift_rate()
+        );
+        assert!((fdf.temperature_coefficient().0 - k).abs() < 1e-3);
+        // It persists: the reset survives a snapshot round trip.
+        let mut again = trained_on_drift();
+        again.rebaseline(None);
+        let restored =
+            FocusDriftForecaster::from_state(again.to_state(), DriftConfig::default()).unwrap();
+        assert!(restored.to_state().covariance[0] >= POSITION_UNKNOWN_VARIANCE);
+    }
+
+    #[test]
+    fn rebaselining_an_empty_filter_does_nothing() {
+        let mut fdf = FocusDriftForecaster::new();
+        fdf.rebaseline(None);
+        fdf.rebaseline(Some(10.0));
+        assert_eq!(fdf.update_count(), 0);
+        assert_eq!(fdf.last_update(), None);
     }
 }
