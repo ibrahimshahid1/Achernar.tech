@@ -21,7 +21,8 @@
 //! 1. stage every file under `.<frame-id>.partial`, hashing while writing
 //! 2. write `manifest.v1.json` describing what should be there
 //! 3. fsync the files and attempt to sync the staging directory
-//! 4. open the SQLite transaction and insert frames + frame_assets + outbox
+//! 4. open the SQLite transaction and insert frames + the frame's equipment
+//!    window (`exposure_device_windows`) + frame_assets + outbox
 //! 5. rename the staging directory into place
 //! 6. commit
 //!
@@ -652,6 +653,20 @@ impl CaptureStore {
         .await
         .map_err(|e| StorageError::Database(format!("insert frame: {e}")))?;
 
+        // The frame's equipment window (H1, D7), in the same transaction, so
+        // every committed frame has an `exposure_device_windows` row. The
+        // capture path assembles it as `acquisition.equipment.window`; a
+        // caller that did not records the exposure times with everything else
+        // unknown. A failed window write never costs the exposure itself: the
+        // native bytes are the success that counts.
+        let window = exposure_window_row(capture);
+        if let Err(e) = crate::storage::exposure_windows_repo::upsert(&mut *tx, &window).await {
+            tracing::warn!(
+                "Could not record the equipment window of frame {}: {e}",
+                capture.frame_id
+            );
+        }
+
         for (asset, staged_asset) in capture.assets.iter().zip(staged.iter()) {
             sqlx::query(
                 r#"INSERT INTO frame_assets (
@@ -1010,6 +1025,36 @@ fn remove_partials(root: &Path) -> usize {
 
 /// Observing night under the same local-noon boundary used by every dataset
 /// grouping key. A directory and its catalogue row must never disagree.
+/// Why a frame's window row holds no equipment state.
+const WINDOW_NOT_ASSEMBLED: &str = "equipment_window_not_assembled";
+
+/// The `exposure_device_windows` row for `capture`: the window the capture
+/// path assembled (`acquisition.equipment.window`), keyed to this frame, or,
+/// when there is none, the exposure bracket with every equipment value
+/// unknown (never a guessed 0 or "quiescent"). Without a verified wheel the
+/// filter is the client label, marked unverified.
+fn exposure_window_row(capture: &PendingCapture) -> crate::equipment::events::ExposureWindowRow {
+    use crate::equipment::events::ExposureWindowRow;
+    let assembled = capture
+        .acquisition
+        .pointer("/equipment/window")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<ExposureWindowRow>(value).ok());
+    if let Some(mut row) = assembled {
+        row.frame_id = capture.frame_id.clone();
+        return row;
+    }
+    ExposureWindowRow {
+        frame_id: capture.frame_id.clone(),
+        exposure_started_at: Some(unix_to_datetime(capture.exposure_started_at)),
+        exposure_completed_at: Some(unix_to_datetime(capture.exposure_completed_at)),
+        filter_name: capture.filter_name.clone(),
+        filter_verified: capture.filter_name.as_ref().map(|_| false),
+        quiescence_reason: Some(WINDOW_NOT_ASSEMBLED.to_string()),
+        ..ExposureWindowRow::default()
+    }
+}
+
 fn night_of(unix_seconds: f64) -> String {
     crate::storage::night::night_id(unix_to_datetime(unix_seconds))
 }
@@ -1525,6 +1570,92 @@ mod tests {
             .unwrap();
         assert_eq!(status.0, "corrupt");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn every_committed_frame_has_an_equipment_window_row() {
+        use crate::equipment::events::ExposureWindowRow;
+        use crate::equipment::snapshot::SafetyGate;
+        use crate::equipment::types::{ClockQuality, EqFrame, PierSide};
+        use crate::storage::exposure_windows_repo;
+
+        let dir = std::env::temp_dir().join(format!("achernar-window-{}", uuid::Uuid::new_v4()));
+        let store = CaptureStore::new(&dir);
+        let pool = test_pool().await;
+
+        // The capture path's assembled window travels in the acquisition
+        // block and becomes this frame's row, keyed to the committed frame.
+        let mut assembled = sample("frame-with-window");
+        let window = ExposureWindowRow {
+            frame_id: "ignored-and-rekeyed".into(),
+            exposure_started_at: Some(unix_to_datetime(assembled.exposure_started_at)),
+            exposure_completed_at: Some(unix_to_datetime(assembled.exposure_completed_at)),
+            clock_quality: ClockQuality::HostTriggerBracket,
+            finalised: false,
+            mount_frame: Some(EqFrame::JNowApparent),
+            pier_side: Some(PierSide::West),
+            tracking: Some(true),
+            focuser_pos_start: Some(12_345),
+            focuser_pos_end: Some(12_345),
+            focuser_moved: Some(false),
+            filter_name: Some("Ha".into()),
+            filter_slot: Some(2),
+            filter_verified: Some(true),
+            safety_state: Some(SafetyGate::None),
+            quiescent: Some(true),
+            events: vec![7, 9],
+            ..ExposureWindowRow::default()
+        };
+        assembled.acquisition["equipment"] = serde_json::json!({
+            "schema": "capture_equipment.v1",
+            "window": window,
+        });
+        let committed = store.persist_capture(&pool, assembled).await.unwrap();
+        let row = exposure_windows_repo::load(&pool, &committed.frame_id)
+            .await
+            .unwrap()
+            .expect("the assembled window row");
+        assert_eq!(row.frame_id, "frame-with-window");
+        assert_eq!(row.clock_quality, ClockQuality::HostTriggerBracket);
+        assert_eq!(row.pier_side, Some(PierSide::West));
+        assert_eq!(row.tracking, Some(true));
+        assert_eq!(row.filter_name.as_deref(), Some("Ha"));
+        assert_eq!(row.filter_verified, Some(true));
+        assert_eq!(row.events, vec![7, 9]);
+        assert!(!row.finalised, "a provisional window is never called final");
+        // The manifest is self-describing for the equipment too.
+        let manifest: CaptureManifest = serde_json::from_slice(
+            &std::fs::read(dir.join(&committed.relative_dir).join(MANIFEST_FILENAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.acquisition["equipment"]["window"]["tracking"],
+            true
+        );
+
+        // A caller that assembled nothing still gets a row: the exposure
+        // bracket, the client filter label marked unverified, and every
+        // equipment value unknown.
+        let mut bare = sample("frame-without-window");
+        bare.filter_name = Some("L".into());
+        let committed = store.persist_capture(&pool, bare).await.unwrap();
+        let row = exposure_windows_repo::load(&pool, &committed.frame_id)
+            .await
+            .unwrap()
+            .expect("a minimal window row");
+        assert_eq!(
+            row.exposure_started_at,
+            Some(unix_to_datetime(1_785_636_000.0))
+        );
+        assert_eq!(row.clock_quality, ClockQuality::Unknown);
+        assert_eq!(row.filter_name.as_deref(), Some("L"));
+        assert_eq!(row.filter_verified, Some(false));
+        assert_eq!(row.tracking, None);
+        assert_eq!(row.focuser_pos_start, None);
+        assert_eq!(row.quiescent, None);
+        assert_eq!(row.quiescence_reason.as_deref(), Some(WINDOW_NOT_ASSEMBLED));
+        assert!(row.mount_mid_json.is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
