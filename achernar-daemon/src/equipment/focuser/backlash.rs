@@ -20,7 +20,9 @@
 //!   the compensated target would leave them the compensation is skipped,
 //!   and when even the current offset would, the offset is dropped (the move
 //!   goes to the plain logical target and the session reports a
-//!   `focuser_position_reset`).
+//!   `focuser_position_reset`). A persisted offset outside the band (the
+//!   amounts were reduced since it was written) is cut back to the band and
+//!   reported the same way.
 //! - `backlash_owner = firmware`: the device compensates internally and
 //!   Achernar applies none, whatever the model says.
 //!
@@ -94,9 +96,10 @@ pub struct BacklashPlan {
     /// either is unknown.
     pub reversal: Option<bool>,
     pub skipped: Option<SkipReason>,
-    /// `absolute` only: the offset this move removes because the raw target
-    /// would otherwise leave the travel bounds. The logical position then
-    /// re-baselines by this many steps.
+    /// `absolute` only: the offset this move removes, because the raw target
+    /// would otherwise leave the travel bounds, or because a persisted offset
+    /// lies outside the model's `[-in, +out]` band (the amounts were reduced).
+    /// The logical position then re-baselines by this many steps.
     pub offset_dropped: Option<i32>,
     /// The compensation state once every leg has completed.
     pub state_after: BacklashState,
@@ -272,20 +275,27 @@ pub fn plan(
             let raw_with = |offset: i64| i64::from(logical_target) + offset;
             // Every move's raw target is checked, not just a reversal's: the
             // offset alone can push a target near either end out of bounds.
-            let chosen = if within(bounds, raw_with(compensated)) {
-                compensated
+            // `carried` is the part of the starting offset the move keeps.
+            let (chosen, carried) = if within(bounds, raw_with(compensated)) {
+                (compensated, kept)
             } else if within(bounds, raw_with(kept)) {
                 plan.skipped = Some(SkipReason::OutsideTravelBounds);
-                kept
+                (kept, kept)
             } else {
                 // The logical target is inside the bounds, so dropping the
                 // offset always yields a valid raw target.
                 plan.skipped = Some(SkipReason::OutsideTravelBounds);
-                if offset != 0 {
-                    plan.offset_dropped = Some(offset);
-                }
-                0
+                (0, 0)
             };
+            // What the move gives up of the starting offset: all of it when
+            // it is dropped, or the excess of a stale offset (persisted under
+            // larger amounts) outside [-in, +out]. The logical position
+            // re-baselines by that much, so it is reported, never silent.
+            let given_up = i64::from(offset) - carried;
+            if given_up != 0 {
+                plan.offset_dropped =
+                    Some(given_up.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32);
+            }
             // `chosen` lies in [-in, +out] (or is zero) and `raw_with(chosen)`
             // passed `within`, so both fit in an i32.
             plan.state_after.offset = chosen as i32;
@@ -581,6 +591,49 @@ mod tests {
             offsets[6..].chunks(2).all(|pair| pair == [30, 10]),
             "{offsets:?}"
         );
+    }
+
+    #[test]
+    fn a_stale_offset_outside_the_band_is_cut_back_and_reported() {
+        // Persisted under in_steps = 50; the profile now says 20.
+        let model = BacklashModel::Absolute {
+            in_steps: 20,
+            out_steps: 20,
+        };
+        let stale = BacklashState {
+            offset: -50,
+            last_direction: Some(FocusDirection::In),
+        };
+        let bounds = Some((0, 50_000));
+        // Same direction: the offset is cut back to -20, a 30-step rebase.
+        let p = plan(model, BacklashOwner::Achernar, stale, 10_000, 9_000, bounds);
+        assert_eq!(targets(&p), vec![8_980]);
+        assert_eq!((p.skipped, p.state_after.offset), (None, -20));
+        assert_eq!(p.offset_dropped, Some(-30));
+        // A reversal compensates from the cut-back offset; the excess is
+        // still reported.
+        let p = plan(
+            model,
+            BacklashOwner::Achernar,
+            stale,
+            10_000,
+            11_000,
+            bounds,
+        );
+        assert_eq!((targets(&p), p.state_after.offset), (vec![11_000], 0));
+        assert_eq!(p.offset_dropped, Some(-30));
+        // Compensation clamped by the band is not a rebase.
+        let held = BacklashState {
+            offset: 10,
+            last_direction: Some(FocusDirection::In),
+        };
+        let asym = BacklashModel::Absolute {
+            in_steps: 20,
+            out_steps: 30,
+        };
+        let p = plan(asym, BacklashOwner::Achernar, held, 10_000, 11_000, bounds);
+        assert_eq!(p.state_after.offset, 30);
+        assert_eq!(p.offset_dropped, None);
     }
 
     #[test]

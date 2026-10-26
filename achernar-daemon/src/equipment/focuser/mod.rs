@@ -1822,6 +1822,31 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_absolute_offset_is_cut_back_to_the_band_with_a_reset() {
+        // The offset was persisted under in_steps = 50 at the raw position
+        // the device still reports; the profile now says 20.
+        let profile = json!({
+            "backlash": {"model": "absolute", "in_steps": 20, "out_steps": 20},
+            "backlash_state": {"offset": -50, "last_direction": "in", "raw": 25_000},
+        });
+        let mut rig = sim_rig(
+            SimFocuserConfig::absolute(),
+            &configs(|_| {}),
+            Some(profile),
+        );
+        assert_eq!(rig.session.logical_position(), Some(25_050));
+        assert_eq!(rig.run(FocuserCmd::MoveTo(24_000)), OpOutcome::Succeeded);
+        assert_eq!(sim_moves(&rig), vec![SimCall::MoveAbsolute(23_980)]);
+        assert_eq!(rig.session.backlash_state().offset, -20);
+        assert_eq!(rig.session.logical_position(), Some(24_000));
+        // Raw 23 980 read 24 030 under the old offset: reported, not silent.
+        assert_eq!(
+            rig.resets(),
+            vec![(Some(24_030), Some(24_000), "backlash_offset_dropped".into())]
+        );
+    }
+
+    #[test]
     fn firmware_owned_backlash_gets_no_compensation() {
         let cfgs = configs(|c| {
             c.focus_backlash.enabled = true;
@@ -2005,6 +2030,29 @@ mod tests {
         // An ordinary move afterwards is back to the per-move rule.
         assert_eq!(rig.run(FocuserCmd::MoveTo(25_000)), OpOutcome::Succeeded);
         assert_eq!(tempcomp_writes(&rig), vec![false, true, false, true]);
+    }
+
+    #[test]
+    fn consecutive_autofocus_moves_without_a_begin_keep_tempcomp_off() {
+        // The review probe: three moves of one run, no begin_autofocus_run.
+        let mut cfg = SimFocuserConfig::absolute();
+        cfg.temp_comp = true;
+        let mut rig = sim_rig(cfg, &configs(|_| {}), None);
+        let mut after_each = Vec::new();
+        for target in [25_300, 25_100, 25_200] {
+            assert_eq!(af_move(&mut rig, target, "run-p"), OpOutcome::Succeeded);
+            after_each.push(rig.control().temp_comp());
+        }
+        assert_eq!(after_each, vec![false; 3]);
+        assert_eq!(
+            tempcomp_writes(&rig),
+            vec![false],
+            "one switch-off, no restore"
+        );
+        rig.session
+            .end_autofocus_run(rig.drv.as_mut(), Some("run-p"))
+            .unwrap();
+        assert_eq!(tempcomp_writes(&rig), vec![false, true]);
     }
 
     #[test]
