@@ -16,7 +16,8 @@
 //!    adapter's edge events;
 //! 3. steps the active operation: completion predicate, then settle, then
 //!    verification (C-5); a passed deadline cancels it (halting the
-//!    hardware, C-4) and resolves `TimedOut`.
+//!    hardware, C-4) and resolves `TimedOut`, or `Unknown` on a device with
+//!    no halt (a filter wheel), since nothing stopped it.
 //!
 //! Commands are planned by the kind adapter ([`WorkerKind::plan`]) into an
 //! instant action, a long [`Operation`], a halt, or a concurrent action.
@@ -28,15 +29,29 @@
 //! Abort (D4, D19) never waits for this thread: the handle runs the driver's
 //! out-of-band `AbortPath` on a blocking thread and puts a `Cancel` at the
 //! head of the queue. The worker then cancels the operation and resolves it
-//! `Aborted` once a poll confirms motion stopped.
+//! `Aborted` once a poll reads that motion stopped (a poll that cannot read
+//! motion confirms nothing; the confirmation timeout then ends it
+//! `Unknown`). An abort also stops what waits behind it: the motion
+//! commands still queued when the cancel is handled are refused, and so is
+//! any motion command whose permit the gate issued before the abort (the
+//! gate's abort epochs, [`WorkerDeps::aborts`]). They resolve
+//! `Aborted { by }` without starting.
 //!
 //! Health (§2.8): one failed or slow poll degrades the device; loss needs
 //! `lost_after_failures` consecutive failures or no good poll for
 //! `lost_after_s`, then one reconnect attempt (NINA's reconnect-once). The
-//! [`Watchdog`] covers a worker blocked inside a driver call. A lost device
-//! stays lost for the connection: its operation resolves `Unknown`
-//! (raising an `outcome_unknown` resume block), the abort path is still
-//! attempted, and later commands fail until a disconnect retires it.
+//! [`Watchdog`] covers a worker blocked inside a driver call: on loss it
+//! starts the abort path on a blocking thread and resolves the operation
+//! `Unknown` at once, without waiting for the hung call. A lost device
+//! stays lost for the connection: its last values are published as stale,
+//! its operation resolves `Unknown` (raising an `outcome_unknown` resume
+//! block), the abort path is attempted once, and later commands fail until
+//! a disconnect retires it.
+//!
+//! Daemon shutdown (§2.15, [`halts_at_shutdown`]) halts focuser and rotator
+//! moves, stops a jog and aborts an Achernar slew. Park, unpark, home,
+//! dome, cover and wheel operations are left running and resolve
+//! `Unknown`.
 //!
 //! Every driver call runs under `catch_unwind`. On a panic the worker runs
 //! the abort path, resolves the ticket `Unknown`, marks the device `Lost`
@@ -60,6 +75,7 @@ use super::commands::{
 use super::events::{
     ConnectionEnd, DeviceConnectionRecord, EquipmentEvent, EventKind, GroundTruthRecord,
 };
+use super::gate::{run_detached, AbortEpochs};
 use super::handle::{Envelope, EnvelopeBody, Permit, WorkerEnd};
 use super::health_bridge::{
     mark_lost, on_poll_failed, on_poll_ok, on_stale, HealthChange, HealthPolicy, Watchdog, Watched,
@@ -132,6 +148,14 @@ const RECOVERY_TICKS: u32 = 20;
 /// A command enum the worker can run.
 pub trait DeviceCommand: Send + 'static {
     fn op_kind(&self) -> OpKind;
+
+    /// True for a command that starts (or keeps up) motion. An abort or
+    /// e-stop refuses such a command when it was authorised or queued
+    /// before the abort (D19). Stops, halts, reads and plain sets never
+    /// are refused this way.
+    fn starts_motion(&self) -> bool {
+        self.op_kind().moves_hardware()
+    }
 }
 
 macro_rules! device_command {
@@ -144,20 +168,74 @@ macro_rules! device_command {
     };
 }
 
-device_command!(
-    MountCmd,
-    FocuserCmd,
-    FilterWheelCmd,
-    GuiderCmd,
-    RotatorCmd,
-    CoverCalibratorCmd,
-    SwitchCmd,
-    DomeCmd,
-);
+device_command!(FilterWheelCmd, RotatorCmd, CoverCalibratorCmd, SwitchCmd);
+
+impl DeviceCommand for MountCmd {
+    fn op_kind(&self) -> OpKind {
+        MountCmd::op_kind(self)
+    }
+
+    /// Tracking on drives the axes, and setting SideOfPier flips the mount
+    /// (ASCOM). MoveAxis at rate 0 is a stop.
+    fn starts_motion(&self) -> bool {
+        match self {
+            MountCmd::SetTracking(on) => *on,
+            MountCmd::MoveAxis { rate_deg_s, .. } => rate_deg_s.abs() > 0.0,
+            MountCmd::SetSideOfPier(_) => true,
+            other => other.op_kind().moves_hardware(),
+        }
+    }
+}
+
+impl DeviceCommand for FocuserCmd {
+    fn op_kind(&self) -> OpKind {
+        FocuserCmd::op_kind(self)
+    }
+
+    /// Temperature compensation on moves the focuser by itself.
+    fn starts_motion(&self) -> bool {
+        match self {
+            FocuserCmd::SetTempComp(on) => *on,
+            other => other.op_kind().moves_hardware(),
+        }
+    }
+}
+
+impl DeviceCommand for GuiderCmd {
+    fn op_kind(&self) -> OpKind {
+        GuiderCmd::op_kind(self)
+    }
+
+    /// Guiding (started or resumed) pulses the mount; a dither moves it.
+    fn starts_motion(&self) -> bool {
+        matches!(
+            self,
+            GuiderCmd::Start { .. } | GuiderCmd::Resume | GuiderCmd::Dither { .. }
+        )
+    }
+}
+
+impl DeviceCommand for DomeCmd {
+    fn op_kind(&self) -> OpKind {
+        DomeCmd::op_kind(self)
+    }
+
+    /// A slaved dome follows the mount.
+    fn starts_motion(&self) -> bool {
+        match self {
+            DomeCmd::SetSlaved(on) => *on,
+            other => other.op_kind().moves_hardware(),
+        }
+    }
+}
 
 impl DeviceCommand for WeatherCmd {
     fn op_kind(&self) -> OpKind {
         OpKind::Refresh
+    }
+
+    fn starts_motion(&self) -> bool {
+        false
     }
 }
 
@@ -165,6 +243,24 @@ impl DeviceCommand for SafetyCmd {
     fn op_kind(&self) -> OpKind {
         OpKind::Refresh
     }
+
+    fn starts_motion(&self) -> bool {
+        false
+    }
+}
+
+/// Daemon shutdown (§2.15) halts only these: focuser and rotator moves, a
+/// jog, and an Achernar slew. Park, unpark, home, dome, cover and wheel
+/// operations keep running, and tracking and PHD2 are left alone.
+pub fn halts_at_shutdown(op: OpKind) -> bool {
+    matches!(
+        op,
+        OpKind::FocuserMove
+            | OpKind::RotatorMove
+            | OpKind::MoveAxis
+            | OpKind::Slew
+            | OpKind::SlewAltAz
+    )
 }
 
 /// A one-shot driver action.
@@ -357,6 +453,11 @@ pub struct WorkerDeps<S> {
     /// The hub ring for this kind (`EquipmentHub::attach`).
     pub ring: Option<Arc<Ring<S>>>,
     pub watchdog: Option<Arc<Watchdog>>,
+    /// The gate's abort epochs (`CommandGate::abort_epochs`). With them, a
+    /// motion command authorised before an abort or e-stop is refused even
+    /// when it was already queued (D19). Without them, only the motion
+    /// commands queued when the cancel is handled are refused.
+    pub aborts: Option<Arc<AbortEpochs>>,
 }
 
 #[derive(Debug, Default)]
@@ -441,7 +542,19 @@ impl Drop for WorkerHandle {
 struct SharedFlags {
     lost_announced: bool,
     unknown_announced: Option<CommandId>,
+    /// The operation whose abort path already ran (once per operation).
+    abort_ran: Option<CommandId>,
     finished: bool,
+}
+
+/// The active operation's ticket. It lives here, not on the worker thread,
+/// so the watchdog can resolve it while the worker is stuck in a driver
+/// call; whichever side takes it first resolves it, exactly once.
+struct PendingDone {
+    command_id: CommandId,
+    op: OpKind,
+    started_mono_ns: u64,
+    tx: oneshot::Sender<OpOutcome>,
 }
 
 struct WorkerShared<C, S> {
@@ -450,6 +563,8 @@ struct WorkerShared<C, S> {
     policy: HealthPolicy,
     clock: Arc<dyn Clock>,
     events: Arc<dyn EventSink>,
+    abort_path: Option<Arc<dyn AbortPath>>,
+    done: Mutex<Option<PendingDone>>,
     flags: Mutex<SharedFlags>,
 }
 
@@ -491,6 +606,69 @@ impl<C, S: DeviceSnapshot> WorkerShared<C, S> {
             self.emit(EventKind::OutcomeUnknown { op, reason }, Some(command_id));
         }
     }
+
+    /// Claim the abort path for `command_id`: true the first time only.
+    fn claim_abort(&self, command_id: Option<CommandId>) -> bool {
+        let Some(command_id) = command_id else {
+            return true;
+        };
+        let mut flags = lock(&self.flags);
+        if flags.abort_ran == Some(command_id) {
+            false
+        } else {
+            flags.abort_ran = Some(command_id);
+            true
+        }
+    }
+
+    /// Resolve the active ticket with `outcome`, unless the other side
+    /// already did. Emits `operation_ended` (and `outcome_unknown` for an
+    /// unknown outcome) with it.
+    fn resolve_done(&self, outcome: &OpOutcome) -> bool {
+        let Some(pending) = lock(&self.done).take() else {
+            return false;
+        };
+        let duration_ms = self
+            .clock
+            .now_mono_ns()
+            .saturating_sub(pending.started_mono_ns)
+            / 1_000_000;
+        let _ = pending.tx.send(outcome.clone());
+        self.emit(
+            EventKind::OperationEnded {
+                op: pending.op,
+                outcome: outcome.clone(),
+                duration_ms,
+            },
+            Some(pending.command_id),
+        );
+        if let OpOutcome::Unknown(err) = outcome {
+            self.announce_unknown(pending.command_id, pending.op, err.message.clone());
+        }
+        true
+    }
+
+    /// The device was lost while the worker may be stuck inside the driver
+    /// (§2.15, D4): start the abort path on a blocking thread now, and
+    /// resolve the operation `Unknown` without waiting for the hung call.
+    fn abandon_active(&self, reason: &str) {
+        let command_id = lock(&self.done).as_ref().map(|p| p.command_id);
+        let Some(command_id) = command_id else {
+            return;
+        };
+        if let Some(path) = self.abort_path.clone() {
+            if self.claim_abort(Some(command_id)) {
+                run_detached("eq-abort", move || {
+                    match catch_unwind(AssertUnwindSafe(|| path.abort())) {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => tracing::warn!("abort path after loss failed: {err}"),
+                        Err(_) => tracing::warn!("abort path after loss panicked"),
+                    }
+                });
+            }
+        }
+        self.resolve_done(&OpOutcome::Unknown(DeviceError::disconnected(reason)));
+    }
 }
 
 impl<C: Send + 'static, S: DeviceSnapshot> Watched for WorkerShared<C, S> {
@@ -510,15 +688,14 @@ impl<C: Send + 'static, S: DeviceSnapshot> Watched for WorkerShared<C, S> {
             }
             HealthChange::Lost { class, reason } => {
                 self.announce_lost(class, reason.clone());
-                // The worker may be stuck inside the driver: raise the
-                // operation's outcome_unknown now (§2.15).
+                // The worker may be stuck inside the driver: run the abort
+                // path and resolve the operation unknown now (§2.15), which
+                // raises its outcome_unknown block.
+                let reason = reason.unwrap_or_else(|| "device lost during the operation".into());
                 if let Some(op) = self.end.current().active_op().cloned() {
-                    self.announce_unknown(
-                        op.command_id,
-                        op.kind,
-                        reason.unwrap_or_else(|| "device lost during the operation".into()),
-                    );
+                    self.announce_unknown(op.command_id, op.kind, reason.clone());
                 }
+                self.abandon_active(&reason);
             }
             _ => {}
         }
@@ -534,7 +711,6 @@ struct Active<D: ?Sized> {
     op: Box<dyn Operation<D>>,
     info: ActiveOp,
     permit: Permit,
-    done: Option<oneshot::Sender<OpOutcome>>,
     events: OpEvents,
     settle_until: Option<u64>,
     /// `Some` once cancelled: who cancelled it, and since when.
@@ -570,6 +746,10 @@ struct Worker<K: WorkerKind> {
     ring: Option<Arc<Ring<K::Snap>>>,
     control: Arc<WorkerControl>,
     abort_path: Option<Arc<dyn AbortPath>>,
+    aborts: Option<Arc<AbortEpochs>>,
+    /// The latest abort this worker handled (`Aborted { by }` for commands
+    /// it refuses as authorised before it).
+    last_abort: Option<CommandId>,
     cadence: Cadence,
     tick: u64,
     next_poll_at: u64,
@@ -596,12 +776,15 @@ pub fn spawn_worker<K: WorkerKind>(
     let name = format!("eq-{}-{}", kind_name(identity.kind), &id[..id.len().min(8)]);
     let cadence = kind.cadence();
     let end = Arc::new(end);
+    let abort_path = driver.abort_path();
     let shared = Arc::new(WorkerShared {
         end: Arc::clone(&end),
         interval_ns: AtomicU64::new(ns(cadence.idle)),
         policy: config.policy,
         clock: Arc::clone(&deps.clock),
         events: Arc::clone(&deps.events),
+        abort_path: abort_path.clone(),
+        done: Mutex::new(None),
         flags: Mutex::new(SharedFlags::default()),
     });
     if let Some(watchdog) = &deps.watchdog {
@@ -610,7 +793,6 @@ pub fn spawn_worker<K: WorkerKind>(
     }
     let control = Arc::new(WorkerControl::default());
     let (connected_tx, connected_rx) = oneshot::channel();
-    let abort_path = driver.abort_path();
     let worker = Worker {
         kind_id: identity.kind,
         kind,
@@ -622,6 +804,8 @@ pub fn spawn_worker<K: WorkerKind>(
         ring: deps.ring,
         control: Arc::clone(&control),
         abort_path,
+        aborts: deps.aborts,
+        last_abort: None,
         cadence,
         tick: 0,
         next_poll_at: 0,
@@ -982,24 +1166,43 @@ impl<K: WorkerKind> Worker<K> {
             }
             _ => {}
         }
-        if let Some(previous) = self.last.clone() {
-            let (active_op, health) = self.snapshot_ctx_parts();
-            let ctx = SnapshotContext {
-                identity: &self.end.identity,
-                clock: self.clock.as_ref(),
-                tick: self.tick,
-                previous: Some(previous.as_ref()),
-                active_op: active_op.as_ref(),
-                health: &health,
-            };
-            let stale = self.kind.stale_snapshot(&previous, &ctx);
-            if let Some(stale) = stale {
-                let snap = self.publish(stale);
-                self.last = Some(snap);
-            }
-        }
+        self.publish_stale();
         // Time passes even while polls fail.
         self.after_poll(None);
+    }
+
+    /// Publish the adapter's stale copy of the latest snapshot (C-2, D5):
+    /// after a failed poll, and when the device is lost, so its last values
+    /// are never presented as fresh.
+    fn publish_stale(&mut self) {
+        let Some(previous) = self.last.clone() else {
+            return;
+        };
+        let (active_op, health) = self.snapshot_ctx_parts();
+        let ctx = SnapshotContext {
+            identity: &self.end.identity,
+            clock: self.clock.as_ref(),
+            tick: self.tick,
+            previous: Some(previous.as_ref()),
+            active_op: active_op.as_ref(),
+            health: &health,
+        };
+        let kind = &mut self.kind;
+        let stale = match catch_unwind(AssertUnwindSafe(|| kind.stale_snapshot(&previous, &ctx))) {
+            Ok(stale) => stale,
+            Err(panic) => {
+                tracing::warn!(
+                    device = %self.end.identity.name,
+                    "stale snapshot panicked: {}",
+                    panic_message(panic.as_ref())
+                );
+                None
+            }
+        };
+        if let Some(stale) = stale {
+            let snap = self.publish(stale);
+            self.last = Some(snap);
+        }
     }
 
     fn try_reconnect(&mut self, cause: &DeviceError) -> bool {
@@ -1047,8 +1250,13 @@ impl<K: WorkerKind> Worker<K> {
     }
 
     /// Run the abort path on this thread (the device is lost or the driver
-    /// panicked; there is nothing else to wait for).
+    /// panicked; there is nothing else to wait for). Skipped when the
+    /// watchdog already ran it for the active operation.
     fn best_effort_abort(&self) {
+        let active = self.active.as_ref().map(|a| a.info.command_id);
+        if !self.shared.claim_abort(active) {
+            return;
+        }
         if let Some(path) = &self.abort_path {
             match catch_unwind(AssertUnwindSafe(|| path.abort())) {
                 Ok(Ok(())) => {}
@@ -1077,6 +1285,8 @@ impl<K: WorkerKind> Worker<K> {
         });
         self.shared.announce_lost(class, reason.clone());
         self.close_connection(ConnectionEnd::Lost);
+        // Nothing more will be read: the last values are stale from now on.
+        self.publish_stale();
         if self.active.is_some() {
             self.best_effort_abort();
             let message =
@@ -1105,6 +1315,7 @@ impl<K: WorkerKind> Worker<K> {
         });
         self.shared.announce_lost(FailureClass::DriverPanic, reason);
         self.close_connection(ConnectionEnd::Failed);
+        self.publish_stale();
         // Dropping the driver may panic too.
         let drv = self.drv.take();
         let _ = catch_unwind(AssertUnwindSafe(move || drop(drv)));
@@ -1125,31 +1336,12 @@ impl<K: WorkerKind> Worker<K> {
 
     fn resolve(&mut self, outcome: OpOutcome) {
         self.drain_op_events();
-        let Some(mut active) = self.active.take() else {
+        let Some(active) = self.active.take() else {
             return;
         };
-        let duration_ms = self
-            .clock
-            .now_mono_ns()
-            .saturating_sub(active.info.started_mono_ns)
-            / 1_000_000;
-        if let Some(done) = active.done.take() {
-            let _ = done.send(outcome.clone());
-        }
-        let command_id = active.info.command_id;
-        let op = active.info.kind;
-        self.emit(
-            EventKind::OperationEnded {
-                op,
-                outcome: outcome.clone(),
-                duration_ms,
-            },
-            Some(command_id),
-        );
-        if let OpOutcome::Unknown(err) = &outcome {
-            self.shared
-                .announce_unknown(command_id, op, err.message.clone());
-        }
+        // The watchdog may already have resolved it (device lost while this
+        // thread was inside the driver); then it is not resolved twice.
+        self.shared.resolve_done(&outcome);
         // Releases the domains (on every path, including panics).
         drop(active);
         self.republish();
@@ -1169,7 +1361,9 @@ impl<K: WorkerKind> Worker<K> {
             )
         };
         if let Some((by, since)) = cancel {
-            let stopped = snap.map(|s| s.device_moving() != Some(true));
+            // Only a poll that read "not moving" confirms the stop; a poll
+            // that could not read motion leaves it to the timeout (§2.5).
+            let stopped = snap.map(|s| s.device_moving() == Some(false));
             match stopped {
                 Some(true) => self.resolve(OpOutcome::Aborted { by }),
                 _ if now.saturating_sub(since) >= ns(self.config.cancel_confirm_timeout) => {
@@ -1183,7 +1377,15 @@ impl<K: WorkerKind> Worker<K> {
         }
         if now >= deadline {
             self.cancel_op();
-            self.resolve(OpOutcome::TimedOut);
+            if self.kind.has_halt() {
+                self.resolve(OpOutcome::TimedOut);
+            } else {
+                // Nothing stopped it (C-4): its final state is unknown, which
+                // blocks automatic resumption (v6 §8.2.1).
+                self.resolve(OpOutcome::Unknown(DeviceError::outcome_unknown(
+                    "the deadline passed on a device with no halt; its final position is unknown",
+                )));
+            }
             return;
         }
         if snap.is_none() {
@@ -1296,6 +1498,7 @@ impl<K: WorkerKind> Worker<K> {
                 Flow::Continue
             }
             EnvelopeBody::Cancel { by } => {
+                self.last_abort = Some(by);
                 if self.mode == Mode::Running {
                     let already = self
                         .active
@@ -1305,6 +1508,7 @@ impl<K: WorkerKind> Worker<K> {
                         self.cancel_active(Some(by), true);
                     }
                 }
+                self.refuse_queued_motion();
                 Flow::Continue
             }
             EnvelopeBody::Disconnect { force, done } => self.on_disconnect(command_id, force, done),
@@ -1313,6 +1517,86 @@ impl<K: WorkerKind> Worker<K> {
 
     fn refuse(&self, accepted: oneshot::Sender<DeviceResult<()>>, err: DeviceError) {
         let _ = accepted.send(Err(err));
+    }
+
+    /// The gate stamped `permit` before an abort of this kind (D19): the
+    /// command was authorised before the abort and must not start.
+    fn authorised_before_abort(&self, permit: &Permit) -> bool {
+        let Some(aborts) = &self.aborts else {
+            return false;
+        };
+        aborts
+            .issued_epoch(permit.command_id(), self.kind_id)
+            .is_some_and(|issued| issued < aborts.epoch(self.kind_id))
+    }
+
+    /// The gate stamped `permit` with the current abort epoch: authorised
+    /// after every abort of this kind so far.
+    fn authorised_after_abort(&self, permit: &Permit) -> bool {
+        let Some(aborts) = &self.aborts else {
+            return false;
+        };
+        aborts
+            .issued_epoch(permit.command_id(), self.kind_id)
+            .is_some_and(|issued| issued >= aborts.epoch(self.kind_id))
+    }
+
+    /// Refuse a motion command that an abort superseded: it never starts
+    /// and is recorded as `Aborted { by }`.
+    fn refuse_superseded(
+        &self,
+        command_id: CommandId,
+        op: OpKind,
+        source: CommandSource,
+        accepted: oneshot::Sender<DeviceResult<()>>,
+    ) {
+        let by = self.last_abort;
+        self.emit(
+            EventKind::OperationCommanded { op, source },
+            Some(command_id),
+        );
+        self.emit_ended(op, command_id, OpOutcome::Aborted { by }, 0);
+        let message = match by {
+            Some(by) => format!("abort {by} was issued after this command; it was not started"),
+            None => "an abort was issued after this command; it was not started".into(),
+        };
+        self.refuse(accepted, DeviceError::cancelled(message));
+    }
+
+    /// An abort also stops what waits behind it (D19). Every motion command
+    /// still queued when the cancel is handled was queued before the abort,
+    /// or raced it, so it is refused, unless the gate stamped its permit
+    /// with the current abort epoch (authorised after the abort). Stops,
+    /// halts, reads and the e-stop's own tracking-off stay queued, in order.
+    fn refuse_queued_motion(&mut self) {
+        let queued = self.end.commands.len();
+        let mut kept = Vec::new();
+        for _ in 0..queued {
+            let Some(Envelope { command_id, body }) = self.end.commands.try_pop() else {
+                break;
+            };
+            match body {
+                EnvelopeBody::Command {
+                    cmd,
+                    permit,
+                    accepted,
+                    done,
+                } if cmd.starts_motion() && !self.authorised_after_abort(&permit) => {
+                    let source = permit.source().clone();
+                    // Released before the caller hears of the refusal.
+                    drop(permit);
+                    drop(done);
+                    self.refuse_superseded(command_id, cmd.op_kind(), source, accepted);
+                }
+                body => kept.push(Envelope { command_id, body }),
+            }
+        }
+        // Back at the head, in their original order. A queue closed in the
+        // meantime drops them, which releases their permits and fails their
+        // callers.
+        for envelope in kept.into_iter().rev() {
+            let _ = self.end.commands.push_front(envelope);
+        }
     }
 
     fn on_command(
@@ -1343,6 +1627,11 @@ impl<K: WorkerKind> Worker<K> {
             }
         }
         let op_kind = cmd.op_kind();
+        if cmd.starts_motion() && self.authorised_before_abort(&permit) {
+            let source = permit.source().clone();
+            drop(permit);
+            return self.refuse_superseded(command_id, op_kind, source, accepted);
+        }
         self.emit(
             EventKind::OperationCommanded {
                 op: op_kind,
@@ -1529,6 +1818,12 @@ impl<K: WorkerKind> Worker<K> {
             }
             Ok(Ok(())) => {
                 let (utc, mono) = self.now();
+                *lock(&self.shared.done) = Some(PendingDone {
+                    command_id,
+                    op: op_kind,
+                    started_mono_ns: mono,
+                    tx: done,
+                });
                 self.active = Some(Active {
                     op,
                     info: ActiveOp {
@@ -1540,7 +1835,6 @@ impl<K: WorkerKind> Worker<K> {
                         deadline_mono_ns: mono.saturating_add(ns(deadline)),
                     },
                     permit,
-                    done: Some(done),
                     events,
                     settle_until: None,
                     cancel: None,
@@ -1598,17 +1892,26 @@ impl<K: WorkerKind> Worker<K> {
         Flow::Exit
     }
 
-    /// §2.15: halt motion this worker started, never park, close politely.
+    /// §2.15: halt focuser and rotator moves, stop a jog and abort an
+    /// Achernar slew; leave park, unpark, home, dome, cover and wheel
+    /// operations running (their outcome is then unknown); never park;
+    /// close politely.
     fn shutdown(&mut self) {
         if self.mode == Mode::Running && self.active.is_some() {
-            let moves = self
-                .active
-                .as_ref()
-                .is_some_and(|a| a.info.kind.moves_hardware());
-            if moves {
-                self.cancel_op();
+            let op = self.active.as_ref().map(|a| a.info.kind);
+            match op {
+                Some(op) if halts_at_shutdown(op) => {
+                    self.cancel_op();
+                    self.resolve(OpOutcome::Aborted { by: None });
+                }
+                Some(op) if op.moves_hardware() => {
+                    self.resolve(OpOutcome::Unknown(DeviceError::outcome_unknown(format!(
+                        "the daemon shut down during {op:?}; it was left running and its \
+                         result was not observed"
+                    ))));
+                }
+                _ => self.resolve(OpOutcome::Aborted { by: None }),
             }
-            self.resolve(OpOutcome::Aborted { by: None });
         }
         if let Some(drv) = self.drv.as_mut() {
             if let Ok(Err(err)) = catch_unwind(AssertUnwindSafe(|| drv.disconnect())) {
@@ -1759,6 +2062,8 @@ mod tests {
         reconnect_fails: bool,
         disconnected: bool,
         ignore_halt: bool,
+        /// IsMoving cannot be read (the member errors).
+        moving_unknown: bool,
     }
 
     struct Shared {
@@ -1885,11 +2190,17 @@ mod tests {
             })
         }
         fn state(&mut self) -> DeviceResult<FocuserState> {
-            let (position, moving) = self.shared.with(|s| (s.position, s.moving));
+            let (position, moving, moving_unknown) = self
+                .shared
+                .with(|s| (s.position, s.moving, s.moving_unknown));
             let clock = self.clock.as_ref();
             Ok(FocuserState {
                 position: Observed::fresh_at(position, Source::Property, clock),
-                is_moving: Observed::fresh_at(moving, Source::Property, clock),
+                is_moving: if moving_unknown {
+                    Observed::error(Source::Property)
+                } else {
+                    Observed::fresh_at(moving, Source::Property, clock)
+                },
                 temperature_c: Observed::unsupported(Source::Property),
                 temp_comp: Observed::unsupported(Source::Property),
             })
@@ -2045,6 +2356,13 @@ mod tests {
     }
 
     fn rig_with(kind: TestKind, policy: HealthPolicy) -> Rig {
+        rig_kind(kind, policy)
+    }
+
+    fn rig_kind<K>(kind: K, policy: HealthPolicy) -> Rig
+    where
+        K: WorkerKind<Driver = dyn FocuserDriver, Cmd = FocuserCmd, Snap = FocuserSnapshot>,
+    {
         let clock = Arc::new(ManualClock::new());
         let sink = RecordingSink::new();
         let hub = EquipmentHub::new(HubConfig::default(), clock.clone(), sink.clone());
@@ -2080,6 +2398,7 @@ mod tests {
                 recorder: sink.clone(),
                 ring: Some(ring),
                 watchdog: Some(hub.watchdog()),
+                aborts: Some(hub.gate().abort_epochs()),
             },
         )
         .unwrap();
@@ -2669,6 +2988,7 @@ mod tests {
                 recorder: hub.recorder(),
                 ring: None,
                 watchdog: None,
+                aborts: None,
             },
         )
         .unwrap();
@@ -2676,5 +2996,441 @@ mod tests {
         assert_eq!(err.class, ErrorClass::Transport);
         assert!(worker.join_timeout(Duration::from_secs(5)));
         assert!(handle.is_retired(), "a failed connect retires the handle");
+    }
+
+    // -- variants of the test kind ---------------------------------------------------
+
+    /// The test kind, with its moves run as another operation kind and an
+    /// optional halt.
+    struct Variant {
+        base: TestKind,
+        op: OpKind,
+        halt: bool,
+    }
+
+    impl Variant {
+        fn new(op: OpKind, halt: bool, deadline: Duration) -> Self {
+            Self {
+                base: TestKind {
+                    settle: Duration::ZERO,
+                    deadline,
+                    panic_on_step: false,
+                },
+                op,
+                halt,
+            }
+        }
+    }
+
+    impl WorkerKind for Variant {
+        type Driver = dyn FocuserDriver;
+        type Cmd = FocuserCmd;
+        type Snap = FocuserSnapshot;
+
+        fn kind(&self) -> DeviceKind {
+            DeviceKind::Focuser
+        }
+
+        fn has_halt(&self) -> bool {
+            self.halt
+        }
+
+        fn plan(
+            &mut self,
+            cmd: FocuserCmd,
+            drv: &mut Drv,
+            ctx: &PlanContext<'_, FocuserSnapshot>,
+        ) -> Plan<Drv> {
+            match cmd {
+                FocuserCmd::MoveTo(target) => {
+                    let halt = self.halt;
+                    let op = FnOperation::new(
+                        self.op,
+                        self.base.deadline,
+                        move |drv: &mut Drv| drv.move_absolute(target),
+                        |drv: &mut Drv| {
+                            Ok(!drv.state()?.is_moving.known().copied().unwrap_or(true))
+                        },
+                        move |drv: &mut Drv| if halt { drv.halt() } else { Ok(()) },
+                    )
+                    .with_poll(Duration::from_millis(100));
+                    Plan::Operation(Box::new(op))
+                }
+                other => self.base.plan(other, drv, ctx),
+            }
+        }
+
+        fn snapshot(
+            &mut self,
+            drv: &mut Drv,
+            poll: &RawPoll,
+            ctx: &SnapshotContext<'_, FocuserSnapshot>,
+        ) -> DeviceResult<FocuserSnapshot> {
+            self.base.snapshot(drv, poll, ctx)
+        }
+
+        fn stale_snapshot(
+            &mut self,
+            previous: &FocuserSnapshot,
+            ctx: &SnapshotContext<'_, FocuserSnapshot>,
+        ) -> Option<FocuserSnapshot> {
+            self.base.stale_snapshot(previous, ctx)
+        }
+    }
+
+    /// Wait (real time) until the worker is blocked inside a poll.
+    async fn wait_blocked(rig: &Rig) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !rig.shared.with(|s| s.blocked) {
+            assert!(Instant::now() < deadline, "the worker never blocked");
+            rig.clock.advance_ms(100);
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// The `operation_ended` outcomes recorded for `command_id`.
+    fn ended(rig: &Rig, command_id: CommandId) -> Vec<OpOutcome> {
+        rig.sink
+            .records()
+            .into_iter()
+            .filter_map(|r| match r {
+                GroundTruthRecord::Event(e) if e.command_id == Some(command_id) => match &e.event {
+                    EventKind::OperationEnded { outcome, .. } => Some(outcome.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    // -- abort and e-stop stop queued motion (D19) ------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_move_queued_before_an_estop_never_starts() {
+        let rig = rig();
+        rig.shared.with(|s| s.steps_per_poll = 1);
+        assert!(drive(&rig, Duration::from_millis(100), || rig
+            .shared
+            .with(|s| s.polls)
+            >= 1));
+        // The worker is stuck in a slow poll while a move is queued.
+        rig.shared.with(|s| s.block_next_poll = true);
+        wait_blocked(&rig).await;
+        let handle = rig.handle.clone();
+        let queued =
+            tokio::spawn(async move { handle.send(FocuserCmd::MoveTo(3_000), operator()).await });
+        // Let `send` queue the envelope; it then waits for acceptance.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !queued.is_finished(),
+            "the worker cannot accept while blocked"
+        );
+        let report = crate::equipment::estop::run_estop(
+            &rig.hub,
+            crate::equipment::estop::EstopRequest {
+                abort_exposure: false,
+                source: CommandSource::Operator { overriding: false },
+            },
+        )
+        .await;
+        assert!(report.all_ok(), "{report:?}");
+        assert!(rig.shared.with(|s| s.blocked), "still inside the slow call");
+        // The slow call returns: the cancel is handled, then the queued move
+        // is refused, never started.
+        rig.shared.release();
+        let err = queued.await.unwrap().unwrap_err();
+        assert_eq!(err.class, ErrorClass::Cancelled, "{err}");
+        let polls = rig.shared.with(|s| s.polls);
+        assert!(drive(&rig, Duration::from_millis(100), || rig
+            .shared
+            .with(|s| s.polls)
+            > polls + 3));
+        assert_eq!(rig.shared.with(|s| (s.position, s.moving)), (0, false));
+        assert!(rig
+            .sink
+            .records()
+            .iter()
+            .any(|r| matches!(r, GroundTruthRecord::Event(e) if matches!(
+                &e.event,
+                EventKind::OperationEnded { op: OpKind::FocuserMove, outcome: OpOutcome::Aborted { by: Some(_) }, .. }
+            ))));
+        // A move sent after the e-stop runs.
+        let ticket = rig
+            .handle
+            .send(FocuserCmd::MoveTo(3), operator())
+            .await
+            .unwrap();
+        assert_eq!(wait_outcome(&rig, ticket).await, OpOutcome::Succeeded);
+        assert_eq!(rig.shared.with(|s| s.position), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_permit_issued_before_an_abort_never_starts_motion() {
+        let rig = rig();
+        let gate = Arc::clone(rig.hub.gate());
+        let source = CommandSource::Operator { overriding: false };
+        let move_to = |target: i32| {
+            GatedCommand::new(
+                GatedOp::Focuser(FocuserCmd::MoveTo(target)),
+                source.clone(),
+                AutonomyMode::Manual,
+                Priority::Exposure,
+            )
+        };
+        // Authorised, then delayed (for example by the D20 guider stop)
+        // while the operator aborts the focuser.
+        let early = move_to(500);
+        let early_permit = gate.authorize(&early).unwrap();
+        let abort = gate.abort(&rig.handle, source.clone());
+        assert!(abort.outcome().await.is_ok());
+        let err = rig
+            .handle
+            .send(FocuserCmd::MoveTo(500), early_permit)
+            .await
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Cancelled);
+        assert_eq!(
+            ended(&rig, early.command_id),
+            vec![OpOutcome::Aborted {
+                by: Some(abort_ticket_id(&rig))
+            }]
+        );
+        assert_eq!(rig.shared.with(|s| s.position), 0);
+        // A command authorised after the abort runs.
+        let late = move_to(40);
+        let permit = gate.authorize(&late).unwrap();
+        let ticket = rig
+            .handle
+            .send(FocuserCmd::MoveTo(40), permit)
+            .await
+            .unwrap();
+        assert_eq!(wait_outcome(&rig, ticket).await, OpOutcome::Succeeded);
+        assert_eq!(rig.shared.with(|s| s.position), 40);
+        // Stops and sets are never refused this way.
+        let halt = gate
+            .authorize(&GatedCommand::new(
+                GatedOp::Focuser(FocuserCmd::Halt),
+                source.clone(),
+                AutonomyMode::Manual,
+                Priority::Safety,
+            ))
+            .unwrap();
+        let _ = gate.abort(&rig.handle, source.clone());
+        let halted = rig.handle.send(FocuserCmd::Halt, halt).await.unwrap();
+        assert_eq!(halted.wait().await, OpOutcome::Succeeded);
+    }
+
+    /// The id the worker resolved the latest abort with.
+    fn abort_ticket_id(rig: &Rig) -> CommandId {
+        rig.sink
+            .records()
+            .into_iter()
+            .rev()
+            .find_map(|r| match r {
+                GroundTruthRecord::Event(e) => match &e.event {
+                    EventKind::OperationEnded {
+                        outcome: OpOutcome::Aborted { by: Some(by) },
+                        ..
+                    } => Some(*by),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("an aborted operation")
+    }
+
+    // -- cancel confirmation, deadlines and shutdown ----------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_is_confirmed_only_by_a_poll_that_read_not_moving() {
+        let rig = rig();
+        rig.shared.with(|s| s.steps_per_poll = 1);
+        let ticket = rig
+            .handle
+            .send(FocuserCmd::MoveTo(10_000), operator())
+            .await
+            .unwrap();
+        let id = ticket.command_id;
+        // IsMoving can no longer be read, so no poll can confirm the halt.
+        rig.shared.with(|s| s.moving_unknown = true);
+        rig.handle.abort();
+        let polls = rig.shared.with(|s| s.polls);
+        assert!(drive(&rig, Duration::from_millis(100), || rig
+            .shared
+            .with(|s| s.polls)
+            >= polls + 5));
+        assert!(
+            ended(&rig, id).is_empty(),
+            "an unread IsMoving is not a confirmed stop"
+        );
+        // The confirmation timeout then ends it unknown.
+        assert!(matches!(
+            wait_outcome(&rig, ticket).await,
+            OpOutcome::Unknown(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_device_with_no_halt_that_overruns_its_deadline_is_unknown() {
+        let rig = rig_kind(
+            Variant::new(OpKind::FilterMove, false, Duration::from_secs(2)),
+            HealthPolicy::default(),
+        );
+        rig.shared.with(|s| s.steps_per_poll = 1);
+        let ticket = rig
+            .handle
+            .send(FocuserCmd::MoveTo(10_000), operator())
+            .await
+            .unwrap();
+        let outcome = wait_outcome(&rig, ticket).await;
+        assert!(
+            matches!(&outcome, OpOutcome::Unknown(e) if e.class == ErrorClass::OutcomeUnknown),
+            "{outcome:?}"
+        );
+        assert!(drive(&rig, Duration::from_millis(10), || rig
+            .hub
+            .resume()
+            .active()
+            .iter()
+            .any(|b| matches!(
+                b.kind,
+                crate::equipment::snapshot::ResumeBlockKind::OutcomeUnknown {
+                    op: OpKind::FilterMove,
+                    ..
+                }
+            ))));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_halts_only_moves_jogs_and_slews() {
+        for (op, halts) in [
+            (OpKind::FocuserMove, true),
+            (OpKind::RotatorMove, true),
+            (OpKind::MoveAxis, true),
+            (OpKind::Slew, true),
+            (OpKind::SlewAltAz, true),
+            (OpKind::Park, false),
+            (OpKind::Unpark, false),
+            (OpKind::Home, false),
+            (OpKind::DomePark, false),
+            (OpKind::DomeSlew, false),
+            (OpKind::DomeOpenShutter, false),
+            (OpKind::DomeCloseShutter, false),
+            (OpKind::CoverOpen, false),
+            (OpKind::CoverClose, false),
+            (OpKind::FilterMove, false),
+        ] {
+            assert_eq!(halts_at_shutdown(op), halts, "{op:?}");
+            let mut rig = rig_kind(
+                Variant::new(op, true, Duration::from_secs(600)),
+                HealthPolicy::default(),
+            );
+            rig.shared.with(|s| s.steps_per_poll = 1);
+            let ticket = rig
+                .handle
+                .send(FocuserCmd::MoveTo(10_000), operator())
+                .await
+                .unwrap();
+            let worker = rig.worker.take().unwrap();
+            worker.stop();
+            assert!(worker.join_timeout(Duration::from_secs(5)));
+            let outcome = ticket.wait().await;
+            let halted = rig.shared.with(|s| s.halted);
+            if halts {
+                assert_eq!(outcome, OpOutcome::Aborted { by: None }, "{op:?}");
+                assert!(halted >= 1, "{op:?} is halted at shutdown");
+            } else {
+                assert!(
+                    matches!(&outcome, OpOutcome::Unknown(e) if e.class == ErrorClass::OutcomeUnknown),
+                    "{op:?}: {outcome:?}"
+                );
+                assert_eq!(halted, 0, "{op:?} is left running");
+            }
+            assert!(rig.handle.is_retired());
+        }
+    }
+
+    // -- loss --------------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_watchdog_aborts_and_resolves_a_stuck_operation_at_once() {
+        let rig = rig();
+        rig.shared.with(|s| s.steps_per_poll = 1);
+        let ticket = rig
+            .handle
+            .send(FocuserCmd::MoveTo(10_000), operator())
+            .await
+            .unwrap();
+        let id = ticket.command_id;
+        rig.shared.with(|s| s.block_next_poll = true);
+        wait_blocked(&rig).await;
+        rig.clock.advance_ms(15_000);
+        rig.hub.watchdog().tick(rig.clock.now_mono_ns());
+        assert_eq!(rig.handle.health().state, LinkState::Lost);
+        // Without waiting for the hung call: the abort path runs and the
+        // ticket resolves unknown.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while rig.abort.calls() == 0 {
+            assert!(Instant::now() < deadline, "the abort path never ran");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let mut done = ticket.done;
+        assert!(matches!(done.try_recv(), Ok(OpOutcome::Unknown(_))));
+        assert!(rig.shared.with(|s| s.blocked), "the call is still hung");
+        assert!(!rig.hub.resume().active().is_empty());
+        // When the call returns, nothing is resolved or aborted twice.
+        rig.shared.release();
+        assert!(drive(&rig, Duration::from_millis(10), || rig
+            .handle
+            .snapshot()
+            .state
+            .position
+            .state
+            == ObsState::Stale));
+        assert_eq!(rig.abort.calls(), 1);
+        assert_eq!(ended(&rig, id).len(), 1);
+        let unknowns = rig
+            .sink
+            .event_names()
+            .into_iter()
+            .filter(|n| *n == "outcome_unknown")
+            .count();
+        assert_eq!(unknowns, 1);
+    }
+
+    #[test]
+    fn a_lost_device_publishes_its_last_values_as_stale() {
+        let rig = rig();
+        assert!(drive(&rig, Duration::from_millis(100), || rig
+            .shared
+            .with(|s| s.polls)
+            >= 2));
+        assert_eq!(rig.handle.snapshot().state.position.state, ObsState::Fresh);
+        // NotConnected, and the single reconnect fails: lost at once.
+        rig.shared.with(|s| {
+            s.fail_polls = 1000;
+            s.fail_with = Some(DeviceError::not_connected("Connected=false"));
+            s.reconnect_fails = true;
+        });
+        assert!(drive(&rig, Duration::from_millis(250), || rig
+            .handle
+            .health()
+            .state
+            == LinkState::Lost));
+        rig.clock.advance(Duration::from_secs(600));
+        let snap = rig.handle.snapshot();
+        assert_eq!(snap.state.position.state, ObsState::Stale);
+        assert_eq!(snap.state.position.value, Some(0), "the last value is kept");
+        assert_eq!(
+            rig.hub
+                .rings()
+                .focuser
+                .latest()
+                .unwrap()
+                .state
+                .position
+                .state,
+            ObsState::Stale
+        );
     }
 }

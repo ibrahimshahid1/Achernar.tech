@@ -5,10 +5,14 @@
 //! `LostLock`, the gate's executor
 //!
 //! 1. sends `GuiderCmd::Stop` (PHD2 `stop_capture`) through the gate, with
-//!    the motion command's source and priority;
+//!    the motion command's source and priority. When the motion's owner
+//!    (the command itself, or the compound operation a step belongs to,
+//!    such as a flip) already claims the guider, the stop runs as a child
+//!    of that claim instead of competing with it;
 //! 2. waits up to 10 s (by the injected clock) for the guider to report
 //!    `Stopped`;
-//! 3. records `was_guiding` on the operation.
+//! 3. records `was_guiding` on the operation, and whether the stop was
+//!    actually sent.
 //!
 //! A guider that will not stop fails the motion with `guider_stop_failed`,
 //! unless the source is safety: a safety park must never wait on PHD2, so it
@@ -19,12 +23,12 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use super::commands::{GatedCommand, GatedOp, GuiderCmd, MountCmd};
-use super::gate::CommandGate;
+use super::commands::{Domain, GatedCommand, GatedOp, GuiderCmd, MountCmd};
+use super::gate::{CommandGate, StepOwner};
 use super::handle::GuiderHandle;
 use super::snapshot::GuiderAppState;
 use super::traits::Clock;
-use super::types::{CommandId, CommandSource, DeviceError, OpOutcome};
+use super::types::{CommandId, CommandSource, DeviceError, DeviceKind, OpOutcome};
 
 /// How long the stop waits for `Stopped` (§2.9).
 pub const STOP_GUIDING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -54,14 +58,43 @@ pub fn guider_active(state: GuiderAppState) -> bool {
 /// What the pre-motion stop did, recorded on the operation.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct PreMotion {
+    /// The guider was guiding, calibrating or had lost lock before the
+    /// motion.
     pub was_guiding: bool,
     /// The guider state seen before the motion.
     pub guider_state: Option<GuiderAppState>,
+    /// True only when the stop reached the guider.
+    #[serde(default)]
+    pub stop_sent: bool,
+    /// The stop command, only when it was sent.
     pub stop_command_id: Option<CommandId>,
     pub waited_ms: u64,
     /// A stop that failed but did not block a safety source, or an unknown
     /// guider state.
     pub warning: Option<String>,
+}
+
+/// Why the stop failed, and whether it reached the guider at all.
+#[derive(Debug, Clone, PartialEq)]
+struct StopFailure {
+    reason: String,
+    sent: bool,
+}
+
+impl StopFailure {
+    fn before_send(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            sent: false,
+        }
+    }
+
+    fn after_send(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            sent: true,
+        }
+    }
 }
 
 /// The guider would not stop (`guider_stop_failed`).
@@ -96,12 +129,15 @@ impl std::fmt::Display for CoordError {
 
 impl std::error::Error for CoordError {}
 
-/// Stop guiding before `motion` (D20). Returns what was done, or the
-/// failure that must fail the motion.
+/// Stop guiding before `motion` (D20). `owner` is the permit holder the
+/// motion runs under (the motion itself, or the compound operation it is a
+/// step of); when it claims the guider the stop is authorised as its child.
+/// Returns what was done, or the failure that must fail the motion.
 pub async fn stop_guiding_before_motion(
     gate: &CommandGate,
     guider: Option<&GuiderHandle>,
     motion: &GatedCommand,
+    owner: Option<&StepOwner>,
     clock: &dyn Clock,
     timeout: Duration,
 ) -> Result<PreMotion, CoordError> {
@@ -142,24 +178,28 @@ pub async fn stop_guiding_before_motion(
         "motion_command_id": motion.command_id,
     }));
     let started = clock.now_mono_ns();
-    let result = run_stop(gate, guider, &stop, clock, timeout).await;
+    let result = run_stop(gate, guider, &stop, owner, clock, timeout).await;
     let waited_ms = clock.now_mono_ns().saturating_sub(started) / 1_000_000;
     match result {
         Ok(()) => Ok(PreMotion {
             was_guiding: true,
             guider_state: state,
+            stop_sent: true,
             stop_command_id: Some(stop.command_id),
             waited_ms,
             warning: None,
         }),
-        Err(reason) if motion.source == CommandSource::Safety => Ok(PreMotion {
+        Err(failure) if motion.source == CommandSource::Safety => Ok(PreMotion {
             was_guiding: true,
             guider_state: state,
-            stop_command_id: Some(stop.command_id),
+            stop_sent: failure.sent,
+            stop_command_id: failure.sent.then_some(stop.command_id),
             waited_ms,
-            warning: Some(reason),
+            warning: Some(failure.reason),
         }),
-        Err(reason) => Err(CoordError { reason }),
+        Err(failure) => Err(CoordError {
+            reason: failure.reason,
+        }),
     }
 }
 
@@ -167,15 +207,25 @@ async fn run_stop(
     gate: &CommandGate,
     guider: &GuiderHandle,
     stop: &GatedCommand,
+    owner: Option<&StepOwner>,
     clock: &dyn Clock,
     timeout: Duration,
-) -> Result<(), String> {
-    let permit = gate.authorize(stop).map_err(|err| err.to_string())?;
+) -> Result<(), StopFailure> {
+    let guider_domain = Domain::Device(DeviceKind::Guider);
+    let permit = match owner.filter(|owner| owner.holds(guider_domain)) {
+        // A flip (or a step of one) already owns the guider: stopping it is
+        // part of the same operation, not a competing command.
+        Some(owner) => gate.child_permit_of(owner, stop),
+        None => gate.authorize(stop),
+    }
+    .map_err(|err| StopFailure::before_send(err.to_string()))?;
     let ticket = match guider.send(GuiderCmd::Stop, permit).await {
         Ok(ticket) => ticket,
         Err(err) => {
             gate.record_outcome(stop, &OpOutcome::Failed(err.clone()));
-            return Err(format!("the guider refused stop: {err}"));
+            return Err(StopFailure::before_send(format!(
+                "the guider refused stop: {err}"
+            )));
         }
     };
     gate.record_executed(stop, Vec::new());
@@ -191,7 +241,10 @@ async fn run_stop(
                 Ok(outcome) => {
                     if !outcome.is_success() {
                         gate.record_outcome(stop, &outcome);
-                        return Err(format!("stop ended {}", outcome.label()));
+                        return Err(StopFailure::after_send(format!(
+                            "stop ended {}",
+                            outcome.label()
+                        )));
                     }
                     finished = Some(outcome);
                 }
@@ -201,7 +254,9 @@ async fn run_stop(
                         "the guider dropped the stop command",
                     ));
                     gate.record_outcome(stop, &outcome);
-                    return Err("the guider dropped the stop command".into());
+                    return Err(StopFailure::after_send(
+                        "the guider dropped the stop command",
+                    ));
                 }
             }
         }
@@ -213,11 +268,11 @@ async fn run_stop(
         if clock.now_mono_ns() >= deadline {
             let outcome = OpOutcome::TimedOut;
             gate.record_outcome(stop, &outcome);
-            return Err(format!(
+            return Err(StopFailure::after_send(format!(
                 "the guider did not report Stopped within {:.0} s (state {:?})",
                 timeout.as_secs_f64(),
                 state
-            ));
+            )));
         }
         tokio::select! {
             changed = snapshots.changed() => {
@@ -234,10 +289,13 @@ async fn run_stop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::equipment::commands::GateError;
     use crate::equipment::gate::tests::gate_with_ctx;
     use crate::equipment::gate::SubmitError;
     use crate::equipment::snapshot::{GuiderSnapshot, MountSnapshot};
-    use crate::equipment::testing::fake_handles::{fake_guider, fake_mount, FakeResponse};
+    use crate::equipment::testing::fake_handles::{
+        fake_guider, fake_mount, FakeDevice, FakeResponse,
+    };
     use crate::equipment::types::{AutonomyMode, EqCoord, EqFrame, Observed, Priority, Source};
     use std::sync::Arc;
 
@@ -278,22 +336,20 @@ mod tests {
         *ctx.guider.lock().unwrap() = Some(guider.clone());
         let (mount, mount_fake) = fake_mount(MountSnapshot::default());
         let cmd = slew(CommandSource::Operator { overriding: false });
-        let submitted = gate
-            .submit(
-                &mount,
-                cmd.clone(),
-                MountCmd::Slew {
-                    target: EqCoord::default(),
-                },
-            )
-            .await
-            .unwrap();
+        let submitted = gate.submit(&mount, cmd.clone()).await.unwrap();
         let report = submitted.pre_motion.unwrap();
         assert!(report.was_guiding);
+        assert!(report.stop_sent);
         assert_eq!(report.guider_state, Some(GuiderAppState::Guiding));
-        // The guider got its stop before the mount got its slew.
+        // The guider got its stop before the mount got its slew, and the
+        // mount got the target the checks validated.
         assert_eq!(guider_fake.commands(), vec![GuiderCmd::Stop]);
-        assert_eq!(mount_fake.commands().len(), 1);
+        assert_eq!(
+            mount_fake.commands(),
+            vec![MountCmd::Slew {
+                target: EqCoord::new(5.0, 20.0, EqFrame::J2000)
+            }]
+        );
         assert_eq!(submitted.ticket.wait().await, OpOutcome::Succeeded);
         let stop_id = report.stop_command_id.unwrap();
         assert_eq!(
@@ -307,15 +363,142 @@ mod tests {
         );
         // A stopped guider is left alone.
         let again = gate
-            .submit(
-                &mount,
-                slew(CommandSource::Operator { overriding: false }),
-                MountCmd::Park,
-            )
+            .submit(&mount, slew(CommandSource::Operator { overriding: false }))
             .await
             .unwrap();
         assert!(!again.pre_motion.unwrap().was_guiding);
         assert_eq!(guider_fake.commands().len(), 1);
+    }
+
+    fn stopping_guider(
+        state: GuiderAppState,
+    ) -> (GuiderHandle, FakeDevice<GuiderCmd, GuiderSnapshot>) {
+        let (guider, guider_fake) = fake_guider(guiding(state));
+        guider_fake.set_responder(|cmd, snap: &mut GuiderSnapshot| {
+            if *cmd == GuiderCmd::Stop {
+                snap.app_state = Observed::fresh(
+                    GuiderAppState::Stopped,
+                    Source::Phd2Event,
+                    chrono::Utc::now(),
+                    2,
+                );
+            }
+            FakeResponse::succeed()
+        });
+        (guider, guider_fake)
+    }
+
+    #[tokio::test]
+    async fn a_flip_stops_guiding_under_its_own_guider_claim() {
+        for (source, priority) in [
+            (
+                CommandSource::Operator { overriding: false },
+                Priority::MountRecovery,
+            ),
+            (
+                CommandSource::Trigger {
+                    rule: "meridian".into(),
+                },
+                Priority::MountRecovery,
+            ),
+            (CommandSource::Safety, Priority::Safety),
+        ] {
+            let (gate, ctx) = gate_with_ctx();
+            let (guider, guider_fake) = stopping_guider(GuiderAppState::Guiding);
+            *ctx.guider.lock().unwrap() = Some(guider.clone());
+            let (mount, mount_fake) = fake_mount(MountSnapshot::default());
+            // The flip claims mount, guider and the camera boundary.
+            let flip = GatedCommand::new(
+                GatedOp::Flip,
+                source.clone(),
+                AutonomyMode::Manual,
+                priority,
+            );
+            let flip_permit = gate.authorize(&flip).unwrap();
+            // Its slew is a step: checked on its own target, sent as checked.
+            let target = EqCoord::new(5.0, 20.0, EqFrame::J2000);
+            let step = GatedCommand::new(
+                GatedOp::Mount(MountCmd::Slew { target }),
+                source.clone(),
+                AutonomyMode::Manual,
+                priority,
+            );
+            let submitted = gate
+                .submit_step(&mount, &flip_permit, step)
+                .await
+                .unwrap_or_else(|e| panic!("{source:?}: {e}"));
+            let report = submitted.pre_motion.unwrap();
+            assert!(report.was_guiding && report.stop_sent, "{source:?}");
+            assert!(report.warning.is_none(), "{source:?}: {report:?}");
+            assert_eq!(guider_fake.commands(), vec![GuiderCmd::Stop], "{source:?}");
+            assert_eq!(mount_fake.commands(), vec![MountCmd::Slew { target }]);
+            let stop_id = report.stop_command_id.unwrap();
+            assert_eq!(
+                ctx.stages(stop_id),
+                vec![
+                    crate::equipment::events::AuditStage::Proposed,
+                    crate::equipment::events::AuditStage::Validated,
+                    crate::equipment::events::AuditStage::Executed,
+                    crate::equipment::events::AuditStage::Outcome,
+                ]
+            );
+            // The flip still holds the guider; its child stop never took it.
+            assert_eq!(
+                gate.holder(Domain::Device(DeviceKind::Guider))
+                    .map(|c| c.command_id),
+                Some(flip.command_id)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compound_operations_are_not_sent_as_one_device_command() {
+        let (gate, ctx) = gate_with_ctx();
+        let (mount, mount_fake) = fake_mount(MountSnapshot::default());
+        let flip = GatedCommand::new(
+            GatedOp::Flip,
+            CommandSource::Operator { overriding: false },
+            AutonomyMode::Manual,
+            Priority::MountRecovery,
+        );
+        let err = gate.submit(&mount, flip.clone()).await.unwrap_err();
+        assert!(
+            matches!(&err, SubmitError::Gate(GateError::Refused { .. })),
+            "{err}"
+        );
+        assert!(mount_fake.commands().is_empty());
+        assert_eq!(
+            ctx.stages(flip.command_id),
+            vec![
+                crate::equipment::events::AuditStage::Proposed,
+                crate::equipment::events::AuditStage::Rejected,
+            ]
+        );
+        assert!(gate.is_idle(), "nothing was claimed");
+    }
+
+    #[tokio::test]
+    async fn a_safety_motion_whose_stop_never_reached_the_guider_says_so() {
+        let (gate, ctx) = gate_with_ctx();
+        let (guider, guider_fake) = fake_guider(guiding(GuiderAppState::Guiding));
+        guider_fake.set_responder(|_, _| {
+            FakeResponse::reject(DeviceError::transport("PHD2 socket closed"))
+        });
+        *ctx.guider.lock().unwrap() = Some(guider.clone());
+        let (mount, mount_fake) = fake_mount(MountSnapshot::default());
+        let park = GatedCommand::new(
+            GatedOp::Mount(MountCmd::Park),
+            CommandSource::Safety,
+            AutonomyMode::Manual,
+            Priority::Safety,
+        );
+        let submitted = gate.submit(&mount, park).await.unwrap();
+        let report = submitted.pre_motion.unwrap();
+        assert!(report.was_guiding, "the guider was guiding");
+        assert!(!report.stop_sent);
+        assert!(report.stop_command_id.is_none());
+        assert!(report.warning.unwrap().contains("refused"));
+        assert_eq!(mount_fake.commands(), vec![MountCmd::Park]);
     }
 
     #[tokio::test]
@@ -341,13 +524,7 @@ mod tests {
             }
         });
         let err = gate
-            .submit(
-                &mount,
-                slew(CommandSource::Operator { overriding: false }),
-                MountCmd::Slew {
-                    target: EqCoord::default(),
-                },
-            )
+            .submit(&mount, slew(CommandSource::Operator { overriding: false }))
             .await
             .unwrap_err();
         assert!(matches!(&err, SubmitError::Coord(e) if e.code() == "guider_stop_failed"));
@@ -371,9 +548,13 @@ mod tests {
             AutonomyMode::Manual,
             Priority::Safety,
         );
-        let submitted = gate.submit(&mount, park, MountCmd::Park).await.unwrap();
+        let submitted = gate.submit(&mount, park).await.unwrap();
         let report = submitted.pre_motion.unwrap();
         assert!(report.was_guiding);
+        assert!(
+            report.stop_sent,
+            "the stop was accepted, PHD2 never stopped"
+        );
         assert!(report.warning.unwrap().contains("Stopped"));
         assert_eq!(mount_fake.commands(), vec![MountCmd::Park]);
         stop_advancing.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -393,6 +574,7 @@ mod tests {
             &gate,
             Some(&guider),
             &motion,
+            None,
             ctx.clock.as_ref(),
             STOP_GUIDING_TIMEOUT,
         )
@@ -404,6 +586,7 @@ mod tests {
             &gate,
             Some(&unknown),
             &motion,
+            None,
             ctx.clock.as_ref(),
             STOP_GUIDING_TIMEOUT,
         )

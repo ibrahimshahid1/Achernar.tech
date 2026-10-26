@@ -19,6 +19,14 @@
 //!   `outcome_unknown`, a lost mount or guider, and `limit_reached`;
 //! - the [`BusyPublisher`] (H20) and the [`CommandGate`].
 //!
+//! Readers never present a lost, degraded or silent device's last values
+//! as fresh (D5, C-2): H6 (`ambient_temperature`) and H14 (`coc_context`)
+//! demote the values of a device that is not Ready, or whose latest
+//! snapshot is older than [`max_read_age`], to stale before choosing; and
+//! `window()` reads weather and safety at the window's middle only from a
+//! sample within that age, else it records them stale (`stale_kinds`, and
+//! safety `Unknown`).
+//!
 //! [`EquipmentHub::empty`] is inert (D11): it spawns no task and opens no
 //! database writer, so existing `AppState::new` callers are unaffected.
 //! [`EquipmentHub::start`] spawns the 250 ms publisher, which refreshes the
@@ -52,7 +60,8 @@ use super::snapshot::{
     FocuserSnapshot, GuidePhase, GuideRms, GuideStepSample, GuideWindowStats, GuiderSnapshot,
     MotionInterval, MountSnapshot, MovedFlags, Quiescence, ResumeBlock, ResumeBlockKind,
     RotatorSnapshot, SafetyGate, SafetyLevel, SafetySnapshot, SafetySource, SafetySummary,
-    SwitchSnapshot, TemperatureReading, TemperatureSourceKind, Twilight, WeatherSnapshot,
+    SwitchSnapshot, TemperatureReading, TemperatureSourceKind, Twilight, WeatherReading,
+    WeatherSnapshot,
 };
 use super::traits::{CameraActivity, Clock, EquipmentReader, NullRecorder, RecorderSink};
 use super::types::{
@@ -709,6 +718,54 @@ pub fn guide_rms(samples: &[(f64, f64, Option<f64>)]) -> Option<GuideRms> {
     Some(rms)
 }
 
+/// Readings older than this many idle cadences are not presented as fresh:
+/// about 3x the cadence, allowing for the adaptive 4x slowdown (§2.7).
+const READ_AGE_CADENCES: u32 = 12;
+
+/// How old a device's latest snapshot (or a window sample's distance from
+/// the window's middle) may be before its values count as stale (D5, C-2).
+pub fn max_read_age(kind: DeviceKind) -> Duration {
+    default_cadence(kind).idle.saturating_mul(READ_AGE_CADENCES)
+}
+
+/// `observed`, demoted to stale when its device is not live. A value that
+/// was not fresh is returned unchanged.
+fn vet<T>(observed: Observed<T>, live: bool) -> Observed<T> {
+    if live || observed.state != ObsState::Fresh {
+        observed
+    } else {
+        observed.into_stale()
+    }
+}
+
+/// A weather reading with every value marked stale.
+fn stale_weather(reading: &WeatherReading) -> WeatherReading {
+    let mut r = reading.clone();
+    for value in [
+        &mut r.cloud_cover_pct,
+        &mut r.dew_point_c,
+        &mut r.humidity_pct,
+        &mut r.pressure_hpa,
+        &mut r.rain_rate_mm_h,
+        &mut r.sky_brightness_lux,
+        &mut r.sky_quality_mag_arcsec2,
+        &mut r.sky_temperature_c,
+        &mut r.star_fwhm_arcsec,
+        &mut r.temperature_c,
+        &mut r.wind_direction_deg,
+        &mut r.wind_gust_ms,
+        &mut r.wind_speed_ms,
+    ] {
+        *value = std::mem::take(value).into_stale();
+    }
+    r
+}
+
+/// True when `at` lies within `kind`'s read age of `t`.
+fn within_read_age(kind: DeviceKind, at: DateTime<Utc>, t: DateTime<Utc>) -> bool {
+    (at - t).abs() <= chrono_of(max_read_age(kind))
+}
+
 enum KindQuiet {
     Quiet(DateTime<Utc>),
     Moved(u64),
@@ -802,6 +859,24 @@ impl HubCore {
 
     fn link(&self, kind: DeviceKind) -> Option<LinkState> {
         self.device(kind).map(|h| h.health().state)
+    }
+
+    /// Whether `kind`'s published values may be presented as fresh: the
+    /// device is attached and Ready, and its latest snapshot is recent. A
+    /// lost or degraded device's last values are stale to every reader
+    /// (D5, C-2), even before its worker publishes a stale snapshot (it may
+    /// be stuck inside the driver).
+    fn live(&self, kind: DeviceKind) -> bool {
+        let Some(handle) = self.device(kind) else {
+            return false;
+        };
+        if handle.is_retired() || handle.health().state != LinkState::Ready {
+            return false;
+        }
+        // A snapshot that was never published carries its own states.
+        handle
+            .snapshot_age_ms(self.clock.now_mono_ns())
+            .is_none_or(|age| Duration::from_millis(age) <= max_read_age(kind))
     }
 
     // -- events and blocks -------------------------------------------------------
@@ -1267,18 +1342,32 @@ impl HubCore {
         window.dome = self.finalise(&r.dome, DeviceKind::Dome, &mut pass);
         let WindowPass {
             finalised,
-            stale_kinds,
+            mut stale_kinds,
             ..
         } = pass;
         let mid = midpoint(start, end);
         window.mount_mid = mount_position_at(&r.mount, mid);
-        window.weather = r.weather.nearest(mid).map(|s| s.reading.clone());
+        // Weather and safety are read at the middle of the window. A sample
+        // farther from it than the read age (the device was lost, or stopped
+        // publishing) is stale, never the state during the exposure.
+        window.weather = r.weather.nearest(mid).map(|s| {
+            if within_read_age(DeviceKind::Weather, s.at_utc(), mid) {
+                s.reading.clone()
+            } else {
+                stale_kinds.push(DeviceKind::Weather);
+                stale_weather(&s.reading)
+            }
+        });
         window.safety = match r.safety_monitor.nearest(mid) {
             Some(sample) => {
                 let identity = self
                     .device(DeviceKind::SafetyMonitor)
                     .map(|h| (*h.identity()).clone());
-                let link = if sample.level.is_fresh() {
+                let near = within_read_age(DeviceKind::SafetyMonitor, sample.at_utc(), mid);
+                if !near {
+                    stale_kinds.push(DeviceKind::SafetyMonitor);
+                }
+                let link = if near && sample.level.is_fresh() {
                     LinkState::Ready
                 } else {
                     LinkState::Degraded
@@ -1402,16 +1491,19 @@ impl HubCore {
         let mut candidates: Vec<Observed<TemperatureReading>> = Vec::new();
         if let Some(weather) = &snap.weather {
             let identity = identity_of(DeviceKind::Weather);
-            candidates.push(weather.reading.temperature_c.clone().map(|celsius| {
-                TemperatureReading {
-                    celsius,
-                    source: TemperatureSourceKind::Weather,
-                    role: TemperatureRole::Ambient,
-                    identity_key: identity.as_ref().map(|i| i.identity_key.clone()),
-                    connection_id: identity.as_ref().map(|i| i.connection_id),
-                    camera_sensor_fallback: false,
-                }
-            }));
+            let live = self.live(DeviceKind::Weather);
+            candidates.push(
+                vet(weather.reading.temperature_c.clone(), live).map(|celsius| {
+                    TemperatureReading {
+                        celsius,
+                        source: TemperatureSourceKind::Weather,
+                        role: TemperatureRole::Ambient,
+                        identity_key: identity.as_ref().map(|i| i.identity_key.clone()),
+                        connection_id: identity.as_ref().map(|i| i.connection_id),
+                        camera_sensor_fallback: false,
+                    }
+                }),
+            );
         }
         if let Some(focuser) = &snap.focuser {
             if matches!(
@@ -1420,16 +1512,19 @@ impl HubCore {
             ) {
                 let identity = identity_of(DeviceKind::Focuser);
                 let role = focuser.temperature_role;
-                candidates.push(focuser.state.temperature_c.clone().map(|celsius| {
-                    TemperatureReading {
-                        celsius,
-                        source: TemperatureSourceKind::FocuserProbe,
-                        role,
-                        identity_key: identity.as_ref().map(|i| i.identity_key.clone()),
-                        connection_id: identity.as_ref().map(|i| i.connection_id),
-                        camera_sensor_fallback: false,
-                    }
-                }));
+                let live = self.live(DeviceKind::Focuser);
+                candidates.push(
+                    vet(focuser.state.temperature_c.clone(), live).map(|celsius| {
+                        TemperatureReading {
+                            celsius,
+                            source: TemperatureSourceKind::FocuserProbe,
+                            role,
+                            identity_key: identity.as_ref().map(|i| i.identity_key.clone()),
+                            connection_id: identity.as_ref().map(|i| i.connection_id),
+                            camera_sensor_fallback: false,
+                        }
+                    }),
+                );
             }
         }
         if let Some(sensor) = read(&self.camera_sensor).clone() {
@@ -1477,10 +1572,11 @@ impl HubCore {
             ..CocContext::default()
         };
         if let Some(mount) = &mount {
-            context.mount_alt_deg = mount.state.alt_deg.clone();
-            context.mount_az_deg = mount.state.az_deg.clone();
-            context.tracking = mount.state.tracking.clone();
-            context.slewing = mount.state.slewing.clone();
+            let live = self.live(DeviceKind::Mount);
+            context.mount_alt_deg = vet(mount.state.alt_deg.clone(), live);
+            context.mount_az_deg = vet(mount.state.az_deg.clone(), live);
+            context.tracking = vet(mount.state.tracking.clone(), live);
+            context.slewing = vet(mount.state.slewing.clone(), live);
             context.pointing_j2000 = mount.j2000;
         }
         let ephemeris = read(&self.ephemeris).clone();
@@ -1494,17 +1590,19 @@ impl HubCore {
         }
         let mut corroboration = CocCorroboration::default();
         if let Some(weather) = &snap.weather {
+            let live = self.live(DeviceKind::Weather);
             let r = &weather.reading;
-            corroboration.cloud_cover_pct = r.cloud_cover_pct.clone();
-            corroboration.sky_temperature_c = r.sky_temperature_c.clone();
-            corroboration.rain_rate_mm_h = r.rain_rate_mm_h.clone();
-            corroboration.humidity_pct = r.humidity_pct.clone();
-            corroboration.dew_point_c = r.dew_point_c.clone();
-            corroboration.sky_quality_mag_arcsec2 = r.sky_quality_mag_arcsec2.clone();
+            corroboration.cloud_cover_pct = vet(r.cloud_cover_pct.clone(), live);
+            corroboration.sky_temperature_c = vet(r.sky_temperature_c.clone(), live);
+            corroboration.rain_rate_mm_h = vet(r.rain_rate_mm_h.clone(), live);
+            corroboration.humidity_pct = vet(r.humidity_pct.clone(), live);
+            corroboration.dew_point_c = vet(r.dew_point_c.clone(), live);
+            corroboration.sky_quality_mag_arcsec2 = vet(r.sky_quality_mag_arcsec2.clone(), live);
         }
         if let Some(monitor) = &snap.safety_monitor {
             let warning_is_unsafe = self.config.warning_is_unsafe;
-            corroboration.is_safe = monitor.level.clone().map(|level| match level {
+            let live = self.live(DeviceKind::SafetyMonitor);
+            corroboration.is_safe = vet(monitor.level.clone(), live).map(|level| match level {
                 SafetyLevel::Safe => true,
                 SafetyLevel::Unsafe => false,
                 SafetyLevel::Warning => !warning_is_unsafe,
@@ -1545,17 +1643,21 @@ impl HubCore {
         };
         context.corroboration = corroboration;
         if let Some(cover) = &snap.cover_calibrator {
-            context.cover_state = cover.state.cover_state.clone();
+            let live = self.live(DeviceKind::CoverCalibrator);
+            context.cover_state = vet(cover.state.cover_state.clone(), live);
         }
         if let Some(dome) = &snap.dome {
-            context.dome_shutter = dome.state.shutter.clone();
+            let live = self.live(DeviceKind::Dome);
+            context.dome_shutter = vet(dome.state.shutter.clone(), live);
         }
         if let Some(switch) = &snap.switch {
+            let live = self.live(DeviceKind::Switch);
             for channel in &switch.channels {
                 if channel.role.as_deref() == Some("dew_heater") {
-                    context
-                        .dew_heaters
-                        .insert(channel.channel.name.clone(), channel.value.clone());
+                    context.dew_heaters.insert(
+                        channel.channel.name.clone(),
+                        vet(channel.value.clone(), live),
+                    );
                 }
             }
         }
@@ -2530,6 +2632,101 @@ mod tests {
         assert_eq!(context.dew_heaters["Dew A"].value, Some(0.6));
         assert_eq!(twilight_for_sun_alt(5.0), Twilight::Day);
         assert_eq!(twilight_for_sun_alt(-20.0), Twilight::Night);
+    }
+
+    #[test]
+    fn a_lost_or_silent_source_is_never_read_as_fresh() {
+        let (hub, clock, _sink) = hub_with_clock();
+        clock.advance_ms(1000);
+        let (weather, weather_fake) = fake_weather(WeatherSnapshot::default());
+        hub.attach(weather);
+        weather_fake.update(|s| {
+            s.reading = WeatherReading {
+                temperature_c: Observed::fresh_at(10.0, Source::Property, clock.as_ref()),
+                cloud_cover_pct: Observed::fresh_at(5.0, Source::Property, clock.as_ref()),
+                ..WeatherReading::default()
+            };
+            s.set_published(clock.now_utc(), clock.now_mono_ns());
+        });
+        let (monitor, monitor_fake) = fake_safety_monitor(SafetySnapshot::default());
+        hub.attach(monitor);
+        monitor_fake.update(|s| {
+            s.level = Observed::fresh_at(SafetyLevel::Safe, Source::Property, clock.as_ref());
+            s.set_published(clock.now_utc(), clock.now_mono_ns());
+        });
+        let (focuser, focuser_fake) = fake_focuser(FocuserSnapshot::default());
+        hub.attach(focuser);
+        let probe = |clock: &ManualClock, celsius: f64| {
+            focuser_fake.update(|s| {
+                s.temperature_role = TemperatureRole::Ambient;
+                s.state.temperature_c = Observed::fresh_at(celsius, Source::Property, clock);
+                s.set_published(clock.now_utc(), clock.now_mono_ns());
+            });
+        };
+        probe(&clock, 4.0);
+        hub.refresh();
+        // Live: the weather station wins H6 and corroboration is full.
+        assert_eq!(
+            hub.ambient_temperature().value.unwrap().source,
+            TemperatureSourceKind::Weather
+        );
+        assert_eq!(
+            hub.coc_context().corroboration.level,
+            CorroborationLevel::Full
+        );
+        let live_start = clock.now_utc();
+        clock.advance_ms(1000);
+        let live_window = hub.window(live_start, clock.now_utc());
+        assert_eq!(live_window.safety.unwrap().state, SafetyGate::Safe);
+
+        // Both are lost; 20 minutes later only the focuser probe is live.
+        weather_fake.set_link(LinkState::Lost);
+        monitor_fake.set_link(LinkState::Lost);
+        clock.advance_ms(20 * 60 * 1000);
+        probe(&clock, 3.0);
+        hub.refresh();
+        let ambient = hub.ambient_temperature();
+        let reading = ambient.value.as_ref().unwrap();
+        assert_eq!(reading.source, TemperatureSourceKind::FocuserProbe);
+        assert_eq!(reading.celsius, 3.0);
+        assert_eq!(ambient.state, ObsState::Fresh);
+        let coc = hub.coc_context();
+        assert_eq!(coc.corroboration.is_safe.value, Some(true));
+        assert_eq!(coc.corroboration.is_safe.state, ObsState::Stale);
+        assert_eq!(coc.corroboration.cloud_cover_pct.state, ObsState::Stale);
+        assert_eq!(coc.corroboration.level, CorroborationLevel::Partial);
+        // An exposure after the loss never records the last good values.
+        let start = clock.now_utc();
+        clock.advance_ms(60_000);
+        let end = clock.now_utc();
+        clock.advance_ms(60_000);
+        let window = hub.window(start, end);
+        assert_eq!(window.safety.unwrap().state, SafetyGate::Unknown);
+        let weather = window.weather.unwrap();
+        assert_eq!(weather.temperature_c.value, Some(10.0));
+        assert_eq!(weather.temperature_c.state, ObsState::Stale);
+        assert!(window.stale_kinds.contains(&DeviceKind::Weather));
+        assert!(window.stale_kinds.contains(&DeviceKind::SafetyMonitor));
+        assert_eq!(hub.snapshot().safety.state, SafetyGate::Unknown);
+
+        // Ready again but silent for 20 minutes: still not fresh. (The probe
+        // reads on, and a probe silent for two minutes is stale too.)
+        weather_fake.set_link(LinkState::Ready);
+        probe(&clock, 3.0);
+        assert_eq!(
+            hub.ambient_temperature().value.unwrap().source,
+            TemperatureSourceKind::FocuserProbe
+        );
+        // A new reading makes it live again.
+        weather_fake.update(|s| {
+            s.reading.temperature_c = Observed::fresh_at(9.0, Source::Property, clock.as_ref());
+            s.set_published(clock.now_utc(), clock.now_mono_ns());
+        });
+        assert_eq!(
+            hub.ambient_temperature().value.unwrap().source,
+            TemperatureSourceKind::Weather
+        );
+        assert!(max_read_age(DeviceKind::Weather) >= Duration::from_secs(40));
     }
 
     #[test]

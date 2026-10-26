@@ -29,11 +29,22 @@
 //! [`CommandGate::submit`] is the executor: authorize, stop PHD2 before a
 //! slew, park, flip or center (D20, `coord.rs`), send to the worker, audit
 //! the acceptance and the outcome, and raise an `outcome_unknown` resume
-//! block when the outcome is unknown.
+//! block when the outcome is unknown. The device command it sends is always
+//! the one inside the [`GatedOp`] the checks validated
+//! ([`GatedDeviceCommand`]). A compound operation (flip, center, autofocus,
+//! filter handshake) is authorised once and its device steps go through
+//! [`CommandGate::submit_step`], so every step's own target is checked too.
+//!
+//! [`AbortEpochs`] make an abort or e-stop also stop commands that were
+//! authorised before it but still wait in a worker's queue (D19), and stop
+//! a compound operation authorised before it from moving that device again
+//! ([`CommandGate::child_permit`] refuses its motion steps). Abort is
+//! audited at every stage, outcome included ([`GateAbort`]).
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
 use uuid::Uuid;
@@ -42,18 +53,21 @@ use crate::control::action_arbiter::{arbitrate, Arbitration};
 use crate::control::ownership::{DomainClaim, DomainLedger};
 
 use super::commands::{
-    Domain, GateError, GatedCommand, GatedOp, GuiderCmd, MountCmd, SafetyRejection,
+    CoverCalibratorCmd, Domain, DomeCmd, FilterWheelCmd, FocuserCmd, GateError, GatedCommand,
+    GatedOp, GuiderCmd, MountCmd, RotatorCmd, SafetyRejection, SwitchCmd,
 };
 use super::coord::{self, CoordError, PreMotion};
 use super::events::{AuditRecord, AuditStage, EquipmentEvent, EventKind, GroundTruthRecord};
-use super::handle::{AbortTicket, DeviceHandle, GuiderHandle, OpTicket, Permit};
+use super::handle::{DeviceHandle, GuiderHandle, OpTicket, Permit};
 use super::ops::OpKind;
 use super::resume::{BlockRequest, ClearError};
 use super::snapshot::{EquipmentSnapshot, ResumeBlock, ResumeBlockKind};
 use super::traits::{Clock, SafetyCheck};
 use super::types::{
-    AutonomyMode, CommandId, CommandSource, DeviceError, DeviceKind, OpOutcome, Priority,
+    kind_name, AutonomyMode, CommandId, CommandSource, DeviceError, DeviceKind, DeviceResult,
+    ErrorClass, OpOutcome, Priority,
 };
+use super::worker::DeviceCommand;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -102,6 +116,243 @@ impl Default for GateConfig {
 pub struct Submitted {
     pub ticket: OpTicket,
     pub pre_motion: Option<PreMotion>,
+}
+
+// ---------------------------------------------------------------------------
+// Device commands taken from the validated op
+// ---------------------------------------------------------------------------
+
+/// A device command type the gate can execute. The command is taken from
+/// the [`GatedOp`] that the safety checks validated, so what reaches the
+/// hardware is always what was checked.
+pub trait GatedDeviceCommand: Sized + Send + 'static {
+    /// The command `op` carries, or `None` when `op` is not a command of
+    /// this kind (a compound operation, or another device kind).
+    fn from_gated(op: &GatedOp) -> Option<Self>;
+}
+
+macro_rules! gated_device_command {
+    ($($variant:ident => $ty:ty),* $(,)?) => {
+        $(impl GatedDeviceCommand for $ty {
+            fn from_gated(op: &GatedOp) -> Option<Self> {
+                match op {
+                    GatedOp::$variant(cmd) => Some(cmd.clone()),
+                    _ => None,
+                }
+            }
+        })*
+    };
+}
+
+gated_device_command!(
+    Mount => MountCmd,
+    Focuser => FocuserCmd,
+    FilterWheel => FilterWheelCmd,
+    Guider => GuiderCmd,
+    Rotator => RotatorCmd,
+    CoverCalibrator => CoverCalibratorCmd,
+    Switch => SwitchCmd,
+    Dome => DomeCmd,
+);
+
+/// The parent of a compound operation's step: what
+/// [`CommandGate::child_permit_of`] needs from the parent's permit. Unlike
+/// a `&Permit` it can be held across an `.await` in a `Send` future.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StepOwner {
+    pub command_id: CommandId,
+    pub domains: Vec<Domain>,
+}
+
+impl StepOwner {
+    pub fn of(permit: &Permit) -> Self {
+        Self {
+            command_id: permit.command_id(),
+            domains: permit.domains().to_vec(),
+        }
+    }
+
+    pub fn holds(&self, domain: Domain) -> bool {
+        self.domains.contains(&domain)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Abort epochs
+// ---------------------------------------------------------------------------
+
+/// Abort epochs (D19, §2.9): an abort or e-stop must also stop commands
+/// that were authorised before it but still wait in a worker's queue (for
+/// example behind a slow driver call).
+///
+/// Every abort and e-stop issued through the gate bumps the epoch of each
+/// device kind it targets, before the worker's cancel is queued. Every
+/// permit the gate issues is stamped with the epochs of its device domains
+/// as they were when its authorisation began, and the stamp is forgotten
+/// when the permit drops. A worker that handles a cancel reads its kind's
+/// epoch; from then on it refuses a motion command whose stamp is older
+/// (resolved `Aborted { by }`, never started). A command authorised after
+/// the abort carries the new epoch and runs normally.
+#[derive(Debug, Default)]
+pub struct AbortEpochs {
+    inner: Mutex<EpochState>,
+}
+
+#[derive(Debug, Default)]
+struct EpochState {
+    epochs: BTreeMap<DeviceKind, u64>,
+    issued: HashMap<CommandId, Vec<(DeviceKind, u64)>>,
+}
+
+impl AbortEpochs {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The current epoch of `kind` (0 until its first abort).
+    pub fn epoch(&self, kind: DeviceKind) -> u64 {
+        lock(&self.inner).epochs.get(&kind).copied().unwrap_or(0)
+    }
+
+    /// An abort or e-stop targets `kind`: start a new epoch. Call before
+    /// the device's cancel is queued.
+    pub fn bump(&self, kind: DeviceKind) -> u64 {
+        let mut inner = lock(&self.inner);
+        let epoch = inner.epochs.entry(kind).or_insert(0);
+        *epoch += 1;
+        *epoch
+    }
+
+    /// The current epochs of `kinds`, to stamp a permit with.
+    pub fn stamp(&self, kinds: &[DeviceKind]) -> Vec<(DeviceKind, u64)> {
+        let inner = lock(&self.inner);
+        kinds
+            .iter()
+            .map(|kind| (*kind, inner.epochs.get(kind).copied().unwrap_or(0)))
+            .collect()
+    }
+
+    fn record(&self, command_id: CommandId, stamp: Vec<(DeviceKind, u64)>) {
+        if !stamp.is_empty() {
+            lock(&self.inner).issued.insert(command_id, stamp);
+        }
+    }
+
+    fn forget(&self, command_id: CommandId) {
+        lock(&self.inner).issued.remove(&command_id);
+    }
+
+    /// The epoch of `kind` when `command_id`'s authorisation began, while
+    /// its permit is alive. `None` for a permit the gate did not stamp
+    /// (an unmanaged permit, or a domain the command does not claim).
+    pub fn issued_epoch(&self, command_id: CommandId, kind: DeviceKind) -> Option<u64> {
+        lock(&self.inner)
+            .issued
+            .get(&command_id)
+            .and_then(|stamp| stamp.iter().find(|(k, _)| *k == kind).map(|(_, e)| *e))
+    }
+
+    /// Live stamps (diagnostics and tests).
+    pub fn outstanding(&self) -> usize {
+        lock(&self.inner).issued.len()
+    }
+}
+
+/// True for an op that starts motion (the abort epochs refuse such a
+/// command authorised before an abort, D19).
+pub fn starts_motion(op: &GatedOp) -> bool {
+    match op {
+        GatedOp::Mount(cmd) => cmd.starts_motion(),
+        GatedOp::Focuser(cmd) => cmd.starts_motion(),
+        GatedOp::FilterWheel(cmd) => cmd.starts_motion(),
+        GatedOp::Guider(cmd) => cmd.starts_motion(),
+        GatedOp::Rotator(cmd) => cmd.starts_motion(),
+        GatedOp::CoverCalibrator(cmd) => cmd.starts_motion(),
+        GatedOp::Switch(cmd) => cmd.starts_motion(),
+        GatedOp::Dome(cmd) => cmd.starts_motion(),
+        other => other.kind().moves_hardware(),
+    }
+}
+
+/// The device kinds a command's stamp covers.
+fn stamped_kinds(cmd: &GatedCommand) -> Vec<DeviceKind> {
+    let mut kinds: Vec<DeviceKind> = cmd
+        .domains
+        .iter()
+        .filter_map(|domain| match domain {
+            Domain::Device(kind) => Some(*kind),
+            Domain::CameraBoundary => None,
+        })
+        .collect();
+    kinds.sort();
+    kinds.dedup();
+    kinds
+}
+
+// ---------------------------------------------------------------------------
+// Audited abort
+// ---------------------------------------------------------------------------
+
+/// How long [`CommandGate::abort`] waits for the abort path before it
+/// audits the outcome as unknown (the Alpaca abort agent times out at 5 s).
+pub const ABORT_OUTCOME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What [`CommandGate::abort`] returns: the handle's
+/// [`AbortTicket`](super::handle::AbortTicket) fields, with the abort
+/// path's result also audited as the `outcome` stage (H21, D19).
+#[derive(Debug)]
+pub struct GateAbort {
+    /// The audited abort command.
+    pub command_id: CommandId,
+    /// The id the worker resolves the cancelled operation with
+    /// (`Aborted { by }`).
+    pub ticket_id: CommandId,
+    /// A `Cancel` was queued at the head of the worker's queue.
+    pub cancel_sent: bool,
+    /// The out-of-band abort path was started.
+    pub abort_path_ran: bool,
+    result: oneshot::Receiver<DeviceResult<()>>,
+}
+
+impl GateAbort {
+    /// The abort path's result (audited once it arrives).
+    pub async fn outcome(self) -> DeviceResult<()> {
+        self.result.await.unwrap_or_else(|_| {
+            Err(DeviceError::outcome_unknown(
+                "the abort path stopped without reporting a result",
+            ))
+        })
+    }
+
+    /// Non-blocking check.
+    pub fn try_outcome(&mut self) -> Option<DeviceResult<()>> {
+        match self.result.try_recv() {
+            Ok(result) => Some(result),
+            Err(oneshot::error::TryRecvError::Empty) => None,
+            Err(oneshot::error::TryRecvError::Closed) => Some(Err(DeviceError::outcome_unknown(
+                "the abort path stopped without reporting a result",
+            ))),
+        }
+    }
+}
+
+/// Run `f` on a blocking thread: tokio's blocking pool inside a runtime, a
+/// dedicated thread otherwise.
+pub(crate) fn run_detached(name: &str, f: impl FnOnce() + Send + 'static) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn_blocking(f)),
+        Err(_) => {
+            let _ = std::thread::Builder::new().name(name.into()).spawn(f);
+        }
+    }
+}
+
+fn abort_outcome(result: &DeviceResult<()>) -> OpOutcome {
+    match result {
+        Ok(()) => OpOutcome::Succeeded,
+        Err(err) if err.class == ErrorClass::OutcomeUnknown => OpOutcome::Unknown(err.clone()),
+        Err(err) => OpOutcome::Failed(err.clone()),
+    }
 }
 
 /// Why [`CommandGate::submit`] failed.
@@ -210,6 +461,7 @@ pub struct CommandGate {
     checks: RwLock<Vec<Arc<dyn SafetyCheck>>>,
     config: RwLock<GateConfig>,
     shutting_down: AtomicBool,
+    aborts: Arc<AbortEpochs>,
 }
 
 impl std::fmt::Debug for CommandGate {
@@ -232,7 +484,14 @@ impl CommandGate {
             checks: RwLock::new(builtins),
             config: RwLock::new(config),
             shutting_down: AtomicBool::new(false),
+            aborts: Arc::new(AbortEpochs::new()),
         }
+    }
+
+    /// The abort epochs workers compare permits against (D19). Pass them to
+    /// every worker this gate's permits reach (`WorkerDeps::aborts`).
+    pub fn abort_epochs(&self) -> Arc<AbortEpochs> {
+        Arc::clone(&self.aborts)
     }
 
     pub fn config(&self) -> GateConfig {
@@ -476,9 +735,35 @@ impl CommandGate {
 
     // -- authorisation ---------------------------------------------------------
 
+    /// A release callback that forgets `command_id`'s abort-epoch stamp,
+    /// then runs `then`.
+    fn stamped_release(
+        &self,
+        command_id: CommandId,
+        stamp: Vec<(DeviceKind, u64)>,
+        then: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        if stamp.is_empty() {
+            return then;
+        }
+        self.aborts.record(command_id, stamp);
+        let aborts = Arc::downgrade(&self.aborts);
+        Some(Box::new(move || {
+            if let Some(aborts) = aborts.upgrade() {
+                aborts.forget(command_id);
+            }
+            if let Some(then) = then {
+                then();
+            }
+        }))
+    }
+
     /// Authorise a command (§2.9). On success the returned permit holds the
     /// command's domains until it drops.
     pub fn authorize(&self, cmd: &GatedCommand) -> Result<Permit, GateError> {
+        // The stamp is taken before anything else, so an abort or e-stop that
+        // lands while this command is being authorised still stops it (D19).
+        let stamp = self.aborts.stamp(&stamped_kinds(cmd));
         self.audit(cmd, AuditStage::Proposed, true, None, Vec::new(), None);
         if cmd.op.bypasses_gate_checks() {
             self.audit(
@@ -563,7 +848,10 @@ impl CommandGate {
                 lock(&ledger).release(command_id);
             }
         });
-        Ok(Permit::new(cmd, Some(release)))
+        Ok(Permit::new(
+            cmd,
+            self.stamped_release(command_id, stamp, Some(release)),
+        ))
     }
 
     /// A permit for one step of a compound operation (a focuser move inside
@@ -572,11 +860,22 @@ impl CommandGate {
     /// have been preempted; the step's own safety checks run. The permit
     /// holds no ownership of its own: the parent's does.
     pub fn child_permit(&self, parent: &Permit, cmd: &GatedCommand) -> Result<Permit, GateError> {
+        self.child_permit_of(&StepOwner::of(parent), cmd)
+    }
+
+    /// [`CommandGate::child_permit`] for a parent known by its id and
+    /// domains.
+    pub fn child_permit_of(
+        &self,
+        parent: &StepOwner,
+        cmd: &GatedCommand,
+    ) -> Result<Permit, GateError> {
+        let stamp = self.aborts.stamp(&stamped_kinds(cmd));
         self.audit(
             cmd,
             AuditStage::Proposed,
             true,
-            Some(format!("step of {}", parent.command_id())),
+            Some(format!("step of {}", parent.command_id)),
             Vec::new(),
             None,
         );
@@ -593,14 +892,26 @@ impl CommandGate {
         if let Some(err) = self.resume_refusal(cmd) {
             return Err(self.reject(cmd, err));
         }
+        if let Some(kind) = self.aborted_since(parent, cmd) {
+            return Err(self.reject(
+                cmd,
+                GateError::Refused {
+                    reason: format!(
+                        "the {} was aborted after {} was authorised; its motion steps no longer run",
+                        kind_name(kind),
+                        parent.command_id
+                    ),
+                },
+            ));
+        }
         let domains = ownership_domains(cmd);
         let refusal = {
             let ledger = lock(&self.ledger);
-            if let Some(by) = ledger.preempted_by(parent.command_id()) {
+            if let Some(by) = ledger.preempted_by(parent.command_id) {
                 let domain = domains
                     .first()
                     .copied()
-                    .or_else(|| parent.domains().first().copied())
+                    .or_else(|| parent.domains.first().copied())
                     .unwrap_or(Domain::CameraBoundary);
                 Some(GateError::OwnershipConflict {
                     domain,
@@ -610,7 +921,7 @@ impl CommandGate {
             } else {
                 domains.iter().find_map(|&domain| {
                     let holder = ledger.holder(domain);
-                    (holder.map(|claim| claim.command_id) != Some(parent.command_id())).then(|| {
+                    (holder.map(|claim| claim.command_id) != Some(parent.command_id)).then(|| {
                         GateError::OwnershipConflict {
                             domain,
                             holder: holder.map(|claim| claim.command_id),
@@ -629,26 +940,118 @@ impl CommandGate {
             return Err(self.safety_rejected(cmd, rejection));
         }
         self.audit(cmd, AuditStage::Validated, true, None, annotations, None);
-        Ok(Permit::new(cmd, None))
+        Ok(Permit::new(
+            cmd,
+            self.stamped_release(cmd.command_id, stamp, None),
+        ))
+    }
+
+    /// A device the step would move was aborted (or e-stopped) after the
+    /// parent was authorised (D19): a compound operation does not carry on
+    /// moving it. Stops, reads and sets stay allowed.
+    fn aborted_since(&self, parent: &StepOwner, cmd: &GatedCommand) -> Option<DeviceKind> {
+        if !starts_motion(&cmd.op) {
+            return None;
+        }
+        stamped_kinds(cmd).into_iter().find(|&kind| {
+            self.aborts
+                .issued_epoch(parent.command_id, kind)
+                .is_some_and(|issued| issued < self.aborts.epoch(kind))
+        })
     }
 
     // -- execution -------------------------------------------------------------
 
+    /// The device command inside `cmd`, or the audited refusal of a command
+    /// that carries none for this kind (a compound operation).
+    fn device_command<C: GatedDeviceCommand>(
+        &self,
+        cmd: &GatedCommand,
+        kind: DeviceKind,
+        audit_proposed: bool,
+    ) -> Result<C, SubmitError> {
+        match C::from_gated(&cmd.op) {
+            Some(device_cmd) => Ok(device_cmd),
+            None => {
+                if audit_proposed {
+                    self.audit(cmd, AuditStage::Proposed, true, None, Vec::new(), None);
+                }
+                Err(SubmitError::Gate(self.reject(
+                    cmd,
+                    GateError::Refused {
+                        reason: format!(
+                            "{:?} is not a {} command; a compound operation is authorised \
+                             once and its device steps are sent with submit_step",
+                            cmd.kind(),
+                            kind_name(kind)
+                        ),
+                    },
+                )))
+            }
+        }
+    }
+
     /// Authorise, coordinate (D20), send, and audit a device command. The
-    /// returned ticket resolves with the outcome, which is also audited; an
-    /// `Unknown` outcome raises an `outcome_unknown` resume block. Must run
-    /// inside a tokio runtime.
+    /// command sent is the one inside `cmd.op`, the op the safety checks
+    /// validated. The returned ticket resolves with the outcome, which is
+    /// also audited; an `Unknown` outcome raises an `outcome_unknown` resume
+    /// block. Must run inside a tokio runtime.
     pub async fn submit<C, S>(
         &self,
         handle: &DeviceHandle<C, S>,
         cmd: GatedCommand,
+    ) -> Result<Submitted, SubmitError>
+    where
+        C: GatedDeviceCommand,
+        S: Send + Sync + 'static,
+    {
+        let device_cmd = self.device_command::<C>(&cmd, handle.kind(), true)?;
+        let permit = self.authorize(&cmd)?;
+        let owner = StepOwner::of(&permit);
+        self.execute(handle, cmd, device_cmd, permit, owner).await
+    }
+
+    /// One device step of a compound operation (the slew of a flip or a
+    /// center, the focuser move of an autofocus run): a child permit of
+    /// `parent` (the step's own checks run), the D20 pre-motion stop under
+    /// the parent's guider claim when it holds one, then the same send and
+    /// audit as [`CommandGate::submit`].
+    pub fn submit_step<'a, C, S>(
+        &'a self,
+        handle: &'a DeviceHandle<C, S>,
+        parent: &Permit,
+        step: GatedCommand,
+    ) -> impl std::future::Future<Output = Result<Submitted, SubmitError>> + Send + 'a
+    where
+        C: GatedDeviceCommand,
+        S: Send + Sync + 'static,
+    {
+        let owner = StepOwner::of(parent);
+        let prepared = self
+            .device_command::<C>(&step, handle.kind(), false)
+            .and_then(|device_cmd| {
+                self.child_permit_of(&owner, &step)
+                    .map(|permit| (device_cmd, permit))
+                    .map_err(SubmitError::Gate)
+            });
+        async move {
+            let (device_cmd, permit) = prepared?;
+            self.execute(handle, step, device_cmd, permit, owner).await
+        }
+    }
+
+    async fn execute<C, S>(
+        &self,
+        handle: &DeviceHandle<C, S>,
+        cmd: GatedCommand,
         device_cmd: C,
+        permit: Permit,
+        owner: StepOwner,
     ) -> Result<Submitted, SubmitError>
     where
         C: Send + 'static,
         S: Send + Sync + 'static,
     {
-        let permit = self.authorize(&cmd)?;
         let pre_motion = if coord::needs_guider_stop(&cmd.op) {
             let guider = self.ctx.guider();
             let clock = self.ctx.clock();
@@ -657,6 +1060,7 @@ impl CommandGate {
                 self,
                 guider.as_ref(),
                 &cmd,
+                Some(&owner),
                 clock.as_ref(),
                 timeout,
             )
@@ -689,6 +1093,9 @@ impl CommandGate {
         let mut annotations = Vec::new();
         if let Some(report) = &pre_motion {
             annotations.push(format!("was_guiding={}", report.was_guiding));
+            if report.was_guiding {
+                annotations.push(format!("guider_stop_sent={}", report.stop_sent));
+            }
             if let Some(warning) = &report.warning {
                 annotations.push(format!("pre_motion_warning={warning}"));
             }
@@ -735,9 +1142,13 @@ impl CommandGate {
         })
     }
 
-    /// Abort a device (D19): audited, never refused by ownership or checks,
-    /// and attempted on a degraded or lost handle until it is retired.
-    pub fn abort<C, S>(&self, handle: &DeviceHandle<C, S>, source: CommandSource) -> AbortTicket {
+    /// Abort a device (D19): audited at every stage (the outcome once the
+    /// abort path reports, or as unknown after [`ABORT_OUTCOME_TIMEOUT`]),
+    /// never refused by ownership or checks, and attempted on a degraded or
+    /// lost handle until it is retired. Commands authorised before the abort
+    /// that still wait in the worker's queue are refused by the worker
+    /// ([`AbortEpochs`]).
+    pub fn abort<C, S>(&self, handle: &DeviceHandle<C, S>, source: CommandSource) -> GateAbort {
         let cmd = GatedCommand::new(
             GatedOp::Abort {
                 kind: handle.kind(),
@@ -749,6 +1160,8 @@ impl CommandGate {
         // Abort bypasses the checks, so this always succeeds and audits the
         // proposed and validated stages.
         let _ = self.authorize(&cmd);
+        // Before the cancel is queued, so the worker sees the new epoch.
+        self.aborts.bump(handle.kind());
         let ticket = handle.abort();
         self.audit(
             &cmd,
@@ -762,7 +1175,43 @@ impl CommandGate {
             ],
             None,
         );
-        ticket
+        let (tx, rx) = oneshot::channel();
+        let audited = GateAbort {
+            command_id: cmd.command_id,
+            ticket_id: ticket.command_id,
+            cancel_sent: ticket.cancel_sent,
+            abort_path_ran: ticket.abort_path_ran,
+            result: rx,
+        };
+        let ctx = Arc::clone(&self.ctx);
+        let mut ticket = ticket;
+        run_detached("eq-abort-audit", move || {
+            let deadline = Instant::now() + ABORT_OUTCOME_TIMEOUT;
+            let result = loop {
+                if let Some(result) = ticket.try_outcome() {
+                    break result;
+                }
+                if Instant::now() >= deadline {
+                    break Err(DeviceError::outcome_unknown(format!(
+                        "the abort path had not reported after {} s",
+                        ABORT_OUTCOME_TIMEOUT.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            let outcome = abort_outcome(&result);
+            audit_with(
+                ctx.as_ref(),
+                &cmd,
+                AuditStage::Outcome,
+                outcome.is_success(),
+                outcome_reason(&outcome),
+                Vec::new(),
+                Some(outcome),
+            );
+            let _ = tx.send(result);
+        });
+        audited
     }
 
     /// The operator clear (`POST equipment/resume-blocks/clear {id}`),
@@ -1422,10 +1871,7 @@ pub(crate) mod tests {
             Priority::Exposure,
         );
         let id = cmd.command_id;
-        let submitted = gate
-            .submit(&handle, cmd, FocuserCmd::MoveBy(40))
-            .await
-            .unwrap();
+        let submitted = gate.submit(&handle, cmd).await.unwrap();
         assert!(submitted.pre_motion.is_none());
         assert_eq!(submitted.ticket.wait().await, OpOutcome::Succeeded);
         assert_eq!(
@@ -1445,10 +1891,7 @@ pub(crate) mod tests {
             AutonomyMode::Manual,
             Priority::Exposure,
         );
-        let err = gate
-            .submit(&handle, refused.clone(), FocuserCmd::MoveTo(-1))
-            .await
-            .unwrap_err();
+        let err = gate.submit(&handle, refused.clone()).await.unwrap_err();
         assert_eq!(err.http_status(), 400);
         assert_eq!(err.code(DeviceKind::Focuser), "focuser_invalid_value");
         assert_eq!(
@@ -1471,10 +1914,7 @@ pub(crate) mod tests {
             AutonomyMode::Manual,
             Priority::Exposure,
         );
-        let submitted = gate
-            .submit(&handle, lost, FocuserCmd::MoveBy(5))
-            .await
-            .unwrap();
+        let submitted = gate.submit(&handle, lost).await.unwrap();
         assert!(matches!(
             submitted.ticket.wait().await,
             OpOutcome::Unknown(_)
@@ -1486,10 +1926,251 @@ pub(crate) mod tests {
                 op: OpKind::FocuserMove
             }
         );
-        // Abort is audited and reaches the device's abort path.
+        // Abort is audited at every stage, outcome included, and reaches the
+        // device's abort path.
         let ticket = gate.abort(&handle, operator(false));
+        let abort_id = ticket.command_id;
         assert!(ticket.abort_path_ran);
         assert!(ticket.outcome().await.is_ok());
         assert_eq!(fake.abort_path().calls(), 1);
+        assert_eq!(
+            ctx.stages(abort_id),
+            vec![
+                AuditStage::Proposed,
+                AuditStage::Validated,
+                AuditStage::Executed,
+                AuditStage::Outcome
+            ]
+        );
+        // A failing abort path is audited as a failed outcome.
+        fake.abort_path()
+            .set_result(Err(DeviceError::transport("abort agent refused")));
+        let failed = gate.abort(&handle, operator(false));
+        let failed_id = failed.command_id;
+        assert!(failed.outcome().await.is_err());
+        let outcome = lock(&ctx.records).iter().find_map(|r| match r {
+            GroundTruthRecord::Audit(a)
+                if a.command_id == failed_id && a.stage == AuditStage::Outcome =>
+            {
+                Some(a.outcome.clone())
+            }
+            _ => None,
+        });
+        assert!(matches!(outcome, Some(Some(OpOutcome::Failed(_)))));
+    }
+
+    #[tokio::test]
+    async fn submit_sends_exactly_the_command_the_checks_validated() {
+        let (gate, ctx) = gate_with_ctx();
+        gate.register_check(Arc::new(BelowTen));
+        let (mount, mount_fake) = crate::equipment::testing::fake_handles::fake_mount(
+            crate::equipment::snapshot::MountSnapshot::default(),
+        );
+        let slew = |dec: f64| {
+            GatedCommand::new(
+                GatedOp::Mount(MountCmd::Slew {
+                    target: crate::equipment::types::EqCoord::new(
+                        1.0,
+                        dec,
+                        crate::equipment::types::EqFrame::J2000,
+                    ),
+                }),
+                CommandSource::Trigger { rule: "seq".into() },
+                AutonomyMode::Bounded,
+                Priority::Exposure,
+            )
+        };
+        let low = gate.submit(&mount, slew(-80.0)).await.unwrap_err();
+        assert_eq!(low.http_status(), 422);
+        assert!(
+            mount_fake.commands().is_empty(),
+            "a refused target never moves"
+        );
+        let ok = gate.submit(&mount, slew(20.0)).await.unwrap();
+        assert_eq!(ok.ticket.wait().await, OpOutcome::Succeeded);
+        assert_eq!(
+            mount_fake.commands(),
+            vec![MountCmd::Slew {
+                target: crate::equipment::types::EqCoord::new(
+                    1.0,
+                    20.0,
+                    crate::equipment::types::EqFrame::J2000
+                )
+            }]
+        );
+        // A step of a compound operation is checked on its own target too.
+        let center = GatedCommand::new(
+            GatedOp::Center {
+                target: crate::equipment::types::EqCoord::new(
+                    1.0,
+                    -80.0,
+                    crate::equipment::types::EqFrame::J2000,
+                ),
+                tolerance_arcmin: None,
+                max_attempts: None,
+            },
+            CommandSource::Trigger { rule: "seq".into() },
+            AutonomyMode::Bounded,
+            Priority::MountRecovery,
+        );
+        let parent = gate.authorize(&center).unwrap();
+        let mut step = slew(-80.0);
+        step.priority = Priority::MountRecovery;
+        let err = gate.submit_step(&mount, &parent, step).await.unwrap_err();
+        assert_eq!(err.http_status(), 422);
+        assert_eq!(mount_fake.commands().len(), 1);
+        drop(parent);
+        let _ = ctx;
+    }
+
+    #[test]
+    fn submit_futures_are_send() {
+        fn assert_send<T: Send>(_: &T) {}
+        let (gate, _ctx) = gate_with_ctx();
+        let (handle, _fake) = fake_focuser(FocuserSnapshot::default());
+        let cmd = GatedCommand::new(
+            GatedOp::Focuser(FocuserCmd::MoveBy(1)),
+            operator(false),
+            AutonomyMode::Manual,
+            Priority::Exposure,
+        );
+        let submit = gate.submit(&handle, cmd.clone());
+        assert_send(&submit);
+        drop(submit);
+        let parent = gate
+            .authorize(&GatedCommand::new(
+                GatedOp::Autofocus { run_id: None },
+                operator(false),
+                AutonomyMode::Manual,
+                Priority::Autofocus,
+            ))
+            .unwrap();
+        let step = gate.submit_step(&handle, &parent, cmd);
+        assert_send(&step);
+    }
+
+    #[tokio::test]
+    async fn a_compound_operation_stops_moving_a_device_aborted_after_it_began() {
+        let (gate, _ctx) = gate_with_ctx();
+        let (focuser, _fake) = fake_focuser(FocuserSnapshot::default());
+        let source = CommandSource::Trigger { rule: "af".into() };
+        let af = GatedCommand::new(
+            GatedOp::Autofocus { run_id: None },
+            source.clone(),
+            AutonomyMode::Bounded,
+            Priority::Autofocus,
+        );
+        let parent = gate.authorize(&af).unwrap();
+        let step = |cmd: FocuserCmd| {
+            GatedCommand::new(
+                GatedOp::Focuser(cmd),
+                source.clone(),
+                AutonomyMode::Bounded,
+                Priority::Autofocus,
+            )
+        };
+        assert!(gate
+            .child_permit(&parent, &step(FocuserCmd::MoveBy(5)))
+            .is_ok());
+        // The operator aborts the focuser mid-run.
+        let abort = gate.abort(&focuser, operator(false));
+        assert!(abort.outcome().await.is_ok());
+        let err = gate
+            .child_permit(&parent, &step(FocuserCmd::MoveBy(5)))
+            .unwrap_err();
+        assert!(
+            matches!(&err, GateError::Refused { reason } if reason.contains("aborted")),
+            "{err}"
+        );
+        // Stops and plain sets still run as steps.
+        assert!(gate
+            .child_permit(&parent, &step(FocuserCmd::SetTempComp(false)))
+            .is_ok());
+        assert!(gate.child_permit(&parent, &step(FocuserCmd::Halt)).is_ok());
+        // A run authorised after the abort moves normally.
+        drop(parent);
+        let again = gate.authorize(&af).unwrap();
+        assert!(gate
+            .child_permit(&again, &step(FocuserCmd::MoveBy(5)))
+            .is_ok());
+        assert!(starts_motion(&GatedOp::Mount(MountCmd::SetTracking(true))));
+        assert!(!starts_motion(&GatedOp::Mount(MountCmd::SetTracking(
+            false
+        ))));
+        assert!(!starts_motion(&GatedOp::Mount(MountCmd::MoveAxis {
+            axis: 0,
+            rate_deg_s: 0.0
+        })));
+        assert!(starts_motion(&GatedOp::Flip));
+        assert!(!starts_motion(&GatedOp::Guider(GuiderCmd::Stop)));
+    }
+
+    #[test]
+    fn permits_carry_abort_epoch_stamps_until_they_drop() {
+        let (gate, _ctx) = gate_with_ctx();
+        let epochs = gate.abort_epochs();
+        let focuser = || {
+            GatedCommand::new(
+                GatedOp::Focuser(FocuserCmd::MoveTo(10)),
+                operator(false),
+                AutonomyMode::Manual,
+                Priority::Exposure,
+            )
+        };
+        let before = focuser();
+        let permit = gate.authorize(&before).unwrap();
+        assert_eq!(
+            epochs.issued_epoch(before.command_id, DeviceKind::Focuser),
+            Some(0)
+        );
+        assert_eq!(
+            epochs.issued_epoch(before.command_id, DeviceKind::Mount),
+            None
+        );
+        assert_eq!(epochs.bump(DeviceKind::Focuser), 1);
+        drop(permit);
+        assert_eq!(epochs.outstanding(), 0, "the stamp is forgotten on drop");
+        let after = focuser();
+        let permit = gate.authorize(&after).unwrap();
+        assert_eq!(
+            epochs.issued_epoch(after.command_id, DeviceKind::Focuser),
+            Some(1)
+        );
+        // Child permits are stamped too; abort and halts are not.
+        let af = GatedCommand::new(
+            GatedOp::Autofocus { run_id: None },
+            CommandSource::Trigger { rule: "af".into() },
+            AutonomyMode::Bounded,
+            Priority::Autofocus,
+        );
+        drop(permit);
+        let parent = gate.authorize(&af).unwrap();
+        let step = GatedCommand::new(
+            GatedOp::Focuser(FocuserCmd::MoveBy(5)),
+            af.source.clone(),
+            AutonomyMode::Bounded,
+            Priority::Autofocus,
+        );
+        let child = gate.child_permit(&parent, &step).unwrap();
+        assert_eq!(
+            epochs.issued_epoch(step.command_id, DeviceKind::Focuser),
+            Some(1)
+        );
+        drop(child);
+        assert_eq!(
+            epochs.issued_epoch(step.command_id, DeviceKind::Focuser),
+            None
+        );
+        let halt = GatedCommand::new(
+            GatedOp::Focuser(FocuserCmd::Halt),
+            operator(false),
+            AutonomyMode::Manual,
+            Priority::Safety,
+        );
+        let _halt = gate.authorize(&halt).unwrap();
+        assert_eq!(
+            epochs.issued_epoch(halt.command_id, DeviceKind::Focuser),
+            None
+        );
     }
 }
