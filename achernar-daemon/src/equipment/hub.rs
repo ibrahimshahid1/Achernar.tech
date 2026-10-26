@@ -164,6 +164,23 @@ pub trait SkyEphemeris: Send + Sync {
     fn sky(&self, at: DateTime<Utc>, site: &Site) -> Option<SkyGeometry>;
 }
 
+/// [`SkyEphemeris`] over the astro module (`astro::ephem`, WP1A-3):
+/// topocentric Sun and Moon altitudes and the Moon's illuminated fraction.
+/// [`EquipmentHub::from_configs`] installs it; an invalid site gives `None`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AstroEphemeris;
+
+impl SkyEphemeris for AstroEphemeris {
+    fn sky(&self, at: DateTime<Utc>, site: &Site) -> Option<SkyGeometry> {
+        let sky = super::astro::ephem::sky_conditions(site, at)?;
+        Some(SkyGeometry {
+            sun_alt_deg: sky.sun_alt_deg,
+            moon_alt_deg: sky.moon_alt_deg,
+            moon_illumination: sky.moon.illuminated_fraction,
+        })
+    }
+}
+
 /// Twilight band of a solar altitude (civil -6, nautical -12, astronomical
 /// -18 degrees; day above the -0.833 degree sunrise altitude).
 pub fn twilight_for_sun_alt(sun_alt_deg: f64) -> Twilight {
@@ -1709,6 +1726,27 @@ impl EventSink for HubCore {
     }
 }
 
+/// A `RecorderSink` that routes `GroundTruthRecord::Event` through the hub
+/// (sequenced, connection-id filtered, broadcast, resume-block side effects,
+/// then journaled once by the bus) and passes every other record straight to
+/// the recorder. The recorder rejects events without a `seq`, so a service
+/// that records its events itself must be given this sink, never the bare
+/// recorder.
+pub struct SequencingSink {
+    core: Arc<HubCore>,
+}
+
+impl RecorderSink for SequencingSink {
+    fn record(&self, rec: GroundTruthRecord) {
+        match rec {
+            GroundTruthRecord::Event(event) => {
+                let _ = self.core.ingest(Arc::unwrap_or_clone(event));
+            }
+            other => self.core.recorder.record(other),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The hub
 // ---------------------------------------------------------------------------
@@ -1775,6 +1813,7 @@ impl EquipmentHub {
             recorder,
         );
         hub.set_site(site);
+        hub.set_ephemeris(Some(Arc::new(AstroEphemeris)));
         hub
     }
 
@@ -1847,6 +1886,15 @@ impl EquipmentHub {
 
     pub fn emit(&self, event: EquipmentEvent) -> Option<Arc<EquipmentEvent>> {
         self.core.ingest(event)
+    }
+
+    /// The `RecorderSink` for a service that hands its events over as
+    /// `GroundTruthRecord::Event` (the focuser session, WP1A-5). See
+    /// [`SequencingSink`].
+    pub fn sequencing_recorder(&self) -> Arc<dyn RecorderSink> {
+        Arc::new(SequencingSink {
+            core: Arc::clone(&self.core),
+        })
     }
 
     pub fn watchdog(&self) -> Arc<Watchdog> {
@@ -2632,6 +2680,89 @@ mod tests {
         assert_eq!(context.dew_heaters["Dew A"].value, Some(0.6));
         assert_eq!(twilight_for_sun_alt(5.0), Twilight::Day);
         assert_eq!(twilight_for_sun_alt(-20.0), Twilight::Night);
+    }
+
+    #[test]
+    fn the_astro_ephemeris_fills_the_coc_sky_and_from_configs_installs_it() {
+        let (hub, clock, _sink) = hub_with_clock();
+        let site = Site {
+            lat_deg: 40.0,
+            lon_deg: -75.0,
+            elev_m: 100.0,
+            source: SiteSource::Config,
+        };
+        hub.set_site(Some(site));
+        hub.set_ephemeris(Some(Arc::new(AstroEphemeris)));
+        let context = hub.coc_context();
+        let expected =
+            crate::equipment::astro::ephem::sky_conditions(&site, clock.now_utc()).unwrap();
+        assert_eq!(context.sun_alt_deg, Some(expected.sun_alt_deg));
+        assert_eq!(context.moon_alt_deg, Some(expected.moon_alt_deg));
+        assert_eq!(
+            context.moon_illumination,
+            Some(expected.moon.illuminated_fraction)
+        );
+        assert_eq!(
+            context.twilight,
+            Some(twilight_for_sun_alt(expected.sun_alt_deg))
+        );
+        // An invalid site leaves the sky unknown rather than guessed.
+        let bad = Site {
+            lat_deg: f64::NAN,
+            ..site
+        };
+        assert!(AstroEphemeris.sky(clock.now_utc(), &bad).is_none());
+
+        let configs = crate::config::AchernarConfig::default().equipment_configs();
+        let configured =
+            EquipmentHub::from_configs(&configs, Some(site), Arc::new(NullRecorder::new()));
+        assert!(read(&configured.core.ephemeris).is_some());
+        assert!(configured.coc_context().twilight.is_some());
+        assert!(read(&EquipmentHub::empty().core.ephemeris).is_none());
+    }
+
+    #[test]
+    fn the_sequencing_recorder_sequences_events_and_passes_other_records_through() {
+        let (hub, clock, sink) = hub_with_clock();
+        let recorder = hub.sequencing_recorder();
+        let connection = Uuid::new_v4();
+        hub.bus().set_live(DeviceKind::Focuser, connection);
+        let first = hub.bus().next_seq();
+        let halted = |connection_id: Uuid| {
+            GroundTruthRecord::Event(Arc::new(
+                EquipmentEvent::new(
+                    EventKind::FocuserHalted {
+                        position: Some(1200),
+                    },
+                    clock.as_ref(),
+                )
+                .for_device(DeviceKind::Focuser, connection_id),
+            ))
+        };
+        recorder.record(halted(connection));
+        recorder.record(GroundTruthRecord::Profile(
+            crate::equipment::events::ProfileUpdate {
+                identity_key: "alpaca:127.0.0.1:11111/focuser/0".into(),
+                kind: DeviceKind::Focuser,
+                patch: serde_json::json!({"settle_ms": 100}),
+                updated_at: clock.now_utc(),
+            },
+        ));
+        // A late event from an old connection is dropped, not journaled.
+        recorder.record(halted(Uuid::new_v4()));
+        let records = sink.records();
+        assert_eq!(records.len(), 2, "{records:?}");
+        match &records[0] {
+            GroundTruthRecord::Event(event) => {
+                assert_eq!(event.seq, first);
+                assert_eq!(event.name(), "focuser_halted");
+            }
+            other => panic!("expected the sequenced event, got {other:?}"),
+        }
+        assert!(matches!(records[1], GroundTruthRecord::Profile(_)));
+        assert_eq!(hub.bus().next_seq(), first + 1);
+        assert_eq!(hub.bus().dropped_stale(), 1);
+        assert_eq!(hub.bus().since(0, &[], 10).len(), 1);
     }
 
     #[test]

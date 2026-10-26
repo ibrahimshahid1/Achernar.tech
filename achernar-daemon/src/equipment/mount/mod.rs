@@ -1371,7 +1371,11 @@ fn derive_geometry(
         return;
     };
     let fresh = state.ra_h.is_fresh() && state.dec_deg.is_fresh();
-    let altaz = limits::alt_az(limits::hour_angle_h(lst, pos.ra_h), pos.dec_deg, site.lat_deg);
+    let altaz = limits::alt_az(
+        limits::hour_angle_h(lst, pos.ra_h),
+        pos.dec_deg,
+        site.lat_deg,
+    );
     if state.alt_deg.value.is_none() {
         state.alt_deg = derived(altaz.alt_deg, fresh, now_utc, now_mono);
     }
@@ -1932,7 +1936,10 @@ mod tests {
             (raw.alt_deg - expected.alt_deg).abs() > 0.1,
             "the test shift must matter"
         );
-        assert_eq!(rig.runtime.tracker.of_date().unwrap().frame, EqFrame::JNowApparent);
+        assert_eq!(
+            rig.runtime.tracker.of_date().unwrap().frame,
+            EqFrame::JNowApparent
+        );
     }
 
     #[test]
@@ -2097,7 +2104,8 @@ mod tests {
             MountPlan::Start(op) if op.kind() == OpKind::Park
         ));
         assert!(matches!(
-            rig.runtime.plan(MountCmd::RenewJog, meta, Some(OpKind::Slew)),
+            rig.runtime
+                .plan(MountCmd::RenewJog, meta, Some(OpKind::Slew)),
             MountPlan::Refused(_)
         ));
     }
@@ -2139,8 +2147,12 @@ mod tests {
             .value
             .unwrap();
         let target = EqCoord::new(EqCoord::wrap_ra_h(lst - 3.0), 60.0, EqFrame::Unknown);
-        let mut op = build_operation(&rig.runtime.shared(), MountCmd::Slew { target }, meta.clone())
-            .unwrap();
+        let mut op = build_operation(
+            &rig.runtime.shared(),
+            MountCmd::Slew { target },
+            meta.clone(),
+        )
+        .unwrap();
         op.start(&mut rig.sim, rig.clock.as_ref()).unwrap();
         assert_eq!(advance(rig, &mut op, meta, 2), None);
         assert!(rig.sim.control().slewing());
@@ -2217,7 +2229,11 @@ mod tests {
         assert!(cancelled);
         assert_eq!(outcome.unwrap(), OpOutcome::Succeeded);
         assert!(!rig.sim.control().slewing(), "AbortSlew reached the mount");
-        assert!(rig.sim.control().calls().contains(&"abort_slew".to_string()));
+        assert!(rig
+            .sim
+            .control()
+            .calls()
+            .contains(&"abort_slew".to_string()));
     }
 
     #[test]
@@ -2260,8 +2276,7 @@ mod tests {
 
     #[tokio::test]
     async fn estop_aborts_then_queues_one_stop_at_estop_rank() {
-        let (handle, fake) =
-            crate::equipment::testing::fake_handles::fake_mount(mount_with_axes());
+        let (handle, fake) = crate::equipment::testing::fake_handles::fake_mount(mount_with_axes());
         let report = estop_mount(&handle, true).await;
         assert!(report.result().is_ok(), "{report:?}");
         assert_eq!(fake.abort_path().calls(), 1);
@@ -2315,16 +2330,17 @@ mod tests {
             at("move_axis:1:0").expect("axis 1 stopped"),
             at("tracking_off").expect("tracking off"),
         );
-        assert!(axis0 < off && axis1 < off, "the section 2.9 order: {calls:?}");
+        assert!(
+            axis0 < off && axis1 < off,
+            "the section 2.9 order: {calls:?}"
+        );
         assert!(
             !calls.iter().any(|c| c.starts_with("move_axis:2")),
             "axis 2 cannot move"
         );
         // An ordinary tracking off does not touch the axes.
         rig.sim.move_axis(1, 2.0).unwrap();
-        let outcome = rig
-            .run(MountCmd::SetTracking(false), operator())
-            .unwrap();
+        let outcome = rig.run(MountCmd::SetTracking(false), operator()).unwrap();
         assert_eq!(outcome, OpOutcome::Succeeded);
         assert_eq!(rig.sim.control().axis_rates()[1], 2.0);
     }
@@ -2358,8 +2374,7 @@ mod tests {
         // The first MoveAxis 0 outranks the slew: the worker cancels it and
         // starts a one-shot stop.
         let MountPlan::Start(mut stop) =
-            rig.runtime
-                .plan(axis(0), estop.clone(), Some(OpKind::Slew))
+            rig.runtime.plan(axis(0), estop.clone(), Some(OpKind::Slew))
         else {
             panic!("e-stop MoveAxis 0 must be planned to start");
         };
@@ -2369,7 +2384,8 @@ mod tests {
         // The second is absorbed by it, not refused as a conflict, and still
         // reaches the hardware although this stop never moved axis 1.
         assert!(matches!(
-            rig.runtime.plan(axis(1), estop.clone(), Some(OpKind::MoveAxis)),
+            rig.runtime
+                .plan(axis(1), estop.clone(), Some(OpKind::MoveAxis)),
             MountPlan::Absorbed(OpOutcome::Succeeded)
         ));
         assert_eq!(
@@ -2404,7 +2420,8 @@ mod tests {
         use crate::equipment::testing::fake_handles::FakeResponse;
         let (handle, fake) =
             crate::equipment::testing::fake_handles::fake_mount(MountSnapshot::default());
-        fake.abort_path().set_delay(Some(Duration::from_millis(800)));
+        fake.abort_path()
+            .set_delay(Some(Duration::from_millis(800)));
         let arrived = Arc::new(Mutex::new(None));
         let seen = Arc::clone(&arrived);
         fake.set_responder(move |cmd, _| {
