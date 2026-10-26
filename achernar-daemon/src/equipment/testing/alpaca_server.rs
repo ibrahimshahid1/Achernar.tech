@@ -1686,6 +1686,7 @@ mod tests {
             ScriptedDevice::new("focuser", 0, "F").property("position", 1)
         ]);
         let agent = ureq::Agent::config_builder()
+            .proxy(None)
             .http_status_as_error(false)
             .build()
             .new_agent();

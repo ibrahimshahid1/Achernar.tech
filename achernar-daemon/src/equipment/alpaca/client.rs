@@ -15,17 +15,23 @@
 //!   numbers). PUT bodies are `application/x-www-form-urlencoded`.
 //! - Applies the C-3 timeout classes. The effective timeout is the longer of
 //!   the caller's class and the class the C-3 table gives the member, so a
-//!   `park` is never cut off at 10 s. The TCP connect phase is capped at 5 s
-//!   so a stalled connect is reported as one.
+//!   `park` is never cut off at 10 s. Name resolution and the TCP connect
+//!   are each limited so that both end strictly before the overall deadline
+//!   ([`PhaseLimits`]); ureq then reports a stall in either as a `Resolve`
+//!   or `Connect` timeout, never as the `Global` one, so it is known not to
+//!   have reached the device.
 //! - Runs the C-3 response checks ([`super::errors::check_response`]).
 //! - **Retries once, after 100 ms, only on a timeout or a socket error**
 //!   (the ASCOM Library rule; C-2). HTTP errors, Alpaca errors and malformed
 //!   replies are never retried. A GET is retried after any timeout or socket
 //!   error. A PUT is retried only when the request provably never reached the
 //!   device (connection refused, no usable address, DNS failure, or a
-//!   connect-phase timeout): a PUT that may have been delivered is not re-sent, because a
-//!   duplicated relative focuser move or guide pulse would move hardware
-//!   twice. Its error says the outcome is unknown.
+//!   resolve- or connect-phase timeout): a PUT that may have been delivered
+//!   is not re-sent, because a duplicated relative focuser move or guide
+//!   pulse would move hardware twice. Its error says the outcome is unknown.
+//! - Never uses a proxy. ureq's default configuration takes one from
+//!   `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY`; device control, aborts
+//!   included, always goes straight to the device ([`agent_settings`]).
 //!
 //! Connections: GETs use a pooled agent (keep-alive suits the 1-10 Hz polls).
 //! PUTs use an agent that never reuses a connection, which is what makes the
@@ -184,6 +190,47 @@ impl TimeoutTable {
     }
 }
 
+/// Slack between the end of the latest possible connect and the overall
+/// deadline of a request; see [`PhaseLimits`].
+pub const PRE_SEND_MARGIN: Duration = Duration::from_millis(50);
+
+/// How long name resolution and the TCP connect (with TLS for `https`) may
+/// take in one request, so that ureq names the phase that stalled.
+///
+/// ureq reports the deadline that expired first. The overall deadline runs
+/// from the start of the call, and ureq also ends the connect phase at "end
+/// of resolution + resolve limit". If the overall deadline could fall during
+/// either phase, a stalled connect would be reported as `Timeout::Global`,
+/// which is also how a stall after the request was written is reported, and
+/// a PUT that never left the host would not be retried. So:
+///
+/// - `connect = min(cap, (timeout - PRE_SEND_MARGIN) / 2)`;
+/// - `resolve = connect + 1 ms`, so the "end of resolution + resolve limit"
+///   bound falls just after the connect limit and a connect stall is named
+///   `Connect`;
+/// - `resolve + connect < timeout`, so neither phase can outlast the overall
+///   deadline, even when resolution takes its whole limit.
+///
+/// With the C-3 table and a 5 s cap: 5 s classes and the abort lane get
+/// 2.475 s per phase; 10 s gets 4.975 s; 100 s gets 5 s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PhaseLimits {
+    pub resolve: Duration,
+    pub connect: Duration,
+}
+
+impl PhaseLimits {
+    pub fn for_timeout(timeout: Duration, cap: Duration) -> Self {
+        let connect = (timeout.saturating_sub(PRE_SEND_MARGIN) / 2)
+            .min(cap)
+            .max(Duration::from_millis(1));
+        Self {
+            resolve: connect + Duration::from_millis(1),
+            connect,
+        }
+    }
+}
+
 /// The C-3 timeout class of a member (lower-case Alpaca member name).
 pub fn member_timeout_class(member: &str) -> TimeoutClass {
     match member.to_ascii_lowercase().as_str() {
@@ -208,7 +255,8 @@ pub fn member_timeout_class(member: &str) -> TimeoutClass {
 pub struct ClientConfig {
     pub client_id: ClientId,
     pub timeouts: TimeoutTable,
-    /// Upper bound on the TCP connect phase of any request.
+    /// Upper bound on the TCP connect phase of any request. Short timeouts
+    /// get less; see [`PhaseLimits`].
     pub connect_phase_cap: Duration,
     /// Timeout of every abort-channel request (§2.5: 5 s).
     pub abort_timeout: Duration,
@@ -353,14 +401,35 @@ pub(crate) fn parse_base_url(text: &str) -> DeviceResult<BaseUrl> {
     })
 }
 
-fn build_agent(pooled: bool) -> ureq::Agent {
-    let builder = ureq::Agent::config_builder()
+pub(crate) type AgentBuilder = ureq::config::ConfigBuilder<ureq::typestate::AgentScope>;
+
+/// The settings every Alpaca agent (device lanes and the management API)
+/// applies on top of `builder`.
+///
+/// `proxy(None)` is required: ureq's default configuration takes a proxy
+/// from `ALL_PROXY`, `HTTPS_PROXY` or `HTTP_PROXY` and applies it to plain
+/// `http://` URLs too. With one set (Docker, a corporate shell) every read,
+/// command and abort would be tunnelled through a proxy that may not reach
+/// the LAN device, and the device would become uncommandable (D4, D19).
+pub(crate) fn agent_settings(builder: AgentBuilder) -> AgentBuilder {
+    builder
+        .proxy(None)
         .http_status_as_error(false)
         .max_redirects(0)
         .accept(super::errors::ALPACA_JSON_MIME)
         .user_agent(concat!("Achernar/", env!("CARGO_PKG_VERSION")))
-        .no_delay(true);
-    let builder = if pooled {
+        .no_delay(true)
+}
+
+fn build_agent(pooled: bool) -> ureq::Agent {
+    lane_settings(ureq::Agent::config_builder(), pooled)
+        .build()
+        .new_agent()
+}
+
+fn lane_settings(builder: AgentBuilder, pooled: bool) -> AgentBuilder {
+    let builder = agent_settings(builder);
+    if pooled {
         builder
             .max_idle_connections(8)
             .max_idle_connections_per_host(2)
@@ -369,8 +438,7 @@ fn build_agent(pooled: bool) -> ureq::Agent {
         builder
             .max_idle_connections(0)
             .max_idle_connections_per_host(0)
-    };
-    builder.build().new_agent()
+    }
 }
 
 fn validate_member(member: &str) -> DeviceResult<()> {
@@ -619,21 +687,23 @@ impl Shared {
         pairs.push((form::CLIENT_TRANSACTION_ID_KEY, transaction_id.to_string()));
         let encoded = form::encode_pairs(&pairs);
         let url = format!("{}{member}", self.prefix);
-        let connect_timeout = timeout.min(self.config.connect_phase_cap);
+        let limits = PhaseLimits::for_timeout(timeout, self.config.connect_phase_cap);
         let agent = self.agent(lane);
         let result = match verb {
             Verb::Get => agent
                 .get(format!("{url}?{encoded}"))
                 .config()
                 .timeout_global(Some(timeout))
-                .timeout_connect(Some(connect_timeout))
+                .timeout_resolve(Some(limits.resolve))
+                .timeout_connect(Some(limits.connect))
                 .build()
                 .call(),
             Verb::Put => agent
                 .put(&url)
                 .config()
                 .timeout_global(Some(timeout))
-                .timeout_connect(Some(connect_timeout))
+                .timeout_resolve(Some(limits.resolve))
+                .timeout_connect(Some(limits.connect))
                 .build()
                 .content_type(form::FORM_CONTENT_TYPE)
                 .send(encoded.as_bytes()),
@@ -667,6 +737,12 @@ fn classify_error(error: ureq::Error) -> Failure {
         ureq::Error::Timeout(which) => {
             let message = format!("Alpaca request timed out ({which:?} phase)");
             match which {
+                // [`PhaseLimits`] makes both end before the overall deadline,
+                // so a stall there is never reported as `Global`. ureq can
+                // also name `Connect` for a stall while writing the request
+                // head (it bounds that write by "end of connect + connect
+                // limit"); the head was then not completely written, so the
+                // device cannot have acted on it.
                 Timeout::Resolve | Timeout::Connect => {
                     Failure::NotSent(DeviceError::timeout(message))
                 }
@@ -1331,7 +1407,9 @@ mod tests {
         // Nothing listens on this port, so the request provably was not
         // delivered. Unix refuses the connection at once; Windows retries the
         // SYN and the connect phase times out instead. Both are connect-phase
-        // failures and both are retried.
+        // failures and both are retried: quick_config's 400 ms timeouts give
+        // a 175 ms connect limit, which ureq reports as `Connect`, not
+        // `Global` (see PhaseLimits).
         let port = {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             listener.local_addr().unwrap().port()
@@ -1353,6 +1431,176 @@ mod tests {
         assert!(err.message.contains("after one retry"), "{}", err.message);
         assert_eq!(client.stats().retries, 1);
         assert_eq!(client.stats().requests, 1);
+    }
+
+    /// A loopback listener whose accept queue is full, so a further connect
+    /// is never accepted: macOS and Linux drop the SYN, Windows refuses it.
+    /// The listener and the connections that fill it must stay alive while
+    /// the test runs.
+    fn full_backlog_listener() -> (std::net::TcpListener, Vec<std::net::TcpStream>) {
+        // tokio's TcpSocket is the portable way to choose the backlog; the
+        // runtime only registers the socket and is gone before any request.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        let listener = {
+            let _context = runtime.enter();
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+            socket.listen(1).unwrap().into_std().unwrap()
+        };
+        drop(runtime);
+        let addr = listener.local_addr().unwrap();
+        let mut held = Vec::new();
+        while held.len() < 64 {
+            match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+                Ok(stream) => held.push(stream),
+                Err(_) => return (listener, held),
+            }
+        }
+        panic!("the accept queue of a backlog-1 listener never filled");
+    }
+
+    fn assert_retried_as_never_sent(client: &AlpacaClient, err: &DeviceError) {
+        assert!(err.message.contains("after one retry"), "{}", err.message);
+        assert!(
+            !err.message.contains("outcome is unknown"),
+            "{}",
+            err.message
+        );
+        assert_eq!(client.stats().retries, 1);
+        assert_eq!(client.stats().requests, 1);
+        if cfg!(unix) {
+            // The SYN was dropped, so the connect phase timed out.
+            assert_eq!(err.class, ErrorClass::Timeout, "{err}");
+            assert!(err.message.contains("Connect phase"), "{}", err.message);
+        } else {
+            // Refused, or Windows' SYN retries outlast the connect limit.
+            assert!(
+                matches!(err.class, ErrorClass::Transport | ErrorClass::Timeout),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_connect_that_is_never_accepted_is_retried_on_the_abort_lane_and_for_connect_members() {
+        // The abort lane and the Connect class are the lanes whose timeout
+        // equals the connect cap (5 s each by default, 400 ms in
+        // quick_config). A stalled connect there must still be reported as
+        // a connect-phase failure, so the PUT is sent once more.
+        let (listener, _held) = full_backlog_listener();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+
+        let client = AlpacaClient::new(&base, "telescope", 0, quick_config()).unwrap();
+        let abort: Arc<dyn AlpacaTransport> = Arc::new(client.abort_channel());
+        let started = Instant::now();
+        let err = PutAbortPath::new(abort, "AbortSlew").abort().unwrap_err();
+        assert_retried_as_never_sent(&client, &err);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let client = AlpacaClient::new(&base, "telescope", 0, quick_config()).unwrap();
+        let err = client
+            .put(
+                "connected",
+                &[("Connected", "True".into())],
+                TimeoutClass::Connect,
+            )
+            .unwrap_err();
+        assert_retried_as_never_sent(&client, &err);
+    }
+
+    #[test]
+    fn resolve_and_connect_always_end_before_the_overall_deadline() {
+        let id = ClientId::new(1).unwrap();
+        let clients = [
+            AlpacaClient::new("http://127.0.0.1:1", "telescope", 0, ClientConfig::new(id)).unwrap(),
+            AlpacaClient::new("http://127.0.0.1:1", "telescope", 0, quick_config()).unwrap(),
+        ];
+        let classes = [
+            TimeoutClass::Connect,
+            TimeoutClass::Ordinary,
+            TimeoutClass::Long,
+        ];
+        for client in &clients {
+            let shared = &client.shared;
+            for lane in [Lane::Read, Lane::Command, Lane::Abort] {
+                for class in classes {
+                    for member in ["connected", "position", "abortslew", "park"] {
+                        let timeout = shared.timeout_for(member, class, lane);
+                        let limits =
+                            PhaseLimits::for_timeout(timeout, shared.config.connect_phase_cap);
+                        let case =
+                            format!("{lane:?} {class:?} {member}: {limits:?} in {timeout:?}");
+                        assert!(limits.resolve + limits.connect < timeout, "{case}");
+                        assert!(limits.resolve > limits.connect, "{case}");
+                        assert!(limits.connect <= shared.config.connect_phase_cap, "{case}");
+                    }
+                }
+            }
+        }
+        let cap = Duration::from_secs(5);
+        assert_eq!(
+            PhaseLimits::for_timeout(Duration::from_secs(5), cap).connect,
+            Duration::from_millis(2475)
+        );
+        assert_eq!(
+            PhaseLimits::for_timeout(Duration::from_secs(10), cap).connect,
+            Duration::from_millis(4975)
+        );
+        assert_eq!(
+            PhaseLimits::for_timeout(Duration::from_secs(100), cap),
+            PhaseLimits {
+                resolve: Duration::from_millis(5001),
+                connect: cap
+            }
+        );
+    }
+
+    #[test]
+    fn device_traffic_never_goes_through_a_proxy() {
+        // A builder that already carries a proxy, as ureq's default one does
+        // when HTTP_PROXY or HTTPS_PROXY is set. The process environment is
+        // not touched: other tests run in parallel in this process. The
+        // proxy port is closed, so honouring it would fail the request.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let proxied = || {
+            ureq::Agent::config_builder()
+                .http_status_as_error(false)
+                .proxy(Some(ureq::Proxy::new(&format!("http://{closed}")).unwrap()))
+        };
+        let script = HttpScript::start(vec![HttpScript::alpaca_ok(json!(1))]);
+        let url = format!("{}/api/v1/focuser/0/position", script.base_url());
+        // The control: an agent that keeps the proxy cannot reach the server.
+        let honoured = proxied().build().new_agent();
+        assert!(honoured.config().proxy().is_some());
+        assert!(honoured.get(&url).call().is_err());
+        assert!(script.requests().is_empty());
+
+        for pooled in [true, false] {
+            let agent = lane_settings(proxied(), pooled).build().new_agent();
+            assert!(agent.config().proxy().is_none(), "pooled={pooled}");
+        }
+        let direct = lane_settings(proxied(), false).build().new_agent();
+        assert_eq!(direct.get(&url).call().unwrap().status().as_u16(), 200);
+        assert_eq!(script.requests().len(), 1, "went straight to the server");
+
+        let client =
+            AlpacaClient::new("http://127.0.0.1:1", "telescope", 0, quick_config()).unwrap();
+        for lane in [Lane::Read, Lane::Command, Lane::Abort] {
+            assert!(
+                client.shared.agent(lane).config().proxy().is_none(),
+                "{lane:?}"
+            );
+        }
     }
 
     #[test]

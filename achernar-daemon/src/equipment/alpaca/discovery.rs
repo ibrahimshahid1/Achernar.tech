@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::client::{next_transaction_id, parse_base_url, ClientId};
+use super::client::{agent_settings, next_transaction_id, parse_base_url, AgentBuilder, ClientId};
 use super::errors::{check_response, expect_string, expect_u32, field, Verb};
 use super::form;
 use crate::equipment::types::{identity_key, DeviceError, DeviceResult, Endpoint};
@@ -241,6 +241,14 @@ pub fn parse_configured_devices(value: &Value) -> DeviceResult<ConfiguredDevices
     Ok(out)
 }
 
+/// The management agent's settings: the shared Alpaca ones (no proxy, no
+/// redirects, the Alpaca `Accept`), one overall timeout, no pooling.
+fn management_settings(builder: AgentBuilder, timeout: Duration) -> AgentBuilder {
+    agent_settings(builder)
+        .timeout_global(Some(timeout))
+        .max_idle_connections(0)
+}
+
 /// The Alpaca management API of one server. Blocking.
 pub struct ManagementClient {
     base: String,
@@ -253,13 +261,7 @@ impl ManagementClient {
     /// `base` is `http(s)://host:port`; `timeout` bounds each request.
     pub fn new(base: &str, client_id: ClientId, timeout: Duration) -> DeviceResult<Self> {
         let url = parse_base_url(base)?;
-        let agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .accept(super::errors::ALPACA_JSON_MIME)
-            .user_agent(concat!("Achernar/", env!("CARGO_PKG_VERSION")))
-            .timeout_global(Some(timeout))
-            .max_idle_connections(0)
+        let agent = management_settings(ureq::Agent::config_builder(), timeout)
             .build()
             .new_agent();
         Ok(Self {
@@ -878,5 +880,24 @@ mod tests {
             ManagementClient::new("auto", ClientId::new(1).unwrap(), Duration::from_secs(1))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn management_requests_never_go_through_a_proxy() {
+        // As ureq's default builder is when HTTP_PROXY or HTTPS_PROXY is set;
+        // the process environment is not touched.
+        let proxied = ureq::Agent::config_builder()
+            .proxy(Some(ureq::Proxy::new("http://127.0.0.1:9").unwrap()));
+        let agent = management_settings(proxied, Duration::from_secs(1))
+            .build()
+            .new_agent();
+        assert!(agent.config().proxy().is_none());
+        let management = ManagementClient::new(
+            "http://127.0.0.1:1",
+            ClientId::new(1).unwrap(),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(management.agent.config().proxy().is_none());
     }
 }
