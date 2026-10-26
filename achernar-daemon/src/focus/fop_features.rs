@@ -34,7 +34,19 @@
 //! - Backlash (#32) is the compensation Achernar applies: `0` when its model
 //!   is `none` (the contract's truthful default), the steps of the travel
 //!   direction for `overshoot` and `absolute`, and missing when the firmware
-//!   owns backlash, because Achernar then does not know the amount.
+//!   owns backlash, because Achernar then does not know the amount. The
+//!   travel direction is that of the move that brought the focuser to the
+//!   sample: the last non-zero `dp`, or for the run's first position the
+//!   move from the run's start position. With no move at all and unequal in
+//!   and out steps it is missing (`backlash_direction_unknown`).
+//!
+//!   This differs from the contract's training source,
+//!   `focuser_profiles.backlash_steps` (one value, defaulting to 0). ML
+//!   change note (e) for the contract owner: the online #32 is the
+//!   direction-dependent compensation above, missing when the firmware owns
+//!   backlash; the training builder must mirror it (from
+//!   `focus_samples.backlash_model` and the sample's move direction) or the
+//!   contract must change.
 //! - The CFZ (#33) needs the focal ratio and a V-curve or configured
 //!   steps-per-micron scale.
 //!
@@ -293,8 +305,10 @@ fn ambient_celsius(ambient: &Observed<TemperatureReading>) -> Result<f64, &'stat
 }
 
 /// The backlash compensation Achernar applies for a move in `direction`
-/// (#32).
-fn backlash_steps(focuser: &FocuserSnapshot, direction: f64) -> Result<f64, &'static str> {
+/// (#32): `Some(+1.0)` outward, `Some(-1.0)` inward, `None` when no move of
+/// the run brought the focuser to the sample. Without a direction the value
+/// is known only when both directions compensate alike.
+fn backlash_steps(focuser: &FocuserSnapshot, direction: Option<f64>) -> Result<f64, &'static str> {
     if focuser.backlash_owner == BacklashOwner::Firmware {
         return Err("backlash_firmware_owned");
     }
@@ -309,12 +323,11 @@ fn backlash_steps(focuser: &FocuserSnapshot, direction: f64) -> Result<f64, &'st
             out_steps,
         } => (in_steps, out_steps),
     };
-    let steps = if direction > 0.0 {
-        out_steps
-    } else if direction < 0.0 {
-        in_steps
-    } else {
-        in_steps.max(out_steps)
+    let steps = match direction {
+        Some(d) if d > 0.0 => out_steps,
+        Some(d) if d < 0.0 => in_steps,
+        _ if in_steps == out_steps => in_steps,
+        _ => return Err("backlash_direction_unknown"),
     };
     Ok(f64::from(steps.max(0)))
 }
@@ -456,9 +469,15 @@ pub fn build(inputs: &FopInputs<'_>) -> FopFeatureVector {
     let improvements = dh.iter().rev().take_while(|d| **d < 0.0).count();
     b.set(31, Some(improvements as f64), "hfr_unavailable");
 
-    // Rig (#32, #33).
+    // Rig (#32, #33). The move that brought the focuser to this sample: the
+    // last non-zero `dp`, else (the run's first position, and repeats at it)
+    // the move from the run's start position.
+    let move_direction = direction.or_else(|| {
+        let d = sign(i64::from(inputs.position) - i64::from(inputs.run_start_position));
+        (d != 0.0).then_some(d)
+    });
     match inputs.focuser {
-        Some(focuser) => match backlash_steps(focuser, direction.unwrap_or(0.0)) {
+        Some(focuser) => match backlash_steps(focuser, move_direction) {
             Ok(steps) => b.set(32, Some(steps), "backlash_unknown"),
             Err(reason) => b.set(32, None, reason),
         },
@@ -746,6 +765,53 @@ mod tests {
         );
         let v = build(&inputs(&[], &ambient, Some(&none)));
         assert_eq!(v.get("backlash_norm"), Some(0.0));
+    }
+
+    #[test]
+    fn the_first_samples_backlash_follows_the_move_from_the_run_start() {
+        let ambient = Observed::not_set(Source::Derived);
+        let snap = focuser(
+            PositionSource::Device,
+            BacklashModel::Overshoot {
+                in_steps: 30,
+                out_steps: 80,
+            },
+            BacklashOwner::Achernar,
+        );
+        // s_0 at 1200 from a start of 1000: an outward move.
+        let mut i = inputs(&[], &ambient, Some(&snap));
+        assert_eq!(build(&i).get("backlash_norm"), Some(80.0));
+        // s_0 at 900: inward.
+        i.position = 900;
+        assert_eq!(build(&i).get("backlash_norm"), Some(30.0));
+        // A repeat at s_0 keeps the direction of the move to s_0.
+        let history = [HistorySample {
+            position: 900,
+            hfr: 3.0,
+            sensor_temperature_c: None,
+        }];
+        let mut repeat = inputs(&history, &ambient, Some(&snap));
+        repeat.position = 900;
+        assert_eq!(build(&repeat).get("backlash_norm"), Some(30.0));
+        // No move at all: unknown for unequal steps, never max(in, out).
+        i.position = 1_000;
+        let v = build(&i);
+        assert_eq!(v.get("backlash_norm"), None);
+        assert_eq!(
+            v.missing.get("backlash_norm"),
+            Some(&"backlash_direction_unknown")
+        );
+        let symmetric = focuser(
+            PositionSource::Device,
+            BacklashModel::Absolute {
+                in_steps: 50,
+                out_steps: 50,
+            },
+            BacklashOwner::Achernar,
+        );
+        let mut s = inputs(&[], &ambient, Some(&symmetric));
+        s.position = 1_000;
+        assert_eq!(build(&s).get("backlash_norm"), Some(50.0));
     }
 
     #[test]

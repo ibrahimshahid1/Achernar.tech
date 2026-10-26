@@ -19,7 +19,9 @@
 //! Hooks implemented here:
 //!
 //! - **H3** sample freshness (A06): [`frame_freshness`] plus the hub's
-//!   quiescence over the exposure window, in [`judge_frame`].
+//!   quiescence over the exposure window and a focuser read-back from a poll
+//!   at or after the window's end, in [`judge_frame`]. Samples record the
+//!   timing basis their window came from as their clock quality.
 //! - **H4** a verification frame after the move to best focus
 //!   ([`verify_focus`]), recorded on the `focus_actions` row.
 //! - **H5** the FDF learns only from a verified, non-simulator run, at the
@@ -825,18 +827,30 @@ async fn run_autofocus_session(
         stream.driver_id.as_deref() == Some("sim") || focuser.identity().driver == DriverId::Sim;
     let mut warnings = Vec::new();
     let filter = run_filter(state, filter_label, &mut warnings);
+    let wheel_connected =
+        crate::api::equipment::wheel_slot(state).is_some_and(|wheel| !wheel.is_retired());
+    if let Some(warning) = af_filter_warning(
+        &state.equipment_ctx.configs.filter_wheel.af_filter,
+        &filter,
+        wheel_connected,
+    ) {
+        warnings.push(warning);
+    }
     let cfz = run_cfz(state).await;
 
     let op = AutofocusOp::authorize(state, focuser, guiding)?;
     // H20: no model switch during autofocus (v6 §6.7.6).
     let _busy = state.equipment.busy_flags().claim(BusyFlag::Autofocus);
-    op.started(
-        state,
-        vec![
-            format!("guiding_during_autofocus={guiding:?}"),
-            format!("simulation={simulation}"),
-        ],
-    );
+    let mut annotations = vec![
+        format!("guiding_during_autofocus={guiding:?}"),
+        format!("simulation={simulation}"),
+    ];
+    for warning in &warnings {
+        tracing::warn!("autofocus: {warning}");
+        annotations.push(format!("warning: {warning}"));
+    }
+    let logged = warnings.len();
+    op.started(state, annotations);
     let ctx = Arc::new(RunContext {
         state: state.clone(),
         focus_safety: Mutex::new(FocusSafetyGuard::new(config.safety.clone())),
@@ -887,12 +901,24 @@ async fn run_autofocus_session(
 
     release_guiding(state, &ctx.op, held, &mut warnings).await;
     release_tempcomp(state, &ctx.op, tempcomp, &mut warnings).await;
-    for warning in &warnings {
+    for warning in &warnings[logged..] {
         tracing::warn!("autofocus: {warning}");
     }
     match result {
-        Ok(mut response) => {
-            ctx.op.finish(state, OpOutcome::Succeeded);
+        Ok(SweepResult {
+            mut response,
+            not_verified,
+        }) => {
+            // H4: a run that converged but whose verification frame did not
+            // confirm focus has not succeeded. Accepted completion is not
+            // confirmed completion (v6 §7.8): the audit outcome and
+            // `operation_ended` agree with the run's `autofocus_failed`. The
+            // body still returns the converged result, with `verified: false`.
+            let outcome = match &not_verified {
+                Some(reason) => failed_outcome(&format!("focus_not_verified: {reason}")),
+                None => OpOutcome::Succeeded,
+            };
+            ctx.op.finish(state, outcome);
             response.warnings = warnings;
             Ok(response)
         }
@@ -912,12 +938,57 @@ fn failed_outcome(reason: &str) -> OpOutcome {
     OpOutcome::Failed(crate::equipment::types::DeviceError::driver(reason))
 }
 
+/// `[filter_wheel] af_filter` is configured, but the run does not switch to
+/// it: switching goes through the filter handshake as a child step, and that
+/// contract does not exist yet. Say so in the response, the audit and the
+/// log, rather than let the operator believe the run measured through it.
+/// `None` when no AF filter is configured or the verified slot is already it
+/// (matched like the wheel matches names: trimmed, ASCII case-insensitive).
+fn af_filter_warning(af_filter: &str, filter: &RunFilter, wheel_connected: bool) -> Option<String> {
+    let wanted = af_filter.trim();
+    if wanted.is_empty() {
+        return None;
+    }
+    if let Some(verified) = &filter.verified {
+        if verified.name.trim().eq_ignore_ascii_case(wanted) {
+            return None;
+        }
+        return Some(format!(
+            "the configured AF filter {wanted:?} was not applied (autofocus does not switch \
+             filters yet); the run measured through the wheel's verified filter {:?}",
+            verified.name
+        ));
+    }
+    let through = match &filter.name {
+        Some(label) => format!("through the unverified filter label {label:?}"),
+        None => "through an unknown filter".to_string(),
+    };
+    Some(if wheel_connected {
+        format!(
+            "the configured AF filter {wanted:?} was not applied (autofocus does not switch \
+             filters yet) and the wheel's filter is not verified; the run measured {through}"
+        )
+    } else {
+        format!(
+            "the configured AF filter {wanted:?} was not applied: no filter wheel is \
+             connected; the run measured {through}"
+        )
+    })
+}
+
+/// A sweep that ran to its end: the response, and why focus was not
+/// verified when the H4 frame did not confirm it.
+struct SweepResult {
+    response: FocusRunResponse,
+    not_verified: Option<String>,
+}
+
 /// The sweep, the move to best focus, the verification (H4) and the FDF
 /// update (H5).
 async fn sweep_and_verify(
     ctx: &Arc<RunContext>,
     warnings: &mut Vec<String>,
-) -> crate::error::Result<FocusRunResponse> {
+) -> crate::error::Result<SweepResult> {
     let state = &ctx.state;
     let mut agent = state.focus_agent.lock().await;
     let measure_ctx = Arc::clone(ctx);
@@ -966,7 +1037,12 @@ async fn sweep_and_verify(
     persist_run_logged(ctx, &run).await;
 
     let Some(best_position) = run.best_position else {
-        return Ok(response_from_run(&run));
+        // The agent converges only with a best position; nothing was moved
+        // to, so there is nothing to verify.
+        return Ok(SweepResult {
+            response: response_from_run(&run),
+            not_verified: Some("the run converged without a best-focus position".into()),
+        });
     };
     let from_position = current_focuser_position(&ctx.op.focuser).unwrap_or(run.start_position);
     let final_move = match move_focuser_to_position(ctx, best_position).await {
@@ -1027,7 +1103,7 @@ async fn sweep_and_verify(
     if let Err(err) = persist_focus_action(&state.local_store, &action, Some(&record)).await {
         tracing::error!("Focused successfully but failed to persist focus action: {err}");
     }
-    if verification.verified {
+    let not_verified = if verification.verified {
         ctx.op.emit(
             state,
             EventKind::AutofocusVerified {
@@ -1038,11 +1114,13 @@ async fn sweep_and_verify(
                 measured_at: verification.measured_at.unwrap_or_else(Utc::now),
             },
         );
+        None
     } else {
-        let reason = format!(
-            "focus not verified: {}",
-            verification.reason.as_deref().unwrap_or("unknown")
-        );
+        let detail = verification
+            .reason
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
+        let reason = format!("focus not verified: {detail}");
         warnings.push(reason.clone());
         ctx.op.emit(
             state,
@@ -1051,7 +1129,8 @@ async fn sweep_and_verify(
                 reason,
             },
         );
-    }
+        Some(detail)
+    };
     if verification.aborted {
         return Err(FocusError::RunFailed("Autofocus aborted".to_string()).into());
     }
@@ -1073,7 +1152,10 @@ async fn sweep_and_verify(
 
     let mut response = response_from_run(&run);
     response.verified = Some(verification.verified);
-    Ok(response)
+    Ok(SweepResult {
+        response,
+        not_verified,
+    })
 }
 
 /// The focuser's logical position from its latest snapshot (the worker
@@ -1427,6 +1509,12 @@ pub(crate) enum Freshness {
     Fresh {
         start: DateTime<Utc>,
         end: DateTime<Utc>,
+        /// What the window was derived from, which is what a sample records
+        /// as its clock quality: `driver_exposure_start` only when a driver
+        /// start was present and used; the conservative arrival bound is
+        /// `host_arrival` (`simulator` for simulator frames), whatever the
+        /// camera's own clock quality.
+        basis: ClockQuality,
     },
     Skip(FrameSkip),
     Refused(FrameRefusal),
@@ -1471,10 +1559,12 @@ pub(crate) fn frame_freshness(baseline: &FreshnessBaseline, frame: &FrameTiming)
     let Some(exposure_s) = frame.exposure_s.filter(|e| e.is_finite() && *e > 0.0) else {
         return Freshness::Refused(FrameRefusal::UnknownStart("exposure_unknown"));
     };
-    let (start, end) = match frame.exposure_start {
-        Some(start) if frame.clock_quality == ClockQuality::DriverExposureStart => {
-            (start, start + chrono_secs(exposure_s))
-        }
+    let (start, end, basis) = match frame.exposure_start {
+        Some(start) if frame.clock_quality == ClockQuality::DriverExposureStart => (
+            start,
+            start + chrono_secs(exposure_s),
+            ClockQuality::DriverExposureStart,
+        ),
         _ => {
             let Some(interval_s) = frame
                 .frame_interval_s
@@ -1482,7 +1572,11 @@ pub(crate) fn frame_freshness(baseline: &FreshnessBaseline, frame: &FrameTiming)
             else {
                 return Freshness::Refused(FrameRefusal::UnknownStart("frame_interval_unknown"));
             };
-            (arrival - chrono_secs(exposure_s + interval_s), arrival)
+            let basis = match frame.clock_quality {
+                ClockQuality::Simulator => ClockQuality::Simulator,
+                _ => ClockQuality::HostArrival,
+            };
+            (arrival - chrono_secs(exposure_s + interval_s), arrival, basis)
         }
     };
     if end <= baseline.settled_at {
@@ -1491,7 +1585,7 @@ pub(crate) fn frame_freshness(baseline: &FreshnessBaseline, frame: &FrameTiming)
     if start < baseline.settled_at {
         return Freshness::Skip(FrameSkip::InFlight);
     }
-    Freshness::Fresh { start, end }
+    Freshness::Fresh { start, end, basis }
 }
 
 fn unix_time(seconds: f64) -> Option<DateTime<Utc>> {
@@ -1546,9 +1640,29 @@ struct AcceptedFrame {
     observed: ObservedFrame,
     window_start: DateTime<Utc>,
     window_end: DateTime<Utc>,
+    /// The timing basis the window was derived from (see [`Freshness`]).
+    timing_basis: ClockQuality,
     readback_after: Option<i32>,
+    /// When the after read-back was taken: at or after `window_end`.
+    readback_after_at: DateTime<Utc>,
     focuser: Arc<FocuserSnapshot>,
     kinds: Vec<DeviceKind>,
+}
+
+/// When the focuser read-back in `snapshot` was taken. An absolute
+/// focuser's position is the device's own reading, timed at its request; a
+/// relative focuser's is the session's count, current as of the snapshot's
+/// publication. Never later than the publication.
+fn readback_taken_at(snapshot: &FocuserSnapshot) -> DateTime<Utc> {
+    let read_at = snapshot
+        .state
+        .position
+        .observed_at
+        .filter(|_| snapshot.capabilities.absolute);
+    match read_at {
+        Some(at) => at.min(snapshot.published_at),
+        None => snapshot.published_at,
+    }
 }
 
 /// The verdict on one frame, timing and quiescence together.
@@ -1564,8 +1678,16 @@ enum FrameVerdict {
 
 /// H3 for one frame: [`frame_freshness`], then no motion of any connected
 /// optics, pointing or light-path device inside the exposure window (the
-/// hub's quiescence over its ring buffers and journal), then the focuser's
-/// read-back unchanged since the settle.
+/// hub's quiescence over its ring buffers and journal), then a focuser
+/// read-back taken at or after the window's end that is unchanged since the
+/// settle and not in motion.
+///
+/// The hub's quiescence accepts a window with no focuser sample after its
+/// end while the latest sample is recent, so it cannot see a move that an
+/// outside client (another Alpaca or ASCOM Remote client, a handset) starts
+/// during the exposure. The read-back after must therefore come from a poll
+/// that covers the window: until the worker publishes one, the frame is
+/// undecided and is asked about again.
 fn judge_frame(
     state: &AppState,
     focuser: &FocuserHandle,
@@ -1574,11 +1696,14 @@ fn judge_frame(
     stream: &StreamInfo,
     observed: &ObservedFrame,
 ) -> FrameVerdict {
-    let (start, end) = match frame_freshness(baseline, &frame_timing(observed, stream)) {
-        Freshness::Fresh { start, end } => (start, end),
-        Freshness::Skip(skip) => return FrameVerdict::Skip(format!("{skip:?}")),
-        Freshness::Refused(refusal) => return FrameVerdict::Refuse(refusal),
-    };
+    use crate::equipment::ring::DeviceSnapshot as _;
+
+    let (start, end, timing_basis) =
+        match frame_freshness(baseline, &frame_timing(observed, stream)) {
+            Freshness::Fresh { start, end, basis } => (start, end, basis),
+            Freshness::Skip(skip) => return FrameVerdict::Skip(format!("{skip:?}")),
+            Freshness::Refused(refusal) => return FrameVerdict::Refuse(refusal),
+        };
     let kinds = quiescence_kinds(state);
     match state.equipment.quiescent(&kinds, start, end) {
         Quiescence::Quiescent { .. } => {}
@@ -1591,17 +1716,30 @@ fn judge_frame(
         Quiescence::Unknown { reason } => return FrameVerdict::Undecided(reason),
     }
     let snapshot = focuser.snapshot();
+    let readback_at = readback_taken_at(&snapshot);
+    if readback_at < end {
+        return FrameVerdict::Undecided(format!(
+            "focuser_no_readback_after_end (latest read-back {readback_at}, exposure end {end})"
+        ));
+    }
     if snapshot.logical_position != readback_before {
         return FrameVerdict::Skip(format!(
             "the focuser read back {:?} after the exposure, {readback_before:?} before",
             snapshot.logical_position
         ));
     }
+    if snapshot.in_motion() {
+        return FrameVerdict::Skip(
+            "the focuser was moving at the read-back after the exposure".into(),
+        );
+    }
     FrameVerdict::Accept(Box::new(AcceptedFrame {
         observed: observed.clone(),
         window_start: start,
         window_end: end,
+        timing_basis,
         readback_after: snapshot.logical_position,
+        readback_after_at: readback_at,
         focuser: snapshot,
         kinds,
     }))
@@ -1861,10 +1999,15 @@ async fn record_sample(
             "focuser_settled_event_at": moved.settled_event_at,
             "exposure_window_start": accepted.window_start,
             "exposure_window_end": accepted.window_end,
-            "clock_quality": stream.clock_quality,
+            // The basis the window was derived from; the camera's own
+            // clock quality beside it.
+            "clock_quality": accepted.timing_basis,
+            "stream_clock_quality": stream.clock_quality,
             "frame_counter_baseline": settle.baseline.frame_counter,
             "position_readback_before": settle.readback,
             "position_readback_after": accepted.readback_after,
+            "position_readback_after_at": accepted.readback_after_at,
+            "focuser_snapshot_published_at": accepted.focuser.published_at,
             "position_source": accepted.focuser.position_source,
             "focuser_move_id": moved.move_id,
             "focuser_move_command_id": moved.command_id,
@@ -1921,7 +2064,9 @@ async fn record_sample(
         settled_at: Some(settle.baseline.settled_at),
         exposure_started_at: Some(accepted.window_start),
         capture_id: Some(committed.capture_id.clone()),
-        clock_quality: Some(stream.clock_quality),
+        // What `exposure_started_at` was derived from, not the camera's
+        // nominal quality: a stream frame's start is the arrival bound.
+        clock_quality: Some(accepted.timing_basis),
         moved_during_exposure: Some(false),
         filter_verified: Some(ctx.filter.verified.is_some()),
         // These describe `focus_samples.temperature`, which is the camera's
@@ -2342,16 +2487,33 @@ pub async fn get_drift_prediction(
 
     // Audit the evaluation. A failed write must not fail the request: the
     // operator asked what focus is doing, not to write a row.
-    if let Err(err) = crate::storage::focus_drift_repo::record_event(
-        state.local_store.pool(),
-        None,
-        &prediction,
-        Some(temperature_c),
-    )
-    .await
-    {
-        tracing::warn!("Failed to record focus_drift_event: {err}");
-    }
+    //
+    // `focus_drift_events` is FDF ground truth, and its `temperature` column
+    // has no source or fallback flag beside it. An evaluation at the camera
+    // sensor's temperature (the H6 fallback) is therefore not recorded: a row
+    // would be indistinguishable from one at an ambient reading. It is still
+    // published, flagged, in the body.
+    let event_recorded = if reading.camera_sensor_fallback {
+        tracing::debug!(
+            "focus_drift_event not recorded: evaluated at the camera-sensor fallback temperature"
+        );
+        false
+    } else {
+        match crate::storage::focus_drift_repo::record_event(
+            state.local_store.pool(),
+            None,
+            &prediction,
+            Some(temperature_c),
+        )
+        .await
+        {
+            Ok(_) => true,
+            Err(err) => {
+                tracing::warn!("Failed to record focus_drift_event: {err}");
+                false
+            }
+        }
+    };
 
     let (k, k_sigma) = coefficient;
     let mut body = serde_json::json!({
@@ -2374,6 +2536,7 @@ pub async fn get_drift_prediction(
         "temperature_source": temperature_source,
         "temperature_age_ms": reading.age_ms,
         "camera_sensor_fallback": reading.camera_sensor_fallback,
+        "event_recorded": event_recorded,
 
         // ── Decision. Null when no refocus threshold is known. ─────────────
         "exceed_probability": prediction.exceed_probability,
@@ -3828,6 +3991,7 @@ mod tests {
             Freshness::Fresh {
                 start: t(10_500),
                 end: t(12_500),
+                basis: ClockQuality::HostArrival,
             }
         );
         // Exactly at the settle is after it.
@@ -3877,8 +4041,44 @@ mod tests {
             Freshness::Fresh {
                 start: t(10_100),
                 end: t(11_100),
+                basis: ClockQuality::DriverExposureStart,
             }
         );
+    }
+
+    #[test]
+    fn a06_records_the_timing_basis_it_used_not_the_cameras_nominal_quality() {
+        // A camera whose driver could time its exposures (asi, alpaca, ...)
+        // delivering a stream frame without a driver start: the window is
+        // the arrival bound, and that is what the sample records.
+        let mut stream = stream_frame(43, 12_500);
+        stream.clock_quality = ClockQuality::DriverExposureStart;
+        assert_eq!(
+            frame_freshness(&settled(), &stream),
+            Freshness::Fresh {
+                start: t(10_500),
+                end: t(12_500),
+                basis: ClockQuality::HostArrival,
+            }
+        );
+        // A trigger-bracketed camera's stream frame is the arrival bound too.
+        stream.clock_quality = ClockQuality::HostTriggerBracket;
+        assert!(matches!(
+            frame_freshness(&settled(), &stream),
+            Freshness::Fresh {
+                basis: ClockQuality::HostArrival,
+                ..
+            }
+        ));
+        // Simulator frames stay marked as such.
+        stream.clock_quality = ClockQuality::Simulator;
+        assert!(matches!(
+            frame_freshness(&settled(), &stream),
+            Freshness::Fresh {
+                basis: ClockQuality::Simulator,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -3943,6 +4143,9 @@ mod tests {
         started_unix: f64,
         interval_s: f64,
         best: i32,
+        /// Triple the HFR of frames taken off the 100-step sweep grid (the
+        /// fitted optimum's verification frame), so H4 fails.
+        degrade_off_grid: bool,
     }
 
     fn v_curve_hfr(position: i32, best: i32) -> f64 {
@@ -3958,6 +4161,7 @@ mod tests {
                 started_unix: Utc::now().timestamp_micros() as f64 / 1e6,
                 interval_s: 0.03,
                 best,
+                degrade_off_grid: false,
             }
         }
     }
@@ -3975,7 +4179,11 @@ mod tests {
                 frame.frame_counter = k + 1;
                 frame.unix_timestamp = arrival;
             }
-            observed.observation.hfr_px = Some(v_curve_hfr(position, self.best) as f32);
+            let mut hfr = v_curve_hfr(position, self.best);
+            if self.degrade_off_grid && position % 100 != 0 {
+                hfr *= 3.0;
+            }
+            observed.observation.hfr_px = Some(hfr as f32);
             observed.observation.star_count = 30;
             observed.observation.timestamp = Utc::now();
             Some(observed)
@@ -4237,20 +4445,17 @@ mod tests {
             FrameVerdict::Skip(reason) => assert!(reason.contains("moved"), "{reason}"),
             _ => panic!("a frame with focuser motion in its window must be skipped"),
         }
-        // A later frame, after the event, is accepted.
+        // A later frame, after the event, is accepted once a poll covers it.
         tokio::time::sleep(Duration::from_millis(400)).await;
         observed.capture_unix_time = at(Utc::now());
         observed.frame_counter += 1;
-        match judge_frame(
-            &fx.state,
-            &focuser,
-            &baseline,
-            Some(500),
-            &stream,
-            &observed,
-        ) {
+        let end = unix_time(observed.capture_unix_time).unwrap();
+        match judge_until_decided(&fx.state, &focuser, &baseline, Some(500), &stream, &observed)
+            .await
+        {
             FrameVerdict::Accept(accepted) => {
                 assert_eq!(accepted.readback_after, Some(500));
+                assert!(accepted.readback_after_at >= end);
                 assert!(accepted.kinds.contains(&DeviceKind::Focuser));
             }
             FrameVerdict::Skip(reason) | FrameVerdict::Undecided(reason) => {
@@ -4270,6 +4475,132 @@ mod tests {
             FrameVerdict::Skip(reason) => assert!(reason.contains("read back"), "{reason}"),
             _ => panic!("a changed read-back must be skipped"),
         }
+    }
+
+    /// Judge a frame until the verdict is no longer undecided (5 s at most).
+    async fn judge_until_decided(
+        state: &AppState,
+        focuser: &FocuserHandle,
+        baseline: &FreshnessBaseline,
+        readback_before: Option<i32>,
+        stream: &StreamInfo,
+        observed: &ObservedFrame,
+    ) -> FrameVerdict {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let verdict = judge_frame(state, focuser, baseline, readback_before, stream, observed);
+            if !matches!(verdict, FrameVerdict::Undecided(_)) || Instant::now() >= deadline {
+                return verdict;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// H3: with the default 2 s idle cadence a sub-second exposure usually
+    /// ends between two focuser polls. The latest read-back then predates the
+    /// exposure, so the frame is not accepted until a poll taken after the
+    /// window's end confirms the position (the hub's quiescence alone would
+    /// accept it on a fresh pre-window sample).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_frame_waits_for_a_focuser_poll_after_its_exposure() {
+        let fx = fixture(crate::hardware::focuser::SimFocuser::new(500), false).await;
+        let focuser = crate::api::equipment::focuser_handle(&fx.state).unwrap();
+        // The worker's first idle poll.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while focuser.snapshot().logical_position.is_none() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let first = focuser.snapshot();
+        assert_eq!(first.logical_position, Some(500));
+        let stream = StreamInfo {
+            exposure_s: 0.1,
+            frame_interval_s: 0.1,
+            camera_name: None,
+            driver_id: Some("sim".into()),
+            clock_quality: ClockQuality::Simulator,
+        };
+        // A 0.2 s window ending 1 s from now: no poll can have covered it
+        // yet, and the next idle poll is up to 2 s away.
+        let end = Utc::now() + chrono::Duration::seconds(1);
+        let baseline = FreshnessBaseline {
+            settled_at: end - chrono::Duration::seconds(1),
+            frame_counter: None,
+            generation: 1,
+        };
+        let mut observed = simulator_observation();
+        observed.capture_unix_time = end.timestamp_micros() as f64 / 1e6;
+        // The hub alone calls the window quiescent on the pre-window sample.
+        let start = end - chrono::Duration::milliseconds(200);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(
+            fx.state
+                .equipment
+                .quiescent(&[DeviceKind::Focuser], start, end),
+            Quiescence::Quiescent { .. }
+        ) && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(Utc::now() < end, "the test machine is too slow for this window");
+        match judge_frame(
+            &fx.state,
+            &focuser,
+            &baseline,
+            Some(500),
+            &stream,
+            &observed,
+        ) {
+            FrameVerdict::Undecided(reason) => {
+                assert!(reason.contains("focuser_no_readback_after_end"), "{reason}")
+            }
+            FrameVerdict::Accept(accepted) => panic!(
+                "accepted on a read-back taken at {} for an exposure ending {end}",
+                accepted.readback_after_at
+            ),
+            FrameVerdict::Skip(reason) => panic!("skipped: {reason}"),
+            FrameVerdict::Refuse(refusal) => panic!("refused: {refusal}"),
+        }
+        // The next idle poll after the window's end decides it.
+        match judge_until_decided(&fx.state, &focuser, &baseline, Some(500), &stream, &observed)
+            .await
+        {
+            FrameVerdict::Accept(accepted) => {
+                assert!(accepted.readback_after_at >= end);
+                assert!(accepted.focuser.published_at >= end);
+                assert_eq!(accepted.readback_after, Some(500));
+            }
+            FrameVerdict::Undecided(reason) | FrameVerdict::Skip(reason) => {
+                panic!("a poll after the exposure must decide it: {reason}")
+            }
+            FrameVerdict::Refuse(refusal) => panic!("refused: {refusal}"),
+        }
+    }
+
+    #[test]
+    fn a_configured_af_filter_that_is_not_in_place_is_reported() {
+        let unverified = RunFilter {
+            name: Some("L".into()),
+            verified: None,
+            missing_reason: "filter_unverified",
+        };
+        let verified = |name: &str| RunFilter {
+            name: Some(name.into()),
+            verified: Some(VerifiedFilter {
+                name: name.into(),
+                offset_steps: None,
+            }),
+            missing_reason: "",
+        };
+        // Nothing configured: nothing to say.
+        assert_eq!(af_filter_warning("  ", &verified("Ha"), true), None);
+        // Already in place (matched like the wheel matches names).
+        assert_eq!(af_filter_warning(" l ", &verified("L"), true), None);
+        let other = af_filter_warning("L", &verified("Ha"), true).unwrap();
+        assert!(other.contains("not applied") && other.contains("\"Ha\""), "{other}");
+        let unknown = af_filter_warning("L", &unverified, true).unwrap();
+        assert!(unknown.contains("not verified"), "{unknown}");
+        let no_wheel = af_filter_warning("L", &unverified, false).unwrap();
+        assert!(no_wheel.contains("no filter wheel"), "{no_wheel}");
     }
 
     // -----------------------------------------------------------------------
@@ -4387,7 +4718,17 @@ mod tests {
         assert!(fop["values"][12].is_null());
         assert!(fop["values"][16].is_null());
         assert_eq!(quality["a06"]["clock_quality"], "simulator");
+        assert_eq!(quality["a06"]["stream_clock_quality"], "simulator");
         assert!(quality["a06"]["focuser_move_id"].is_string());
+        // H3: the read-back after comes from a poll at or after the window.
+        let a06_time = |key: &str| {
+            quality["a06"][key]
+                .as_str()
+                .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
+                .unwrap_or_else(|| panic!("a06.{key}: {}", quality["a06"][key]))
+        };
+        assert!(a06_time("position_readback_after_at") >= a06_time("exposure_window_end"));
+        assert!(a06_time("focuser_snapshot_published_at") >= a06_time("exposure_window_end"));
 
         // H4: the verified action with its verification frame.
         let action = sqlx::query(
@@ -4449,6 +4790,72 @@ mod tests {
             std::fs::read(&drift_path).unwrap(),
             b"{\"sentinel\": true}".to_vec()
         );
+    }
+
+    /// H4: a run that converges but whose verification frame does not
+    /// confirm focus returns the converged result with `verified: false`, and
+    /// its audit outcome and `operation_ended` say failed
+    /// (`focus_not_verified`), in agreement with its `autofocus_failed`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unverified_run_is_recorded_as_failed_not_succeeded() {
+        let mut fx = fixture(crate::hardware::focuser::SimFocuser::new(1_000), true).await;
+        fx.config.initial_step_size = 100;
+        fx.config.samples_per_position = 1;
+        fx.config.sweep_radius_points = 3;
+        let mut camera = ScriptedCamera::new(fx.sim.clone(), 1_050);
+        camera.degrade_off_grid = true;
+        let response = run_autofocus_session(
+            &fx.state,
+            fx.config.clone(),
+            None,
+            Arc::new(camera),
+            GuidingDuringAutofocus::Keep,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{}: {}", err.code, err.message));
+        assert_eq!(response.state, "Converged");
+        let best = response.best_position.unwrap();
+        assert_ne!(best % 100, 0, "the fitted optimum {best} must be off the grid");
+        assert_eq!(response.verified, Some(false));
+        assert!(
+            response
+                .warnings
+                .iter()
+                .any(|w| w.starts_with("focus not verified")),
+            "{:?}",
+            response.warnings
+        );
+
+        let events = fx.state.equipment.events_since(0, &[], 500);
+        assert!(events
+            .iter()
+            .any(|e| matches!(&e.event, EventKind::AutofocusFailed { .. })));
+        let ended = events
+            .iter()
+            .find_map(|e| match &e.event {
+                EventKind::OperationEnded {
+                    op: OpKind::Autofocus,
+                    outcome,
+                    ..
+                } => Some(outcome.clone()),
+                _ => None,
+            })
+            .expect("operation_ended");
+        match ended {
+            OpOutcome::Failed(err) => {
+                assert!(err.to_string().contains("focus_not_verified"), "{err}")
+            }
+            other => panic!("an unverified run ended {}", other.label()),
+        }
+        assert!(!events.iter().any(|e| matches!(
+            &e.event,
+            EventKind::OperationEnded {
+                op: OpKind::Autofocus,
+                outcome: OpOutcome::Succeeded,
+                ..
+            }
+        )));
+        assert!(fx.state.equipment.gate().is_idle());
     }
 
     // -----------------------------------------------------------------------
