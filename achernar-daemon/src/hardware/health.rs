@@ -16,13 +16,39 @@ use crate::state::{AppState, CameraRuntimeState};
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeviceKind {
     Camera,
     Mount,
     Focuser,
     FilterWheel,
+    // Equipment-layer kinds (spec §2.4). Their handles live in the equipment
+    // hub; the passive probe loop below never probes them.
+    Guider,
+    Rotator,
+    CoverCalibrator,
+    Switch,
+    Weather,
+    SafetyMonitor,
+    Dome,
+}
+
+impl DeviceKind {
+    /// Every kind, in registry (and `device_health` key) order.
+    pub const ALL: [DeviceKind; 11] = [
+        DeviceKind::Camera,
+        DeviceKind::Mount,
+        DeviceKind::Focuser,
+        DeviceKind::FilterWheel,
+        DeviceKind::Guider,
+        DeviceKind::Rotator,
+        DeviceKind::CoverCalibrator,
+        DeviceKind::Switch,
+        DeviceKind::Weather,
+        DeviceKind::SafetyMonitor,
+        DeviceKind::Dome,
+    ];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,17 +82,13 @@ impl Default for DeviceHealth {
 pub struct DeviceRegistry(pub BTreeMap<DeviceKind, DeviceHealth>);
 
 impl Default for DeviceRegistry {
+    /// Every kind starts disconnected and unprobed (`probe_supported: None`).
     fn default() -> Self {
         Self(
-            [
-                DeviceKind::Camera,
-                DeviceKind::Mount,
-                DeviceKind::Focuser,
-                DeviceKind::FilterWheel,
-            ]
-            .into_iter()
-            .map(|kind| (kind, DeviceHealth::default()))
-            .collect(),
+            DeviceKind::ALL
+                .into_iter()
+                .map(|kind| (kind, DeviceHealth::default()))
+                .collect(),
         )
     }
 }
@@ -421,6 +443,15 @@ fn probe_device(state: &AppState, kind: DeviceKind, id: &str) {
                 .map(|snapshot| (true, Some(snapshot)))
                 .map_err(|e| e.to_string())
         }
+        // Equipment-layer kinds are never probed here: their workers are the
+        // probe (spec §2.8), so the registry entry stays unprobed.
+        DeviceKind::Guider
+        | DeviceKind::Rotator
+        | DeviceKind::CoverCalibrator
+        | DeviceKind::Switch
+        | DeviceKind::Weather
+        | DeviceKind::SafetyMonitor
+        | DeviceKind::Dome => return,
     };
     match result {
         Ok((supported, snapshot)) => {
@@ -440,6 +471,13 @@ fn probe_device(state: &AppState, kind: DeviceKind, id: &str) {
             DeviceKind::Mount | DeviceKind::Focuser | DeviceKind::FilterWheel => {
                 retire_auxiliary(state, kind)
             }
+            DeviceKind::Guider
+            | DeviceKind::Rotator
+            | DeviceKind::CoverCalibrator
+            | DeviceKind::Switch
+            | DeviceKind::Weather
+            | DeviceKind::SafetyMonitor
+            | DeviceKind::Dome => {}
         }
     }
 }
@@ -485,6 +523,14 @@ pub(crate) fn retire_auxiliary(state: &AppState, kind: DeviceKind) {
             drop(retired);
         }
         DeviceKind::Camera => {}
+        // Equipment-layer handles live in the hub, which retires them itself.
+        DeviceKind::Guider
+        | DeviceKind::Rotator
+        | DeviceKind::CoverCalibrator
+        | DeviceKind::Switch
+        | DeviceKind::Weather
+        | DeviceKind::SafetyMonitor
+        | DeviceKind::Dome => {}
     }
 }
 
@@ -531,6 +577,64 @@ mod tests {
             assert!(!devices.checked(kind, "old", true, None));
             assert_eq!(devices.snapshot(kind).unwrap()["name"], "new");
         }
+    }
+
+    #[test]
+    fn device_kind_serde_names_are_the_contract_names() {
+        assert_eq!(
+            serde_json::to_value(DeviceKind::ALL).unwrap(),
+            json!([
+                "camera",
+                "mount",
+                "focuser",
+                "filter_wheel",
+                "guider",
+                "rotator",
+                "cover_calibrator",
+                "switch",
+                "weather",
+                "safety_monitor",
+                "dome",
+            ])
+        );
+        for kind in DeviceKind::ALL {
+            let text = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serde_json::from_str::<DeviceKind>(&text).unwrap(), kind);
+        }
+    }
+
+    #[test]
+    fn new_kinds_start_disconnected_unprobed_and_keep_the_connection_guard() {
+        let devices = DeviceRegistry::default();
+        assert_eq!(devices.0.len(), DeviceKind::ALL.len());
+        let json = serde_json::to_value(&devices.0).unwrap();
+        for kind in [
+            DeviceKind::Guider,
+            DeviceKind::Rotator,
+            DeviceKind::CoverCalibrator,
+            DeviceKind::Switch,
+            DeviceKind::Weather,
+            DeviceKind::SafetyMonitor,
+            DeviceKind::Dome,
+        ] {
+            let health = &devices.0[&kind];
+            assert!(!health.connected);
+            assert_eq!(health.status, "disconnected");
+            assert_eq!(health.probe_supported, None);
+            let key = serde_json::to_value(kind).unwrap();
+            assert_eq!(json[key.as_str().unwrap()]["status"], "disconnected");
+
+            let mut devices = DeviceRegistry::default();
+            devices.connected(kind, "old".into(), None);
+            assert!(devices.disconnected(kind, Some("old"), None));
+            assert!(!devices.checked(kind, "old", true, Some(json!({"name":"stale"}))));
+            devices.connected(kind, "new".into(), Some(json!({"name":"new"})));
+            assert!(!devices.disconnected(kind, Some("old"), None));
+            assert_eq!(devices.snapshot(kind).unwrap()["name"], "new");
+        }
+        // The existing keys keep their order and shape.
+        let keys: Vec<&String> = json.as_object().unwrap().keys().collect();
+        assert!(keys.contains(&&"filter_wheel".to_string()));
     }
 
     #[test]

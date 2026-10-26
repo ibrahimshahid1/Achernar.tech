@@ -18,6 +18,8 @@ dependencies = [
  "ndarray 0.15.6",
  "ort",
  "parking_lot",
+ "percent-encoding",
+ "rand",
  "rusb",
  "serde",
  "serde_json",

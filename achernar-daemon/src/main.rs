@@ -15,6 +15,7 @@ mod api;
 mod cloud_client;
 mod config;
 mod control;
+mod equipment;
 mod error;
 mod filter_wheel;
 mod fits;

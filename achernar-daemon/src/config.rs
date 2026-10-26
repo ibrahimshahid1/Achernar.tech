@@ -1,6 +1,8 @@
 //! Configuration parsing for achernar.toml.
 //! Implements all config sections including [focus], [focus.safety],
-//! [focus.backlash], [focus.models], [mount], [filter_wheel].
+//! [focus.backlash], [focus.models], [mount], [filter_wheel], and the
+//! equipment-layer sections [equipment], [site], [focuser], [guider],
+//! [safety] and [weather] (equipment spec §2.11).
 
 use serde::Deserialize;
 
@@ -23,6 +25,18 @@ pub struct AchernarConfig {
     pub storage: StorageConfig,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub equipment: EquipmentConfig,
+    #[serde(default)]
+    pub site: SiteConfig,
+    #[serde(default)]
+    pub focuser: FocuserConfig,
+    #[serde(default)]
+    pub guider: GuiderConfig,
+    #[serde(default)]
+    pub safety: SafetyConfig,
+    #[serde(default)]
+    pub weather: WeatherConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -576,6 +590,43 @@ pub struct MountConfig {
     pub guide_rate: f64,
     #[serde(default)]
     pub max_slew_rate: f64,
+    // Equipment layer (spec §2.11). `guide_rate` above is now a fallback,
+    // used only when the mount reports no guide rate (source `Profile`).
+    /// Settle after a slew, in addition to the driver's own SlewSettleTime.
+    #[serde(default = "default_mount_settle_s")]
+    pub settle_s: f64,
+    #[serde(default = "default_slew_timeout_s")]
+    pub slew_timeout_s: u64,
+    #[serde(default = "default_arrival_tolerance_arcmin")]
+    pub arrival_tolerance_arcmin: f64,
+    /// `mount` syncs the mount; `offset` keeps a solved pointing offset
+    /// (NINA "NoSync"), recommended while M-4 data is collected.
+    #[serde(default)]
+    pub sync_mode: crate::equipment::types::MountSyncMode,
+    /// Write UTC at connect, only when |delta| >= `time_tolerance_s`. Off by
+    /// default: connect writes nothing to a mount (D16).
+    #[serde(default)]
+    pub time_sync: bool,
+    #[serde(default = "default_time_tolerance_s")]
+    pub time_tolerance_s: f64,
+    #[serde(default)]
+    pub equatorial_system_override: EquatorialSystemOverride,
+    /// How Topocentric/EOD is interpreted; recorded with every sample.
+    #[serde(default)]
+    pub jnow_flavour: crate::equipment::types::JNowFlavour,
+    #[serde(default = "default_max_pulse_ms")]
+    pub max_pulse_ms: u32,
+    #[serde(default)]
+    pub guide_dec_reverse_on_pier_west: bool,
+    #[serde(default = "default_jog_deadman_ms")]
+    pub jog_deadman_ms: u64,
+    /// Tier 2 fallback park for mounts without CanPark.
+    #[serde(default)]
+    pub fallback_park: FallbackPark,
+    #[serde(default)]
+    pub center: MountCenterConfig,
+    #[serde(default)]
+    pub flip: MountFlipConfig,
 }
 
 impl Default for MountConfig {
@@ -584,6 +635,20 @@ impl Default for MountConfig {
             safety: MountSafetyConfig::default(),
             guide_rate: 0.5,
             max_slew_rate: 8.0,
+            settle_s: default_mount_settle_s(),
+            slew_timeout_s: default_slew_timeout_s(),
+            arrival_tolerance_arcmin: default_arrival_tolerance_arcmin(),
+            sync_mode: crate::equipment::types::MountSyncMode::default(),
+            time_sync: false,
+            time_tolerance_s: default_time_tolerance_s(),
+            equatorial_system_override: EquatorialSystemOverride::default(),
+            jnow_flavour: crate::equipment::types::JNowFlavour::default(),
+            max_pulse_ms: default_max_pulse_ms(),
+            guide_dec_reverse_on_pier_west: false,
+            jog_deadman_ms: default_jog_deadman_ms(),
+            fallback_park: FallbackPark::default(),
+            center: MountCenterConfig::default(),
+            flip: MountFlipConfig::default(),
         }
     }
 }
@@ -599,6 +664,12 @@ pub struct MountSafetyConfig {
     pub horizon_model_path: Option<String>,
     #[serde(default)]
     pub park_on_safety_violation: bool,
+    /// CSV of `az_deg,alt_deg`; empty = no horizon profile. Replaces
+    /// `horizon_model_path`, which is ignored with a warning.
+    #[serde(default)]
+    pub horizon_profile_path: String,
+    #[serde(default = "default_limit_hysteresis_deg")]
+    pub limit_hysteresis_deg: f64,
 }
 
 impl Default for MountSafetyConfig {
@@ -608,17 +679,663 @@ impl Default for MountSafetyConfig {
             max_hour_angle: default_max_ha(),
             horizon_model_path: None,
             park_on_safety_violation: true,
+            horizon_profile_path: String::new(),
+            limit_hysteresis_deg: default_limit_hysteresis_deg(),
         }
     }
 }
 
+#[allow(dead_code)] // read by equipment/mount/limits.rs (WP1A-4)
+impl MountSafetyConfig {
+    pub fn horizon_profile(&self) -> Option<&str> {
+        Some(self.horizon_profile_path.trim()).filter(|path| !path.is_empty())
+    }
+}
+
 /// Filter wheel configuration — Section 8.2.
-#[derive(Debug, Clone, Deserialize, Default)]
+///
+/// `filter_names` and `focus_offsets` are SEEDS only (equipment spec D17):
+/// they are never applied to a wheel automatically. The operator imports
+/// them into the connected wheel's identity profile explicitly.
+#[derive(Debug, Clone, Deserialize)]
 pub struct FilterWheelConfig {
     #[serde(default)]
     pub filter_names: Vec<String>,
     #[serde(default)]
     pub focus_offsets: Vec<i32>,
+    /// Settle after a verified slot change; the profile value wins.
+    #[serde(default = "default_filter_settle_ms")]
+    pub settle_ms: u64,
+    #[serde(default = "default_max_switch_timeout_ms")]
+    pub max_switch_timeout_ms: u64,
+    #[serde(default)]
+    pub min_switch_interval_s: f64,
+    /// Applies profile offsets only; never the TOML seeds.
+    #[serde(default = "default_true")]
+    pub use_focus_offsets: bool,
+    #[serde(default = "default_true")]
+    pub pause_guiding_on_offset: bool,
+    #[serde(default)]
+    pub parallel_offset_move: bool,
+    /// Filter to switch to for autofocus; empty = none.
+    #[serde(default)]
+    pub af_filter: String,
+}
+
+impl Default for FilterWheelConfig {
+    fn default() -> Self {
+        Self {
+            filter_names: Vec::new(),
+            focus_offsets: Vec::new(),
+            settle_ms: default_filter_settle_ms(),
+            max_switch_timeout_ms: default_max_switch_timeout_ms(),
+            min_switch_interval_s: 0.0,
+            use_focus_offsets: true,
+            pause_guiding_on_offset: true,
+            parallel_offset_move: false,
+            af_filter: String::new(),
+        }
+    }
+}
+
+// ─── Equipment layer (equipment spec §2.11) ─────────────────────────────────
+//
+// Unknown keys are ignored and every default is safe: nothing auto-connects,
+// nothing is broadcast, connect writes nothing to a mount, and policy
+// actuation stays off. Rig-specific values (backlash, offsets, settle times,
+// filter metadata, focuser origin) live in the identity profile, never here
+// (D17). These sections are read by the equipment layer, which later work
+// packages wire in; until then nothing outside tests reads them.
+
+/// `[equipment]`: behaviour shared by every device.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct EquipmentConfig {
+    /// A device with no good poll for this long is `Lost`.
+    #[serde(default = "default_lost_after_s")]
+    pub lost_after_s: u64,
+    /// Consecutive failed polls before a device is `Lost`.
+    #[serde(default = "default_lost_after_failures")]
+    pub lost_after_failures: u32,
+    /// Platform 7 `connecting` wait; generous for slow ESP32 Wi-Fi.
+    #[serde(default = "default_connect_timeout_s")]
+    pub connect_timeout_s: u64,
+    /// Gates `"auto"`/empty Alpaca options and UDP discovery (D13).
+    #[serde(default)]
+    pub allow_broadcast_discovery: bool,
+    #[serde(default = "default_alpaca_discovery_port")]
+    pub alpaca_discovery_port: u16,
+    /// 0 = generate once (random 1..65535) and persist in the data directory.
+    #[serde(default)]
+    pub alpaca_client_id: u32,
+    /// INDI `CONNECTION` is device-wide: switching it off could cut off PHD2
+    /// or KStars, so Achernar leaves it on unless this is set (D16).
+    #[serde(default)]
+    pub indi_disconnect_device: bool,
+    #[serde(default = "default_true")]
+    pub estop_stops_tracking: bool,
+    /// Downsampled device series for TME/replay; 0 disables.
+    #[serde(default = "default_telemetry_log_hz")]
+    pub telemetry_log_hz: f64,
+    #[serde(default = "default_ring_buffer_minutes")]
+    pub ring_buffer_minutes: u64,
+}
+
+impl Default for EquipmentConfig {
+    fn default() -> Self {
+        Self {
+            lost_after_s: default_lost_after_s(),
+            lost_after_failures: default_lost_after_failures(),
+            connect_timeout_s: default_connect_timeout_s(),
+            allow_broadcast_discovery: false,
+            alpaca_discovery_port: default_alpaca_discovery_port(),
+            alpaca_client_id: 0,
+            indi_disconnect_device: false,
+            estop_stops_tracking: true,
+            telemetry_log_hz: default_telemetry_log_hz(),
+            ring_buffer_minutes: default_ring_buffer_minutes(),
+        }
+    }
+}
+
+/// `[site] sync`: what connect does when the mount's site differs (M-b).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SiteSyncMode {
+    /// Emit `site_mismatch` and change nothing.
+    #[default]
+    VerifyOnly,
+    /// Write the mount (only while it is not slewing), then verify.
+    ToMount,
+    /// Adopt the mount's site for the session.
+    FromMount,
+    None,
+}
+
+/// `[site]`. Omitted coordinates mean "site unknown": geometry features then
+/// report so, rather than assume a location.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SiteConfig {
+    #[serde(default)]
+    pub latitude_deg: Option<f64>,
+    /// East positive.
+    #[serde(default)]
+    pub longitude_deg: Option<f64>,
+    #[serde(default)]
+    pub elevation_m: Option<f64>,
+    #[serde(default)]
+    pub sync: SiteSyncMode,
+    #[serde(default = "default_site_tolerance_deg")]
+    pub tolerance_deg: f64,
+    #[serde(default = "default_elevation_tolerance_m")]
+    pub elevation_tolerance_m: f64,
+}
+
+impl Default for SiteConfig {
+    fn default() -> Self {
+        Self {
+            latitude_deg: None,
+            longitude_deg: None,
+            elevation_m: None,
+            sync: SiteSyncMode::default(),
+            tolerance_deg: default_site_tolerance_deg(),
+            elevation_tolerance_m: default_elevation_tolerance_m(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl SiteConfig {
+    /// The configured site. `Ok(None)` when no coordinate is set; an error
+    /// when only some are set or a value is out of range, so a half-typed
+    /// site is surfaced rather than completed with invented numbers.
+    pub fn site(&self) -> Result<Option<crate::equipment::types::Site>, String> {
+        match (self.latitude_deg, self.longitude_deg, self.elevation_m) {
+            (None, None, None) => Ok(None),
+            (Some(lat_deg), Some(lon_deg), Some(elev_m)) => {
+                let site = crate::equipment::types::Site {
+                    lat_deg,
+                    lon_deg,
+                    elev_m,
+                    source: crate::equipment::types::SiteSource::Config,
+                };
+                site.validate().map(|()| Some(site))
+            }
+            _ => Err("[site] needs latitude_deg, longitude_deg and elevation_m together".into()),
+        }
+    }
+}
+
+/// `[mount] equatorial_system_override`: overrides the frame the mount
+/// reports (M-a). Empty means no override.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub enum EquatorialSystemOverride {
+    #[default]
+    #[serde(rename = "")]
+    None,
+    #[serde(rename = "j2000")]
+    J2000,
+    #[serde(rename = "jnow_mean")]
+    JNowMean,
+    #[serde(rename = "jnow_apparent")]
+    JNowApparent,
+}
+
+#[allow(dead_code)]
+impl EquatorialSystemOverride {
+    pub fn frame(self) -> Option<crate::equipment::types::EqFrame> {
+        use crate::equipment::types::EqFrame;
+        match self {
+            EquatorialSystemOverride::None => None,
+            EquatorialSystemOverride::J2000 => Some(EqFrame::J2000),
+            EquatorialSystemOverride::JNowMean => Some(EqFrame::JNowMean),
+            EquatorialSystemOverride::JNowApparent => Some(EqFrame::JNowApparent),
+        }
+    }
+}
+
+/// `[mount] fallback_park` (Tier 2).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FallbackPark {
+    #[default]
+    None,
+    Pole,
+}
+
+/// `[mount.center]`: the slew-solve-correct loop (M-n, Tier 1).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MountCenterConfig {
+    #[serde(default = "default_center_tolerance_arcmin")]
+    pub tolerance_arcmin: f64,
+    #[serde(default = "default_center_max_attempts")]
+    pub max_attempts: u32,
+}
+
+impl Default for MountCenterConfig {
+    fn default() -> Self {
+        Self {
+            tolerance_arcmin: default_center_tolerance_arcmin(),
+            max_attempts: default_center_max_attempts(),
+        }
+    }
+}
+
+/// `[mount.flip]` (Tier 2). Inert unless the mount `can_flip` (D14).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct MountFlipConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_flip_minutes_after")]
+    pub minutes_after_meridian: f64,
+    #[serde(default = "default_flip_max_minutes_after")]
+    pub max_minutes_after_meridian: f64,
+    #[serde(default = "default_flip_settle_s")]
+    pub settle_s: f64,
+    #[serde(default = "default_true")]
+    pub recenter: bool,
+    #[serde(default)]
+    pub autofocus_after: bool,
+}
+
+impl Default for MountFlipConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            minutes_after_meridian: default_flip_minutes_after(),
+            max_minutes_after_meridian: default_flip_max_minutes_after(),
+            settle_s: default_flip_settle_s(),
+            recenter: true,
+            autofocus_after: false,
+        }
+    }
+}
+
+/// `[focuser] tempcomp_during_moves` (F-d).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TempCompDuringMoves {
+    /// Turn TempComp off for the move and restore it afterwards.
+    #[default]
+    Off,
+    Leave,
+}
+
+/// `[focuser]`: device behaviour only. Backlash stays in `[focus.backlash]`
+/// plus the identity profile.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct FocuserConfig {
+    #[serde(default = "default_stuck_timeout_s")]
+    pub stuck_timeout_s: u64,
+    #[serde(default = "default_max_reissue")]
+    pub max_reissue: u32,
+    #[serde(default)]
+    pub tempcomp_during_moves: TempCompDuringMoves,
+    /// A per-identity profile value wins.
+    #[serde(default)]
+    pub temperature_role: crate::equipment::types::TemperatureRole,
+    /// Optional Alpaca Action name reporting homed|restored|unknown (F-i).
+    #[serde(default)]
+    pub position_source_action: String,
+}
+
+impl Default for FocuserConfig {
+    fn default() -> Self {
+        Self {
+            stuck_timeout_s: default_stuck_timeout_s(),
+            max_reissue: default_max_reissue(),
+            tempcomp_during_moves: TempCompDuringMoves::default(),
+            temperature_role: crate::equipment::types::TemperatureRole::default(),
+            position_source_action: String::new(),
+        }
+    }
+}
+
+/// `[guider] guiding_during_autofocus` (G-m).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuidingDuringAutofocus {
+    #[default]
+    Keep,
+    Pause,
+    Stop,
+}
+
+/// `[guider]`: the PHD2 client (§3.5).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct GuiderConfig {
+    /// Never call PHD2 `set_connected` unless asked.
+    #[serde(default)]
+    pub connect_equipment: bool,
+    #[serde(default = "default_rpc_timeout_s")]
+    pub rpc_timeout_s: u64,
+    #[serde(default = "default_settle_pixels")]
+    pub settle_pixels: f64,
+    #[serde(default = "default_settle_time_s")]
+    pub settle_time_s: f64,
+    #[serde(default = "default_settle_timeout_s")]
+    pub settle_timeout_s: f64,
+    /// Guide-camera pixels.
+    #[serde(default = "default_dither_amount_px")]
+    pub dither_amount_px: f64,
+    #[serde(default)]
+    pub dither_ra_only: bool,
+    /// Empty = discover via `get_algo_param_names` (G-j).
+    #[serde(default)]
+    pub aggressiveness_param_ra: String,
+    #[serde(default)]
+    pub aggressiveness_param_dec: String,
+    #[serde(default = "default_algo_param_min")]
+    pub algo_param_min: f64,
+    #[serde(default = "default_algo_param_max")]
+    pub algo_param_max: f64,
+    /// M-1 `set_algo_param` by a policy (Tier 2). Off by default (D18).
+    #[serde(default)]
+    pub allow_policy_actuation: bool,
+    #[serde(default)]
+    pub guiding_during_autofocus: GuidingDuringAutofocus,
+}
+
+impl Default for GuiderConfig {
+    fn default() -> Self {
+        Self {
+            connect_equipment: false,
+            rpc_timeout_s: default_rpc_timeout_s(),
+            settle_pixels: default_settle_pixels(),
+            settle_time_s: default_settle_time_s(),
+            settle_timeout_s: default_settle_timeout_s(),
+            dither_amount_px: default_dither_amount_px(),
+            dither_ra_only: false,
+            aggressiveness_param_ra: String::new(),
+            aggressiveness_param_dec: String::new(),
+            algo_param_min: default_algo_param_min(),
+            algo_param_max: default_algo_param_max(),
+            allow_policy_actuation: false,
+            guiding_during_autofocus: GuidingDuringAutofocus::default(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl GuiderConfig {
+    /// The configured PHD2 settle parameters.
+    pub fn settle(&self) -> crate::equipment::commands::Settle {
+        crate::equipment::commands::Settle {
+            pixels: self.settle_pixels,
+            time_s: self.settle_time_s,
+            timeout_s: self.settle_timeout_s,
+        }
+    }
+}
+
+/// `[safety] on_unsafe` (§3.10).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnUnsafe {
+    /// Park if `[mount.safety] park_on_safety_violation`, else stop tracking.
+    #[default]
+    FromMountConfig,
+    Park,
+    StopTracking,
+    Notify,
+}
+
+/// `[safety] resume`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyResume {
+    /// Tier 1.
+    #[default]
+    Manual,
+    /// Tier 2; off by default (D18).
+    Auto,
+}
+
+/// `[safety]`: the on-unsafe policy (§3.10).
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct SafetyConfig {
+    #[serde(default)]
+    pub on_unsafe: OnUnsafe,
+    #[serde(default = "default_true")]
+    pub abort_exposure_on_unsafe: bool,
+    /// INDI Busy and ASCOM-less "warning" states count as unsafe.
+    #[serde(default = "default_true")]
+    pub warning_is_unsafe: bool,
+    #[serde(default)]
+    pub resume: SafetyResume,
+    #[serde(default = "default_resume_after_safe_s")]
+    pub resume_after_safe_s: u64,
+}
+
+impl Default for SafetyConfig {
+    fn default() -> Self {
+        Self {
+            on_unsafe: OnUnsafe::default(),
+            abort_exposure_on_unsafe: true,
+            warning_is_unsafe: true,
+            resume: SafetyResume::default(),
+            resume_after_safe_s: default_resume_after_safe_s(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl SafetyConfig {
+    /// `on_unsafe` with `from_mount_config` resolved against
+    /// `[mount.safety] park_on_safety_violation`.
+    pub fn effective_on_unsafe(&self, mount_safety: &MountSafetyConfig) -> OnUnsafe {
+        match self.on_unsafe {
+            OnUnsafe::FromMountConfig if mount_safety.park_on_safety_violation => OnUnsafe::Park,
+            OnUnsafe::FromMountConfig => OnUnsafe::StopTracking,
+            other => other,
+        }
+    }
+}
+
+/// `[weather]`.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WeatherConfig {
+    /// One `environment_log` probe row per interval.
+    #[serde(default = "default_weather_log_interval_s")]
+    pub log_interval_s: u64,
+}
+
+impl Default for WeatherConfig {
+    fn default() -> Self {
+        Self {
+            log_interval_s: default_weather_log_interval_s(),
+        }
+    }
+}
+
+/// Everything the equipment layer reads, handed to
+/// `AppState::with_equipment` (spec §2.10).
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct EquipmentConfigs {
+    pub equipment: EquipmentConfig,
+    pub site: SiteConfig,
+    pub mount: MountConfig,
+    pub focuser: FocuserConfig,
+    pub filter_wheel: FilterWheelConfig,
+    pub guider: GuiderConfig,
+    pub safety: SafetyConfig,
+    pub weather: WeatherConfig,
+    pub focus_safety: FocusSafetyConfig,
+    pub focus_backlash: BacklashConfig,
+}
+
+#[allow(dead_code)]
+impl AchernarConfig {
+    pub fn equipment_configs(&self) -> EquipmentConfigs {
+        EquipmentConfigs {
+            equipment: self.equipment.clone(),
+            site: self.site.clone(),
+            mount: self.mount.clone(),
+            focuser: self.focuser.clone(),
+            filter_wheel: self.filter_wheel.clone(),
+            guider: self.guider.clone(),
+            safety: self.safety.clone(),
+            weather: self.weather.clone(),
+            focus_safety: self.focus.safety.clone(),
+            focus_backlash: self.focus.backlash.clone(),
+        }
+    }
+
+    /// Problems worth a startup warning. None of them stops the daemon.
+    pub fn equipment_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if self.mount.safety.horizon_model_path.is_some() {
+            warnings.push(
+                "[mount.safety] horizon_model_path is ignored; set horizon_profile_path to a \
+                 CSV of az_deg,alt_deg instead"
+                    .into(),
+            );
+        }
+        if let Err(err) = self.site.site() {
+            warnings.push(format!("{err}; the site is treated as unknown"));
+        }
+        if self.equipment.alpaca_client_id > 65_535 {
+            warnings.push(format!(
+                "[equipment] alpaca_client_id {} is outside 1..65535",
+                self.equipment.alpaca_client_id
+            ));
+        }
+        if self
+            .guider
+            .algo_param_min
+            .partial_cmp(&self.guider.algo_param_max)
+            != Some(std::cmp::Ordering::Less)
+        {
+            warnings.push("[guider] algo_param_min must be below algo_param_max".into());
+        }
+        if !self.filter_wheel.focus_offsets.is_empty() || !self.filter_wheel.filter_names.is_empty()
+        {
+            warnings.push(
+                "[filter_wheel] filter_names and focus_offsets are seeds only; they are never \
+                 applied to a wheel until imported with POST filter-wheel/import-seed"
+                    .into(),
+            );
+        }
+        warnings
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_lost_after_s() -> u64 {
+    10
+}
+fn default_lost_after_failures() -> u32 {
+    3
+}
+fn default_connect_timeout_s() -> u64 {
+    30
+}
+fn default_alpaca_discovery_port() -> u16 {
+    32227
+}
+fn default_telemetry_log_hz() -> f64 {
+    1.0
+}
+fn default_ring_buffer_minutes() -> u64 {
+    30
+}
+fn default_site_tolerance_deg() -> f64 {
+    0.001
+}
+fn default_elevation_tolerance_m() -> f64 {
+    10.0
+}
+fn default_mount_settle_s() -> f64 {
+    5.0
+}
+fn default_slew_timeout_s() -> u64 {
+    600
+}
+fn default_arrival_tolerance_arcmin() -> f64 {
+    1.0
+}
+fn default_time_tolerance_s() -> f64 {
+    10.0
+}
+fn default_max_pulse_ms() -> u32 {
+    5000
+}
+fn default_jog_deadman_ms() -> u64 {
+    1000
+}
+fn default_limit_hysteresis_deg() -> f64 {
+    0.5
+}
+fn default_center_tolerance_arcmin() -> f64 {
+    1.0
+}
+fn default_center_max_attempts() -> u32 {
+    3
+}
+fn default_flip_minutes_after() -> f64 {
+    5.0
+}
+fn default_flip_max_minutes_after() -> f64 {
+    10.0
+}
+fn default_flip_settle_s() -> f64 {
+    30.0
+}
+fn default_stuck_timeout_s() -> u64 {
+    30
+}
+fn default_max_reissue() -> u32 {
+    1
+}
+fn default_filter_settle_ms() -> u64 {
+    500
+}
+fn default_max_switch_timeout_ms() -> u64 {
+    10_000
+}
+fn default_rpc_timeout_s() -> u64 {
+    10
+}
+fn default_settle_pixels() -> f64 {
+    1.5
+}
+fn default_settle_time_s() -> f64 {
+    10.0
+}
+fn default_settle_timeout_s() -> f64 {
+    40.0
+}
+fn default_dither_amount_px() -> f64 {
+    5.0
+}
+fn default_algo_param_min() -> f64 {
+    0.1
+}
+fn default_algo_param_max() -> f64 {
+    1.0
+}
+fn default_resume_after_safe_s() -> u64 {
+    300
+}
+fn default_weather_log_interval_s() -> u64 {
+    60
 }
 
 /// Camera configuration.
@@ -810,6 +1527,12 @@ impl Default for AchernarConfig {
             plate_solve: PlateSolveConfig::default(),
             storage: StorageConfig::default(),
             telemetry: TelemetryConfig::default(),
+            equipment: EquipmentConfig::default(),
+            site: SiteConfig::default(),
+            focuser: FocuserConfig::default(),
+            guider: GuiderConfig::default(),
+            safety: SafetyConfig::default(),
+            weather: WeatherConfig::default(),
         }
     }
 }
@@ -873,6 +1596,187 @@ mod example_config_tests {
         assert_eq!(config.plate_solve.search_radius_deg, 30.0);
         assert_eq!(config.plate_solve.timeout_s, 300);
         assert_eq!(config.plate_solve.astap_path, None);
+    }
+
+    /// The example documents the equipment defaults, so a copied example
+    /// behaves exactly like no file at all.
+    #[test]
+    fn the_example_equipment_sections_are_the_defaults() {
+        use super::*;
+        let config: AchernarConfig = toml::from_str(include_str!("../achernar.example.toml"))
+            .expect("achernar.example.toml must parse");
+        assert_eq!(config.equipment, EquipmentConfig::default());
+        assert_eq!(config.site, SiteConfig::default());
+        assert_eq!(config.focuser, FocuserConfig::default());
+        assert_eq!(config.guider, GuiderConfig::default());
+        assert_eq!(config.safety, SafetyConfig::default());
+        assert_eq!(config.weather, WeatherConfig::default());
+        assert_eq!(config.mount.center, MountCenterConfig::default());
+        assert_eq!(config.mount.flip, MountFlipConfig::default());
+        let defaults = MountConfig::default();
+        assert_eq!(config.mount.settle_s, defaults.settle_s);
+        assert_eq!(config.mount.slew_timeout_s, defaults.slew_timeout_s);
+        assert_eq!(config.mount.sync_mode, defaults.sync_mode);
+        assert_eq!(config.mount.time_sync, defaults.time_sync);
+        assert_eq!(config.mount.jnow_flavour, defaults.jnow_flavour);
+        assert_eq!(
+            config.mount.equatorial_system_override,
+            EquatorialSystemOverride::None
+        );
+        assert_eq!(config.mount.max_pulse_ms, defaults.max_pulse_ms);
+        assert_eq!(config.mount.jog_deadman_ms, defaults.jog_deadman_ms);
+        assert_eq!(config.mount.fallback_park, FallbackPark::None);
+        assert_eq!(config.mount.safety.horizon_profile(), None);
+        assert_eq!(config.mount.safety.limit_hysteresis_deg, 0.5);
+        let wheel = FilterWheelConfig::default();
+        assert_eq!(config.filter_wheel.settle_ms, wheel.settle_ms);
+        assert_eq!(
+            config.filter_wheel.max_switch_timeout_ms,
+            wheel.max_switch_timeout_ms
+        );
+        assert_eq!(
+            config.filter_wheel.use_focus_offsets,
+            wheel.use_focus_offsets
+        );
+        assert_eq!(config.filter_wheel.af_filter, "");
+        // The seeds are still parsed, and flagged as seeds.
+        assert_eq!(config.filter_wheel.focus_offsets.len(), 7);
+        assert!(config
+            .equipment_warnings()
+            .iter()
+            .any(|w| w.contains("seeds only")));
+    }
+
+    #[test]
+    fn equipment_defaults_open_nothing_and_write_nothing() {
+        use super::*;
+        let config = AchernarConfig::default();
+        assert!(!config.equipment.allow_broadcast_discovery);
+        assert!(!config.equipment.indi_disconnect_device);
+        assert_eq!(config.equipment.alpaca_client_id, 0);
+        assert!(!config.mount.time_sync);
+        assert_eq!(config.site.sync, SiteSyncMode::VerifyOnly);
+        assert_eq!(config.site.site(), Ok(None));
+        assert!(!config.guider.connect_equipment);
+        assert!(!config.guider.allow_policy_actuation);
+        assert_eq!(config.safety.resume, SafetyResume::Manual);
+        assert!(!config.mount.flip.enabled);
+        assert_eq!(
+            config.safety.effective_on_unsafe(&config.mount.safety),
+            OnUnsafe::Park
+        );
+        let mut no_park = config.mount.safety.clone();
+        no_park.park_on_safety_violation = false;
+        assert_eq!(
+            config.safety.effective_on_unsafe(&no_park),
+            OnUnsafe::StopTracking
+        );
+        assert_eq!(config.guider.settle().timeout_s, 40.0);
+        assert!(config.equipment_warnings().is_empty());
+        let bundle = config.equipment_configs();
+        assert_eq!(bundle.focus_safety.max_step_single, 500);
+    }
+
+    #[test]
+    fn unknown_equipment_keys_are_ignored() {
+        let config: super::AchernarConfig = toml::from_str(
+            r#"
+            [equipment]
+            lost_after_s = 20
+            some_future_key = "x"
+
+            [site]
+            latitude_deg = 40.0
+            longitude_deg = -75.0
+            elevation_m = 100
+            observatory_code = "Z99"
+
+            [mount]
+            settle_s = 2.5
+            unknown_mount_key = 1
+
+            [mount.flip]
+            enabled = true
+            pause_before_flip = true
+
+            [focuser]
+            tempcomp_during_moves = "leave"
+            focuser_colour = "red"
+
+            [guider]
+            dither_amount_px = 3
+            phd2_flavour = "dev"
+
+            [safety]
+            on_unsafe = "stop_tracking"
+            siren = true
+
+            [weather]
+            log_interval_s = 30
+            wind_units = "kts"
+
+            [filter_wheel]
+            settle_ms = 750
+            wheel_colour = "black"
+
+            [a_section_from_the_future]
+            anything = 1
+            "#,
+        )
+        .expect("unknown keys must be ignored");
+        assert_eq!(config.equipment.lost_after_s, 20);
+        let site = config.site.site().unwrap().unwrap();
+        assert_eq!(
+            (site.lat_deg, site.lon_deg, site.elev_m),
+            (40.0, -75.0, 100.0)
+        );
+        assert_eq!(config.mount.settle_s, 2.5);
+        assert!(config.mount.flip.enabled);
+        assert_eq!(
+            config.focuser.tempcomp_during_moves,
+            super::TempCompDuringMoves::Leave
+        );
+        assert_eq!(config.guider.dither_amount_px, 3.0);
+        assert_eq!(config.safety.on_unsafe, super::OnUnsafe::StopTracking);
+        assert_eq!(config.weather.log_interval_s, 30);
+        assert_eq!(config.filter_wheel.settle_ms, 750);
+        // Untouched sections keep their defaults.
+        assert_eq!(config.mount.slew_timeout_s, 600);
+        assert_eq!(config.mount.safety.max_hour_angle, 5.5);
+    }
+
+    #[test]
+    fn wrong_equipment_values_are_errors_and_half_a_site_is_flagged() {
+        for bad in [
+            "[mount]\nsync_mode = \"sometimes\"\n",
+            "[mount]\nequatorial_system_override = \"b1950\"\n",
+            "[site]\nsync = \"always\"\n",
+            "[guider]\nguiding_during_autofocus = \"maybe\"\n",
+            "[safety]\nresume = \"eventually\"\n",
+            "[equipment]\nalpaca_discovery_port = 70000\n",
+        ] {
+            assert!(
+                toml::from_str::<super::AchernarConfig>(bad).is_err(),
+                "{bad} must not parse"
+            );
+        }
+        let config: super::AchernarConfig =
+            toml::from_str("[site]\nlatitude_deg = 40.0\n").unwrap();
+        assert!(config.site.site().is_err());
+        assert!(config
+            .equipment_warnings()
+            .iter()
+            .any(|w| w.contains("[site]")));
+        let config: super::AchernarConfig =
+            toml::from_str("[site]\nlatitude_deg = 95.0\nlongitude_deg = 0.0\nelevation_m = 0.0\n")
+                .unwrap();
+        assert!(config.site.site().is_err());
+        let config: super::AchernarConfig =
+            toml::from_str("[mount]\nequatorial_system_override = \"jnow_mean\"\n").unwrap();
+        assert_eq!(
+            config.mount.equatorial_system_override.frame(),
+            Some(crate::equipment::types::EqFrame::JNowMean)
+        );
     }
 }
 fn default_max_stars() -> u32 {

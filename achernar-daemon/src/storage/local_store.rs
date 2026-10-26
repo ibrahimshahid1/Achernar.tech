@@ -168,6 +168,11 @@ const MIGRATIONS: &[(i64, &str, &str)] = &[
         "plate_solve_provenance",
         include_str!("../../migrations/008_plate_solve_provenance.sql"),
     ),
+    (
+        9,
+        "equipment_layer",
+        include_str!("../../migrations/009_equipment_layer.sql"),
+    ),
 ];
 
 /// True for errors that mean "this statement's effect is already present".
@@ -272,6 +277,233 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(versions, sorted, "migration versions must be unique and ascending");
+    }
+}
+
+/// Migration 009 (equipment layer, spec §4.3) on a fresh database and on one
+/// already at 008, and the `equipment_overheads` view against the event
+/// serialisation the recorder will write.
+#[cfg(test)]
+mod equipment_migration_tests {
+    use super::{split_statements, LocalStore, MIGRATIONS};
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use sqlx::SqlitePool;
+
+    const NEW_TABLES: [&str; 9] = [
+        "device_connections",
+        "equipment_events",
+        "exposure_device_windows",
+        "focuser_moves",
+        "guide_steps",
+        "dither_events",
+        "pointing_samples",
+        "policy_decisions",
+        "device_profiles",
+    ];
+
+    fn temp_db(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("achernar-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("achernar.db");
+        (dir, db)
+    }
+
+    async fn names(pool: &SqlitePool, sql: &str) -> Vec<String> {
+        sqlx::query_as::<_, (String,)>(sql)
+            .fetch_all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(name,)| name)
+            .collect()
+    }
+
+    async fn columns(pool: &SqlitePool, table: &str) -> Vec<String> {
+        names(
+            pool,
+            &format!("SELECT name FROM pragma_table_info('{table}')"),
+        )
+        .await
+    }
+
+    async fn assert_equipment_schema(pool: &SqlitePool) {
+        let tables = names(pool, "SELECT name FROM sqlite_master WHERE type = 'table'").await;
+        for table in NEW_TABLES {
+            assert!(tables.iter().any(|t| t == table), "missing table {table}");
+        }
+        let views = names(pool, "SELECT name FROM sqlite_master WHERE type = 'view'").await;
+        assert!(views.iter().any(|v| v == "equipment_overheads"));
+        for (table, column) in [
+            ("focus_samples", "position_readback_before"),
+            ("focus_samples", "backlash_model"),
+            ("focus_actions", "verification_frame_id"),
+            ("filter_switch_events", "handshake_ok"),
+            ("filter_switch_events", "background_after"),
+            ("guider_state_log", "rms0_total_arcsec"),
+            ("environment_log", "sensor_ages_json"),
+            ("environment_log", "device_identity_key"),
+            ("focuser_profiles", "identity_key"),
+            ("control_audit_logs", "command_id"),
+            ("control_audit_logs", "stage"),
+        ] {
+            assert!(
+                columns(pool, table).await.iter().any(|c| c == column),
+                "missing {table}.{column}"
+            );
+        }
+        let versions: Vec<(i64,)> =
+            sqlx::query_as("SELECT version FROM schema_migrations ORDER BY version")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        let versions: Vec<i64> = versions.into_iter().map(|(v,)| v).collect();
+        assert_eq!(versions, (1..=9).collect::<Vec<i64>>());
+    }
+
+    #[tokio::test]
+    async fn migration_009_applies_on_a_fresh_database() {
+        let (dir, db) = temp_db("009-fresh");
+        let store = LocalStore::open(db.to_str().unwrap()).await.unwrap();
+        let pool = store.pool();
+        assert_equipment_schema(pool).await;
+
+        // The overheads view reads the payload exactly as events.rs writes it.
+        use crate::equipment::events::{EquipmentEvent, EventKind};
+        use crate::equipment::ops::OpKind;
+        use crate::equipment::testing::manual_clock::ManualClock;
+        use crate::equipment::types::{CommandId, CommandSource, OpOutcome};
+        let clock = ManualClock::new();
+        let command = CommandId::new();
+        let commanded = EquipmentEvent::new(
+            EventKind::OperationCommanded {
+                op: OpKind::FilterHandshake,
+                source: CommandSource::Operator { overriding: false },
+            },
+            &clock,
+        )
+        .with_command(command);
+        clock.advance_ms(4250);
+        let ended = EquipmentEvent::new(
+            EventKind::OperationEnded {
+                op: OpKind::FilterHandshake,
+                outcome: OpOutcome::Succeeded,
+                duration_ms: 4250,
+            },
+            &clock,
+        )
+        .with_command(command);
+        for (seq, event) in [(1_i64, &commanded), (2, &ended)] {
+            let value = serde_json::to_value(event).unwrap();
+            sqlx::query(
+                "INSERT INTO equipment_events \
+                 (seq, event_id, at_utc, mono_ns, device_kind, command_id, kind, payload_json) \
+                 VALUES (?, ?, ?, ?, 'filter_wheel', ?, ?, ?)",
+            )
+            .bind(seq)
+            .bind(event.event_id.to_string())
+            .bind(
+                event
+                    .at_utc
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            )
+            .bind(event.mono_ns as i64)
+            .bind(command.to_string())
+            .bind(value["kind"].as_str().unwrap())
+            .bind(value["payload"].to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        let row: (String, String, String, String, f64) = sqlx::query_as(
+            "SELECT command_id, operation, outcome, started_at, duration_s \
+             FROM equipment_overheads",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, command.to_string());
+        assert_eq!(row.1, "filter_handshake");
+        assert_eq!(row.2, "succeeded");
+        assert_eq!(row.3, "2026-01-01T00:00:00.000Z");
+        assert!((row.4 - 4.25).abs() < 1e-9);
+
+        // Reopening is a no-op.
+        drop(store);
+        let store = LocalStore::open(db.to_str().unwrap()).await.unwrap();
+        assert_equipment_schema(store.pool()).await;
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn migration_009_applies_on_a_database_already_at_008() {
+        let (dir, db) = temp_db("009-from-008");
+        {
+            let options = SqliteConnectOptions::new()
+                .filename(&db)
+                .create_if_missing(true)
+                .foreign_keys(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(options)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, \
+                 name TEXT NOT NULL, applied_at TEXT NOT NULL DEFAULT (datetime('now')))",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            for (version, name, sql) in MIGRATIONS.iter().filter(|(v, _, _)| *v <= 8) {
+                for statement in split_statements(sql) {
+                    sqlx::query(&statement).execute(&pool).await.unwrap();
+                }
+                sqlx::query("INSERT INTO schema_migrations (version, name) VALUES (?, ?)")
+                    .bind(*version)
+                    .bind(*name)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            for statement in [
+                "INSERT INTO focus_runs (id, rig_id, start_position, state, started_at) \
+                 VALUES ('r1', 'rig', 100, 'converged', '2026-10-01T00:00:00Z')",
+                "INSERT INTO focus_samples (run_id, position, hfr, captured_at) \
+                 VALUES ('r1', 100, 2.5, '2026-10-01T00:00:01Z')",
+                "INSERT INTO environment_log (observed_at, ambient_temp_c) \
+                 VALUES ('2026-10-01T00:00:00Z', 4.5)",
+                "INSERT INTO control_audit_logs (action) VALUES ('legacy')",
+            ] {
+                sqlx::query(statement).execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
+
+        let store = LocalStore::open(db.to_str().unwrap()).await.unwrap();
+        let pool = store.pool();
+        assert_equipment_schema(pool).await;
+        let sample: (i64, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT position, position_readback_before, position_source FROM focus_samples",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(sample, (100, None, None), "existing rows keep their values");
+        let env: (f64, Option<f64>) =
+            sqlx::query_as("SELECT ambient_temp_c, pressure_hpa FROM environment_log")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(env, (4.5, None));
+        let audit: (String, Option<String>) =
+            sqlx::query_as("SELECT action, command_id FROM control_audit_logs")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(audit, ("legacy".to_string(), None));
+        drop(store);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
 

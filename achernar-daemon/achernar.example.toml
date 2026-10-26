@@ -156,24 +156,122 @@ enabled = false
 # changes every night — it is NOT a model artefact and must not be committed.
 state_path = "focus_drift_state.json"
 
+# ── Equipment layer (equipment spec §2.11) ──────────────────────────────────
+# Device connections still arrive through POST /connect: nothing in this file
+# connects, scans or broadcasts on its own. Every value below is the default.
+# Rig-specific numbers (backlash, filter offsets, settle times, focuser origin)
+# live in each device's identity profile, never in this file.
+
+[equipment]
+lost_after_s = 10                   # no good poll for this long: device lost
+lost_after_failures = 3             # or this many failed polls in a row
+connect_timeout_s = 30              # Platform 7 connect wait (slow Wi-Fi devices)
+allow_broadcast_discovery = false   # gates "auto"/empty Alpaca options and UDP discovery
+alpaca_discovery_port = 32227
+alpaca_client_id = 0                # 0 = generate once (random 1..65535) and persist
+indi_disconnect_device = false      # INDI CONNECTION is device-wide; leave it for PHD2/KStars
+estop_stops_tracking = true
+telemetry_log_hz = 1.0              # downsampled device series for TME/replay; 0 disables
+ring_buffer_minutes = 30
+
+[site]                              # omitted = unknown; geometry features then say so
+# Set all three together, or none.
+# latitude_deg = 40.0
+# longitude_deg = -75.0             # east positive
+# elevation_m = 100
+sync = "verify_only"                # verify_only | to_mount | from_mount | none
+tolerance_deg = 0.001
+elevation_tolerance_m = 10
+
 [mount]                       # Mount control (Section 8.3)
 # Mounts are chosen when connecting, not in this file. Any ASCOM Alpaca telescope
 # (a commercial mount, ASCOM Remote, or a DIY Alpaca controller) uses driver "alpaca":
 #   POST /api/v1/discover {"equipment_type":"mount","driver":"alpaca","option":"http://<host>:11111"}
 #   POST /api/v1/connect  {"equipment_type":"mount","driver":"alpaca","option":"http://<host>:11111#device=0"}
 # guide_rate is a fraction of sidereal; keep it equal to the mount's own guide rate.
+# It is only a fallback, used when the mount reports no guide rate of its own.
 guide_rate = 0.5
 max_slew_rate = 8.0
+settle_s = 5.0                      # after the driver's own slew settle time
+slew_timeout_s = 600
+arrival_tolerance_arcmin = 1.0
+sync_mode = "mount"                 # mount | offset (keep a solved offset; NINA "NoSync")
+time_sync = false                   # true: write UTC at connect when |delta| >= time_tolerance_s
+time_tolerance_s = 10
+equatorial_system_override = ""     # "" | j2000 | jnow_mean | jnow_apparent
+jnow_flavour = "apparent"           # how Topocentric/EOD is read; recorded with every sample
+max_pulse_ms = 5000
+guide_dec_reverse_on_pier_west = false
+jog_deadman_ms = 1000
+fallback_park = "none"              # none | pole (Tier 2)
 
 [mount.safety]
 min_altitude = 0.0
 max_hour_angle = 5.5
 park_on_safety_violation = true
+# horizon_model_path is ignored (with a warning); use horizon_profile_path.
 # horizon_model_path = "../models/horizon/1.0.0/model.onnx"
+horizon_profile_path = ""           # CSV of az_deg,alt_deg; empty = none
+limit_hysteresis_deg = 0.5
+
+[mount.center]                      # slew, solve, correct, re-slew
+tolerance_arcmin = 1.0
+max_attempts = 3
+
+[mount.flip]                        # Tier 2; inert unless the mount can flip
+enabled = false
+minutes_after_meridian = 5
+max_minutes_after_meridian = 10
+settle_s = 30
+recenter = true
+autofocus_after = false
 
 [filter_wheel]               # Filter wheel (Section 8.2)
+# filter_names and focus_offsets are SEEDS only. They are never applied to a
+# wheel automatically: POST /api/v1/filter-wheel/import-seed copies them into
+# the connected wheel's identity profile. Applying invented offsets to a real
+# wheel would move a real focuser by invented amounts.
 filter_names = ["L", "R", "G", "B", "Ha", "OIII", "SII"]
 focus_offsets = [0, 12, 8, 15, 120, 118, 122]
+settle_ms = 500                     # the profile value wins
+max_switch_timeout_ms = 10000
+min_switch_interval_s = 0
+use_focus_offsets = true            # profile offsets only, never the seeds above
+pause_guiding_on_offset = true
+parallel_offset_move = false
+af_filter = ""
+
+[focuser]                           # device behaviour; backlash stays in [focus.backlash]
+stuck_timeout_s = 30
+max_reissue = 1
+tempcomp_during_moves = "off"       # off | leave
+temperature_role = "unknown"        # ambient | tube | unknown (a profile value wins)
+position_source_action = ""         # optional Alpaca Action reporting homed|restored|unknown
+
+[guider]                            # PHD2 through its event server
+connect_equipment = false           # never call PHD2 set_connected unless asked
+rpc_timeout_s = 10
+settle_pixels = 1.5
+settle_time_s = 10
+settle_timeout_s = 40
+dither_amount_px = 5.0              # guide-camera pixels
+dither_ra_only = false
+aggressiveness_param_ra = ""        # "" = discover from PHD2's get_algo_param_names
+aggressiveness_param_dec = ""
+algo_param_min = 0.1
+algo_param_max = 1.0
+allow_policy_actuation = false      # M-1 set_algo_param by a policy (Tier 2)
+guiding_during_autofocus = "keep"   # keep | pause | stop
+
+[safety]                            # safety-monitor policy
+on_unsafe = "from_mount_config"     # from_mount_config | park | stop_tracking | notify
+abort_exposure_on_unsafe = true
+warning_is_unsafe = true            # INDI Busy and "warning" states count as unsafe
+resume = "manual"                   # manual (Tier 1) | auto (Tier 2)
+resume_after_safe_s = 300
+
+[weather]
+log_interval_s = 60
 
 [camera]
 # default_gain = 100
