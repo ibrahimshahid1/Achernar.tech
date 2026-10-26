@@ -35,7 +35,9 @@
 //! 9. Apply the focuser **relative** move Δ = offset[new] − offset[prev],
 //!    through the focuser's own move path and its safety checks. Sequential
 //!    by default; `parallel_offset_move` starts it with the wheel move.
-//! 10. If an offset is uncertain (unmeasured or estimated), emit
+//! 10. If an offset is uncertain (unmeasured or estimated), or the wheel
+//!     verified the new slot without its offset being applied (no focuser,
+//!     a refusal, a failed move, an abort while settling), emit
 //!     `focus_verification_required`.
 //! 11. Resume guiding and wait until the guider has settled.
 //! 12. Release ownership (the permit is dropped on every path).
@@ -1122,10 +1124,22 @@ impl FilterChanger {
         let settle_ms = self.elapsed_ms(settle_start);
         st.settle_ms_actual = Some(settle_ms);
         if let Some(by) = settled {
-            if parallel.take().is_some() {
-                if let Some((handle, _)) = &focuser {
+            // The wheel verified the new slot but the focuser does not hold
+            // its offset, so the next change would compute Δ from a slot the
+            // focuser was never adjusted for: focus must be verified.
+            if let Some((handle, delta)) = &focuser {
+                let reason = if parallel.take().is_some() {
                     let _ = handle.abort();
-                }
+                    format!(
+                        "offset_move_halted: the change was aborted while settling; \
+                         the parallel offset move ({delta} steps) may be partly applied"
+                    )
+                } else {
+                    format!(
+                        "offset_not_applied: the change was aborted while settling ({delta} steps)"
+                    )
+                };
+                st.report.focus_verification.push(reason);
             }
             return Err(Stop::blocked(
                 OpOutcome::Aborted { by: Some(by) },
@@ -2367,6 +2381,76 @@ mod tests {
             rig.guider_fake.commands(),
             vec![GuiderCmd::Pause { full: false }, GuiderCmd::Resume]
         );
+    }
+
+    /// Abort `change` once the wheel has verified the target, i.e. during
+    /// the settle wait.
+    async fn abort_while_settling(rig: &Rig, name: &str) -> (CommandId, HandshakeReport) {
+        rig.timer.hold_sleeps();
+        let task = spawn_change(rig, name);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !rig
+            .events
+            .events()
+            .iter()
+            .any(|e| matches!(e.event, EventKind::FilterArrived { verified: true, .. }))
+        {
+            assert!(Instant::now() < deadline, "the wheel never arrived");
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let by = rig.changer.abort();
+        (by, task.await.unwrap())
+    }
+
+    /// Review (W-c step 3): an abort while settling leaves the wheel verified
+    /// at the new slot without its offset, so focus must be verified before
+    /// the next change trusts that slot's offset.
+    #[tokio::test]
+    async fn an_abort_while_settling_requires_focus_verification() {
+        let rig = sim_rig(Options::default());
+        let (by, report) = abort_while_settling(&rig, "Ha").await;
+        assert!(
+            matches!(report.outcome, OpOutcome::Aborted { by: Some(id) } if id == by),
+            "{report:?}"
+        );
+        let block = report.resume_block.clone().expect("a resume block");
+        assert!(block.reason.contains("aborted while settling"), "{block:?}");
+        assert_eq!(
+            report.focus_verification,
+            vec![
+                "offset_not_applied: the change was aborted while settling (120 steps)".to_string()
+            ]
+        );
+        assert!(rig.events.names().contains(&"focus_verification_required"));
+        assert!(!rig.events.names().contains(&"filter_settled"));
+        assert!(rig.focuser_fake.commands().is_empty());
+        assert_eq!(report.offset_applied_steps, None);
+        assert_eq!(
+            rig.guider_fake.commands(),
+            vec![GuiderCmd::Pause { full: false }, GuiderCmd::Resume]
+        );
+        let snap = rig.changer.wheel().snapshot();
+        assert!(snap.verified && snap.verified_slot == Some(4));
+        let rec = rig.switch_records().pop().unwrap();
+        assert!(!rec.handshake_ok && rec.offset_applied_steps.is_none());
+
+        // A parallel offset move is halted and may be partly applied.
+        let rig = sim_rig(Options {
+            settings: FilterSettings {
+                parallel_offset_move: true,
+                ..FilterSettings::default()
+            },
+            ..Options::default()
+        });
+        let (_, report) = abort_while_settling(&rig, "Ha").await;
+        assert!(matches!(report.outcome, OpOutcome::Aborted { .. }));
+        assert_eq!(rig.focuser_fake.commands(), vec![FocuserCmd::MoveBy(120)]);
+        assert!(report
+            .focus_verification
+            .iter()
+            .any(|r| r.starts_with("offset_move_halted")));
+        assert!(rig.events.names().contains(&"focus_verification_required"));
     }
 
     struct RejectFocuser;

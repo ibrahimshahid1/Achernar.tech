@@ -4,8 +4,9 @@
 //!   blocks, and appends to a shared timeline so a test can assert the order
 //!   of filter events relative to commands seen by fake focuser and guider
 //!   devices.
-//! - [`ManualTimer`]: settle waits advance a `ManualClock`; the watchdog
-//!   never fires unless a test arms it.
+//! - [`ManualTimer`]: settle waits advance a `ManualClock` (or never end
+//!   once a test holds them); the watchdog never fires unless a test arms
+//!   it.
 //! - [`spawn_wheel_worker`]: a minimal stand-in for the WP1A-2 worker that
 //!   drives a real `FilterWheelDriver` (the sim) and [`FilterMoveOp`] behind
 //!   a real `DeviceHandle`, advancing the manual clock one 250 ms tick per
@@ -98,12 +99,14 @@ impl FilterEventSink for CollectingSink {
     }
 }
 
-/// Settle waits advance the manual clock at once; the watchdog fires only
-/// when armed (a hung worker).
+/// Settle waits advance the manual clock at once, or never end while held
+/// (so a test can abort during the settle); the watchdog fires only when
+/// armed (a hung worker).
 #[derive(Debug)]
 pub struct ManualTimer {
     clock: Arc<ManualClock>,
     watchdog_fires: AtomicBool,
+    sleeps_held: AtomicBool,
 }
 
 impl ManualTimer {
@@ -111,16 +114,25 @@ impl ManualTimer {
         Arc::new(Self {
             clock: Arc::clone(clock),
             watchdog_fires: AtomicBool::new(false),
+            sleeps_held: AtomicBool::new(false),
         })
     }
 
     pub fn arm_watchdog(&self) {
         self.watchdog_fires.store(true, Ordering::SeqCst);
     }
+
+    /// Settle waits started from now on never end.
+    pub fn hold_sleeps(&self) {
+        self.sleeps_held.store(true, Ordering::SeqCst);
+    }
 }
 
 impl HandshakeTimer for ManualTimer {
     fn sleep(&self, duration: Duration) -> TimerFuture {
+        if self.sleeps_held.load(Ordering::SeqCst) {
+            return Box::pin(std::future::pending());
+        }
         self.clock.advance(duration);
         Box::pin(async {})
     }
