@@ -16,7 +16,12 @@
 //! 2. For every command it calls [`MountRuntime::plan`] **before** its own
 //!    "one operation per device" conflict rule. [`MountPlan::Absorbed`]
 //!    (a jog renewal or a second jog axis) and [`MountPlan::CancelActive`]
-//!    (`AbortSlew` while an operation runs) must bypass that rule.
+//!    (`AbortSlew` while an operation runs: cancel it, then start the
+//!    returned abort operation) must bypass that rule. Every other command
+//!    comes back as [`MountPlan::Start`] even while an operation runs, and
+//!    the worker's rule decides: `InvalidOperation`, unless the permit
+//!    outranks the active one (§2.5, §2.9; [`CommandMeta::outranks`]), in
+//!    which case the active operation's `cancel()` runs first.
 //! 3. After every poll it calls [`MountRuntime::after_poll`], which builds
 //!    the published [`MountSnapshot`] (derived Alt/Az, LST, HA, J2000,
 //!    `can_flip`, `pier_side_static`, clock delta), emits edge events and
@@ -385,8 +390,13 @@ impl MountShared {
         self.state().session_site = site;
     }
 
+    /// The mount's own site, for geometry when no session site is known. An
+    /// elevation the mount does not report (NaN) takes the session site's,
+    /// else 0 m, so the frame converter never sees NaN.
     pub(crate) fn set_mount_site(&self, site: Option<Site>) {
-        self.state().mount_site = site;
+        let mut state = self.state();
+        let fallback = state.session_site;
+        state.mount_site = site.map(|s| site::with_known_elevation(s, fallback.as_ref()));
     }
 
     /// The best site for geometry: the session site, else the mount's own.
@@ -579,32 +589,81 @@ pub fn stale_state(state: &MountState) -> MountState {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// Who issued the command being turned into an operation.
+/// Who issued the command being turned into an operation, and the
+/// preemption rank of its permit (§2.9 step 2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandMeta {
     pub command_id: CommandId,
     pub source: CommandSource,
+    pub priority: Priority,
+    /// The permit's preemption rank (7 e-stop ... 1 recommendation; an
+    /// operator command holds at least 5).
+    pub rank: u8,
 }
 
 impl CommandMeta {
+    /// A command with the lowest priority its source allows: `Safety` for
+    /// the safety source, `Recommendation` otherwise (an operator still
+    /// holds rank 5). Use [`Self::from_permit`] or [`Self::with_priority`]
+    /// when the real permit is known.
     pub fn new(command_id: CommandId, source: CommandSource) -> Self {
-        Self { command_id, source }
+        let priority = match source {
+            CommandSource::Safety => Priority::Safety,
+            _ => Priority::Recommendation,
+        };
+        let rank = priority.preemption_rank(&source);
+        Self {
+            command_id,
+            source,
+            priority,
+            rank,
+        }
+    }
+
+    pub fn with_priority(mut self, priority: Priority) -> Self {
+        self.priority = priority;
+        self.rank = priority.preemption_rank(&self.source);
+        self
     }
 
     pub fn from_permit(permit: &Permit) -> Self {
-        Self::new(permit.command_id(), permit.source().clone())
+        Self {
+            command_id: permit.command_id(),
+            source: permit.source().clone(),
+            priority: permit.priority(),
+            rank: permit.rank(),
+        }
+    }
+
+    /// The §2.9 arbiter rule, for a worker that keeps the active
+    /// operation's rank: an operator preempts only with `overriding` and
+    /// only a holder below safety; anyone else needs a strictly higher rank.
+    pub fn outranks(&self, holder_rank: u8) -> bool {
+        if self.source.is_operator() {
+            self.source.overriding() && holder_rank < Priority::Safety.rank()
+        } else {
+            self.rank > holder_rank
+        }
     }
 }
 
 /// What the worker does with a mount command.
 pub enum MountPlan {
-    /// Run this operation.
+    /// Run this operation. When another operation is active the worker's
+    /// conflict rule decides (§2.5, §2.9): `InvalidOperation` unless this
+    /// command's permit outranks the active one's (see
+    /// [`CommandMeta::outranks`]), in which case the active operation's
+    /// `cancel()` runs first and it resolves `Aborted { by }`.
     Start(MountOp),
     /// Absorbed by the active operation (a jog renewal or rate change);
     /// resolve the command with this outcome at once.
     Absorbed(OpOutcome),
-    /// `AbortSlew` while an operation runs: cancel it as an abort would.
-    CancelActive,
+    /// `AbortSlew` while an operation runs: cancel it as an abort would,
+    /// bypassing the conflict rule, then start this [`slew::AbortSlewOp`],
+    /// which sends AbortSlew plus MoveAxis 0 on jogging axes and confirms
+    /// Slewing false. The active operation's own cancel may do no I/O (a
+    /// sync, a setter), and a slew or jog by another client may be running.
+    CancelActive(MountOp),
     /// Refused before any hardware command.
     Refused(DeviceError),
 }
@@ -614,7 +673,7 @@ impl fmt::Debug for MountPlan {
         match self {
             MountPlan::Start(op) => write!(f, "Start({:?})", op.kind()),
             MountPlan::Absorbed(outcome) => write!(f, "Absorbed({outcome:?})"),
-            MountPlan::CancelActive => f.write_str("CancelActive"),
+            MountPlan::CancelActive(op) => write!(f, "CancelActive({:?})", op.kind()),
             MountPlan::Refused(err) => write!(f, "Refused({err})"),
         }
     }
@@ -684,6 +743,8 @@ pub struct MountRuntime {
     tracker: MountTracker,
     watchdog: LimitWatchdog,
     last_snapshot: Option<MountSnapshot>,
+    /// The watchdog's tracking-off for the current crossing was announced.
+    limit_stop_announced: bool,
 }
 
 impl fmt::Debug for MountRuntime {
@@ -713,6 +774,7 @@ impl MountRuntime {
             tracker: MountTracker::default(),
             watchdog: LimitWatchdog::new(limits),
             last_snapshot: None,
+            limit_stop_announced: false,
         }
     }
 
@@ -735,7 +797,11 @@ impl MountRuntime {
     }
 
     /// Turn a command into what the worker should do. Call it before the
-    /// worker's own conflict rule (see the module docs).
+    /// worker's own conflict rule (see the module docs). Only jog renewals,
+    /// further jog axes and `AbortSlew` are decided here; any other command
+    /// is built as [`MountPlan::Start`] even while an operation is active,
+    /// so the worker's preemption rule can let a higher-ranked command (a
+    /// safety park, mount recovery, e-stop tracking off) cancel it.
     pub fn plan(&mut self, cmd: MountCmd, meta: CommandMeta, active: Option<OpKind>) -> MountPlan {
         match (cmd, active) {
             (MountCmd::RenewJog, Some(OpKind::MoveAxis)) => {
@@ -753,15 +819,10 @@ impl MountRuntime {
                     Err(err) => MountPlan::Refused(err),
                 }
             }
-            (MountCmd::AbortSlew, Some(_)) => MountPlan::CancelActive,
-            (_, Some(kind)) => MountPlan::Refused(DeviceError::invalid_operation(format!(
-                "another operation ({}) is active on the mount",
-                serde_json::to_value(kind)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_string))
-                    .unwrap_or_default()
-            ))),
-            (cmd, None) => match build_operation(&self.shared, cmd, meta) {
+            (MountCmd::AbortSlew, Some(_)) => MountPlan::CancelActive(Box::new(
+                slew::AbortSlewOp::new(Arc::clone(&self.shared), meta),
+            )),
+            (cmd, _) => match build_operation(&self.shared, cmd, meta) {
                 Ok(op) => MountPlan::Start(op),
                 Err(err) => MountPlan::Refused(err),
             },
@@ -782,13 +843,22 @@ impl MountRuntime {
         let snapshot = self.tracker.update(&self.shared, state, active);
         let now_mono = self.shared.clock().now_mono_ns();
         let site = self.shared.geometry_site();
-        let verdict = self.watchdog.evaluate(&snapshot, site.as_ref(), now_mono);
+        let dec_of_date = self.tracker.of_date().map(|p| p.dec_deg);
+        let verdict =
+            self.watchdog
+                .evaluate_with_dec(&snapshot, site.as_ref(), dec_of_date, now_mono);
         for event in verdict.events {
             self.shared.emit(event, None);
         }
+        if !self.watchdog.tripped() {
+            self.limit_stop_announced = false;
+        }
         if verdict.stop_tracking {
+            // Repeated on every poll while tracking still reads on (the
+            // watchdog escalates with outcome_unknown); announced once.
             match drv.set_tracking(false) {
-                Ok(()) => {
+                Ok(()) if !self.limit_stop_announced => {
+                    self.limit_stop_announced = true;
                     self.shared.emit(
                         EventKind::TrackingChanged {
                             on: Some(false),
@@ -800,7 +870,11 @@ impl MountRuntime {
                     );
                     self.shared.set_announced_tracking(false);
                 }
-                Err(err) => tracing::warn!("mount limit watchdog could not stop tracking: {err}"),
+                Ok(()) => {}
+                Err(err) => tracing::warn!(
+                    "mount limit watchdog could not stop tracking (request {}): {err}",
+                    verdict.stop_attempt
+                ),
             }
         }
         self.last_snapshot = Some(snapshot.clone());
@@ -868,52 +942,122 @@ impl MountRuntime {
         }
     }
 
+    /// MoveAxis 0 on every axis the jog demand says may be moving (a
+    /// running jog, or a stop that failed earlier) and, while a jog
+    /// operation runs, on every CanMoveAxis axis. Failures are logged and
+    /// stay recorded for the next stop.
     fn stop_jog(&mut self, drv: &mut dyn MountDriver) {
-        let axes = self.shared.with_jog(|jog| jog.stop_all());
-        for axis in axes {
-            if let Err(err) = drv.move_axis(axis, 0.0) {
-                tracing::warn!("could not stop mount axis {axis}: {err}");
-            }
-        }
+        let caps = self.shared.capabilities();
+        let jogging = self.shared.jog_active();
+        let demanded = self.shared.with_jog(|jog| jog.moving_axes());
+        let axes: Vec<u8> = (0..jog::AXES)
+            .filter(|axis| {
+                demanded.contains(axis) || (jogging && caps.can_move_axis[usize::from(*axis)])
+            })
+            .collect();
+        let _ = jog::stop_axes(&self.shared, drv, &axes, None);
+        self.shared.with_jog(|jog| jog.end());
     }
 }
 
-/// E-stop for a mount (§2.9): the handle's abort (AbortSlew, plus MoveAxis
-/// 0 while a jog runs) and, when `[equipment] estop_stops_tracking`, a
-/// tracking-off command queued behind the cancel. For `estop.rs` (WP1A-2).
+/// The e-stop response budget (§2.9 step 4).
+pub const ESTOP_BUDGET: Duration = Duration::from_secs(2);
+
+/// What [`estop_mount`] did, step by step (§2.9 step 1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MountEstopReport {
+    /// The out-of-band abort path: AbortSlew, plus MoveAxis 0 on the axes
+    /// the driver knows are jogging.
+    pub abort: DeviceResult<()>,
+    /// The e-stop-rank commands queued with the abort, each with whether
+    /// the worker accepted it (its start, which sends the hardware
+    /// commands): tracking off, which first sends MoveAxis 0 on every
+    /// CanMoveAxis axis, when `stops_tracking`; otherwise MoveAxis 0 on
+    /// each CanMoveAxis axis.
+    pub stops: Vec<(MountCmd, DeviceResult<()>)>,
+}
+
+impl MountEstopReport {
+    /// `Ok` only when every step was accepted; otherwise the first failure
+    /// (the abort path, then the queued stops in order).
+    pub fn result(&self) -> DeviceResult<()> {
+        self.abort.clone()?;
+        for (_, result) in &self.stops {
+            result.clone()?;
+        }
+        Ok(())
+    }
+
+    /// The tracking-off step's result; `None` when tracking was left on.
+    pub fn tracking_off(&self) -> Option<&DeviceResult<()>> {
+        self.stops
+            .iter()
+            .find(|(cmd, _)| *cmd == MountCmd::SetTracking(false))
+            .map(|(_, result)| result)
+    }
+}
+
+async fn within_estop_budget<T>(
+    step: &str,
+    future: impl std::future::Future<Output = DeviceResult<T>>,
+) -> DeviceResult<()> {
+    match tokio::time::timeout(ESTOP_BUDGET, future).await {
+        Ok(result) => result.map(|_| ()),
+        Err(_) => Err(DeviceError::outcome_unknown(format!(
+            "{step} was not confirmed within the {} s e-stop budget",
+            ESTOP_BUDGET.as_secs()
+        ))),
+    }
+}
+
+/// E-stop for a mount (§2.9 step 1), for `estop.rs` (WP1A-2): the handle's
+/// abort path (AbortSlew, plus MoveAxis 0 on jogging axes), then MoveAxis
+/// 0 on every CanMoveAxis axis (also axes another client moved) and, when
+/// `stops_tracking`, tracking off.
 ///
-/// The cancelled operation may still be confirming its stop when the
-/// tracking command arrives, which the worker refuses as a conflict; the
-/// command is then retried for up to [`ESTOP_TRACKING_RETRY`], inside the
-/// 2 s e-stop budget. The abort result is what e-stop reports.
-pub async fn estop_mount(handle: &MountHandle, stops_tracking: bool) -> DeviceResult<()> {
+/// The stops are queued from the safety source at e-stop rank together
+/// with the abort, not after it, so a slow AbortSlew never delays them, and
+/// the worker's preemption rule lets them cancel whatever operation is
+/// still stopping (see [`MountRuntime::plan`]). Only one command ever
+/// contends with the active operation: with `stops_tracking` it is the
+/// tracking off, which at e-stop rank sends MoveAxis 0 on every axis before
+/// Tracking false (see [`tracking::SetTrackingOp`]); without, the first
+/// MoveAxis 0 starts a one-shot stop and absorbs the others, which still
+/// reach the hardware. Each step is bounded by [`ESTOP_BUDGET`] and
+/// reported in the [`MountEstopReport`], so a refused or unconfirmed step
+/// is never reported as success; a step that does not answer in time
+/// reports `outcome_unknown`, though its command still runs. Confirmation
+/// that motion stopped arrives as events.
+pub async fn estop_mount(handle: &MountHandle, stops_tracking: bool) -> MountEstopReport {
     let ticket = handle.abort();
-    let abort = ticket.outcome().await;
-    if stops_tracking {
-        let started = std::time::Instant::now();
-        loop {
-            let permit =
-                Permit::unmanaged(CommandId::new(), Priority::EStop, CommandSource::Safety);
-            match handle.send(MountCmd::SetTracking(false), permit).await {
-                Err(err)
-                    if err.class == super::types::ErrorClass::InvalidOperation
-                        && started.elapsed() < ESTOP_TRACKING_RETRY =>
-                {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(err) => {
-                    tracing::warn!("e-stop could not stop mount tracking: {err}");
-                    break;
-                }
-                Ok(_) => break,
+    let caps = handle.snapshot().capabilities.clone();
+    let cmds: Vec<MountCmd> = if stops_tracking {
+        vec![MountCmd::SetTracking(false)]
+    } else {
+        (0..jog::AXES)
+            .filter(|axis| caps.can_move_axis[usize::from(*axis)])
+            .map(|axis| MountCmd::MoveAxis {
+                axis,
+                rate_deg_s: 0.0,
+            })
+            .collect()
+    };
+    let abort = within_estop_budget("the abort path", ticket.outcome());
+    // `join_all` polls in order, so the commands are queued in that order.
+    let stops = futures::future::join_all(cmds.into_iter().map(|cmd| {
+        let permit = Permit::unmanaged(CommandId::new(), Priority::EStop, CommandSource::Safety);
+        let sent = handle.send(cmd.clone(), permit);
+        async move {
+            let result = within_estop_budget("the e-stop stop", sent).await;
+            if let Err(err) = &result {
+                tracing::warn!("e-stop step {cmd:?} on the mount failed: {err}");
             }
+            (cmd, result)
         }
-    }
-    abort
+    }));
+    let (abort, stops) = tokio::join!(abort, stops);
+    MountEstopReport { abort, stops }
 }
-
-/// How long e-stop retries the tracking-off command (see [`estop_mount`]).
-pub const ESTOP_TRACKING_RETRY: Duration = Duration::from_millis(1500);
 
 // ---------------------------------------------------------------------------
 // Snapshot builder and edge events
@@ -943,6 +1087,8 @@ pub struct MountTracker {
     prev_slewing: Option<bool>,
     external: Option<ExternalSlew>,
     last_state: MountState,
+    /// The last position in the frame of date (see [`of_date_position`]).
+    of_date: Option<EqCoord>,
 }
 
 fn motion_op(kind: OpKind) -> bool {
@@ -964,6 +1110,11 @@ impl MountTracker {
         self.pier_static
     }
 
+    /// The last built snapshot's position in the frame of date.
+    pub fn of_date(&self) -> Option<EqCoord> {
+        self.of_date
+    }
+
     /// Build the snapshot for `state` and emit edge events.
     pub fn update(
         &mut self,
@@ -980,7 +1131,11 @@ impl MountTracker {
 
         shared.set_mount_site(state.site.known().copied());
         let site = shared.geometry_site();
-        derive_geometry(&mut state, site.as_ref(), now_utc, now_mono);
+        let native = caps.native_frame;
+        let pos = position(&state, native);
+        let of_date = pos.map(|p| of_date_position(shared, p, site.as_ref(), now_utc));
+        derive_geometry(&mut state, of_date, site.as_ref(), now_utc, now_mono);
+        self.of_date = of_date;
         if let Some(rate) = settings.guide_rate_fallback_arcsec_s {
             for value in [
                 &mut state.guide_rate_ra_arcsec_s,
@@ -992,8 +1147,6 @@ impl MountTracker {
             }
         }
 
-        let native = caps.native_frame;
-        let pos = position(&state, native);
         let j2000 = pos.and_then(|p| match native {
             EqFrame::J2000 => Some(p),
             EqFrame::Unknown => None,
@@ -1004,7 +1157,12 @@ impl MountTracker {
                     .normalized(),
             ),
         });
-        let ha_h = hour_angle_of(shared, &state, pos, site.as_ref(), now_utc);
+        let ha_h = state
+            .sidereal_time_h
+            .known()
+            .copied()
+            .zip(of_date)
+            .map(|(lst, p)| limits::hour_angle_h(lst, p.ra_h));
         let clock_delta_s = clock_delta(&state).or_else(|| shared.clock_delta_s());
 
         let active_kind = active.as_ref().map(|op| op.kind);
@@ -1185,8 +1343,12 @@ fn derived<T>(value: T, inputs_fresh: bool, now_utc: DateTime<Utc>, now_mono: u6
 
 /// Fill LST, Alt and Az from the site when the mount reports none (R2 for
 /// mounts and adapters without them). Reported values are never replaced.
+/// `of_date` is the mount position in the frame of date
+/// ([`of_date_position`]), so a J2000 mount's derived Alt/Az carry no
+/// precession error.
 fn derive_geometry(
     state: &mut MountState,
+    of_date: Option<EqCoord>,
     site: Option<&Site>,
     now_utc: DateTime<Utc>,
     now_mono: u64,
@@ -1205,15 +1367,11 @@ fn derive_geometry(
     if state.alt_deg.value.is_some() && state.az_deg.value.is_some() {
         return;
     }
-    let (Some(ra), Some(dec), Some(lst)) = (
-        state.ra_h.known().copied(),
-        state.dec_deg.known().copied(),
-        state.sidereal_time_h.known().copied(),
-    ) else {
+    let (Some(pos), Some(lst)) = (of_date, state.sidereal_time_h.known().copied()) else {
         return;
     };
     let fresh = state.ra_h.is_fresh() && state.dec_deg.is_fresh();
-    let altaz = limits::alt_az(limits::hour_angle_h(lst, ra), dec, site.lat_deg);
+    let altaz = limits::alt_az(limits::hour_angle_h(lst, pos.ra_h), pos.dec_deg, site.lat_deg);
     if state.alt_deg.value.is_none() {
         state.alt_deg = derived(altaz.alt_deg, fresh, now_utc, now_mono);
     }
@@ -1222,26 +1380,23 @@ fn derive_geometry(
     }
 }
 
-/// Hour angle from LST and the position's RA of date.
-fn hour_angle_of(
+/// The native position in the frame of date, for hour angle and Alt/Az: a
+/// J2000 position is converted through the [`FrameConverter`]; JNow
+/// positions, and `Unknown` (taken as the mount's own frame of date, as the
+/// legacy API does), pass unchanged.
+fn of_date_position(
     shared: &MountShared,
-    state: &MountState,
-    pos: Option<EqCoord>,
+    pos: EqCoord,
     site: Option<&Site>,
     now_utc: DateTime<Utc>,
-) -> Option<f64> {
-    let lst = state.sidereal_time_h.known().copied()?;
-    let pos = pos?;
-    let ra_of_date = match pos.frame {
-        EqFrame::J2000 => {
-            shared
-                .converter()
-                .convert(pos, EqFrame::JNowApparent, now_utc, site)
-                .ra_h
-        }
-        _ => pos.ra_h,
-    };
-    Some(limits::hour_angle_h(lst, ra_of_date))
+) -> EqCoord {
+    match pos.frame {
+        EqFrame::J2000 => shared
+            .converter()
+            .convert(pos, EqFrame::JNowApparent, now_utc, site)
+            .normalized(),
+        _ => pos,
+    }
 }
 
 /// Mount UTC minus host UTC, from a fresh `utcdate` read (M-b).
@@ -1434,6 +1589,70 @@ pub(crate) mod test_support {
                 other => panic!("unexpected plan {other:?}"),
             };
             Ok(drive(self, op, &meta, 100_000))
+        }
+
+        /// Plan `cmd` while `active` (started with `active_meta`) runs, and
+        /// apply the WP1A-2 worker's rules: an absorbed command resolves at
+        /// once; `CancelActive` cancels and then drives the abort; `Start`
+        /// is refused unless it outranks the active permit, in which case
+        /// the active operation is cancelled first. Returns the command's
+        /// outcome and whether the active operation was cancelled.
+        pub fn run_during(
+            &mut self,
+            cmd: MountCmd,
+            meta: CommandMeta,
+            active: &mut MountOp,
+            active_meta: &CommandMeta,
+        ) -> (DeviceResult<OpOutcome>, bool) {
+            match self.runtime.plan(cmd, meta.clone(), Some(active.kind())) {
+                MountPlan::Absorbed(outcome) => (Ok(outcome), false),
+                MountPlan::Refused(err) => (Err(err), false),
+                MountPlan::CancelActive(op) => {
+                    let _ = active.cancel(&mut self.sim);
+                    (Ok(drive(self, op, &meta, 100_000)), true)
+                }
+                MountPlan::Start(op) => {
+                    if !meta.outranks(active_meta.rank) {
+                        return (
+                            Err(DeviceError::invalid_operation(
+                                "another operation is active on this device",
+                            )),
+                            false,
+                        );
+                    }
+                    let _ = active.cancel(&mut self.sim);
+                    (Ok(drive(self, op, &meta, 100_000)), true)
+                }
+            }
+        }
+    }
+
+    /// J2000 to any other frame adds `ra_h` and `dec_deg`; the reverse
+    /// subtracts them. A stand-in for precession in frame tests.
+    pub struct ShiftConverter {
+        pub ra_h: f64,
+        pub dec_deg: f64,
+    }
+
+    impl FrameConverter for ShiftConverter {
+        fn convert(
+            &self,
+            c: EqCoord,
+            to: EqFrame,
+            _at: DateTime<Utc>,
+            _site: Option<&Site>,
+        ) -> EqCoord {
+            let sign = match (c.frame, to) {
+                (from, to) if from == to => 0.0,
+                (EqFrame::J2000, _) => 1.0,
+                (_, EqFrame::J2000) => -1.0,
+                _ => 0.0,
+            };
+            EqCoord::new(
+                EqCoord::wrap_ra_h(c.ra_h + sign * self.ra_h),
+                c.dec_deg + sign * self.dec_deg,
+                to,
+            )
         }
     }
 
@@ -1677,6 +1896,46 @@ mod tests {
     }
 
     #[test]
+    fn a_j2000_mount_derives_alt_az_and_hour_angle_from_coordinates_of_date() {
+        let mut profile = SimMountProfile::esp32_like();
+        profile.equatorial_system = Some(2);
+        profile.reports_alt_az = false;
+        let mut rig = rig(profile);
+        rig.runtime = MountRuntime::new(
+            MountSettings::default(),
+            MountLimits::default(),
+            Arc::new(ShiftConverter {
+                ra_h: 0.1,
+                dec_deg: 0.3,
+            }),
+            rig.clock.clone(),
+            rig.sim.identity().connection_id,
+            Some(site()),
+        );
+        rig.runtime.on_connected(&mut rig.sim).unwrap();
+        let snapshot = rig.tick(Duration::from_secs(1), None);
+        assert_eq!(snapshot.capabilities.native_frame, EqFrame::J2000);
+        let s = &snapshot.state;
+        let (lst, ra, dec) = (
+            s.sidereal_time_h.value.unwrap(),
+            s.ra_h.value.unwrap(),
+            s.dec_deg.value.unwrap(),
+        );
+        let ha_of_date = limits::hour_angle_h(lst, ra + 0.1);
+        let expected = limits::alt_az(ha_of_date, dec + 0.3, site().lat_deg);
+        assert_eq!(s.alt_deg.source, Source::Derived);
+        assert!((s.alt_deg.value.unwrap() - expected.alt_deg).abs() < 1e-9);
+        assert!((s.az_deg.value.unwrap() - expected.az_deg).abs() < 1e-9);
+        assert!((snapshot.ha_h.unwrap() - ha_of_date).abs() < 1e-9);
+        let raw = limits::alt_az(limits::hour_angle_h(lst, ra), dec, site().lat_deg);
+        assert!(
+            (raw.alt_deg - expected.alt_deg).abs() > 0.1,
+            "the test shift must matter"
+        );
+        assert_eq!(rig.runtime.tracker.of_date().unwrap().frame, EqFrame::JNowApparent);
+    }
+
+    #[test]
     fn pier_side_changes_and_can_flip_on_a_german_mount() {
         let mut rig = rig(SimMountProfile::german_equatorial());
         let first = rig.tick(Duration::from_secs(1), None);
@@ -1830,12 +2089,135 @@ mod tests {
         assert!(matches!(
             rig.runtime
                 .plan(MountCmd::AbortSlew, meta.clone(), Some(OpKind::Slew)),
-            MountPlan::CancelActive
+            MountPlan::CancelActive(op) if op.kind() == OpKind::AbortSlew
+        ));
+        // Anything else is left to the worker's preemption rule.
+        assert!(matches!(
+            rig.runtime.plan(MountCmd::Park, meta.clone(), Some(OpKind::Slew)),
+            MountPlan::Start(op) if op.kind() == OpKind::Park
         ));
         assert!(matches!(
-            rig.runtime.plan(MountCmd::Park, meta, Some(OpKind::Slew)),
-            MountPlan::Refused(err) if err.class == crate::equipment::types::ErrorClass::InvalidOperation
+            rig.runtime.plan(MountCmd::RenewJog, meta, Some(OpKind::Slew)),
+            MountPlan::Refused(_)
         ));
+    }
+
+    fn meta_with(source: CommandSource, priority: Priority) -> CommandMeta {
+        CommandMeta::new(CommandId::new(), source).with_priority(priority)
+    }
+
+    #[test]
+    fn command_meta_ranks_follow_the_arbiter_table() {
+        let operator = operator();
+        assert_eq!(operator.rank, 5, "an operator holds rank 5");
+        let safety = CommandMeta::new(CommandId::new(), CommandSource::Safety);
+        assert_eq!((safety.priority, safety.rank), (Priority::Safety, 6));
+        let recovery = meta_with(CommandSource::System, Priority::MountRecovery);
+        assert_eq!(recovery.rank, 4);
+        assert!(safety.outranks(operator.rank));
+        assert!(!recovery.outranks(operator.rank), "never over an operator");
+        assert!(!operator.outranks(1), "an operator needs override");
+        let overriding = CommandMeta::new(
+            CommandId::new(),
+            CommandSource::Operator { overriding: true },
+        );
+        assert!(overriding.outranks(5) && !overriding.outranks(6));
+        let estop = meta_with(CommandSource::Safety, Priority::EStop);
+        assert!(estop.outranks(6));
+        let permit = Permit::unmanaged(CommandId::new(), Priority::EStop, CommandSource::Safety);
+        let from = CommandMeta::from_permit(&permit);
+        assert_eq!((from.priority, from.rank), (Priority::EStop, 7));
+    }
+
+    /// Start an operator slew to 3 h west of the meridian and step it until
+    /// the mount is moving.
+    fn slewing(rig: &mut Rig, meta: &CommandMeta) -> MountOp {
+        let lst = rig
+            .tick(Duration::from_secs(1), None)
+            .state
+            .sidereal_time_h
+            .value
+            .unwrap();
+        let target = EqCoord::new(EqCoord::wrap_ra_h(lst - 3.0), 60.0, EqFrame::Unknown);
+        let mut op = build_operation(&rig.runtime.shared(), MountCmd::Slew { target }, meta.clone())
+            .unwrap();
+        op.start(&mut rig.sim, rig.clock.as_ref()).unwrap();
+        assert_eq!(advance(rig, &mut op, meta, 2), None);
+        assert!(rig.sim.control().slewing());
+        op
+    }
+
+    #[test]
+    fn a_safety_park_preempts_an_operator_slew() {
+        let mut rig = rig(SimMountProfile::esp32_like());
+        let slew_meta = operator();
+        let mut slew = slewing(&mut rig, &slew_meta);
+        // The operator's own park during its slew is refused by the rule.
+        let (refused, cancelled) =
+            rig.run_during(MountCmd::Park, operator(), &mut slew, &slew_meta);
+        assert!(!cancelled);
+        assert_eq!(
+            refused.unwrap_err().class,
+            crate::equipment::types::ErrorClass::InvalidOperation
+        );
+        assert!(rig.sim.control().slewing(), "the slew goes on");
+        // The unsafe policy's park outranks it: the slew is cancelled first.
+        let safety = CommandMeta::new(CommandId::new(), CommandSource::Safety);
+        let (outcome, cancelled) = rig.run_during(MountCmd::Park, safety, &mut slew, &slew_meta);
+        assert!(cancelled);
+        assert_eq!(outcome.unwrap(), OpOutcome::Succeeded);
+        let snapshot = rig.tick(Duration::from_secs(1), None);
+        assert!(is_parked(&snapshot.state));
+        let calls = rig.sim.control().calls();
+        let abort = calls.iter().position(|c| c == "abort_slew").unwrap();
+        let park = calls.iter().position(|c| c == "park").unwrap();
+        assert!(abort < park, "{calls:?}");
+    }
+
+    #[test]
+    fn safety_tracking_off_preempts_an_operator_slew() {
+        let mut rig = rig(SimMountProfile::esp32_like());
+        let slew_meta = operator();
+        let mut slew = slewing(&mut rig, &slew_meta);
+        let estop = meta_with(CommandSource::Safety, Priority::EStop);
+        let (outcome, cancelled) =
+            rig.run_during(MountCmd::SetTracking(false), estop, &mut slew, &slew_meta);
+        assert!(cancelled);
+        assert_eq!(outcome.unwrap(), OpOutcome::Succeeded);
+        assert!(!rig.sim.control().tracking());
+        assert!(!rig.sim.control().slewing());
+    }
+
+    #[test]
+    fn abort_during_a_setter_still_stops_a_slew_by_another_client() {
+        let mut rig = rig(SimMountProfile::esp32_like());
+        let lst = rig
+            .tick(Duration::from_secs(1), None)
+            .state
+            .sidereal_time_h
+            .value
+            .unwrap();
+        rig.sim.control().external_goto(EqCoord::new(
+            EqCoord::wrap_ra_h(lst - 3.0),
+            60.0,
+            EqFrame::JNowApparent,
+        ));
+        assert!(rig.sim.control().slewing());
+        // A rate setter is running; its own cancel does no I/O.
+        let meta = operator();
+        let mut setter = build_operation(
+            &rig.runtime.shared(),
+            MountCmd::SetTrackingRate(crate::equipment::types::DriveRate::Sidereal),
+            meta.clone(),
+        )
+        .unwrap();
+        setter.start(&mut rig.sim, rig.clock.as_ref()).unwrap();
+        let (outcome, cancelled) =
+            rig.run_during(MountCmd::AbortSlew, operator(), &mut setter, &meta);
+        assert!(cancelled);
+        assert_eq!(outcome.unwrap(), OpOutcome::Succeeded);
+        assert!(!rig.sim.control().slewing(), "AbortSlew reached the mount");
+        assert!(rig.sim.control().calls().contains(&"abort_slew".to_string()));
     }
 
     #[test]
@@ -1870,34 +2252,176 @@ mod tests {
         assert!(rig.runtime.take_events().is_empty());
     }
 
-    #[tokio::test]
-    async fn estop_aborts_then_queues_tracking_off() {
-        let (handle, fake) =
-            crate::equipment::testing::fake_handles::fake_mount(MountSnapshot::default());
-        estop_mount(&handle, true).await.unwrap();
-        assert_eq!(fake.abort_path().calls(), 1);
-        assert!(fake.wait_for_commands(1, Duration::from_secs(5)));
-        assert_eq!(fake.commands(), vec![MountCmd::SetTracking(false)]);
-        estop_mount(&handle, false).await.unwrap();
-        assert_eq!(fake.abort_path().calls(), 2);
-        assert_eq!(fake.commands().len(), 1);
+    fn mount_with_axes() -> MountSnapshot {
+        let mut snapshot = MountSnapshot::default();
+        snapshot.capabilities.can_move_axis = [true, true, false];
+        snapshot
     }
 
     #[tokio::test]
-    async fn estop_retries_tracking_off_while_the_cancelled_op_finishes() {
+    async fn estop_aborts_then_queues_one_stop_at_estop_rank() {
+        let (handle, fake) =
+            crate::equipment::testing::fake_handles::fake_mount(mount_with_axes());
+        let report = estop_mount(&handle, true).await;
+        assert!(report.result().is_ok(), "{report:?}");
+        assert_eq!(fake.abort_path().calls(), 1);
+        assert!(fake.wait_for_commands(1, Duration::from_secs(5)));
+        assert_eq!(
+            fake.commands(),
+            vec![MountCmd::SetTracking(false)],
+            "one e-stop-rank command, which also stops the axes"
+        );
+        assert_eq!(report.tracking_off(), Some(&Ok(())));
+        // Tracking left on: MoveAxis 0 on each CanMoveAxis axis instead.
+        let report = estop_mount(&handle, false).await;
+        assert_eq!(fake.abort_path().calls(), 2);
+        assert_eq!(report.tracking_off(), None);
+        assert!(fake.wait_for_commands(3, Duration::from_secs(5)));
+        assert_eq!(
+            fake.commands()[1..],
+            [
+                MountCmd::MoveAxis {
+                    axis: 0,
+                    rate_deg_s: 0.0
+                },
+                MountCmd::MoveAxis {
+                    axis: 1,
+                    rate_deg_s: 0.0
+                },
+            ]
+        );
+        assert!(report.result().is_ok(), "{report:?}");
+    }
+
+    #[test]
+    fn estop_tracking_off_stops_every_axis_first_and_preempts_a_slew() {
+        let mut rig = rig(SimMountProfile::esp32_like());
+        let slew_meta = operator();
+        let mut slew = slewing(&mut rig, &slew_meta);
+        // Another client has the secondary axis moving.
+        rig.sim.move_axis(1, 2.0).unwrap();
+        let before = rig.sim.control().calls().len();
+        let estop = meta_with(CommandSource::Safety, Priority::EStop);
+        let (outcome, cancelled) =
+            rig.run_during(MountCmd::SetTracking(false), estop, &mut slew, &slew_meta);
+        assert!(cancelled, "e-stop rank preempts the operator slew");
+        assert_eq!(outcome.unwrap(), OpOutcome::Succeeded);
+        assert_eq!(rig.sim.control().axis_rates(), [0.0; 3]);
+        assert!(!rig.sim.control().tracking());
+        let calls = rig.sim.control().calls()[before..].to_vec();
+        let at = |name: &str| calls.iter().position(|c| c == name);
+        let (axis0, axis1, off) = (
+            at("move_axis:0:0").expect("axis 0 stopped"),
+            at("move_axis:1:0").expect("axis 1 stopped"),
+            at("tracking_off").expect("tracking off"),
+        );
+        assert!(axis0 < off && axis1 < off, "the section 2.9 order: {calls:?}");
+        assert!(
+            !calls.iter().any(|c| c.starts_with("move_axis:2")),
+            "axis 2 cannot move"
+        );
+        // An ordinary tracking off does not touch the axes.
+        rig.sim.move_axis(1, 2.0).unwrap();
+        let outcome = rig
+            .run(MountCmd::SetTracking(false), operator())
+            .unwrap();
+        assert_eq!(outcome, OpOutcome::Succeeded);
+        assert_eq!(rig.sim.control().axis_rates()[1], 2.0);
+    }
+
+    #[test]
+    fn estop_tracking_off_reports_a_failed_axis_stop_but_still_stops_tracking() {
+        let mut rig = rig(SimMountProfile::esp32_like());
+        rig.sim
+            .control()
+            .update_faults(|f| f.move_axis_fails = true);
+        let estop = meta_with(CommandSource::Safety, Priority::EStop);
+        let outcome = rig.run(MountCmd::SetTracking(false), estop).unwrap();
+        assert!(
+            matches!(&outcome, OpOutcome::Failed(e) if e.message.contains("MoveAxis")),
+            "{outcome:?}"
+        );
+        assert!(!rig.sim.control().tracking(), "tracking off was still sent");
+    }
+
+    #[test]
+    fn estop_move_axis_stops_without_tracking_stop_both_axes_through_the_worker_rules() {
+        let mut rig = rig(SimMountProfile::esp32_like());
+        let slew_meta = operator();
+        let mut slew = slewing(&mut rig, &slew_meta);
+        rig.sim.move_axis(1, 2.0).unwrap();
+        let estop = meta_with(CommandSource::Safety, Priority::EStop);
+        let axis = |axis| MountCmd::MoveAxis {
+            axis,
+            rate_deg_s: 0.0,
+        };
+        // The first MoveAxis 0 outranks the slew: the worker cancels it and
+        // starts a one-shot stop.
+        let MountPlan::Start(mut stop) =
+            rig.runtime
+                .plan(axis(0), estop.clone(), Some(OpKind::Slew))
+        else {
+            panic!("e-stop MoveAxis 0 must be planned to start");
+        };
+        assert!(estop.outranks(slew_meta.rank));
+        slew.cancel(&mut rig.sim).unwrap();
+        stop.start(&mut rig.sim, rig.clock.as_ref()).unwrap();
+        // The second is absorbed by it, not refused as a conflict, and still
+        // reaches the hardware although this stop never moved axis 1.
+        assert!(matches!(
+            rig.runtime.plan(axis(1), estop.clone(), Some(OpKind::MoveAxis)),
+            MountPlan::Absorbed(OpOutcome::Succeeded)
+        ));
+        assert_eq!(
+            advance(&mut rig, &mut stop, &estop, 4),
+            Some(OpOutcome::Succeeded)
+        );
+        assert_eq!(rig.sim.control().axis_rates(), [0.0; 3]);
+        assert!(!rig.runtime.shared().jog_active());
+    }
+
+    #[tokio::test]
+    async fn estop_reports_a_tracking_off_that_is_refused() {
         use crate::equipment::testing::fake_handles::FakeResponse;
         let (handle, fake) =
             crate::equipment::testing::fake_handles::fake_mount(MountSnapshot::default());
-        let mut refusals = 2;
-        fake.set_responder(move |cmd, _| {
-            if matches!(cmd, MountCmd::SetTracking(false)) && refusals > 0 {
-                refusals -= 1;
-                FakeResponse::reject(DeviceError::invalid_operation("the slew is still stopping"))
+        fake.set_responder(|cmd, _| {
+            if matches!(cmd, MountCmd::SetTracking(false)) {
+                FakeResponse::reject(DeviceError::invalid_operation("refused"))
             } else {
                 FakeResponse::succeed()
             }
         });
-        estop_mount(&handle, true).await.unwrap();
-        assert_eq!(fake.commands().len(), 3, "two refusals, then accepted");
+        let report = estop_mount(&handle, true).await;
+        assert!(report.abort.is_ok());
+        assert!(matches!(report.tracking_off(), Some(Err(e)) if e.message == "refused"));
+        assert!(report.result().is_err(), "e-stop must not report success");
+        assert_eq!(fake.commands().len(), 1, "sent once, never retried");
+    }
+
+    #[tokio::test]
+    async fn estop_queues_tracking_off_without_waiting_for_a_slow_abort() {
+        use crate::equipment::testing::fake_handles::FakeResponse;
+        let (handle, fake) =
+            crate::equipment::testing::fake_handles::fake_mount(MountSnapshot::default());
+        fake.abort_path().set_delay(Some(Duration::from_millis(800)));
+        let arrived = Arc::new(Mutex::new(None));
+        let seen = Arc::clone(&arrived);
+        fake.set_responder(move |cmd, _| {
+            if matches!(cmd, MountCmd::SetTracking(false)) {
+                *lock(&seen) = Some(std::time::Instant::now());
+            }
+            FakeResponse::succeed()
+        });
+        let started = std::time::Instant::now();
+        let report = estop_mount(&handle, true).await;
+        assert!(report.result().is_ok(), "{report:?}");
+        let at = lock(&arrived).expect("tracking off was sent");
+        assert!(
+            at.duration_since(started) < Duration::from_millis(500),
+            "tracking off waited for the abort path: {:?}",
+            at.duration_since(started)
+        );
+        assert!(started.elapsed() >= Duration::from_millis(800));
     }
 }

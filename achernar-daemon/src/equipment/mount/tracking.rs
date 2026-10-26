@@ -11,7 +11,9 @@ use std::time::Duration;
 use crate::equipment::events::EventKind;
 use crate::equipment::ops::{OpKind, OpProgress, Operation};
 use crate::equipment::traits::Clock;
-use crate::equipment::types::{DeviceError, DeviceResult, DriveRate, ObsState, OpOutcome};
+use crate::equipment::types::{
+    DeviceError, DeviceResult, DriveRate, ObsState, OpOutcome, Priority,
+};
 
 use super::{
     duration_ns, is_parked, parked_error, CommandMeta, DynMount, MountShared, ACTIVE_POLL,
@@ -35,6 +37,14 @@ pub fn select_rate(advertised: &[DriveRate], requested: DriveRate) -> DeviceResu
 }
 
 /// Tracking on or off.
+///
+/// Tracking off at e-stop priority is the mount's e-stop step (§2.9 step
+/// 1): MoveAxis 0 on every CanMoveAxis axis, whoever moved it, then
+/// Tracking false, in that order and as one command, so the e-stop never
+/// queues two e-stop-rank commands that the worker's conflict rule would
+/// set against each other. Every step is attempted; a failed axis stop is
+/// the command's refusal (e-stop reports it) even though tracking off was
+/// still sent.
 pub struct SetTrackingOp {
     shared: Arc<MountShared>,
     meta: CommandMeta,
@@ -50,6 +60,10 @@ impl SetTrackingOp {
             on,
             sent_mono_ns: 0,
         }
+    }
+
+    fn estop(&self) -> bool {
+        !self.on && self.meta.priority == Priority::EStop
     }
 
     fn announce(&self, rate: Option<DriveRate>, reason: Option<&str>) {
@@ -76,7 +90,13 @@ impl Operation<DynMount> for SetTrackingOp {
     }
 
     fn start(&mut self, drv: &mut DynMount, clock: &dyn Clock) -> DeviceResult<()> {
+        let axes = if self.estop() {
+            super::jog::stop_movable_axes(&self.shared, drv, Some(self.meta.command_id))
+        } else {
+            Ok(())
+        };
         if !self.shared.capabilities().can_set_tracking {
+            axes?;
             return Err(DeviceError::unsupported(
                 "the mount does not report CanSetTracking",
             ));
@@ -86,7 +106,7 @@ impl Operation<DynMount> for SetTrackingOp {
         }
         drv.set_tracking(self.on)?;
         self.sent_mono_ns = clock.now_mono_ns();
-        Ok(())
+        axes
     }
 
     fn step(&mut self, drv: &mut DynMount, clock: &dyn Clock) -> OpProgress {

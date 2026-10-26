@@ -463,22 +463,60 @@ impl AlpacaTelescope {
         self.next_due.insert(member, 0);
     }
 
+    fn write_site(&mut self, site: &Site) -> DeviceResult<()> {
+        self.put(
+            "sitelatitude",
+            &[("SiteLatitude", number(site.lat_deg))],
+            TimeoutClass::Ordinary,
+        )?;
+        self.put(
+            "sitelongitude",
+            &[("SiteLongitude", number(site.lon_deg))],
+            TimeoutClass::Ordinary,
+        )?;
+        if !site.elev_m.is_finite() || self.is_unsupported("siteelevation") {
+            return Ok(());
+        }
+        match self.put(
+            "siteelevation",
+            &[("SiteElevation", number(site.elev_m))],
+            TimeoutClass::Ordinary,
+        ) {
+            Err(err) if err.is_unknown_member() => {
+                self.memoise_unsupported("siteelevation");
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
     // ---- connect helpers ----
 
+    /// Poll `connecting` until it reads false, for up to `timeout` of
+    /// elapsed time (§2.6 step 4) whatever each GET's latency. This blocking
+    /// connect path runs on the worker thread and sleeps in real time, so
+    /// the deadline is a real-time `Instant`, not the injected clock (a
+    /// manual clock would never reach it). One slow GET can overrun the
+    /// deadline by at most its own connect-class timeout.
     fn wait_connecting(&mut self, timeout: Duration) -> DeviceResult<()> {
         let interval = self.connect_poll_interval.max(Duration::from_millis(1));
-        let polls = (timeout.as_millis() / interval.as_millis()).max(1);
-        for _ in 0..polls {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
             match self.transport.get("connecting", &[], TimeoutClass::Connect) {
                 Ok(value) if as_bool(&value) == Some(false) => return Ok(()),
-                Ok(_) => std::thread::sleep(interval),
+                Ok(_) => {}
                 Err(err) if err.is_unknown_member() => return Ok(()),
                 Err(err) => return Err(err),
             }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            std::thread::sleep(interval.min(deadline - now));
         }
         Err(DeviceError::timeout(format!(
-            "Connecting still reads true after {} s",
-            timeout.as_secs()
+            "Connecting still reads true after {:.1} s",
+            timeout.as_secs_f64()
         )))
     }
 
@@ -641,20 +679,31 @@ impl AlpacaTelescope {
         };
     }
 
+    /// The mount's site. Latitude and longitude are required; ASCOM lets
+    /// SiteElevation raise NotImplemented, in which case the site is still
+    /// reported with the elevation unknown: `f64::NAN`, which
+    /// `Site::differs_from` ignores and JSON publishes as null.
     fn site_obs(&self) -> Observed<Site> {
         let overdue = Self::slow_overdue("sitelatitude");
-        let parts = [
-            self.obs("sitelatitude", overdue, as_f64),
-            self.obs("sitelongitude", overdue, as_f64),
-            self.obs("siteelevation", overdue, as_f64),
-        ];
-        if parts.iter().any(|p| p.state == ObsState::Unsupported) {
+        let lat = self.obs("sitelatitude", overdue, as_f64);
+        let lon = self.obs("sitelongitude", overdue, as_f64);
+        let elev = self.obs("siteelevation", overdue, as_f64);
+        if lat.state == ObsState::Unsupported || lon.state == ObsState::Unsupported {
             return Observed::unsupported(Source::Property);
         }
-        let (Some(lat), Some(lon), Some(elev)) = (parts[0].value, parts[1].value, parts[2].value)
-        else {
+        let elevation_unsupported = elev.state == ObsState::Unsupported;
+        let elev_m = if elevation_unsupported {
+            Some(f64::NAN)
+        } else {
+            elev.value
+        };
+        let (Some(lat_deg), Some(lon_deg), Some(elev_m)) = (lat.value, lon.value, elev_m) else {
             return Observed::not_set(Source::Property);
         };
+        let mut parts = vec![lat, lon];
+        if !elevation_unsupported {
+            parts.push(elev);
+        }
         let oldest = parts
             .iter()
             .min_by_key(|p| p.mono_ns.unwrap_or(0))
@@ -667,9 +716,9 @@ impl AlpacaTelescope {
         };
         Observed {
             value: Some(Site {
-                lat_deg: lat,
-                lon_deg: lon,
-                elev_m: elev,
+                lat_deg,
+                lon_deg,
+                elev_m,
                 source: SiteSource::Mount,
             }),
             state,
@@ -1094,26 +1143,16 @@ impl MountDriver for AlpacaTelescope {
         Ok(())
     }
 
+    /// Latitude and longitude are required. SiteElevation is written only
+    /// when it is implemented (ASCOM allows NotImplemented); a NotImplemented
+    /// answer is memoised and is not a failure. The members are re-read on
+    /// the next poll even after a partial write.
     fn set_site(&mut self, site: &Site) -> DeviceResult<()> {
-        self.put(
-            "sitelatitude",
-            &[("SiteLatitude", number(site.lat_deg))],
-            TimeoutClass::Ordinary,
-        )?;
-        self.put(
-            "sitelongitude",
-            &[("SiteLongitude", number(site.lon_deg))],
-            TimeoutClass::Ordinary,
-        )?;
-        self.put(
-            "siteelevation",
-            &[("SiteElevation", number(site.elev_m))],
-            TimeoutClass::Ordinary,
-        )?;
+        let result = self.write_site(site);
         for member in ["sitelatitude", "sitelongitude", "siteelevation"] {
             self.invalidate(member);
         }
-        Ok(())
+        result
     }
 
     fn set_utc(&mut self, utc: DateTime<Utc>) -> DeviceResult<()> {
@@ -1889,6 +1928,105 @@ mod tests {
             .with_timezone(&Utc);
         assert_eq!(local, expected, "a zoneless TimeStamp is local time");
         assert_eq!(parse_alpaca_datetime("yesterday", true), None);
+    }
+
+    #[test]
+    fn a_mount_without_site_elevation_keeps_its_site_and_verifies_lat_lon() {
+        let fake = esp32();
+        fake.on_get("siteelevation", FakeReply::not_implemented())
+            .on_put("siteelevation", FakeReply::not_implemented());
+        let (mut s, report) = connected(fake);
+        assert!(report
+            .unsupported_members
+            .contains(&"siteelevation".to_string()));
+        s.drv.poll(&plan(1, false, &[])).unwrap();
+        let state = s.drv.state().unwrap();
+        assert_ne!(state.site.state, ObsState::Unsupported);
+        let site = state.site.value.expect("latitude and longitude suffice");
+        assert_eq!((site.lat_deg, site.lon_deg), (40.0, -75.0));
+        assert!(site.elev_m.is_nan(), "the elevation is unknown");
+        assert_eq!(
+            serde_json::to_value(site).unwrap()["elev_m"],
+            Value::Null,
+            "published as null"
+        );
+        // verify_only: a [site] that differs only in elevation matches.
+        let configured = Site {
+            lat_deg: 40.0,
+            lon_deg: -75.0,
+            elev_m: 350.0,
+            source: SiteSource::Config,
+        };
+        let mut runtime = MountRuntime::new(
+            MountSettings::default(),
+            MountLimits::default(),
+            Arc::new(IdentityConverter),
+            s.clock.clone(),
+            s.drv.identity().connection_id,
+            Some(configured),
+        );
+        let post = runtime.on_connected(&mut s.drv).unwrap();
+        assert!(!post.site.site_mismatch);
+        assert_eq!(post.site.mount_site.map(|m| m.lat_deg), Some(40.0));
+        let snapshot = runtime.after_poll(&mut s.drv, None);
+        assert!(snapshot.ha_h.is_some(), "geometry keeps working");
+        // SetSite writes and verifies latitude and longitude only.
+        s.fake
+            .on_get("sitelatitude", FakeReply::value(41.0))
+            .on_get("sitelongitude", FakeReply::value(-74.0));
+        s.fake.clear_calls();
+        let target = Site {
+            lat_deg: 41.0,
+            lon_deg: -74.0,
+            elev_m: 120.0,
+            source: SiteSource::Operator,
+        };
+        let outcome = run(&mut s, &mut runtime, MountCmd::SetSite(target));
+        assert_eq!(outcome, OpOutcome::Succeeded);
+        assert_eq!(s.fake.calls_to(Method::Put, "sitelatitude"), 1);
+        assert_eq!(s.fake.calls_to(Method::Put, "sitelongitude"), 1);
+        assert_eq!(s.fake.calls_to(Method::Put, "siteelevation"), 0);
+        // A mount that keeps a different latitude still fails verification.
+        s.fake.on_get("sitelatitude", FakeReply::value(10.0));
+        let outcome = run(&mut s, &mut runtime, MountCmd::SetSite(target));
+        assert!(matches!(outcome, OpOutcome::Failed(_)), "{outcome:?}");
+    }
+
+    #[test]
+    fn a_site_elevation_put_that_is_not_implemented_is_not_a_failure() {
+        let (mut s, _) = connected(esp32());
+        s.fake.on_put("siteelevation", FakeReply::not_implemented());
+        let site = Site {
+            lat_deg: 41.0,
+            lon_deg: -74.0,
+            elev_m: 120.0,
+            source: SiteSource::Operator,
+        };
+        s.drv.set_site(&site).unwrap();
+        s.drv.set_site(&site).unwrap();
+        assert_eq!(
+            s.fake.calls_to(Method::Put, "siteelevation"),
+            1,
+            "memoised after the first NotImplemented"
+        );
+        assert_eq!(s.fake.calls_to(Method::Put, "sitelatitude"), 2);
+    }
+
+    #[test]
+    fn a_slow_connecting_read_does_not_stretch_the_connect_timeout() {
+        let fake = esp32();
+        fake.on_get(
+            "connecting",
+            FakeReply::Delay(Duration::from_millis(40), Box::new(FakeReply::value(true))),
+        );
+        let mut s = setup(fake);
+        let started = std::time::Instant::now();
+        let err = s.drv.connect(Duration::from_millis(100)).unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(err.class, ErrorClass::Timeout);
+        // Counting 100 polls of 1 ms would have taken about 4 s.
+        assert!(elapsed < Duration::from_millis(1500), "{elapsed:?}");
+        assert!(s.fake.calls_to(Method::Get, "connecting") <= 5);
     }
 
     #[test]

@@ -224,6 +224,11 @@ pub struct SimFaults {
     pub fail_polls: u32,
     /// Tracking writes are accepted but ignored.
     pub tracking_writes_ignored: bool,
+    /// Tracking writes fail with a transport error.
+    pub tracking_writes_fail: bool,
+    /// MoveAxis commands fail with a transport error (the axis keeps its
+    /// rate).
+    pub move_axis_fails: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1021,6 +1026,9 @@ impl MountDriver for SimMount {
         if on && core.at_park {
             return Err(parked());
         }
+        if core.faults.tracking_writes_fail {
+            return Err(DeviceError::transport("simulated Tracking write failure"));
+        }
         if !core.faults.tracking_writes_ignored {
             core.tracking = on;
         }
@@ -1095,6 +1103,9 @@ impl MountDriver for SimMount {
 
     fn move_axis(&mut self, axis: u8, rate_deg_s: f64) -> DeviceResult<()> {
         let mut core = self.command(&format!("move_axis:{axis}:{rate_deg_s}"))?;
+        if core.faults.move_axis_fails {
+            return Err(DeviceError::transport("simulated MoveAxis failure"));
+        }
         let index = usize::from(axis);
         if index > 2 || !core.profile.can_move_axis[index] {
             return Err(not_implemented("MoveAxis on this axis"));

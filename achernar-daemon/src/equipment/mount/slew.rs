@@ -30,8 +30,8 @@ use crate::equipment::ops::{OpKind, OpProgress, Operation};
 use crate::equipment::snapshot::{DestinationSideOfPier, MountState};
 use crate::equipment::traits::Clock;
 use crate::equipment::types::{
-    AlignmentMode, AltAz, DeviceError, DeviceResult, EqCoord, EqFrame, ErrorClass, ObsState,
-    OpOutcome, PierSide,
+    AlignmentMode, AltAz, CommandId, DeviceError, DeviceResult, EqCoord, EqFrame, ErrorClass,
+    ObsState, OpOutcome, PierSide,
 };
 
 use super::limits::{angular_separation_deg, ha_dec_from_alt_az};
@@ -384,9 +384,26 @@ pub fn abort_slew(drv: &mut DynMount) -> DeviceResult<()> {
     }
 }
 
-/// `MountCmd::AbortSlew` sent while no operation runs (a slew by another
-/// client, or a jog): AbortSlew, plus MoveAxis 0 on jogging axes. Completes
-/// when Slewing reads false. Never gated on a Can* flag (O10, D19).
+/// AbortSlew, then MoveAxis 0 on every axis the shared jog demand says may
+/// be moving (a running jog, or a stop that failed), whatever operation is
+/// or is not running (D19, O10: abort is always attempted, never gated on a
+/// Can* flag). Every step is attempted; the first error is returned.
+pub fn stop_motion(
+    shared: &MountShared,
+    drv: &mut DynMount,
+    command_id: Option<CommandId>,
+) -> DeviceResult<()> {
+    let aborted = abort_slew(drv);
+    let axes = shared.with_jog(|jog| jog.moving_axes());
+    let stopped = super::jog::stop_axes(shared, drv, &axes, command_id);
+    aborted.and(stopped)
+}
+
+/// `MountCmd::AbortSlew`: [`stop_motion`], then complete when Slewing reads
+/// false. Started directly when no operation runs (a slew by another
+/// client), and after the cancel when one does
+/// ([`super::MountPlan::CancelActive`]), so an operation whose own cancel
+/// does no I/O (a sync, a setter) still gets the mount stopped.
 pub struct AbortSlewOp {
     shared: Arc<MountShared>,
     meta: CommandMeta,
@@ -414,19 +431,7 @@ impl Operation<DynMount> for AbortSlewOp {
 
     fn start(&mut self, drv: &mut DynMount, clock: &dyn Clock) -> DeviceResult<()> {
         self.sent_mono_ns = clock.now_mono_ns();
-        let result = abort_slew(drv);
-        let axes = self.shared.with_jog(|jog| jog.stop_all());
-        for axis in axes {
-            drv.move_axis(axis, 0.0)?;
-            self.shared.emit(
-                EventKind::MoveAxis {
-                    axis,
-                    rate_deg_s: 0.0,
-                },
-                Some(self.meta.command_id),
-            );
-        }
-        result
+        stop_motion(&self.shared, drv, Some(self.meta.command_id))
     }
 
     fn step(&mut self, drv: &mut DynMount, clock: &dyn Clock) -> OpProgress {

@@ -64,6 +64,38 @@ fn slewing(state: &MountState) -> bool {
     state.slewing.known() == Some(&true)
 }
 
+/// A mount site whose elevation is unknown (NaN: the mount does not
+/// implement SiteElevation) takes `fallback`'s elevation, else 0 m. Lat and
+/// lon are the mount's.
+pub fn with_known_elevation(site: Site, fallback: Option<&Site>) -> Site {
+    if site.elev_m.is_finite() {
+        return site;
+    }
+    Site {
+        elev_m: fallback
+            .map(|f| f.elev_m)
+            .filter(|e| e.is_finite())
+            .unwrap_or(0.0),
+        ..site
+    }
+}
+
+/// Adopt the mount's site for the session (`from_mount`), with provenance
+/// `mount`; a warning is returned when its elevation had to be filled in.
+fn adopt_mount_site(mount: Site, fallback: Option<&Site>) -> (Site, Option<String>) {
+    let adopted = Site {
+        source: SiteSource::Mount,
+        ..with_known_elevation(mount, fallback)
+    };
+    let warning = (!mount.elev_m.is_finite()).then(|| {
+        format!(
+            "the mount does not report SiteElevation; using {} m",
+            adopted.elev_m
+        )
+    });
+    (adopted, warning)
+}
+
 fn reread(drv: &mut dyn MountDriver) -> Option<MountState> {
     drv.poll(&plan(0, false, SITE_MEMBERS)).ok()?;
     drv.state().ok()
@@ -101,10 +133,9 @@ pub fn verify_site_and_time(
     match (settings.site_sync, configured, mount_site) {
         (SiteSyncMode::None, _, _) => {}
         (SiteSyncMode::FromMount, _, Some(mount)) => {
-            report.session_site = Some(Site {
-                source: SiteSource::Mount,
-                ..mount
-            });
+            let (adopted, warning) = adopt_mount_site(mount, configured.as_ref());
+            report.session_site = Some(adopted);
+            report.warnings.extend(warning);
         }
         (SiteSyncMode::FromMount, _, None) => report
             .warnings
@@ -232,10 +263,11 @@ impl Operation<DynMount> for SetSiteOp {
                     "the mount reports no site to adopt",
                 ));
             };
-            self.shared.set_session_site(Some(Site {
-                source: SiteSource::Mount,
-                ..mount
-            }));
+            let (adopted, warning) = adopt_mount_site(mount, self.shared.session_site().as_ref());
+            if let Some(warning) = warning {
+                tracing::warn!("mount site adoption: {warning}");
+            }
+            self.shared.set_session_site(Some(adopted));
             self.done = true;
             return Ok(());
         }

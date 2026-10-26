@@ -301,7 +301,11 @@ impl MountLimitsCheck {
     }
 
     /// Geometry of an equatorial target at the snapshot time, or `None` when
-    /// the latitude or the sidereal time is unknown.
+    /// the latitude or the sidereal time is unknown. A target in frame
+    /// `Unknown` means "the mount's own frame" (as `MountShared::to_native`
+    /// treats it), so it is resolved to the mount's native frame first; a
+    /// J2000 target, or a mount-frame target on a J2000 mount, is converted
+    /// to the frame of date.
     pub fn equatorial_geometry(
         &self,
         target: &EqCoord,
@@ -310,11 +314,23 @@ impl MountLimitsCheck {
         let site = geometry_site(snap);
         let lat = site?.lat_deg;
         let lst = lst_at(snap, site.as_ref())?;
-        let of_date = match target.frame {
-            EqFrame::J2000 => {
-                self.converter
-                    .convert(*target, EqFrame::JNowApparent, snap.taken_at, site.as_ref())
-            }
+        let frame = match target.frame {
+            EqFrame::Unknown => snap
+                .mount
+                .as_deref()
+                .map_or(EqFrame::Unknown, |m| m.capabilities.native_frame),
+            frame => frame,
+        };
+        let of_date = match frame {
+            EqFrame::J2000 => self.converter.convert(
+                EqCoord {
+                    frame: EqFrame::J2000,
+                    ..*target
+                },
+                EqFrame::JNowApparent,
+                snap.taken_at,
+                site.as_ref(),
+            ),
             _ => *target,
         };
         let ha = hour_angle_h(lst, of_date.ra_h);
@@ -548,14 +564,26 @@ struct GoodSample {
     dec_deg: f64,
 }
 
+/// Stop requests that may go unanswered (tracking still reads on) before
+/// the watchdog escalates with `outcome_unknown`.
+pub const STOP_ESCALATE_AFTER: u32 = 3;
+/// After escalating, the tracking-off request is retried at this interval
+/// rather than on every poll.
+pub const STOP_RETRY_BACKOFF: Duration = Duration::from_secs(5);
+
 /// What one watchdog evaluation found.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct WatchVerdict {
-    /// `limit_reached` and `limit_watch_blind`. The `limit_reached` event is
-    /// what raises the `limit_reached` resume block (WP1A-2's `resume.rs`).
+    /// `limit_reached`, `limit_watch_blind` and, when tracking cannot be
+    /// stopped, `outcome_unknown{op: set_tracking}`. The hub turns
+    /// `limit_reached` and `outcome_unknown` into resume blocks.
     pub events: Vec<EventKind>,
-    /// A crossing: stop tracking, never slew away (M-k).
+    /// A crossing while tracking still reads on: stop tracking, never slew
+    /// away (M-k). Repeated on later polls until tracking reads off.
     pub stop_tracking: bool,
+    /// Which tracking-off request this is for the current crossing (1 for
+    /// the first); 0 when `stop_tracking` is false.
+    pub stop_attempt: u32,
     /// The evaluation used a prediction from the last good sample.
     pub predicted: bool,
     pub alt_deg: Option<f64>,
@@ -567,12 +595,23 @@ pub struct WatchVerdict {
 /// predicts the hour angle from the last good sample plus elapsed sidereal
 /// time, and announces `limit_watch_blind` once the data is older than
 /// `lost_after`.
+///
+/// A crossing is announced once (`limit_reached`), but the tracking-off
+/// request is repeated on every evaluation while tracking still reads on: a
+/// write can fail (most likely exactly when the data is stale) or be
+/// ignored. After [`STOP_ESCALATE_AFTER`] unanswered requests it emits
+/// `outcome_unknown{op: set_tracking}` and keeps retrying every
+/// [`STOP_RETRY_BACKOFF`]. Only a reading of tracking off (or the crossing
+/// clearing) resets it.
 #[derive(Debug, Clone)]
 pub struct LimitWatchdog {
     limits: MountLimits,
     last_good: Option<GoodSample>,
     blind_announced: bool,
     tripped: bool,
+    stop_attempts: u32,
+    escalated: bool,
+    next_attempt_mono_ns: u64,
 }
 
 impl LimitWatchdog {
@@ -582,6 +621,9 @@ impl LimitWatchdog {
             last_good: None,
             blind_announced: false,
             tripped: false,
+            stop_attempts: 0,
+            escalated: false,
+            next_attempt_mono_ns: 0,
         }
     }
 
@@ -589,16 +631,42 @@ impl LimitWatchdog {
         &self.limits
     }
 
+    /// A crossing was announced and tracking has not yet read off.
+    pub fn tripped(&self) -> bool {
+        self.tripped
+    }
+
+    fn reset_trip(&mut self) {
+        self.tripped = false;
+        self.stop_attempts = 0;
+        self.escalated = false;
+        self.next_attempt_mono_ns = 0;
+    }
+
+    /// [`Self::evaluate_with_dec`] with the snapshot's own declination.
     pub fn evaluate(
         &mut self,
         snap: &MountSnapshot,
         site: Option<&Site>,
         now_mono_ns: u64,
     ) -> WatchVerdict {
+        self.evaluate_with_dec(snap, site, None, now_mono_ns)
+    }
+
+    /// One evaluation. `dec_of_date_deg` is the declination of date when
+    /// the mount's native frame is not (a J2000 mount); it feeds the
+    /// prediction used while the data is stale.
+    pub fn evaluate_with_dec(
+        &mut self,
+        snap: &MountSnapshot,
+        site: Option<&Site>,
+        dec_of_date_deg: Option<f64>,
+        now_mono_ns: u64,
+    ) -> WatchVerdict {
         let mut verdict = WatchVerdict::default();
         let state = &snap.state;
         if state.tracking.known() != Some(&true) {
-            self.tripped = false;
+            self.reset_trip();
             self.blind_announced = false;
             return verdict;
         }
@@ -623,7 +691,7 @@ impl LimitWatchdog {
         let lat = site.map(|s| s.lat_deg);
         let fresh = state.ra_h.is_fresh() && state.dec_deg.is_fresh();
         let (alt, az, ha) = if fresh {
-            let dec = *state.dec_deg.known().unwrap_or(&0.0);
+            let dec = dec_of_date_deg.unwrap_or(*state.dec_deg.known().unwrap_or(&0.0));
             let ha = snap.ha_h;
             let reported = state
                 .alt_deg
@@ -684,16 +752,36 @@ impl LimitWatchdog {
                 }
             }
         }
-        match crossing {
-            Some((kind, value, limit)) if !self.tripped => {
-                verdict
-                    .events
-                    .push(EventKind::LimitReached { kind, value, limit });
-                verdict.stop_tracking = true;
-                self.tripped = true;
+        let Some((kind, value, limit)) = crossing else {
+            self.reset_trip();
+            return verdict;
+        };
+        if !self.tripped {
+            verdict
+                .events
+                .push(EventKind::LimitReached { kind, value, limit });
+            self.tripped = true;
+        }
+        // Tracking still reads on: every earlier request went unanswered.
+        if self.stop_attempts >= STOP_ESCALATE_AFTER && !self.escalated {
+            self.escalated = true;
+            verdict.events.push(EventKind::OutcomeUnknown {
+                op: OpKind::SetTracking,
+                reason: format!(
+                    "limit_reached: tracking still reads on after {} requests to stop it \
+                     ({kind:?} limit {limit})",
+                    self.stop_attempts
+                ),
+            });
+        }
+        if now_mono_ns >= self.next_attempt_mono_ns {
+            self.stop_attempts += 1;
+            verdict.stop_tracking = true;
+            verdict.stop_attempt = self.stop_attempts;
+            if self.escalated {
+                self.next_attempt_mono_ns =
+                    now_mono_ns.saturating_add(super::duration_ns(STOP_RETRY_BACKOFF));
             }
-            Some(_) => {}
-            None => self.tripped = false,
         }
         verdict
     }
@@ -704,7 +792,7 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use crate::equipment::commands::{GatedCommand, GatedOp};
-    use crate::equipment::sim::mount::SimMountProfile;
+    use crate::equipment::sim::mount::{SimFaults, SimMountProfile};
     use crate::equipment::snapshot::{GuiderAppState, GuiderSnapshot, MountState, SafetySummary};
     use crate::equipment::traits::{Device, IdentityConverter};
     use crate::equipment::types::{AutonomyMode, GuideDirection, Observed, Priority, Source};
@@ -1083,12 +1171,159 @@ mod tests {
             verdict.events[0],
             EventKind::LimitReached { kind: LimitKind::Altitude, limit, .. } if (limit - 19.5).abs() < 1e-9
         ));
-        // Once tripped it does not repeat while still tracking below.
-        assert!(!dog.evaluate(&below, Some(&site), 3).stop_tracking);
+        // While tracking still reads on below the limit, the stop is
+        // requested again, but the crossing is announced once.
+        let again = dog.evaluate(&below, Some(&site), 3);
+        assert!(again.stop_tracking && again.events.is_empty(), "{again:?}");
+        assert_eq!(again.stop_attempt, 2);
         // A slew in progress is not watched.
         let mut slewing = below.clone();
         slewing.state.slewing = Observed::fresh(true, Source::DeviceState, Utc::now(), 4);
         assert!(dog.evaluate(&slewing, Some(&site), 4).events.is_empty());
+    }
+
+    #[test]
+    fn the_watchdog_retries_and_escalates_until_tracking_reads_off() {
+        let mut dog = LimitWatchdog::new(limits(20.0));
+        let site = site();
+        let s = 1_000_000_000u64;
+        let below = tracking_snapshot(AlignmentMode::Polar, 5.0, 0.0, s);
+        let mut attempts = Vec::new();
+        let mut events = Vec::new();
+        for i in 1..=STOP_ESCALATE_AFTER + 1 {
+            let verdict = dog.evaluate(&below, Some(&site), u64::from(i) * s);
+            attempts.push(verdict.stop_attempt);
+            events.extend(verdict.events);
+        }
+        assert_eq!(attempts, vec![1, 2, 3, 4], "one request per poll");
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(events[0], EventKind::LimitReached { .. }));
+        assert!(matches!(
+            &events[1],
+            EventKind::OutcomeUnknown { op: OpKind::SetTracking, reason } if reason.starts_with("limit_reached")
+        ));
+        // After escalating it backs off, without repeating the events.
+        let t = u64::from(STOP_ESCALATE_AFTER + 1) * s;
+        let quiet = dog.evaluate(&below, Some(&site), t + s);
+        assert!(!quiet.stop_tracking && quiet.events.is_empty(), "{quiet:?}");
+        let retry = dog.evaluate(
+            &below,
+            Some(&site),
+            t + super::super::duration_ns(STOP_RETRY_BACKOFF),
+        );
+        assert!(retry.stop_tracking && retry.events.is_empty(), "{retry:?}");
+        // Tracking reads off: the trip resets; a new crossing starts over.
+        let mut off = below.clone();
+        off.state.tracking = Observed::fresh(false, Source::DeviceState, Utc::now(), 20 * s);
+        assert!(!dog.evaluate(&off, Some(&site), 20 * s).stop_tracking);
+        assert!(!dog.tripped());
+        let verdict = dog.evaluate(&below, Some(&site), 21 * s);
+        assert_eq!(verdict.stop_attempt, 1);
+        assert!(matches!(verdict.events[0], EventKind::LimitReached { .. }));
+    }
+
+    #[test]
+    fn the_blind_watchdog_keeps_requesting_the_stop() {
+        let mut dog = LimitWatchdog::new(limits(-90.0));
+        let site = site();
+        let s = 1_000_000_000u64;
+        let good = tracking_snapshot(AlignmentMode::GermanPolar, 5.6, 60.0, s);
+        assert!(dog.evaluate(&good, Some(&site), s).stop_tracking);
+        // The transport fails: tracking can only be read stale, so the stop
+        // is requested again and then escalated.
+        let mut stale = good.clone();
+        stale.state = super::super::stale_state(&good.state);
+        let names: Vec<_> = (2..=5)
+            .flat_map(|i| dog.evaluate(&stale, Some(&site), i * s).events)
+            .map(|e| e.name())
+            .collect();
+        assert!(names.contains(&"outcome_unknown"), "{names:?}");
+    }
+
+    #[test]
+    fn the_runtime_keeps_stopping_tracking_until_the_mount_obeys() {
+        for fault in ["ignored", "failing"] {
+            let mut rig = limit_rig();
+            rig.sim.control().update_faults(|f| match fault {
+                "ignored" => f.tracking_writes_ignored = true,
+                _ => f.tracking_writes_fail = true,
+            });
+            for _ in 0..6 {
+                rig.tick(Duration::from_secs(1), None);
+            }
+            assert!(rig.sim.control().tracking(), "{fault}");
+            let offs = |rig: &Rig| {
+                rig.sim
+                    .control()
+                    .calls()
+                    .iter()
+                    .filter(|c| *c == "tracking_off")
+                    .count()
+            };
+            assert!(offs(&rig) >= 4, "{fault}: retried, {}", offs(&rig));
+            let names = rig.names();
+            assert_eq!(
+                names.iter().filter(|n| **n == "limit_reached").count(),
+                1,
+                "{fault}: {names:?}"
+            );
+            assert!(names.contains(&"outcome_unknown"), "{fault}: {names:?}");
+            // The fault clears: the next retry stops tracking.
+            rig.sim.control().set_faults(SimFaults::default());
+            for _ in 0..6 {
+                rig.tick(Duration::from_secs(1), None);
+            }
+            assert!(!rig.sim.control().tracking(), "{fault}");
+            let snapshot = rig.tick(Duration::from_secs(1), None);
+            assert_eq!(snapshot.state.tracking.value, Some(false), "{fault}");
+            let safety_offs = rig
+                .runtime
+                .take_events()
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        &e.event,
+                        EventKind::TrackingChanged {
+                            on: Some(false),
+                            source: Some(CommandSource::Safety),
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(safety_offs, 1, "{fault}: announced once");
+        }
+    }
+
+    #[test]
+    fn a_mount_frame_target_on_a_j2000_mount_is_converted_for_the_limits() {
+        let shift = super::super::test_support::ShiftConverter {
+            ra_h: 0.2,
+            dec_deg: 0.5,
+        };
+        let check = MountLimitsCheck::new(limits(0.0), Arc::new(shift));
+        let mut snap = snapshot(AlignmentMode::GermanPolar);
+        let mut mount = (**snap.mount.as_ref().unwrap()).clone();
+        mount.capabilities.native_frame = EqFrame::J2000;
+        snap.mount = Some(Arc::new(mount));
+        let geometry = |snap: &EquipmentSnapshot, frame| {
+            check
+                .equatorial_geometry(&EqCoord::new(3.0, 20.0, frame), snap)
+                .unwrap()
+        };
+        let mount_frame = geometry(&snap, EqFrame::Unknown);
+        let j2000 = geometry(&snap, EqFrame::J2000);
+        let of_date = geometry(&snap, EqFrame::JNowApparent);
+        assert_eq!(mount_frame, j2000, "Unknown means the mount's J2000");
+        assert!((mount_frame.alt_deg - of_date.alt_deg).abs() > 0.1);
+        // On a JNow mount the mount frame is already of date.
+        let mut mount = (**snap.mount.as_ref().unwrap()).clone();
+        mount.capabilities.native_frame = EqFrame::JNowApparent;
+        snap.mount = Some(Arc::new(mount));
+        assert_eq!(
+            geometry(&snap, EqFrame::Unknown),
+            geometry(&snap, EqFrame::JNowApparent)
+        );
     }
 
     #[test]
@@ -1145,20 +1380,19 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn the_runtime_stops_tracking_and_records_why() {
+    /// A tracking ESP32-like mount 1 deg above the horizon in the west,
+    /// with `min_altitude` 10 deg: the next poll is a crossing.
+    fn limit_rig() -> Rig {
         let mut profile = SimMountProfile::esp32_like();
         profile.site = Some(site());
         let settings = super::super::MountSettings::default();
         let mut rig = rig_with(profile, settings, Some(site()));
-        rig.runtime.take_events();
         let lst = rig
             .tick(Duration::from_secs(1), None)
             .state
             .sidereal_time_h
             .value
             .unwrap();
-        // Put the mount 1 deg above the horizon in the west while tracking.
         let ha = 5.95;
         rig.sim.control().place(EqCoord::new(
             EqCoord::wrap_ra_h(lst - ha),
@@ -1178,6 +1412,13 @@ mod tests {
             Some(site()),
         );
         rig.runtime.on_connected(&mut rig.sim).unwrap();
+        rig.runtime.take_events();
+        rig
+    }
+
+    #[test]
+    fn the_runtime_stops_tracking_and_records_why() {
+        let mut rig = limit_rig();
         // The poll that sees the crossing publishes tracking still on and
         // stops it; the next poll reads it off.
         let snap = rig.tick(Duration::from_secs(1), None);
