@@ -1,9 +1,64 @@
 //! SharedObservation — Section 8.1.
 //! The central data structure published by the vision loop.
+//!
+//! Besides the pixel measurements, every observation carries what the
+//! equipment layer knows about the frame (equipment spec WP1B-4):
+//!
+//! - `equipment` (H2): whether every connected motion device was quiescent
+//!   over the frame's exposure window, and if not why, with device ages. FQE,
+//!   BGE, TED and COC discard inference made before the equipment settled.
+//! - `coc_context` (H14): mount pointing and motion, site, Sun and Moon,
+//!   weather corroboration with ages, cover, dome and dew heaters, from
+//!   `EquipmentReader::coc_context()`. Wiring the user-owned COC shadow
+//!   service to it is left to the user.
+//! - `ted` (H15): the trailing evidence with the exposure window's tracking,
+//!   pulses and wind, and a sky axis only with a WCS.
+//! - `last_solve_at` and `pointing_error_arcmin` come from
+//!   `plate_solve_events` (the plate-solve state carries its own timestamp),
+//!   never from the previous observation.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::quality::{QualityRejectionReason, QualityStatus, StarRejectionTallies};
+use super::ted_runner::TedEvidence;
+use crate::equipment::snapshot::{CocContext, GuiderAppState};
+use crate::equipment::types::{ClockQuality, DeviceKind};
+
+/// H2: the equipment's validity for one observed frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EquipmentValidity {
+    /// `Some(true)` when every connected motion device was quiescent over
+    /// the window; `Some(false)` when one moved; `None` when unknown (no
+    /// data, stale data, a lost device, no window, or no motion device).
+    pub quiescent: Option<bool>,
+    /// Why the frame is not known to be quiescent.
+    pub reason: Option<String>,
+    pub settled_since: Option<DateTime<Utc>>,
+    pub moved: Option<DeviceKind>,
+    pub moved_event_seq: Option<u64>,
+    /// The conservative exposure window of a stream frame: from two frame
+    /// intervals before its arrival to its arrival.
+    pub window_start: Option<DateTime<Utc>>,
+    pub window_end: Option<DateTime<Utc>>,
+    pub clock_quality: ClockQuality,
+    /// The motion devices that were checked.
+    pub kinds_checked: Vec<DeviceKind>,
+    pub mount_age_ms: Option<u64>,
+    pub focuser_age_ms: Option<u64>,
+    pub filter_wheel_age_ms: Option<u64>,
+    pub guider_age_ms: Option<u64>,
+    pub mount_slewing: Option<bool>,
+    pub mount_tracking: Option<bool>,
+    pub pulse_guiding: Option<bool>,
+    pub guider_state: Option<GuiderAppState>,
+    pub resume_block_active: bool,
+    /// Bumped by every segmentation event (`slew_*`, `filter_*`,
+    /// `focuser_move_*`, `exposure_settings_changed`, `stream_restarted`);
+    /// the cloud heuristic's baselines restart with it.
+    pub segment: u64,
+    pub segment_reset_by: Option<String>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CloudEvent {
@@ -93,8 +148,15 @@ pub struct SharedObservation {
 
     // --- From TrailingElongationDetector ---
     pub trailing_severity: f32,
+    /// `RA`, `Dec` or `Ambiguous` only when a WCS still describes the frame
+    /// (H15); otherwise the sensor axis: `sensor_x`, `sensor_y` or
+    /// `sensor_diagonal`.
     pub trailing_axis: Option<String>,
+    /// Position angle of the trail on the sensor, degrees in [0, 180).
     pub trailing_direction_pa: Option<f32>,
+    /// The full TED evidence, with the exposure window's equipment state.
+    #[serde(default)]
+    pub ted: Option<TedEvidence>,
 
     // --- From BackgroundEstimator ---
     pub background_adu: f32,
@@ -113,11 +175,24 @@ pub struct SharedObservation {
     #[serde(default)]
     pub saturation_gate: crate::vision::quality::SaturationGate,
 
-    // --- From PlateSolver (lower cadence) ---
+    // --- From PlateSolver (lower cadence), read from plate_solve_events ---
+    /// Of the newest successful solve (H12 fills it).
     pub pointing_error_arcmin: Option<f32>,
+    /// Not reported by ASTAP; stays `None`.
     pub wcs_residual_arcsec: Option<f32>,
+    /// Not reported by ASTAP; stays `None`.
     pub last_solve_confidence: Option<f32>,
     pub last_solve_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub last_solve_event_id: Option<String>,
+
+    // --- From the equipment layer ---
+    /// H2: equipment validity of this frame.
+    #[serde(default)]
+    pub equipment: Option<EquipmentValidity>,
+    /// H14: the COC context at this frame.
+    #[serde(default)]
+    pub coc_context: Option<CocContext>,
 
     /// Derived from `status == Valid`. Retained for backward compatibility.
     pub observation_valid: bool,
@@ -172,6 +247,7 @@ impl SharedObservation {
             trailing_severity: 0.0,
             trailing_axis: None,
             trailing_direction_pa: None,
+            ted: None,
             background_adu: 0.0,
             sky_background_adu: 0.0,
             background_sigma: 0.0,
@@ -182,6 +258,9 @@ impl SharedObservation {
             wcs_residual_arcsec: None,
             last_solve_confidence: None,
             last_solve_at: None,
+            last_solve_event_id: None,
+            equipment: None,
+            coc_context: None,
             observation_valid: false,
         }
     }

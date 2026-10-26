@@ -1,23 +1,63 @@
-//! TED runner — Section 8.1.
-//! Trailing/elongation detection: classical SEP + CNN wrapper.
+//! TED runner — Section 8.1 (v6 §7.6.5; equipment spec H15, §7.2.5).
+//!
+//! The trailing/elongation evidence for one frame:
+//!
+//! - **Pixels:** the classical measurement (`trailing.rs`): severity, the
+//!   sensor position angle and sensor axis, always; the sky axis only when a
+//!   plate solve's WCS still describes the frame.
+//! - **Equipment, bracketed by the exposure window:** tracking and rate,
+//!   slewing, pulse guiding and the guide pulses, the guider state,
+//!   declination, pier side and alignment mode (field rotation), rotator
+//!   angle, focuser motion and wind. These come from the hub's device window
+//!   (`EquipmentReader::window`), never from a read after the frame.
+//! - **The RB-E untracked label** (15.041·cos δ ″/s) only with a verified
+//!   `tracking = false` across the window and a known declination.
+//!
+//! Missing values stay missing. There is no learned TED model yet; the
+//! classical measurement is the evidence, and the runner refuses to dress a
+//! bare image up as a sky-axis result.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Trailing axis classification used by the future TED model.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub enum TrailingAxis {
-    None,
-    Ra,
-    Dec,
-    Both,
-}
+use super::trailing::{SensorAxis, SkyAxis, TrailingEstimate};
+use crate::equipment::mount::SIDEREAL_RATE_ARCSEC_S;
+use crate::equipment::snapshot::{DeviceWindow, GuiderAppState};
+use crate::equipment::types::{AlignmentMode, DriveRate, PierSide};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TedOutput {
+/// TED evidence for one frame (H15).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct TedEvidence {
+    /// `classical`, or the learned model's path once one exists.
+    pub model: String,
+    pub severity: f32,
     pub trailing_detected: bool,
-    pub trailing_axis: TrailingAxis,
-    pub trailing_magnitude: f64,
     pub elongation_ratio: f64,
+    pub sensor_pa_deg: Option<f32>,
+    pub sensor_axis: Option<SensorAxis>,
+    pub sky_axis: Option<SkyAxis>,
+    pub sky_pa_deg: Option<f32>,
+    pub solve_event_id: Option<String>,
+    /// Why the sky axis is withheld.
+    pub sky_withheld: Option<String>,
+    pub window_start: Option<DateTime<Utc>>,
+    pub window_end: Option<DateTime<Utc>>,
+    /// True only if tracking was on throughout; false if it was off at any
+    /// point; `None` if unknown anywhere in the window.
+    pub tracking: Option<bool>,
+    pub tracking_rate: Option<DriveRate>,
+    pub slewing_any: Option<bool>,
+    pub pulse_guiding_any: Option<bool>,
+    pub guide_pulses_n: Option<u32>,
+    pub guiding_state: Option<GuiderAppState>,
+    pub dec_deg: Option<f64>,
+    pub pier_side: Option<PierSide>,
+    pub alignment_mode: Option<AlignmentMode>,
+    pub rotator_angle_deg: Option<f64>,
+    pub focuser_moved: Option<bool>,
+    pub wind_speed_ms: Option<f64>,
+    /// RB-E: the untracked drift rate, only with a verified tracking=false.
+    pub untracked_rate_arcsec_s: Option<f64>,
 }
 
 pub struct TedRunner {
@@ -33,82 +73,228 @@ impl TedRunner {
         }
     }
 
-    /// Classical SEP-based trailing detection.
-    pub fn detect_classical(&self, image: &ndarray::Array2<f32>) -> TedOutput {
-        let shape = image.shape();
-        if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
-            return TedOutput {
-                trailing_detected: false,
-                trailing_axis: TrailingAxis::None,
-                trailing_magnitude: 0.0,
-                elongation_ratio: 1.0,
-            };
-        }
-
-        let pixels: Vec<f32> = image.iter().copied().collect();
-        let max_adu = pixels
-            .iter()
-            .copied()
-            .filter(|value| value.is_finite())
-            .fold(0.0_f32, f32::max)
-            .max(1.0);
-        let frame = super::quality::LumaFrame {
-            pixels,
-            width: shape[1],
-            height: shape[0],
-            max_adu,
-            // TED receives a bare ndarray with no camera provenance attached, so
-            // the sensor's saturation point is genuinely unknown here. `max_adu`
-            // above is the observed peak, which is not a saturation point:
-            // deriving one from it would make the threshold depend on how bright
-            // the brightest star in this particular frame happened to be.
-            saturation_adu: None,
-            masks: Default::default(),
-            analysis_descriptor: None,
-        };
-        let background =
-            super::background::estimate_background(&frame.pixels, frame.saturation_adu);
-        let estimate = super::trailing::estimate_trailing(&frame, &background);
-        let trailing_detected = estimate.severity >= self.elongation_threshold_to_severity();
-        let axis = match estimate.axis.as_deref() {
-            Some("RA") => TrailingAxis::Ra,
-            Some("Dec") => TrailingAxis::Dec,
-            Some("Ambiguous") => TrailingAxis::Both,
-            _ => TrailingAxis::None,
-        };
-
-        TedOutput {
-            trailing_detected,
-            trailing_axis: axis,
-            trailing_magnitude: estimate.severity as f64,
-            elongation_ratio: (1.0 / (1.0 - estimate.severity.max(0.0) as f64)).clamp(1.0, 99.0),
-        }
-    }
-
-    /// CNN-based trailing detection (if model available).
-    pub fn detect_cnn(&self, image: &ndarray::Array3<f32>) -> crate::error::Result<TedOutput> {
-        let shape = image.shape();
-        if shape.len() != 3 || shape[0] == 0 || shape[1] == 0 {
-            return Ok(TedOutput {
-                trailing_detected: false,
-                trailing_axis: TrailingAxis::None,
-                trailing_magnitude: 0.0,
-                elongation_ratio: 1.0,
-            });
-        }
-
-        let channel = 0;
-        let mut mono = ndarray::Array2::<f32>::zeros((shape[0], shape[1]));
-        for y in 0..shape[0] {
-            for x in 0..shape[1] {
-                mono[[y, x]] = image[[y, x, channel.min(shape[2] - 1)]];
-            }
-        }
-
-        Ok(self.detect_classical(&mono))
+    fn detected(&self, estimate: &TrailingEstimate) -> bool {
+        estimate.severity >= self.elongation_threshold_to_severity()
     }
 
     fn elongation_threshold_to_severity(&self) -> f32 {
         (1.0 - 1.0 / self.elongation_threshold.max(1.0)) as f32
+    }
+
+    /// The H15 evidence: the measurement, plus the equipment state over the
+    /// exposure `window` when one is known.
+    pub fn evidence(
+        &self,
+        estimate: &TrailingEstimate,
+        window: Option<&DeviceWindow>,
+    ) -> TedEvidence {
+        let mut evidence = TedEvidence {
+            model: self
+                .model_path
+                .clone()
+                .unwrap_or_else(|| "classical".to_string()),
+            severity: estimate.severity,
+            trailing_detected: self.detected(estimate),
+            elongation_ratio: elongation_ratio(estimate.severity),
+            sensor_pa_deg: estimate.sensor_pa_deg,
+            sensor_axis: estimate.sensor_axis,
+            sky_axis: estimate.sky.as_ref().map(|s| s.axis),
+            sky_pa_deg: estimate.sky.as_ref().map(|s| s.sky_pa_deg),
+            solve_event_id: estimate.sky.as_ref().and_then(|s| s.solve_event_id.clone()),
+            sky_withheld: estimate.withheld.clone(),
+            ..TedEvidence::default()
+        };
+        let Some(window) = window else {
+            return evidence;
+        };
+        evidence.window_start = Some(window.start);
+        evidence.window_end = Some(window.end);
+        let all_known = |pick: fn(&crate::equipment::snapshot::MotionInterval) -> Option<bool>| {
+            if window.motion.is_empty() {
+                return None;
+            }
+            window
+                .motion
+                .iter()
+                .map(pick)
+                .collect::<Option<Vec<bool>>>()
+        };
+        evidence.tracking = all_known(|m| m.tracking).map(|v| v.iter().all(|on| *on));
+        if evidence.tracking.is_none() && window.motion.iter().any(|m| m.tracking == Some(false)) {
+            evidence.tracking = Some(false);
+        }
+        evidence.slewing_any = all_known(|m| m.slewing)
+            .map(|v| v.iter().any(|on| *on))
+            .or_else(|| {
+                window
+                    .motion
+                    .iter()
+                    .any(|m| m.slewing == Some(true))
+                    .then_some(true)
+            });
+        evidence.pulse_guiding_any = all_known(|m| m.pulse_guiding)
+            .map(|v| v.iter().any(|on| *on))
+            .or_else(|| {
+                window
+                    .motion
+                    .iter()
+                    .any(|m| m.pulse_guiding == Some(true))
+                    .then_some(true)
+            });
+        evidence.guide_pulses_n = Some(window.guide.pulses_n);
+        evidence.guiding_state = window.guide.state;
+        let mount = window
+            .mount
+            .mid
+            .as_ref()
+            .or(window.mount.start.as_ref())
+            .or(window.mount.end.as_ref());
+        if let Some(mount) = mount {
+            evidence.tracking_rate = mount.state.tracking_rate.known().copied();
+            evidence.dec_deg = window
+                .mount_mid
+                .map(|c| c.dec_deg)
+                .or_else(|| mount.state.dec_deg.known().copied());
+            evidence.pier_side = mount
+                .state
+                .side_of_pier
+                .known()
+                .copied()
+                .filter(|side| *side != PierSide::Unknown);
+            evidence.alignment_mode = mount.capabilities.alignment_mode;
+        }
+        evidence.rotator_angle_deg = window
+            .rotator
+            .mid
+            .as_ref()
+            .and_then(|r| r.state.position_deg.known().copied());
+        evidence.focuser_moved = (window.focuser.samples_n > 0).then_some(window.moved.focuser);
+        evidence.wind_speed_ms = window
+            .weather
+            .as_ref()
+            .and_then(|w| w.wind_speed_ms.known().copied());
+        if evidence.tracking == Some(false) {
+            evidence.untracked_rate_arcsec_s = evidence
+                .dec_deg
+                .map(|dec| SIDEREAL_RATE_ARCSEC_S * dec.to_radians().cos());
+        }
+        evidence
+    }
+}
+
+fn elongation_ratio(severity: f32) -> f64 {
+    (1.0 / (1.0 - severity.max(0.0) as f64)).clamp(1.0, 99.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::equipment::snapshot::{
+        GuideWindowStats, MotionInterval, MountCapabilities, MountSnapshot, MountState,
+        WindowSamples,
+    };
+    use crate::equipment::types::{EqCoord, EqFrame, Observed, Source};
+
+    fn t(s: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_792_029_600 + s, 0).unwrap()
+    }
+
+    fn trailed() -> TrailingEstimate {
+        TrailingEstimate {
+            severity: 0.6,
+            sensor_pa_deg: Some(3.0),
+            sensor_axis: Some(SensorAxis::X),
+            sky: None,
+            withheld: Some("no_plate_solve".into()),
+        }
+    }
+
+    fn window(tracking: [Option<bool>; 2]) -> DeviceWindow {
+        let fresh = |v| Observed::fresh(v, Source::DeviceState, t(5), 0);
+        DeviceWindow {
+            start: t(0),
+            end: t(10),
+            mount: WindowSamples {
+                mid: Some(MountSnapshot {
+                    state: MountState {
+                        dec_deg: fresh(60.0),
+                        tracking_rate: Observed::fresh(
+                            DriveRate::Sidereal,
+                            Source::Property,
+                            t(5),
+                            0,
+                        ),
+                        side_of_pier: Observed::fresh(PierSide::East, Source::DeviceState, t(5), 0),
+                        ..MountState::default()
+                    },
+                    capabilities: MountCapabilities {
+                        alignment_mode: Some(AlignmentMode::Polar),
+                        ..MountCapabilities::default()
+                    },
+                    ..MountSnapshot::default()
+                }),
+                samples_n: 1,
+                ..WindowSamples::default()
+            },
+            mount_mid: Some(EqCoord::new(5.0, 60.0, EqFrame::JNowApparent)),
+            motion: vec![
+                MotionInterval {
+                    from: t(0),
+                    to: t(5),
+                    tracking: tracking[0],
+                    slewing: Some(false),
+                    pulse_guiding: Some(false),
+                },
+                MotionInterval {
+                    from: t(5),
+                    to: t(10),
+                    tracking: tracking[1],
+                    slewing: Some(false),
+                    pulse_guiding: Some(true),
+                },
+            ],
+            guide: GuideWindowStats {
+                state: Some(GuiderAppState::Guiding),
+                pulses_n: 4,
+                ..GuideWindowStats::default()
+            },
+            ..DeviceWindow::default()
+        }
+    }
+
+    #[test]
+    fn evidence_brackets_the_exposure_with_the_window() {
+        let evidence =
+            TedRunner::new(None).evidence(&trailed(), Some(&window([Some(true), Some(true)])));
+        assert_eq!(evidence.model, "classical");
+        assert!(evidence.trailing_detected);
+        assert_eq!(evidence.tracking, Some(true));
+        assert_eq!(evidence.slewing_any, Some(false));
+        assert_eq!(evidence.pulse_guiding_any, Some(true));
+        assert_eq!(evidence.guide_pulses_n, Some(4));
+        assert_eq!(evidence.guiding_state, Some(GuiderAppState::Guiding));
+        assert_eq!(evidence.tracking_rate, Some(DriveRate::Sidereal));
+        assert_eq!(evidence.dec_deg, Some(60.0));
+        assert_eq!(evidence.pier_side, Some(PierSide::East));
+        assert_eq!(evidence.alignment_mode, Some(AlignmentMode::Polar));
+        assert_eq!(evidence.sky_axis, None);
+        assert_eq!(evidence.sky_withheld.as_deref(), Some("no_plate_solve"));
+        assert_eq!(evidence.untracked_rate_arcsec_s, None, "tracking was on");
+    }
+
+    #[test]
+    fn the_untracked_label_needs_tracking_verified_off() {
+        let off =
+            TedRunner::new(None).evidence(&trailed(), Some(&window([Some(false), Some(true)])));
+        assert_eq!(off.tracking, Some(false));
+        let rate = off.untracked_rate_arcsec_s.unwrap();
+        assert!((rate - SIDEREAL_RATE_ARCSEC_S * 0.5).abs() < 1e-6);
+
+        let unknown = TedRunner::new(None).evidence(&trailed(), Some(&window([None, Some(true)])));
+        assert_eq!(unknown.tracking, None);
+        assert_eq!(unknown.untracked_rate_arcsec_s, None);
+
+        let no_window = TedRunner::new(None).evidence(&trailed(), None);
+        assert_eq!((no_window.tracking, no_window.window_start), (None, None));
     }
 }

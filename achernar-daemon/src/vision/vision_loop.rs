@@ -1,19 +1,63 @@
 //! Vision loop — Section 8.1.
 //! Runs at 1-5 Hz and publishes SharedObservation to all subsystems.
+//!
+//! Each observation also carries what the equipment layer knows about the
+//! frame (equipment spec WP1B-4):
+//!
+//! - **H2, preview-frame validity.** The loop subscribes to the hub's event
+//!   bus. A segmentation event (`slew_*`, `filter_*`, `focuser_move_*`,
+//!   `exposure_settings_changed`, `stream_restarted`) restarts the cloud
+//!   heuristic's clear-sky baselines, and a frame that moved never adapts
+//!   them. Each frame's validity comes from `EquipmentReader::quiescent`
+//!   over a conservative window: stream frames carry only their host arrival
+//!   time, so the window runs from two frame intervals before the arrival
+//!   to the arrival (`clock_quality = host_arrival`).
+//! - **H14, COC context** from `EquipmentReader::coc_context()`.
+//! - **H15, TED evidence:** the trail on the sensor always; on the sky only
+//!   with the newest solve's WCS, of the same camera, with the pier side and
+//!   rotator unchanged; plus the window's tracking, pulses and wind.
+//! - **Plate-solve state** (`last_solve_at`, `pointing_error_arcmin`) is read
+//!   from `plate_solve_events`, never carried forward.
+//! - **M-3 Recovery:** a cloud-cleared event asks for a recovery solve, and
+//!   the loop subscribes the plate-solve trigger to the bus at startup.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
+use tokio::sync::broadcast::{self, error::TryRecvError};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
+use crate::equipment::events::EquipmentEvent;
+use crate::equipment::hub::EquipmentHub;
+use crate::equipment::snapshot::{CocContext, DeviceWindow, EquipmentSnapshot, Quiescence};
+use crate::equipment::traits::EquipmentReader;
+use crate::equipment::types::{ClockQuality, DeviceKind, PierSide};
 use crate::hardware::camera::FrameData;
 use crate::state::AppState;
+use crate::storage::plate_solve_repo::LatestSolve;
 
 use super::fqe_runner::{aggregate_fqe, FqeRunner};
 use super::observed_frame::ObservedFrame;
-use super::shared_observation::{CloudEvent, SharedObservation};
+use super::shared_observation::{CloudEvent, EquipmentValidity, SharedObservation};
+use super::ted_runner::TedRunner;
 use super::{preprocess, quality, trailing};
+
+/// Motion devices whose quiescence a frame needs (H2). The camera is OLS's;
+/// switches, weather and safety monitors never move the optics.
+const MOTION_KINDS: [DeviceKind; 7] = [
+    DeviceKind::Mount,
+    DeviceKind::Focuser,
+    DeviceKind::FilterWheel,
+    DeviceKind::Guider,
+    DeviceKind::Rotator,
+    DeviceKind::CoverCalibrator,
+    DeviceKind::Dome,
+];
+
+/// Longest frame interval a window is built from.
+const MAX_FRAME_INTERVAL: chrono::Duration = chrono::Duration::minutes(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CloudStatus {
@@ -47,6 +91,245 @@ impl Default for VisionTrendState {
     }
 }
 
+impl VisionTrendState {
+    /// Restart the baselines after a segmentation event, without counting
+    /// the current frame again.
+    fn segment(&mut self) {
+        *self = Self {
+            last_frame_counter: self.last_frame_counter,
+            ..Self::default()
+        };
+    }
+}
+
+/// Whether an equipment event restarts the cloud baselines (H2).
+pub fn segments_baselines(name: &str) -> bool {
+    name.starts_with("slew_")
+        || name.starts_with("filter_")
+        || name.starts_with("focuser_move_")
+        || name == "exposure_settings_changed"
+        || name == "stream_restarted"
+}
+
+/// Drain the bus: the name of the first segmenting event since the last
+/// tick. A lagged subscription may have missed one, so it segments too.
+fn drain_segmentation(events: &mut broadcast::Receiver<Arc<EquipmentEvent>>) -> Option<String> {
+    let mut first = None;
+    loop {
+        match events.try_recv() {
+            Ok(event) => {
+                if first.is_none() && segments_baselines(event.name()) {
+                    first = Some(event.name().to_string());
+                }
+            }
+            Err(TryRecvError::Lagged(_)) => {
+                if first.is_none() {
+                    first = Some("bus_lagged".to_string());
+                }
+            }
+            Err(TryRecvError::Empty | TryRecvError::Closed) => return first,
+        }
+    }
+}
+
+/// Segmentation count and cause, published with every observation.
+#[derive(Debug, Clone, Default)]
+struct Segments {
+    count: u64,
+    last: Option<String>,
+}
+
+/// Host arrival times of stream frames, as the loop first sees them.
+#[derive(Debug, Clone, Default)]
+struct FrameTiming {
+    frame: Option<(u64, i32)>,
+    seen_at: Option<DateTime<Utc>>,
+    interval: Option<chrono::Duration>,
+}
+
+impl FrameTiming {
+    fn observe(&mut self, generation: u64, counter: i32, now: DateTime<Utc>) {
+        if self.frame == Some((generation, counter)) {
+            return;
+        }
+        if self.frame.map(|(g, _)| g) != Some(generation) {
+            self.seen_at = None;
+        }
+        self.interval = self.seen_at.map(|previous| now - previous);
+        self.seen_at = Some(now);
+        self.frame = Some((generation, counter));
+    }
+
+    /// From two frame intervals before the arrival to the arrival; `None`
+    /// until an interval is known.
+    fn window(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        let end = self.seen_at?;
+        let interval = self.interval?.min(MAX_FRAME_INTERVAL);
+        Some((end - interval * 2, end))
+    }
+}
+
+fn attached(snapshot: &EquipmentSnapshot, kind: DeviceKind) -> bool {
+    match kind {
+        DeviceKind::Mount => snapshot.mount.is_some(),
+        DeviceKind::Focuser => snapshot.focuser.is_some(),
+        DeviceKind::FilterWheel => snapshot.filter_wheel.is_some(),
+        DeviceKind::Guider => snapshot.guider.is_some(),
+        DeviceKind::Rotator => snapshot.rotator.is_some(),
+        DeviceKind::CoverCalibrator => snapshot.cover_calibrator.is_some(),
+        DeviceKind::Dome => snapshot.dome.is_some(),
+        _ => false,
+    }
+}
+
+/// H2 for one frame over `window`.
+fn equipment_validity(
+    hub: &EquipmentHub,
+    snapshot: &EquipmentSnapshot,
+    window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+    segments: &Segments,
+) -> EquipmentValidity {
+    let now_mono = hub.clock().now_mono_ns();
+    let age = |published: u64| now_mono.checked_sub(published).map(|ns| ns / 1_000_000);
+    let kinds: Vec<DeviceKind> = MOTION_KINDS
+        .iter()
+        .copied()
+        .filter(|kind| attached(snapshot, *kind))
+        .collect();
+    let mut validity = EquipmentValidity {
+        quiescent: None,
+        reason: None,
+        settled_since: None,
+        moved: None,
+        moved_event_seq: None,
+        window_start: window.map(|(start, _)| start),
+        window_end: window.map(|(_, end)| end),
+        clock_quality: ClockQuality::HostArrival,
+        kinds_checked: kinds.clone(),
+        mount_age_ms: snapshot
+            .mount
+            .as_ref()
+            .and_then(|m| age(m.published_mono_ns)),
+        focuser_age_ms: snapshot
+            .focuser
+            .as_ref()
+            .and_then(|f| age(f.published_mono_ns)),
+        filter_wheel_age_ms: snapshot
+            .filter_wheel
+            .as_ref()
+            .and_then(|w| age(w.published_mono_ns)),
+        guider_age_ms: snapshot
+            .guider
+            .as_ref()
+            .and_then(|g| age(g.published_mono_ns)),
+        mount_slewing: snapshot
+            .mount
+            .as_ref()
+            .and_then(|m| m.state.slewing.known().copied()),
+        mount_tracking: snapshot
+            .mount
+            .as_ref()
+            .and_then(|m| m.state.tracking.known().copied()),
+        pulse_guiding: snapshot
+            .mount
+            .as_ref()
+            .and_then(|m| m.state.is_pulse_guiding.known().copied()),
+        guider_state: snapshot
+            .guider
+            .as_ref()
+            .and_then(|g| g.app_state.known().copied()),
+        resume_block_active: !snapshot.resume_blocks.is_empty(),
+        segment: segments.count,
+        segment_reset_by: segments.last.clone(),
+    };
+    if kinds.is_empty() {
+        validity.reason = Some("no_motion_devices".into());
+        return validity;
+    }
+    let Some((start, end)) = window else {
+        validity.reason = Some("frame_interval_unknown".into());
+        return validity;
+    };
+    match hub.quiescent(&kinds, start, end) {
+        Quiescence::Quiescent { settled_since } => {
+            validity.quiescent = Some(true);
+            validity.settled_since = Some(settled_since);
+        }
+        Quiescence::Moved { kind, event_seq } => {
+            validity.quiescent = Some(false);
+            validity.reason = Some(format!(
+                "moved:{}",
+                crate::equipment::types::kind_name(kind)
+            ));
+            validity.moved = Some(kind);
+            validity.moved_event_seq = (event_seq > 0).then_some(event_seq);
+        }
+        Quiescence::Unknown { reason } => {
+            validity.reason = Some(reason);
+        }
+    }
+    validity
+}
+
+/// What the equipment layer and the archive say about one frame.
+#[derive(Debug, Clone, Default)]
+pub struct ObservationContext {
+    pub equipment: Option<EquipmentValidity>,
+    pub coc: Option<CocContext>,
+    /// The newest successful plate solve.
+    pub solve: Option<LatestSolve>,
+    /// The streaming camera's name.
+    pub camera: Option<String>,
+    pub pier_side: Option<PierSide>,
+    pub rotator_angle_deg: Option<f64>,
+    /// The exposure window's device state, for TED.
+    pub window: Option<DeviceWindow>,
+}
+
+impl ObservationContext {
+    fn gather(
+        state: &AppState,
+        window: Option<(DateTime<Utc>, DateTime<Utc>)>,
+        segments: &Segments,
+        solve: Option<LatestSolve>,
+    ) -> Self {
+        let hub = &state.equipment;
+        let snapshot = hub.snapshot();
+        let equipment = equipment_validity(hub, &snapshot, window, segments);
+        let any_device = MOTION_KINDS.iter().any(|kind| attached(&snapshot, *kind));
+        let device_window = window
+            .filter(|_| any_device)
+            .map(|(start, end)| hub.window(start, end));
+        let camera = state
+            .camera_runtime
+            .read()
+            .ok()
+            .and_then(|runtime| runtime.camera_name.clone());
+        Self {
+            equipment: Some(equipment),
+            coc: Some(hub.coc_context()),
+            solve,
+            camera,
+            pier_side: snapshot
+                .mount
+                .as_ref()
+                .and_then(|m| m.state.side_of_pier.known().copied()),
+            rotator_angle_deg: snapshot
+                .rotator
+                .as_ref()
+                .and_then(|r| r.state.position_deg.known().copied()),
+            window: device_window,
+        }
+    }
+
+    /// A frame that moved never adapts the cloud baselines.
+    fn moved(&self) -> bool {
+        self.equipment
+            .as_ref()
+            .is_some_and(|e| e.quiescent == Some(false))
+    }
+}
+
 pub fn spawn(state: AppState, rate_hz: f64) -> JoinHandle<()> {
     tokio::spawn(async move {
         run(state, rate_hz).await;
@@ -61,12 +344,22 @@ pub async fn run(state: AppState, rate_hz: f64) {
         "Vision loop started at {:.2} Hz",
         1.0 / period.as_secs_f64()
     );
+    // M-3: the plate-solve trigger follows the bus from startup.
+    crate::mount::auto_solve::attach(&state);
+    let mut events = state.equipment.subscribe();
+    let mut segments = Segments::default();
+    let mut timing = FrameTiming::default();
     let mut trends = VisionTrendState::default();
     let mut trend_generation = state.current_camera_generation();
 
     loop {
         ticker.tick().await;
 
+        if let Some(cause) = drain_segmentation(&mut events) {
+            trends.segment();
+            segments.count += 1;
+            segments.last = Some(cause);
+        }
         let generation = state.current_camera_generation();
         if generation != trend_generation {
             trends = VisionTrendState::default();
@@ -79,18 +372,32 @@ pub async fn run(state: AppState, rate_hz: f64) {
         if frame.stream_generation != generation {
             continue;
         }
+        timing.observe(frame.stream_generation, frame.frame_counter, Utc::now());
 
         let previous = state
             .vision_observation
             .read()
             .ok()
             .and_then(|bus| bus.clone());
+        let solve = match crate::storage::plate_solve_repo::latest_successful_solve(
+            state.local_store.pool(),
+        )
+        .await
+        {
+            Ok(solve) => solve,
+            Err(error) => {
+                tracing::debug!("Vision loop could not read the latest plate solve: {error}");
+                None
+            }
+        };
+        let context = ObservationContext::gather(&state, timing.window(), &segments, solve);
 
-        let observation = match observation_from_frame_with_trends(
+        let observation = match observation_with_context(
             &frame,
             &mut trends,
             previous.as_ref(),
             Some(state.fqe_runner.as_ref()),
+            &context,
         ) {
             Ok(observation) => observation,
             Err(error) => {
@@ -100,37 +407,61 @@ pub async fn run(state: AppState, rate_hz: f64) {
                 SharedObservation::analysis_unavailable(error.to_string())
             }
         };
-        let _publication = state.camera_observation_barrier.lock().unwrap();
-        if frame.stream_generation != generation || state.current_camera_generation() != generation
+        let cleared = observation.cloud_event == CloudEvent::ClearedUp;
         {
-            trends = VisionTrendState::default();
-            trend_generation = state.current_camera_generation();
-            continue;
+            let _publication = state.camera_observation_barrier.lock().unwrap();
+            if frame.stream_generation != generation
+                || state.current_camera_generation() != generation
+            {
+                trends = VisionTrendState::default();
+                trend_generation = state.current_camera_generation();
+                continue;
+            }
+            if let Ok(mut bus) = state.vision_observation.write() {
+                *bus = Some(observation.clone());
+            }
+            if let Ok(mut slot) = state.last_observed_frame.write() {
+                *slot = Some(ObservedFrame {
+                    frame_counter: frame.frame_counter,
+                    capture_unix_time: frame.unix_timestamp,
+                    frame: Arc::new(frame),
+                    observation: observation.clone(),
+                });
+            }
+            let _ = state.vision_updates.send(observation);
         }
-        if let Ok(mut bus) = state.vision_observation.write() {
-            *bus = Some(observation.clone());
+        if cleared {
+            crate::mount::auto_solve::cloud_cleared(&state);
         }
-        if let Ok(mut slot) = state.last_observed_frame.write() {
-            *slot = Some(ObservedFrame {
-                frame_counter: frame.frame_counter,
-                capture_unix_time: frame.unix_timestamp,
-                frame: Arc::new(frame),
-                observation: observation.clone(),
-            });
-        }
-        let _ = state.vision_updates.send(observation);
     }
 }
 
 pub fn observation_from_frame(frame: &FrameData) -> crate::error::Result<SharedObservation> {
-    observation_from_frame_with_trends(frame, &mut VisionTrendState::default(), None, None)
+    observation_with_context(
+        frame,
+        &mut VisionTrendState::default(),
+        None,
+        None,
+        &ObservationContext::default(),
+    )
 }
 
+#[cfg(test)]
 fn observation_from_frame_with_trends(
     frame: &FrameData,
     trends: &mut VisionTrendState,
     previous: Option<&SharedObservation>,
     fqe: Option<&FqeRunner>,
+) -> crate::error::Result<SharedObservation> {
+    observation_with_context(frame, trends, previous, fqe, &ObservationContext::default())
+}
+
+fn observation_with_context(
+    frame: &FrameData,
+    trends: &mut VisionTrendState,
+    previous: Option<&SharedObservation>,
+    fqe: Option<&FqeRunner>,
+    context: &ObservationContext,
 ) -> crate::error::Result<SharedObservation> {
     let luma = match quality::luma_from_frame(frame) {
         Ok(luma) => luma,
@@ -152,7 +483,31 @@ fn observation_from_frame_with_trends(
     }
     let background = quality::background_from_luma(&luma);
     let quality = quality::estimate_quality(&luma, &background);
-    let trailing = trailing::estimate_trailing(&luma, &background);
+
+    // H15: the trail on the sensor; on the sky only with a WCS that still
+    // describes this frame.
+    let solve = context.solve.as_ref();
+    let orientation = solve.map(|solve| trailing::SolveOrientation {
+        cd: solve.wcs.map(|wcs| wcs.cd),
+        naxis: solve.wcs.map(|wcs| wcs.naxis),
+        solve_event_id: Some(solve.event_id.as_str()),
+        camera: solve.camera_name.as_deref(),
+        pier_side: solve.pier_side,
+        rotator_angle_deg: solve.rotator_angle_deg,
+    });
+    let geometry = trailing::FrameGeometry {
+        camera: context.camera.as_deref(),
+        width: luma.width,
+        height: luma.height,
+        pier_side: context.pier_side,
+        rotator_angle_deg: context.rotator_angle_deg,
+    };
+    let trailing = trailing::attribute(
+        trailing::estimate_trailing(&luma, &background),
+        orientation.as_ref(),
+        &geometry,
+    );
+    let ted = TedRunner::new(None).evidence(&trailing, context.window.as_ref());
 
     // FQE shadow inference on the gate-surviving classical stars that also admit
     // a centered 64 px crop. Published alongside the classical fields; any failure logs
@@ -198,14 +553,16 @@ fn observation_from_frame_with_trends(
     }
     let new_frame = trends.last_frame_counter != Some(frame.frame_counter);
     trends.last_frame_counter = Some(frame.frame_counter);
+    // H2: a frame exposed while equipment moved is not evidence about cloud.
+    let counts = new_frame && !context.moved();
     let cloud_probability = update_cloud_probability(
         trends,
         quality.star_count_detected,
         background.background_adu,
         quality.observation_valid(),
-        new_frame,
+        counts,
     );
-    let cloud_event = if new_frame {
+    let cloud_event = if counts {
         update_cloud_event(trends, cloud_probability)
     } else {
         CloudEvent::None
@@ -238,18 +595,25 @@ fn observation_from_frame_with_trends(
         cloud_probability,
         cloud_event,
         trailing_severity: trailing.severity,
-        trailing_axis: trailing.axis,
-        trailing_direction_pa: trailing.direction_pa,
+        trailing_axis: trailing.axis_label(),
+        trailing_direction_pa: trailing.sensor_pa_deg,
+        ted: Some(ted),
         background_adu: background.background_adu,
         sky_background_adu: background.background_adu,
         background_sigma: background.background_sigma,
         snr_proxy_median: background.snr_proxy_median,
         saturation_fraction: background.saturation_fraction,
         saturation_gate: quality.saturation_gate,
-        pointing_error_arcmin: previous.and_then(|obs| obs.pointing_error_arcmin),
-        wcs_residual_arcsec: previous.and_then(|obs| obs.wcs_residual_arcsec),
-        last_solve_confidence: previous.and_then(|obs| obs.last_solve_confidence),
-        last_solve_at: previous.and_then(|obs| obs.last_solve_at.clone()),
+        // From plate_solve_events, never carried forward from `previous`.
+        pointing_error_arcmin: solve
+            .and_then(|s| s.pointing_error_arcmin)
+            .map(|e| e as f32),
+        wcs_residual_arcsec: None,
+        last_solve_confidence: None,
+        last_solve_at: solve.and_then(|s| s.solved_at),
+        last_solve_event_id: solve.map(|s| s.event_id.clone()),
+        equipment: context.equipment.clone(),
+        coc_context: context.coc.clone(),
         observation_valid,
     })
 }
@@ -597,5 +961,339 @@ mod analysis_domain_tests {
         }
         assert_eq!(trends.last_frame_counter, Some(99));
         assert!(trends.consecutive_cloudy <= 1);
+    }
+
+    // ── Equipment hooks (H2, H14, H15, plate-solve state) ──────────────────
+
+    use crate::equipment::events::{EquipmentEvent, EventKind};
+    use crate::equipment::hub::{EquipmentHub, HubConfig};
+    use crate::equipment::ring::DeviceSnapshot;
+    use crate::equipment::snapshot::MountSnapshot;
+    use crate::equipment::testing::fake_handles::fake_mount;
+    use crate::equipment::testing::manual_clock::ManualClock;
+    use crate::equipment::traits::{Clock, NullRecorder};
+    use crate::equipment::types::{EqFrame, Observed, Source};
+    use crate::processing::plate_solver::TanWcs;
+
+    #[test]
+    fn the_segmenting_events_are_the_ones_the_spec_names() {
+        for name in [
+            "slew_commanded",
+            "slew_settled",
+            "filter_moving",
+            "filter_change_ended",
+            "focuser_move_started",
+            "focuser_move_stopped",
+            "exposure_settings_changed",
+            "stream_restarted",
+        ] {
+            assert!(segments_baselines(name), "{name}");
+        }
+        for name in [
+            "guide_step",
+            "focuser_settled",
+            "weather_sample",
+            "pulse_guide",
+        ] {
+            assert!(!segments_baselines(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn draining_the_bus_reports_the_first_segmenting_event_and_a_lag() {
+        let clock = ManualClock::new();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+        let send = |kind| {
+            tx.send(Arc::new(EquipmentEvent::new(kind, &clock)))
+                .unwrap();
+        };
+        assert_eq!(drain_segmentation(&mut rx), None);
+        send(EventKind::GuiderPaused);
+        send(EventKind::SlewStarted);
+        send(EventKind::FilterMoving { to_slot: 1 });
+        assert_eq!(drain_segmentation(&mut rx).as_deref(), Some("slew_started"));
+        assert_eq!(drain_segmentation(&mut rx), None, "drained");
+        for _ in 0..6 {
+            send(EventKind::GuiderPaused);
+        }
+        assert_eq!(drain_segmentation(&mut rx).as_deref(), Some("bus_lagged"));
+
+        // A segment restarts the baselines but never recounts the frame.
+        let mut trends = VisionTrendState {
+            clear_star_baseline: Some(40.0),
+            consecutive_cloudy: 2,
+            last_frame_counter: Some(9),
+            ..VisionTrendState::default()
+        };
+        trends.segment();
+        assert_eq!(trends.clear_star_baseline, None);
+        assert_eq!(trends.consecutive_cloudy, 0);
+        assert_eq!(trends.last_frame_counter, Some(9));
+    }
+
+    #[test]
+    fn a_stream_frame_window_is_two_intervals_before_its_arrival() {
+        let t0 = DateTime::from_timestamp(1_792_029_600, 0).unwrap();
+        let mut timing = FrameTiming::default();
+        timing.observe(1, 10, t0);
+        assert_eq!(timing.window(), None, "no interval yet");
+        timing.observe(1, 10, t0 + chrono::Duration::seconds(1));
+        assert_eq!(timing.window(), None, "the same frame again");
+        timing.observe(1, 11, t0 + chrono::Duration::seconds(2));
+        assert_eq!(
+            timing.window(),
+            Some((
+                t0 - chrono::Duration::seconds(2),
+                t0 + chrono::Duration::seconds(2)
+            ))
+        );
+        // A new stream starts over.
+        timing.observe(2, 0, t0 + chrono::Duration::seconds(3));
+        assert_eq!(timing.window(), None);
+    }
+
+    fn mount_sample(clock: &ManualClock, slewing: bool) -> Arc<MountSnapshot> {
+        let (utc, mono) = (clock.now_utc(), clock.now_mono_ns());
+        let mut snap = MountSnapshot::default();
+        snap.state.ra_h = Observed::fresh(5.5, Source::DeviceState, utc, mono);
+        snap.state.dec_deg = Observed::fresh(20.0, Source::DeviceState, utc, mono);
+        snap.state.slewing = Observed::fresh(slewing, Source::DeviceState, utc, mono);
+        snap.state.tracking = Observed::fresh(true, Source::DeviceState, utc, mono);
+        snap.capabilities.native_frame = EqFrame::JNowApparent;
+        snap.set_published(utc, mono);
+        Arc::new(snap)
+    }
+
+    #[test]
+    fn equipment_validity_reports_quiescence_motion_and_unknowns() {
+        let clock = Arc::new(ManualClock::new());
+        let hub = EquipmentHub::new(
+            HubConfig::default(),
+            clock.clone(),
+            Arc::new(NullRecorder::new()),
+        );
+        let segments = Segments {
+            count: 3,
+            last: Some("slew_settled".into()),
+        };
+        let t0 = clock.now_utc();
+        let window = (
+            t0 + chrono::Duration::milliseconds(3500),
+            t0 + chrono::Duration::milliseconds(4500),
+        );
+
+        let none = equipment_validity(&hub, &hub.snapshot(), Some(window), &segments);
+        assert_eq!(none.quiescent, None);
+        assert_eq!(none.reason.as_deref(), Some("no_motion_devices"));
+        assert_eq!(none.clock_quality, ClockQuality::HostArrival);
+
+        let (mount, _fake) = fake_mount(MountSnapshot::default());
+        let ring = hub.attach(mount.clone());
+        for _ in 0..5 {
+            clock.advance_ms(1000);
+            ring.push(mount_sample(&clock, false));
+        }
+        let unknown = equipment_validity(&hub, &hub.snapshot(), None, &segments);
+        assert_eq!(unknown.reason.as_deref(), Some("frame_interval_unknown"));
+
+        let quiet = equipment_validity(&hub, &hub.snapshot(), Some(window), &segments);
+        assert_eq!(quiet.quiescent, Some(true), "{quiet:?}");
+        assert_eq!(quiet.kinds_checked, vec![DeviceKind::Mount]);
+        assert_eq!(
+            (quiet.segment, quiet.segment_reset_by.as_deref()),
+            (3, Some("slew_settled"))
+        );
+
+        clock.set_utc(t0 + chrono::Duration::milliseconds(4000));
+        let slew = hub
+            .emit(
+                EquipmentEvent::new(EventKind::SlewStarted, clock.as_ref())
+                    .for_device(DeviceKind::Mount, mount.connection_id()),
+            )
+            .unwrap();
+        let moved = equipment_validity(&hub, &hub.snapshot(), Some(window), &segments);
+        assert_eq!(moved.quiescent, Some(false));
+        assert_eq!(moved.moved, Some(DeviceKind::Mount));
+        assert_eq!(moved.moved_event_seq, Some(slew.seq));
+        assert_eq!(moved.reason.as_deref(), Some("moved:mount"));
+    }
+
+    fn validity(quiescent: Option<bool>) -> EquipmentValidity {
+        EquipmentValidity {
+            quiescent,
+            reason: None,
+            settled_since: None,
+            moved: None,
+            moved_event_seq: None,
+            window_start: None,
+            window_end: None,
+            clock_quality: ClockQuality::HostArrival,
+            kinds_checked: vec![DeviceKind::Mount],
+            mount_age_ms: None,
+            focuser_age_ms: None,
+            filter_wheel_age_ms: None,
+            guider_age_ms: None,
+            mount_slewing: None,
+            mount_tracking: None,
+            pulse_guiding: None,
+            guider_state: None,
+            resume_block_active: false,
+            segment: 0,
+            segment_reset_by: None,
+        }
+    }
+
+    #[test]
+    fn a_frame_that_moved_never_counts_toward_a_cloud_event() {
+        // No stars on an empty sky: a high cloud reading on every frame, so
+        // three counted frames declare cloud.
+        let quiet = ObservationContext {
+            equipment: Some(validity(Some(true))),
+            ..ObservationContext::default()
+        };
+        let moving = ObservationContext {
+            equipment: Some(validity(Some(false))),
+            ..ObservationContext::default()
+        };
+        let run = |context: &ObservationContext| {
+            let mut trends = VisionTrendState::default();
+            let mut events = Vec::new();
+            for counter in 0..3 {
+                let mut frame = mono_frame();
+                frame.frame_counter = counter;
+                let previous = observation_from_frame(&frame).unwrap();
+                let observation =
+                    observation_with_context(&frame, &mut trends, Some(&previous), None, context)
+                        .unwrap();
+                events.push(observation.cloud_event);
+            }
+            (events, trends.consecutive_cloudy)
+        };
+        let (events, _) = run(&quiet);
+        assert_eq!(events[2], CloudEvent::CloudDetected);
+        let (events, cloudy) = run(&moving);
+        assert!(events.iter().all(|e| *e == CloudEvent::None));
+        assert_eq!(cloudy, 0);
+    }
+
+    fn latest_solve(camera: &str, pier: PierSide) -> LatestSolve {
+        LatestSolve {
+            event_id: "solve-9".into(),
+            frame_id: Some("frame-9".into()),
+            solved_at: Some(DateTime::from_timestamp(1_792_029_600, 0).unwrap()),
+            exposure_started_at: None,
+            trigger: Some("post_slew".into()),
+            ra_deg: Some(83.8),
+            dec_deg: Some(-5.4),
+            position_angle_deg: Some(0.0),
+            pixel_scale_arcsec: Some(1.2),
+            mirrored: Some(false),
+            wcs: Some(TanWcs {
+                crpix: [2000.5, 1500.5],
+                crval: [83.8, -5.4],
+                cd: [[-3.0e-4, 0.0], [0.0, 3.0e-4]],
+                naxis: [4000, 3000],
+            }),
+            pointing_error_arcmin: Some(2.5),
+            camera_name: Some(camera.into()),
+            pier_side: Some(pier),
+            rotator_angle_deg: None,
+            exposure: None,
+        }
+    }
+
+    #[test]
+    fn the_plate_solve_state_comes_from_the_table_never_the_previous_observation() {
+        let frame = mono_frame();
+        let mut previous = observation_from_frame(&frame).unwrap();
+        previous.last_solve_at = Some(Utc::now());
+        previous.pointing_error_arcmin = Some(9.0);
+        let carried = observation_with_context(
+            &frame,
+            &mut VisionTrendState::default(),
+            Some(&previous),
+            None,
+            &ObservationContext::default(),
+        )
+        .unwrap();
+        assert_eq!(carried.last_solve_at, None, "nothing is carried forward");
+        assert_eq!(carried.pointing_error_arcmin, None);
+
+        let solved = ObservationContext {
+            solve: Some(latest_solve("SV105", PierSide::East)),
+            ..ObservationContext::default()
+        };
+        let observation = observation_with_context(
+            &frame,
+            &mut VisionTrendState::default(),
+            Some(&previous),
+            None,
+            &solved,
+        )
+        .unwrap();
+        assert_eq!(
+            observation.last_solve_at,
+            Some(DateTime::from_timestamp(1_792_029_600, 0).unwrap())
+        );
+        assert_eq!(observation.pointing_error_arcmin, Some(2.5));
+        assert_eq!(observation.last_solve_event_id.as_deref(), Some("solve-9"));
+        assert_eq!(observation.last_solve_confidence, None);
+    }
+
+    /// One star trailed along the sensor's x axis.
+    fn trailed_frame() -> FrameData {
+        let mut frame = mono_frame();
+        for x in 24..40 {
+            frame.data[32 * 64 + x] = 250;
+        }
+        for x in 27..37 {
+            frame.data[31 * 64 + x] = 180;
+            frame.data[33 * 64 + x] = 180;
+        }
+        frame
+    }
+
+    #[test]
+    fn the_bus_trailing_axis_is_ra_or_dec_only_with_a_wcs_that_still_applies() {
+        let analyse = |context: &ObservationContext| {
+            observation_with_context(
+                &trailed_frame(),
+                &mut VisionTrendState::default(),
+                None,
+                None,
+                context,
+            )
+            .unwrap()
+        };
+        let unsolved = analyse(&ObservationContext::default());
+        assert!(unsolved.trailing_severity > 0.15);
+        assert_eq!(unsolved.trailing_axis.as_deref(), Some("sensor_x"));
+        let ted = unsolved.ted.unwrap();
+        assert_eq!(ted.sky_axis, None);
+        assert_eq!(ted.sky_withheld.as_deref(), Some("no_plate_solve"));
+
+        let same_rig = ObservationContext {
+            solve: Some(latest_solve("SV105", PierSide::East)),
+            camera: Some("SV105".into()),
+            pier_side: Some(PierSide::East),
+            ..ObservationContext::default()
+        };
+        let solved = analyse(&same_rig);
+        assert_eq!(solved.trailing_axis.as_deref(), Some("RA"));
+        assert_eq!(
+            solved.ted.unwrap().solve_event_id.as_deref(),
+            Some("solve-9")
+        );
+
+        let other_camera = ObservationContext {
+            camera: Some("R50".into()),
+            ..same_rig.clone()
+        };
+        let withheld = analyse(&other_camera);
+        assert_eq!(withheld.trailing_axis.as_deref(), Some("sensor_x"));
+        assert_eq!(
+            withheld.ted.unwrap().sky_withheld.as_deref(),
+            Some("solved_with_another_camera")
+        );
     }
 }
