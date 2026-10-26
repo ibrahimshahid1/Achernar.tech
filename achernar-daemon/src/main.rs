@@ -163,6 +163,14 @@ async fn main() -> anyhow::Result<()> {
         ),
     }
 
+    // The equipment layer (spec §2.10): configuration, recorder, astro and
+    // the camera hook. It opens no device and broadcasts nothing (D13).
+    let equipment_configs = config.equipment_configs();
+    for warning in config.equipment_warnings() {
+        tracing::warn!("equipment config: {warning}");
+    }
+    let site = config.site.site().ok().flatten();
+    let equipment_store = local_store.clone();
     let app_state = AppState::new(
         config.focus.clone(),
         config.camera.clone(),
@@ -174,7 +182,14 @@ async fn main() -> anyhow::Result<()> {
         rig_optics,
     )
     .with_plate_solver(plate_solver)
-    .with_auto_solve(&config.plate_solve);
+    .with_auto_solve(&config.plate_solve)
+    .with_equipment(&equipment_configs, site, Some(equipment_store));
+    // Sequence numbers continue from the journal (§4.3).
+    match storage::equipment_events_repo::max_seq(app_state.local_store.pool()).await {
+        Ok(Some(max)) => app_state.equipment.bus().continue_after(max),
+        Ok(None) => {}
+        Err(e) => tracing::warn!("Could not read the equipment journal's last seq: {e}"),
+    }
     hardware::health::spawn(app_state.clone());
     cloud_client::spawn_if_configured(app_state.clone());
     vision::vision_loop::spawn(app_state.clone(), 1.0);
@@ -195,6 +210,11 @@ async fn main() -> anyhow::Result<()> {
         .nest("/camera", camera_routes())
         .nest("/mount", mount_routes())
         .nest("/focuser", focuser_routes())
+        .nest("/filter-wheel", filter_wheel_routes())
+        .nest("/guider", guider_routes())
+        .route("/weather", get(api::weather::status))
+        .route("/safety", get(api::safety::status))
+        .nest("/equipment", equipment_routes())
         .nest("/focus", focus_routes())
         .nest("/platesolve", platesolve_routes());
 
@@ -217,9 +237,48 @@ async fn main() -> anyhow::Result<()> {
     info!("Daemon listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // §2.15: refuse new gated commands, halt focuser moves, stop jogs, abort
+    // Achernar slews, never park; close the connection rows and flush the
+    // recorder, each within 2 s.
+    let hub = app_state.equipment.clone();
+    let _ = tokio::task::spawn_blocking(move || hub.shutdown(Duration::from_secs(2))).await;
+    if let Some(recorder) = app_state.equipment_ctx.recorder() {
+        if let Err(e) = recorder
+            .shutdown(chrono::Utc::now(), Duration::from_secs(2))
+            .await
+        {
+            tracing::warn!("Equipment recorder shutdown: {e}");
+        }
+    }
 
     Ok(())
+}
+
+/// SIGINT/SIGTERM, or a Windows console close (Ctrl+C).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    info!("Shutdown requested");
 }
 
 async fn health_check() -> &'static str {
@@ -245,21 +304,62 @@ fn camera_routes() -> Router<AppState> {
 
 fn mount_routes() -> Router<AppState> {
     Router::new()
+        .route("/", get(api::mount::descriptor))
         .route("/slew", post(api::mount::slew))
         .route("/slew-target", post(api::mount::slew_target))
         .route("/sync", post(api::mount::sync))
         .route("/park", post(api::mount::park))
         .route("/unpark", post(api::mount::unpark))
+        .route("/home", post(api::mount::home))
+        .route("/center", post(api::mount::center))
         .route("/abort", post(api::mount::abort))
         .route("/tracking", post(api::mount::set_tracking))
+        .route("/move-axis", post(api::mount::move_axis))
+        .route("/pulse-guide", post(api::mount::pulse_guide))
+        .route("/tracking-rate", post(api::mount::tracking_rate))
+        .route("/guide-rates", post(api::mount::guide_rates))
+        .route("/site-sync", post(api::mount::site_sync))
 }
 
 fn focuser_routes() -> Router<AppState> {
     Router::new()
+        .route("/", get(api::focuser::descriptor))
         .route("/move", post(api::focuser::move_relative))
         .route("/moveto", post(api::focuser::move_absolute))
         .route("/position", get(api::focuser::get_position))
         .route("/abort", post(api::focuser::abort))
+        .route("/tempcomp", post(api::focuser::set_tempcomp))
+        .route("/sync", post(api::focuser::sync))
+        .route("/set-position", post(api::focuser::set_position))
+}
+
+fn filter_wheel_routes() -> Router<AppState> {
+    Router::new()
+        .route("/", get(api::filter_wheel::descriptor))
+        .route("/change", post(api::filter_wheel::change))
+        .route("/abort", post(api::filter_wheel::abort))
+        .route("/import-seed", post(api::filter_wheel::import_seed))
+}
+
+fn guider_routes() -> Router<AppState> {
+    Router::new()
+        .route("/", get(api::guider::descriptor))
+        .route("/start", post(api::guider::start))
+        .route("/stop", post(api::guider::stop))
+        .route("/pause", post(api::guider::pause))
+        .route("/resume", post(api::guider::resume))
+        .route("/dither", post(api::guider::dither))
+}
+
+fn equipment_routes() -> Router<AppState> {
+    Router::new()
+        .route("/estop", post(api::equipment::estop))
+        .route("/resume-blocks", get(api::equipment::resume_blocks))
+        .route(
+            "/resume-blocks/clear",
+            post(api::equipment::clear_resume_block),
+        )
+        .route("/events", get(api::equipment::events))
 }
 
 fn focus_routes() -> Router<AppState> {
@@ -288,6 +388,10 @@ async fn handle_telemetry_socket(mut socket: WebSocket, state: AppState) {
     let mut ticker = interval(Duration::from_millis(1000));
     let mut vision_rx = state.vision_updates.subscribe();
     let mut device_rx = state.device_updates.subscribe();
+    let mut equipment_rx = {
+        use crate::equipment::traits::EquipmentReader;
+        state.equipment.subscribe()
+    };
 
     loop {
         tokio::select! {
@@ -303,6 +407,18 @@ async fn handle_telemetry_socket(mut socket: WebSocket, state: AppState) {
                 if matches!(device_result, Err(tokio::sync::broadcast::error::RecvError::Closed)) { break; }
                 let event=crate::telemetry::telemetry_event(&state).to_string();
                 if socket.send(Message::Text(event)).await.is_err() { break; }
+            }
+            equipment_result = equipment_rx.recv() => {
+                match equipment_result {
+                    Ok(event) => {
+                        let message = crate::telemetry::equipment_event_message(&event).to_string();
+                        if socket.send(Message::Text(message)).await.is_err() { break; }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!("Telemetry socket skipped {skipped} equipment events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
             vision_result = vision_rx.recv() => {
                 match vision_result {

@@ -1,12 +1,17 @@
-//! Lifecycle tests use simulated focuser values and no native hardware handles.
+//! Lifecycle tests use simulated devices behind the equipment layer's
+//! workers and no native hardware handles. The invariants are the ones the
+//! OLS-era tests protected, now for handles (spec §5.3 WP1B-1): telemetry
+//! never blocks on a device slot, a late probe never revives a device, a
+//! retired handle gives 412, a replacement is safe, and relay connect and
+//! disconnect use the registry.
 use super::*;
 use crate::config::{CameraConfig, FocusConfig};
-use crate::hardware::focuser::{ConnectedFocuser, SimFocuser};
 use crate::relay_commands::{execute, RelayCommand};
 use crate::storage::{
     capture_store::CaptureStore, frames_repo::FrameStore, local_store::LocalStore,
 };
 use axum::{extract::State, http::StatusCode, Json};
+use serde_json::json;
 use std::path::PathBuf;
 
 async fn state() -> (PathBuf, AppState) {
@@ -33,42 +38,48 @@ async fn state() -> (PathBuf, AppState) {
 }
 
 async fn cleanup(directory: PathBuf, state: AppState) {
+    for kind in crate::api::equipment::AUXILIARY_KINDS {
+        let _ = crate::api::equipment::disconnect_device(&state, kind, true).await;
+    }
     let pool = state.local_store.pool().clone();
     drop(state);
     pool.close().await;
     std::fs::remove_dir_all(directory).unwrap();
 }
 
-fn install_focuser(state: &AppState, id: &str, position: i32) {
-    let mut slot = state.focuser.lock().unwrap();
-    let focuser = ConnectedFocuser::Simulator(SimFocuser::new(position));
-    let snapshot = focuser_snapshot("fixture focuser".into(), &focuser.health_status().unwrap());
-    *slot = Some(focuser);
-    *state.focuser_name.lock().unwrap() = Some("fixture focuser".into());
-    state
-        .devices
-        .write()
-        .unwrap()
-        .connected(DeviceKind::Focuser, id.into(), Some(snapshot));
+/// Connect the daemon's legacy simulator focuser behind its worker; returns
+/// the registry connection id and the simulator, to inspect it without the
+/// driver.
+async fn install_focuser(
+    state: &AppState,
+    position: i32,
+) -> (String, Arc<Mutex<crate::hardware::focuser::SimFocuser>>) {
+    let driver = crate::equipment::legacy::sim_focuser::LegacySimFocuser::new(
+        position,
+        state.equipment.clock(),
+    );
+    let sim = driver.shared_sim();
+    let body = crate::api::equipment::install_focuser(state, Box::new(driver), "sim", "")
+        .await
+        .unwrap();
+    (body["connection_id"].as_str().unwrap().to_string(), sim)
 }
 
-#[tokio::test]
+fn sim_position(sim: &Arc<Mutex<crate::hardware::focuser::SimFocuser>>) -> i32 {
+    sim.lock().unwrap().position().unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn old_probe_cannot_retire_a_replacement_handle() {
     let (directory, state) = state().await;
-    install_focuser(&state, "replacement", 23456);
+    let (id, sim) = install_focuser(&state, 23456).await;
+    // A late probe and retire for an old connection leave the replacement.
     probe_device(&state, DeviceKind::Focuser, "retired-old-connection");
     retire_auxiliary(&state, DeviceKind::Focuser);
-    assert_eq!(
-        state
-            .focuser
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .position()
-            .unwrap(),
-        23456
-    );
+    let handle = state.focuser.lock().unwrap().clone().unwrap();
+    assert!(!handle.is_retired());
+    assert_eq!(handle.snapshot().logical_position, Some(23456));
+    assert_eq!(sim_position(&sim), 23456);
     assert_eq!(
         state
             .devices
@@ -76,8 +87,22 @@ async fn old_probe_cannot_retire_a_replacement_handle() {
             .unwrap()
             .connection_id(DeviceKind::Focuser)
             .as_deref(),
-        Some("replacement")
+        Some(id.as_str())
     );
+    assert_eq!(
+        crate::telemetry::equipment_status(&state)["focuser"]["position"],
+        23456
+    );
+    // A late projection from an old connection id never revives anything.
+    let lost = crate::equipment::types::HealthState {
+        state: crate::equipment::types::LinkState::Lost,
+        ..crate::equipment::types::HealthState::default()
+    };
+    assert!(!state.devices.write().unwrap().lost(
+        DeviceKind::Focuser,
+        "retired-old-connection",
+        &lost
+    ));
     assert_eq!(
         crate::telemetry::equipment_status(&state)["focuser"]["position"],
         23456
@@ -85,17 +110,18 @@ async fn old_probe_cannot_retire_a_replacement_handle() {
     cleanup(directory, state).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retired_public_device_is_hidden_and_commands_reject_retained_handle() {
     let (directory, state) = state().await;
-    install_focuser(&state, "lost", 10000);
+    let (id, sim) = install_focuser(&state, 10000).await;
     lose_device(
         &state,
         DeviceKind::Focuser,
-        "lost",
+        &id,
         "fixture transport failure".into(),
     );
-    // Native destruction can be delayed; that must not preserve public liveness.
+    // The handle outlives the public loss until it is retired; that must not
+    // preserve public liveness.
     assert!(state.focuser.lock().unwrap().is_some());
     let status = crate::telemetry::equipment_status(&state);
     assert_eq!(status["focuser"], Value::Null);
@@ -104,13 +130,20 @@ async fn retired_public_device_is_hidden_and_commands_reject_retained_handle() {
         status["device_health"]["focuser"]["last_error"],
         "fixture transport failure"
     );
+    assert_eq!(
+        status["device_health"]["focuser"]["reason"], "fixture transport failure",
+        "reason mirrors last_error (§2.8)"
+    );
     assert!(state.focus_abort_requested.load(Ordering::Acquire));
     let direct = crate::api::focuser::move_absolute(
         State(state.clone()),
-        Json(crate::api::focuser::MoveToRequest { position: 20000 }),
+        Json(crate::api::focuser::MoveToRequest {
+            position: 20000,
+            overriding: false,
+        }),
     )
     .await;
-    assert_eq!(direct.unwrap_err(), StatusCode::PRECONDITION_FAILED);
+    assert_eq!(direct.unwrap_err().status, StatusCode::PRECONDITION_FAILED);
     let relayed = execute(
         state.clone(),
         &RelayCommand {
@@ -121,24 +154,30 @@ async fn retired_public_device_is_hidden_and_commands_reject_retained_handle() {
     )
     .await;
     assert!(relayed.is_err());
-    assert_eq!(
-        state
-            .focuser
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .position()
-            .unwrap(),
-        10000
-    );
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(sim_position(&sim), 10000);
+    // Retiring releases the slot and tells the worker to disconnect.
+    let handle = state.focuser.lock().unwrap().clone().unwrap();
     retire_auxiliary(&state, DeviceKind::Focuser);
     assert!(state.focuser.lock().unwrap().is_none());
     assert!(state.focuser_name.lock().unwrap().is_none());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !handle.is_retired() {
+        assert!(Instant::now() < deadline, "the worker was never retired");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // A retired handle refuses even its abort (412).
+    assert_eq!(
+        crate::api::focuser::abort(State(state.clone()))
+            .await
+            .unwrap_err()
+            .status,
+        StatusCode::PRECONDITION_FAILED
+    );
     cleanup(directory, state).await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_connect_and_disconnect_use_the_authoritative_device_registry() {
     let (directory, state) = state().await;
     execute(
@@ -181,19 +220,31 @@ async fn relay_connect_and_disconnect_use_the_authoritative_device_registry() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn telemetry_does_not_wait_for_any_native_device_slot() {
     let (directory, state) = state().await;
-    install_focuser(&state, "cached", 34567);
-    let mount = state.mount.lock().unwrap();
-    let focuser = state.focuser.lock().unwrap();
-    let wheel = state.filter_wheel.lock().unwrap();
+    install_focuser(&state, 34567).await;
+    // A plain thread holds every native slot lock (no guard is held across
+    // an await) until the test releases it.
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder_state = state.clone();
+    let holder = std::thread::spawn(move || {
+        let _mount = holder_state.mount.lock().unwrap();
+        let _focuser = holder_state.focuser.lock().unwrap();
+        let _wheel = holder_state.filter_wheel.lock().unwrap();
+        let _ = held_tx.send(());
+        let _ = release_rx.recv_timeout(Duration::from_secs(10));
+    });
+    held_rx.await.unwrap();
     let worker_state = state.clone();
     let mut job =
         tokio::task::spawn_blocking(move || crate::telemetry::equipment_status(&worker_state));
     let result = tokio::time::timeout(Duration::from_millis(200), &mut job).await;
     // Always release locks before asserting, including a failing regression,
     // so a blocked worker cannot hang the test runtime during shutdown.
-    drop(wheel);
-    drop(focuser);
-    drop(mount);
+    let _ = release_tx.send(());
+    tokio::task::spawn_blocking(move || holder.join())
+        .await
+        .unwrap()
+        .unwrap();
     let timed_out = result.is_err();
     let status = match result {
         Ok(value) => value.unwrap(),

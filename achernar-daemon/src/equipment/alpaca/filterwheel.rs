@@ -30,8 +30,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
+
+use super::devicestate;
 
 use crate::equipment::clock::duration_ns;
 use crate::equipment::snapshot::SlotInfo;
@@ -96,44 +98,10 @@ fn as_text(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Parse a DeviceState `TimeStamp` permissively (§2.14): an explicit offset
-/// or `Z`, else a zone-less local time.
+/// Parse a DeviceState `TimeStamp` through WP1A-1's permissive parser
+/// (§2.14, O11 d): an explicit offset or `Z`, else a zone-less local time.
 pub fn parse_timestamp(text: &str) -> Option<DateTime<Utc>> {
-    let text = text.trim();
-    if let Ok(at) = DateTime::parse_from_rfc3339(text) {
-        return Some(at.with_timezone(&Utc));
-    }
-    [
-        "%Y-%m-%dT%H:%M:%S%.f",
-        "%Y-%m-%dT%H:%M:%S",
-        "%Y-%m-%d %H:%M:%S%.f",
-    ]
-    .iter()
-    .find_map(|format| NaiveDateTime::parse_from_str(text, format).ok())
-    .and_then(|naive| Local.from_local_datetime(&naive).earliest())
-    .map(|at| at.with_timezone(&Utc))
-}
-
-/// `devicestate` entries by lower-case name.
-fn device_state_entries(value: &Value) -> DeviceResult<Vec<(String, Value)>> {
-    let items = value
-        .as_array()
-        .ok_or_else(|| DeviceError::driver(format!("devicestate returned {value}, not a list")))?;
-    Ok(items
-        .iter()
-        .filter_map(|item| {
-            let name = item
-                .get("Name")
-                .or_else(|| item.get("name"))
-                .and_then(Value::as_str)?;
-            let value = item
-                .get("Value")
-                .or_else(|| item.get("value"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            Some((name.to_ascii_lowercase(), value))
-        })
-        .collect())
+    devicestate::parse_timestamp(text).map(|stamp| stamp.utc)
 }
 
 /// The Alpaca filter-wheel driver. Synchronous; called only from its worker
@@ -516,7 +484,8 @@ impl AlpacaFilterWheel {
 
     fn poll_device_state(&mut self) -> DeviceResult<RawPoll> {
         let (result, timing) = self.timed(|| self.get("devicestate", TimeoutClass::Ordinary));
-        let entries = match result.and_then(|value| device_state_entries(&value)) {
+        // WP1A-1's DeviceState parser (O11 d).
+        let entries = match result.and_then(|value| devicestate::parse_device_state(&value)) {
             Ok(entries) => entries,
             Err(err) if err.is_unknown_member() => {
                 self.unsupported.insert("devicestate".into());
@@ -525,12 +494,8 @@ impl AlpacaFilterWheel {
             }
             Err(err) => return self.fail_position(err, PollMethod::DeviceState, timing),
         };
-        let device_time = entries
-            .iter()
-            .find(|(name, _)| name == "timestamp")
-            .and_then(|(_, value)| value.as_str())
-            .and_then(parse_timestamp);
-        let Some((_, value)) = entries.into_iter().find(|(name, _)| name == "position") else {
+        let device_time = entries.timestamp.map(|stamp| stamp.utc);
+        let Some(value) = entries.get("position").cloned() else {
             // DeviceState with a missing entry: read the member this tick.
             return self.poll_member();
         };

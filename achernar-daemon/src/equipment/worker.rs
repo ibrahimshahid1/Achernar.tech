@@ -86,7 +86,7 @@ use super::ring::{DeviceSnapshot, Ring};
 use super::traits::{AbortPath, Clock, ConnectReport, Device, PollPlan, RawPoll, RecorderSink};
 use super::types::{
     kind_name, CommandId, CommandSource, DeviceError, DeviceIdentity, DeviceKind, DeviceResult,
-    FailureClass, HealthState, LinkState, OpOutcome, Priority,
+    ErrorClass, FailureClass, HealthState, LinkState, OpOutcome, Priority,
 };
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -263,6 +263,19 @@ pub fn halts_at_shutdown(op: OpKind) -> bool {
     )
 }
 
+/// O11 e: an operation's initiator failed in a way that does not prove the
+/// device ignored it (a timeout, a transport error, or an already unknown
+/// outcome), on an operation that moves hardware. Refusals that come back
+/// from the device itself (invalid value, parked, not implemented) are plain
+/// failures.
+pub fn initiator_outcome_unknown(op: OpKind, err: &DeviceError) -> bool {
+    op.moves_hardware()
+        && matches!(
+            err.class,
+            ErrorClass::Timeout | ErrorClass::Transport | ErrorClass::OutcomeUnknown
+        )
+}
+
 /// A one-shot driver action.
 pub type Action<D> = Box<dyn FnOnce(&mut D) -> DeviceResult<()> + Send>;
 
@@ -428,6 +441,11 @@ pub struct WorkerConfig {
     pub announce_connected: bool,
     pub session_id: Option<String>,
     pub night_id: Option<String>,
+    /// O11 b: refuse a motion command whose permit the gate did not issue
+    /// (no abort-epoch stamp in [`WorkerDeps::aborts`]). The spine turns it
+    /// on for every production worker; stops, halts, reads and sets are never
+    /// refused this way, so e-stop steps still run.
+    pub require_gate_permits: bool,
 }
 
 impl Default for WorkerConfig {
@@ -441,6 +459,7 @@ impl Default for WorkerConfig {
             announce_connected: true,
             session_id: None,
             night_id: None,
+            require_gate_permits: false,
         }
     }
 }
@@ -1530,6 +1549,21 @@ impl<K: WorkerKind> Worker<K> {
             .is_some_and(|issued| issued < aborts.epoch(self.kind_id))
     }
 
+    /// O11 b: the gate issued `permit` (its abort-epoch stamp is live). Only
+    /// checked when [`WorkerConfig::require_gate_permits`] is set and the gate's
+    /// epochs are installed.
+    fn issued_by_gate(&self, permit: &Permit) -> bool {
+        if !self.config.require_gate_permits {
+            return true;
+        }
+        let Some(aborts) = &self.aborts else {
+            return true;
+        };
+        aborts
+            .issued_epoch(permit.command_id(), self.kind_id)
+            .is_some()
+    }
+
     /// The gate stamped `permit` with the current abort epoch: authorised
     /// after every abort of this kind so far.
     fn authorised_after_abort(&self, permit: &Permit) -> bool {
@@ -1631,6 +1665,14 @@ impl<K: WorkerKind> Worker<K> {
             let source = permit.source().clone();
             drop(permit);
             return self.refuse_superseded(command_id, op_kind, source, accepted);
+        }
+        if cmd.starts_motion() && !self.issued_by_gate(&permit) {
+            let err = DeviceError::invalid_operation(
+                "the command's permit was not issued by the command gate; motion needs a \
+                 gate permit (CommandGate::authorize or child_permit)",
+            );
+            self.emit_ended(op_kind, command_id, OpOutcome::Failed(err.clone()), 0);
+            return self.refuse(accepted, err);
         }
         self.emit(
             EventKind::OperationCommanded {
@@ -1811,6 +1853,40 @@ impl<K: WorkerKind> Worker<K> {
                     accepted,
                     DeviceError::driver(format!("driver panic: {message}")),
                 );
+            }
+            Ok(Err(err)) if initiator_outcome_unknown(op_kind, &err) => {
+                // O11 e: a Timeout or Transport error on the initiator means
+                // the command may have reached the device. It is accepted and
+                // resolved `Unknown` (which raises the hub's outcome_unknown
+                // resume block), and the hardware is halted best effort (C-4)
+                // so nothing keeps moving unobserved.
+                let unknown = DeviceError::outcome_unknown(format!(
+                    "the {op_kind:?} initiator may have reached the device: {err}"
+                ));
+                let _ = accepted.send(Ok(()));
+                self.emit(
+                    EventKind::OperationStarted { op: op_kind },
+                    Some(command_id),
+                );
+                if let Some(drv) = self.drv.as_mut() {
+                    if let Ok(Err(cancel_err)) = catch_unwind(AssertUnwindSafe(|| op.cancel(drv))) {
+                        tracing::warn!(
+                            device = %self.end.identity.name,
+                            "halt after an unconfirmed initiator failed: {cancel_err}"
+                        );
+                    }
+                }
+                for event in events.drain() {
+                    self.emit(event, Some(command_id));
+                }
+                // The events (and the resume block they raise) come before
+                // the outcome, so whoever awaits the ticket sees the block.
+                let outcome = OpOutcome::Unknown(unknown.clone());
+                self.emit_ended(op_kind, command_id, outcome.clone(), 0);
+                self.shared
+                    .announce_unknown(command_id, op_kind, unknown.message);
+                let _ = done.send(outcome);
+                self.next_poll_at = self.clock.now_mono_ns();
             }
             Ok(Err(err)) => {
                 self.emit_ended(op_kind, command_id, OpOutcome::Failed(err.clone()), 0);
@@ -2064,6 +2140,8 @@ mod tests {
         ignore_halt: bool,
         /// IsMoving cannot be read (the member errors).
         moving_unknown: bool,
+        /// The next move's initiator fails with this error.
+        move_fails_with: Option<DeviceError>,
     }
 
     struct Shared {
@@ -2207,10 +2285,13 @@ mod tests {
         }
         fn move_absolute(&mut self, target: i32) -> DeviceResult<()> {
             self.shared.with(|s| {
+                if let Some(err) = s.move_fails_with.take() {
+                    return Err(err);
+                }
                 s.target = Some(target);
                 s.moving = true;
-            });
-            Ok(())
+                Ok(())
+            })
         }
         fn move_relative(&mut self, _steps: i32) -> DeviceResult<()> {
             Err(DeviceError::unsupported("absolute focuser"))
@@ -2363,6 +2444,13 @@ mod tests {
     where
         K: WorkerKind<Driver = dyn FocuserDriver, Cmd = FocuserCmd, Snap = FocuserSnapshot>,
     {
+        rig_kind_with(kind, policy, false)
+    }
+
+    fn rig_kind_with<K>(kind: K, policy: HealthPolicy, require_gate_permits: bool) -> Rig
+    where
+        K: WorkerKind<Driver = dyn FocuserDriver, Cmd = FocuserCmd, Snap = FocuserSnapshot>,
+    {
         let clock = Arc::new(ManualClock::new());
         let sink = RecordingSink::new();
         let hub = EquipmentHub::new(HubConfig::default(), clock.clone(), sink.clone());
@@ -2390,6 +2478,7 @@ mod tests {
                 policy,
                 max_wait: Duration::from_millis(2),
                 connect_timeout: Duration::from_millis(10),
+                require_gate_permits,
                 ..WorkerConfig::default()
             },
             WorkerDeps {
@@ -3104,6 +3193,113 @@ mod tests {
     }
 
     // -- abort and e-stop stop queued motion (D19) ------------------------------------
+
+    fn test_kind() -> TestKind {
+        TestKind {
+            settle: Duration::ZERO,
+            deadline: Duration::from_secs(60),
+            panic_on_step: false,
+        }
+    }
+
+    /// O11 e: an initiator that timed out (or hit a transport error) may
+    /// have reached the device. The worker accepts the command, halts the
+    /// hardware best effort and resolves it `Unknown`, which raises the
+    /// hub's outcome_unknown resume block. A definite refusal stays a
+    /// refusal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_initiator_timeout_is_an_unknown_outcome_with_a_resume_block() {
+        let rig = rig();
+        assert!(drive(&rig, Duration::from_millis(100), || rig
+            .shared
+            .with(|s| s.polls)
+            >= 1));
+        rig.shared
+            .with(|s| s.move_fails_with = Some(DeviceError::timeout("no reply to PUT move")));
+        let ticket = rig
+            .handle
+            .send(FocuserCmd::MoveTo(500), operator())
+            .await
+            .expect("an unconfirmed initiator is accepted, not refused");
+        let outcome = ticket.wait().await;
+        assert!(
+            matches!(&outcome, OpOutcome::Unknown(e) if e.class == ErrorClass::OutcomeUnknown),
+            "{outcome:?}"
+        );
+        assert!(rig.shared.with(|s| s.halted) >= 1, "halted best effort");
+        let blocks = rig.hub.resume().active();
+        assert!(
+            blocks.iter().any(|b| matches!(
+                b.kind,
+                crate::equipment::snapshot::ResumeBlockKind::OutcomeUnknown {
+                    device: DeviceKind::Focuser,
+                    ..
+                }
+            )),
+            "{blocks:?}"
+        );
+        // A refusal from the device itself is a plain failure.
+        rig.shared
+            .with(|s| s.move_fails_with = Some(DeviceError::invalid_value("out of range")));
+        let err = rig
+            .handle
+            .send(FocuserCmd::MoveTo(500), operator())
+            .await
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::InvalidValue);
+        assert!(initiator_outcome_unknown(
+            OpKind::FocuserMove,
+            &DeviceError::transport("socket reset")
+        ));
+        assert!(!initiator_outcome_unknown(
+            OpKind::Refresh,
+            &DeviceError::timeout("slow read")
+        ));
+    }
+
+    /// O11 b: with `require_gate_permits`, motion needs a permit the gate
+    /// issued; stops and halts never do.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn motion_needs_a_gate_permit_when_the_spine_requires_one() {
+        let rig = rig_kind_with(test_kind(), HealthPolicy::default(), true);
+        assert!(drive(&rig, Duration::from_millis(100), || rig
+            .shared
+            .with(|s| s.polls)
+            >= 1));
+        let err = rig
+            .handle
+            .send(FocuserCmd::MoveTo(300), operator())
+            .await
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::InvalidOperation);
+        assert!(
+            err.message.contains("not issued by the command gate"),
+            "{err}"
+        );
+        // A halt with an unmanaged permit still runs.
+        rig.handle
+            .send(FocuserCmd::Halt, operator())
+            .await
+            .expect("halts are never refused for their permit");
+        // The gate's permit is accepted.
+        let cmd = GatedCommand::new(
+            GatedOp::Focuser(FocuserCmd::MoveTo(300)),
+            CommandSource::Operator { overriding: false },
+            AutonomyMode::Manual,
+            Priority::Exposure,
+        );
+        let permit = rig.hub.gate().authorize(&cmd).unwrap();
+        let ticket = rig
+            .handle
+            .send(FocuserCmd::MoveTo(300), permit)
+            .await
+            .unwrap();
+        assert!(drive(&rig, Duration::from_millis(100), || rig
+            .shared
+            .with(|s| s.position)
+            == 300));
+        assert_eq!(ticket.wait().await, OpOutcome::Succeeded);
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_move_queued_before_an_estop_never_starts() {

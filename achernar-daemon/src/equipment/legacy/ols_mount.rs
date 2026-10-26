@@ -271,6 +271,12 @@ impl<B: OlsMountBackend> AbortPath for OlsMountAbort<B> {
             "OLS stop() halts manual motion but cannot abort a GoTo; use the native alpaca driver",
         ))
     }
+
+    fn tracking_off(&self) -> DeviceResult<()> {
+        read(&self.backend)
+            .set_tracking(false)
+            .map_err(DeviceError::transport)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

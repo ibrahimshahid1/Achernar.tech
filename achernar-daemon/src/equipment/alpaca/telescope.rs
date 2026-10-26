@@ -34,8 +34,10 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, FixedOffset, Utc};
 use serde_json::Value;
+
+use super::devicestate;
 
 use crate::equipment::mount::jog::JogFlags;
 use crate::equipment::mount::{native_frame_policy, MountDriverOptions};
@@ -139,44 +141,17 @@ fn get_ci<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Option<&
         .map(|(_, v)| v)
 }
 
-/// Parse an Alpaca date-time permissively (§2.14): RFC 3339 with `Z` or an
-/// explicit offset, or no zone at all, which is local time when
-/// `naive_is_local` (DeviceState `TimeStamp`) and UTC otherwise (`UTCDate`).
+/// Parse an Alpaca date-time permissively (§2.14) with WP1A-1's TimeStamp
+/// parser (O11 d): RFC 3339 with `Z` or an explicit offset, or no zone at
+/// all, which is local time when `naive_is_local` (DeviceState `TimeStamp`)
+/// and UTC otherwise (`UTCDate`).
 pub fn parse_alpaca_datetime(text: &str, naive_is_local: bool) -> Option<DateTime<Utc>> {
-    let text = text.trim();
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(text) {
-        return Some(parsed.with_timezone(&Utc));
-    }
-    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(text, format) {
-            return if naive_is_local {
-                Local
-                    .from_local_datetime(&naive)
-                    .earliest()
-                    .map(|local| local.with_timezone(&Utc))
-            } else {
-                Some(Utc.from_utc_datetime(&naive))
-            };
-        }
-    }
-    None
-}
-
-/// DeviceState `[{Name, Value}, ...]` keyed by lower-case name.
-pub fn parse_device_state(value: &Value) -> HashMap<String, Value> {
-    let mut entries = HashMap::new();
-    for item in value.as_array().into_iter().flatten() {
-        let Some(object) = item.as_object() else {
-            continue;
-        };
-        if let (Some(name), Some(value)) = (
-            get_ci(object, "Name").and_then(Value::as_str),
-            get_ci(object, "Value"),
-        ) {
-            entries.insert(name.to_ascii_lowercase(), value.clone());
-        }
-    }
-    entries
+    let stamp = if naive_is_local {
+        devicestate::parse_timestamp(text)
+    } else {
+        devicestate::parse_timestamp_with(text, FixedOffset::east_opt(0)?)
+    };
+    stamp.map(|stamp| stamp.utc)
 }
 
 /// One cached member read.
@@ -222,6 +197,20 @@ impl AbortPath for AlpacaMountAbort {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// PUT `tracking` false on the abort agent (O11 j). A parked mount does
+    /// not track, so "invalid while parked" counts as success.
+    fn tracking_off(&self) -> DeviceResult<()> {
+        let form = [("Tracking", "false".to_string())];
+        match self
+            .transport
+            .put("tracking", &form, TimeoutClass::Ordinary)
+        {
+            Ok(_) => Ok(()),
+            Err(err) if err.class == ErrorClass::InvalidWhileParked => Ok(()),
+            Err(err) => Err(err),
+        }
     }
 }
 
@@ -875,14 +864,14 @@ impl Device for AlpacaTelescope {
             match result {
                 Ok(value) => {
                     method = PollMethod::DeviceState;
-                    let entries = parse_device_state(&value);
-                    device_time = entries
-                        .get("timestamp")
-                        .and_then(Value::as_str)
-                        .and_then(|s| parse_alpaca_datetime(s, true));
+                    // WP1A-1's DeviceState parser (O11 d); a reply that is not
+                    // a Name/Value list leaves every member missing, so they
+                    // are read individually below.
+                    let entries = devicestate::parse_device_state(&value).unwrap_or_default();
+                    device_time = entries.timestamp.map(|stamp| stamp.utc);
                     let mut missing = Vec::new();
                     for (member, ds_name) in pending {
-                        match entries.get(&ds_name.to_ascii_lowercase()) {
+                        match entries.get(ds_name) {
                             Some(value) => members.push(self.record_ok(
                                 member,
                                 value.clone(),
@@ -1201,6 +1190,7 @@ mod tests {
     use crate::equipment::types::{
         identity_key, CommandId, CommandSource, DeviceKind, DriverId, EqFrame, OpOutcome,
     };
+    use chrono::{Local, TimeZone};
     use serde_json::json;
 
     fn identity() -> DeviceIdentity {

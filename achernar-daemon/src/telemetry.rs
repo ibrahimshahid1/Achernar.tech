@@ -2,7 +2,12 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 
+/// The `/status` and `TELEMETRY_UPDATE` snapshot (spec §2.13). It reads only
+/// the device registry (kept current by the camera probe and the equipment
+/// workers' projectors) and the hub's watches; it never enters a native SDK,
+/// never waits on a device slot and never calls a driver.
 pub fn equipment_status(state: &AppState) -> Value {
+    use crate::equipment::traits::EquipmentReader;
     use crate::hardware::health::DeviceKind;
     // Never enter a native SDK on a telemetry or HTTP status path. Health
     // workers own passive probes; their registry is the connection authority.
@@ -31,9 +36,49 @@ pub fn equipment_status(state: &AppState) -> Value {
     let mount_status = devices.snapshot(DeviceKind::Mount);
     let focuser_status = devices.snapshot(DeviceKind::Focuser);
     let filter_status = devices.snapshot(DeviceKind::FilterWheel);
-    json!({"connected":camera_status.is_some() || mount_status.is_some() || focuser_status.is_some() || filter_status.is_some(),
+    let guiding = devices.snapshot(DeviceKind::Guider);
+    let rotator = devices.snapshot(DeviceKind::Rotator);
+    let cover = devices.snapshot(DeviceKind::CoverCalibrator);
+    let switch = devices.snapshot(DeviceKind::Switch);
+    let weather = devices.snapshot(DeviceKind::Weather);
+    let safety_monitor = devices.snapshot(DeviceKind::SafetyMonitor);
+    let dome = devices.snapshot(DeviceKind::Dome);
+    let any_device = camera_status.is_some()
+        || [
+            &mount_status,
+            &focuser_status,
+            &filter_status,
+            &guiding,
+            &rotator,
+            &cover,
+            &switch,
+            &weather,
+            &safety_monitor,
+            &dome,
+        ]
+        .iter()
+        .any(|block| block.is_some());
+    // The hub's watches: lock-free reads of the busy set (H20) and the
+    // active resume blocks (H22).
+    let busy = serde_json::to_value(*state.equipment.busy().borrow()).unwrap_or(Value::Null);
+    let resume_blocks = serde_json::to_value(state.equipment.resume_blocks().borrow().clone())
+        .unwrap_or(Value::Null);
+    json!({"connected":any_device,
         "camera":camera_status,"mount":mount_status,"focuser":focuser_status,"filter_wheel":filter_status,
+        "guider":guiding,"guiding":guiding,"rotator":rotator,"cover_calibrator":cover,"switch":switch,
+        "weather":weather,"safety_monitor":safety_monitor,"dome":dome,
+        "busy":busy,"resume_blocks":resume_blocks,
         "device_health":devices.0})
+}
+
+/// `EQUIPMENT_EVENT {event}` (§2.13): one equipment event for the telemetry
+/// WebSocket and the relay upstream. Guide steps are included; consumers may
+/// throttle them.
+pub fn equipment_event_message(event: &crate::equipment::events::EquipmentEvent) -> Value {
+    json!({
+        "type": "EQUIPMENT_EVENT",
+        "event": event,
+    })
 }
 
 pub fn telemetry_event(state: &AppState) -> Value {
@@ -43,19 +88,27 @@ pub fn telemetry_event(state: &AppState) -> Value {
         .read()
         .ok()
         .and_then(|obs| obs.clone());
+    let block = |key: &str| status.get(key).cloned().unwrap_or(Value::Null);
     json!({
         "type": "TELEMETRY_UPDATE",
         "timestamp": chrono::Utc::now().timestamp(),
         "payload": {
-            "camera": status.get("camera").cloned().unwrap_or(Value::Null),
-            "mount": status.get("mount").cloned().unwrap_or(Value::Null),
-            "focuser": status.get("focuser").cloned().unwrap_or(Value::Null),
-            "filter_wheel": status.get("filter_wheel").cloned().unwrap_or(Value::Null),
+            "camera": block("camera"),
+            "mount": block("mount"),
+            "focuser": block("focuser"),
+            "filter_wheel": block("filter_wheel"),
             "device_health": status.get("device_health").cloned().unwrap_or_else(||json!({})),
-            // There is no guider in this system. Reporting 0.00" RMS every
-            // second is a measurement of a subsystem that does not exist, and
-            // it reads as perfect guiding. Null until a guider reports.
-            "guiding": Value::Null,
+            // Null until a guider is connected and reports: 0.00" RMS from a
+            // subsystem that does not exist would read as perfect guiding.
+            "guiding": block("guiding"),
+            "rotator": block("rotator"),
+            "cover_calibrator": block("cover_calibrator"),
+            "switch": block("switch"),
+            "weather": block("weather"),
+            "safety_monitor": block("safety_monitor"),
+            "dome": block("dome"),
+            "busy": block("busy"),
+            "resume_blocks": block("resume_blocks"),
             "ai": {
                 // Null (not 0.0) when there is no valid measurement — 0 HFR would
                 // read as perfect focus on a blank frame. The same reasoning

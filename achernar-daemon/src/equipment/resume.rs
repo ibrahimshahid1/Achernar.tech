@@ -222,6 +222,17 @@ impl ResumeBlocks {
         Ok(block)
     }
 
+    /// The safety supervisor's path for one block it raised itself (its
+    /// `safety_unknown` block once safety reads safe or none again). Any
+    /// kind; never exposed to operators. `None` when it was not active.
+    pub fn clear_by_owner(&self, id: Uuid, by: &CommandSource) -> Option<ResumeBlock> {
+        let mut inner = lock(&self.inner);
+        let index = inner.active.iter().position(|b| b.id == id)?;
+        let block = Self::take(&mut inner, index, by.clone(), self.clock.as_ref());
+        self.publish(&inner);
+        Some(block)
+    }
+
     /// The safety-policy path: a confirmed safe reading under the resume
     /// policy clears every `safety_*` block. Returns what was cleared.
     pub fn clear_safety(&self, by: &CommandSource) -> Vec<ResumeBlock> {

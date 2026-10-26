@@ -1,14 +1,21 @@
 pub mod api_error;
 pub mod camera;
 pub mod coc;
+pub mod equipment;
+pub mod filter_wheel;
 pub mod focus;
 pub mod focuser;
+pub mod guider;
 pub mod mount;
 pub mod plate_solve;
+pub mod safety;
+pub mod weather;
 pub mod websocket;
 
 #[cfg(test)]
 mod capture_preflight_tests;
+#[cfg(test)]
+pub(crate) mod equipment_tests;
 
 use axum::{body::Bytes, extract::State, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
@@ -17,9 +24,7 @@ use crate::hardware::{
     camera::OlsCameraDriver,
     capabilities::{driver_capability_report, DriverCapabilityReport},
     discovery::{discover_equipment, DiscoveryReport, DiscoveryRequest},
-    focuser::{ConnectedFocuser, Focuser, FocuserDriver, SimFocuser},
     health::{self, DeviceKind},
-    mount::{Mount, MountDriver},
 };
 use crate::state::AppState;
 use crate::state::CameraActivity;
@@ -80,10 +85,13 @@ pub struct FocuserStatus {
 
 #[derive(Debug, Deserialize)]
 pub struct ConnectRequest {
-    /// Equipment kind: "camera", "mount", or "focuser". Defaults to "camera"
-    /// for compatibility with the original camera-only endpoint.
+    /// Equipment kind: "camera", "mount", "focuser", "filter_wheel",
+    /// "guider", "weather", "safety_monitor" (and the Tier 2 kinds). Defaults
+    /// to "camera" for compatibility with the original camera-only endpoint.
     pub equipment_type: Option<String>,
-    /// Driver type: "sim", "alpaca", "asi", "toup", etc.
+    /// Driver type: "sim", "alpaca", "phd2", "asi", "toup", etc. Required:
+    /// a missing driver is a 400, on the direct route and the relay alike.
+    #[serde(default)]
     pub driver: String,
     /// Driver-specific option (e.g., sim data directory path)
     pub option: Option<String>,
@@ -100,9 +108,14 @@ pub struct ConnectRequest {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct DisconnectRequest {
-    /// camera | mount | focuser | all. Defaults to all for compatibility with
-    /// the original body-less endpoint.
+    /// camera | mount | focuser | filter_wheel | guider | weather |
+    /// safety_monitor | all. Defaults to all for compatibility with the
+    /// original body-less endpoint.
     pub equipment_type: Option<String>,
+    /// A slewing mount refuses a plain disconnect; `force` aborts the slew
+    /// first (§2.6). Disconnect never parks.
+    #[serde(default)]
+    pub force: bool,
 }
 
 pub async fn get_status(
@@ -190,23 +203,19 @@ pub async fn connect_equipment(
         .unwrap_or("camera")
         .to_ascii_lowercase();
 
-    match equipment_type.as_str() {
-        "camera" => connect_camera(state, req).await,
-        "mount" => connect_mount(state, req).await.map_err(|status| {
-            ApiError::new(
-                status,
-                "mount_connect_failed",
-                "Could not connect the mount",
-            )
-        }),
-        "focuser" => connect_focuser(state, req).await.map_err(|status| {
-            ApiError::new(
-                status,
-                "focuser_connect_failed",
-                "Could not connect the focuser",
-            )
-        }),
-        _ => {
+    match equipment::kind_from_str(&equipment_type) {
+        Some(DeviceKind::Camera) => {
+            if req.driver.trim().is_empty() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "missing_driver",
+                    "driver is required (GET /api/v1/drivers lists them)",
+                ));
+            }
+            connect_camera(state, req).await
+        }
+        Some(kind) => equipment::connect_device(&state, kind, req).await.map(Json),
+        None => {
             tracing::warn!("Unsupported equipment type: {}", equipment_type);
             Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -385,148 +394,6 @@ fn connect_error_code(status: StatusCode) -> &'static str {
     }
 }
 
-async fn connect_mount(
-    state: AppState,
-    req: ConnectRequest,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let driver_type = match req.driver.as_str() {
-        "alpaca" => MountDriver::Alpaca,
-        "indi" => MountDriver::Indi,
-        "sim" | "simulator" => MountDriver::Simulator,
-        _ => {
-            tracing::warn!("Unsupported mount driver: {}", req.driver);
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    };
-    let option = req.option.unwrap_or_else(|| "auto".to_string());
-
-    let mut mount = Mount::new(driver_type).map_err(|e| {
-        tracing::error!("Failed to create mount interface: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    mount.connect_with_option(&option).map_err(|e| {
-        tracing::error!("Failed to connect mount: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let drivers = mount.list_drivers().unwrap_or_default();
-    let hw = mount.health_status().map_err(|error| {
-        tracing::error!("Mount did not answer passive status query after connect: {error}");
-        StatusCode::BAD_GATEWAY
-    })?;
-    let snapshot = health::mount_snapshot(format!("{driver_type:?} mount"), &hw);
-    let retired = {
-        let mut slot = state.mount.lock().unwrap();
-        let retired = slot.replace(mount);
-        *state.mount_name.lock().unwrap() = Some(format!("{driver_type:?} mount"));
-        state.devices.write().unwrap().connected(
-            DeviceKind::Mount,
-            uuid::Uuid::new_v4().to_string(),
-            Some(snapshot),
-        );
-        retired
-    };
-    drop(retired);
-    let _ = state.device_updates.send(());
-
-    Ok(Json(serde_json::json!({
-        "status": "connected",
-        "equipment_type": "mount",
-        "driver": req.driver,
-        "option": option,
-        "available_drivers": drivers,
-    })))
-}
-
-async fn connect_focuser(
-    state: AppState,
-    req: ConnectRequest,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    if matches!(req.driver.as_str(), "sim" | "simulator") {
-        let position = req
-            .option
-            .as_deref()
-            .and_then(|option| option.parse::<i32>().ok())
-            .unwrap_or(10000);
-        let focuser = ConnectedFocuser::Simulator(SimFocuser::new(position));
-        let snapshot = health::focuser_snapshot(
-            "Simulator focuser".into(),
-            &focuser.health_status().unwrap(),
-        );
-        let retired = {
-            let mut slot = state.focuser.lock().unwrap();
-            let retired = slot.replace(focuser);
-            *state.focuser_name.lock().unwrap() = Some("Simulator focuser".into());
-            state.devices.write().unwrap().connected(
-                DeviceKind::Focuser,
-                uuid::Uuid::new_v4().to_string(),
-                Some(snapshot),
-            );
-            retired
-        };
-        drop(retired);
-        let _ = state.device_updates.send(());
-
-        return Ok(Json(serde_json::json!({
-            "status": "connected",
-            "equipment_type": "focuser",
-            "driver": req.driver,
-            "position": position,
-            "available_drivers": [{"name": "sim", "option": "initial_position"}],
-        })));
-    }
-
-    let driver_type = match req.driver.as_str() {
-        "alpaca" => FocuserDriver::Alpaca,
-        "indi" => FocuserDriver::Indi,
-        "moonlite" => FocuserDriver::Moonlite,
-        "usb" | "usb_serial" => FocuserDriver::UsbSerial,
-        _ => {
-            tracing::warn!("Unsupported focuser driver: {}", req.driver);
-            return Err(StatusCode::BAD_REQUEST);
-        }
-    };
-    let option = req.option.unwrap_or_else(|| "auto".to_string());
-
-    let mut focuser = Focuser::new(driver_type).map_err(|e| {
-        tracing::error!("Failed to create focuser interface: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-    focuser.connect_with_option(&option).map_err(|e| {
-        tracing::error!("Failed to connect focuser: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let drivers = focuser.list_drivers().unwrap_or_default();
-    let focuser = ConnectedFocuser::Hardware(focuser);
-    let hw = focuser.health_status().map_err(|error| {
-        tracing::error!("Focuser did not answer passive position query after connect: {error}");
-        StatusCode::BAD_GATEWAY
-    })?;
-    let snapshot = health::focuser_snapshot(format!("{driver_type:?} focuser"), &hw);
-    let retired = {
-        let mut slot = state.focuser.lock().unwrap();
-        let retired = slot.replace(focuser);
-        *state.focuser_name.lock().unwrap() = Some(format!("{driver_type:?} focuser"));
-        state.devices.write().unwrap().connected(
-            DeviceKind::Focuser,
-            uuid::Uuid::new_v4().to_string(),
-            Some(snapshot),
-        );
-        retired
-    };
-    drop(retired);
-    let _ = state.device_updates.send(());
-
-    Ok(Json(serde_json::json!({
-        "status": "connected",
-        "equipment_type": "focuser",
-        "driver": req.driver,
-        "option": option,
-        "available_drivers": drivers,
-    })))
-}
-
 pub(crate) async fn disconnect_camera(state: &AppState) -> Result<(), ApiError> {
     let ownership = state.acquisition.clone().lock_owned().await;
     let id = state.camera_runtime.read().unwrap().connection_id.clone();
@@ -554,27 +421,25 @@ pub(crate) async fn disconnect_camera(state: &AppState) -> Result<(), ApiError> 
     Ok(())
 }
 
-async fn disconnect_auxiliary(state: &AppState, kind: DeviceKind) -> Result<(), ApiError> {
-    let id = state.devices.read().unwrap().connection_id(kind);
-    if let Some(id) = id {
-        state
-            .devices
-            .write()
-            .unwrap()
-            .disconnected(kind, Some(&id), None);
+/// Disconnect one auxiliary device (§2.6). A registry entry whose handle is
+/// already gone (lost and retired) is still cleared.
+async fn disconnect_auxiliary(
+    state: &AppState,
+    kind: DeviceKind,
+    force: bool,
+) -> Result<(), ApiError> {
+    if !equipment::disconnect_device(state, kind, force).await? {
+        let id = state.devices.read().unwrap().connection_id(kind);
+        if let Some(id) = id {
+            state
+                .devices
+                .write()
+                .unwrap()
+                .disconnected(kind, Some(&id), None);
+        }
+        health::retire_auxiliary(state, kind);
+        let _ = state.device_updates.send(());
     }
-    if kind == DeviceKind::Focuser {
-        state
-            .focus_abort_requested
-            .store(true, std::sync::atomic::Ordering::Release);
-    }
-    let _ = state.device_updates.send(());
-    let worker_state = state.clone();
-    tokio::task::spawn_blocking(move || health::retire_auxiliary(&worker_state, kind))
-        .await
-        .map_err(|error| {
-            ApiError::hardware(format!("{kind:?} disconnect worker failed: {error}"))
-        })?;
     Ok(())
 }
 
@@ -583,32 +448,31 @@ pub async fn disconnect_equipment(
     request: Option<Json<DisconnectRequest>>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     tracing::info!("Disconnect requested");
-    let equipment_type = request
-        .and_then(|Json(req)| req.equipment_type)
+    let (equipment_type, force) = match request {
+        Some(Json(req)) => (req.equipment_type, req.force),
+        None => (None, false),
+    };
+    let equipment_type = equipment_type
         .unwrap_or_else(|| "all".to_string())
         .to_ascii_lowercase();
 
-    if matches!(equipment_type.as_str(), "camera" | "all") {
+    if equipment_type == "all" {
         disconnect_camera(&state).await?;
-    }
-    if matches!(equipment_type.as_str(), "mount" | "all") {
-        disconnect_auxiliary(&state, DeviceKind::Mount).await?;
-    }
-    if matches!(equipment_type.as_str(), "focuser" | "all") {
-        disconnect_auxiliary(&state, DeviceKind::Focuser).await?;
-    }
-    if matches!(equipment_type.as_str(), "filter_wheel" | "all") {
-        disconnect_auxiliary(&state, DeviceKind::FilterWheel).await?;
-    }
-    if !matches!(
-        equipment_type.as_str(),
-        "camera" | "mount" | "focuser" | "filter_wheel" | "all"
-    ) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "unsupported_equipment_type",
-            format!("Unsupported equipment type '{equipment_type}'"),
-        ));
+        for kind in equipment::AUXILIARY_KINDS {
+            disconnect_auxiliary(&state, kind, force).await?;
+        }
+    } else {
+        match equipment::kind_from_str(&equipment_type) {
+            Some(DeviceKind::Camera) => disconnect_camera(&state).await?,
+            Some(kind) => disconnect_auxiliary(&state, kind, force).await?,
+            None => {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "unsupported_equipment_type",
+                    format!("Unsupported equipment type '{equipment_type}'"),
+                ))
+            }
+        }
     }
     let _ = state.device_updates.send(());
 

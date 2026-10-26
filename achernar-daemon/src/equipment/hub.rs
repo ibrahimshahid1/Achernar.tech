@@ -65,8 +65,8 @@ use super::snapshot::{
 };
 use super::traits::{CameraActivity, Clock, EquipmentReader, NullRecorder, RecorderSink};
 use super::types::{
-    kind_name, AltAz, ClockQuality, CommandSource, DeviceIdentity, DeviceKind, HealthState,
-    LinkState, ObsState, Observed, Site, Source, TemperatureRole,
+    kind_name, AltAz, ClockQuality, CommandSource, DeviceIdentity, DeviceKind, DeviceResult,
+    HealthState, LinkState, ObsState, Observed, Site, Source, TemperatureRole,
 };
 use super::worker::{default_cadence, WorkerHandle};
 use crate::config::EquipmentConfigs;
@@ -463,6 +463,11 @@ impl AnyHandle {
         dispatch!(self, h => h.abort())
     }
 
+    /// Ask the worker (or the guider service) to disconnect (§2.6).
+    pub async fn disconnect(&self, force: bool) -> DeviceResult<()> {
+        dispatch!(self, h => h.disconnect(force).await)
+    }
+
     /// The latest snapshot as JSON (for the registry projection).
     pub fn snapshot_json(&self) -> serde_json::Value {
         dispatch!(self, h => serde_json::to_value(&*h.snapshot()).unwrap_or(serde_json::Value::Null))
@@ -680,59 +685,15 @@ fn signals_motion_of(event: &EquipmentEvent, kind: DeviceKind) -> bool {
 }
 
 /// Guide statistics over `(ra, dec, pixel scale)` samples: standard
-/// deviation (population, as NINA's Welford RMS), RMS about zero and peak per
-/// axis; arcsec only when every sample has a pixel scale.
+/// deviation (population, Welford), RMS about zero and peak per axis; arcsec
+/// only when every sample has a pixel scale. Delegates to the one
+/// implementation, `guider/rms.rs` (O11 f).
 pub fn guide_rms(samples: &[(f64, f64, Option<f64>)]) -> Option<GuideRms> {
-    let n = samples.len();
-    if n == 0 {
-        return None;
+    let mut acc = super::guider::rms::RmsAccumulator::new();
+    for (ra, dec, scale) in samples {
+        acc.push(*ra, *dec, *scale);
     }
-    let stats = |values: &mut dyn Iterator<Item = (f64, f64)>| {
-        let (mut sum_ra, mut sum_dec, mut sq_ra, mut sq_dec, mut count) = (0.0, 0.0, 0.0, 0.0, 0);
-        let (mut peak_ra, mut peak_dec) = (0.0_f64, 0.0_f64);
-        for (ra, dec) in values {
-            sum_ra += ra;
-            sum_dec += dec;
-            sq_ra += ra * ra;
-            sq_dec += dec * dec;
-            peak_ra = peak_ra.max(ra.abs());
-            peak_dec = peak_dec.max(dec.abs());
-            count += 1;
-        }
-        let n = f64::from(count);
-        let (mean_ra, mean_dec) = (sum_ra / n, sum_dec / n);
-        let sd_ra = (sq_ra / n - mean_ra * mean_ra).max(0.0).sqrt();
-        let sd_dec = (sq_dec / n - mean_dec * mean_dec).max(0.0).sqrt();
-        let rms0_ra = (sq_ra / n).sqrt();
-        let rms0_dec = (sq_dec / n).sqrt();
-        (sd_ra, sd_dec, rms0_ra, rms0_dec, peak_ra, peak_dec)
-    };
-    let (sd_ra, sd_dec, rms0_ra, rms0_dec, peak_ra, peak_dec) =
-        stats(&mut samples.iter().map(|(ra, dec, _)| (*ra, *dec)));
-    let mut rms = GuideRms {
-        ra_px: sd_ra,
-        dec_px: sd_dec,
-        total_px: (sd_ra * sd_ra + sd_dec * sd_dec).sqrt(),
-        rms0_ra_px: rms0_ra,
-        rms0_dec_px: rms0_dec,
-        rms0_total_px: (rms0_ra * rms0_ra + rms0_dec * rms0_dec).sqrt(),
-        peak_ra_px: peak_ra,
-        peak_dec_px: peak_dec,
-        steps_n: u32::try_from(n).unwrap_or(u32::MAX),
-        ..GuideRms::default()
-    };
-    if samples.iter().all(|(_, _, scale)| scale.is_some()) {
-        let (sd_ra, sd_dec, rms0_ra, rms0_dec, _, _) = stats(
-            &mut samples
-                .iter()
-                .map(|(ra, dec, scale)| (ra * scale.unwrap_or(0.0), dec * scale.unwrap_or(0.0))),
-        );
-        rms.ra_arcsec = Some(sd_ra);
-        rms.dec_arcsec = Some(sd_dec);
-        rms.total_arcsec = Some((sd_ra * sd_ra + sd_dec * sd_dec).sqrt());
-        rms.rms0_total_arcsec = Some((rms0_ra * rms0_ra + rms0_dec * rms0_dec).sqrt());
-    }
-    Some(rms)
+    acc.result()
 }
 
 /// Readings older than this many idle cadences are not presented as fresh:
@@ -2010,6 +1971,15 @@ impl EquipmentHub {
     /// Raise a resume block (handshake, safety, e-stop producers).
     pub fn raise_block(&self, request: BlockRequest) -> ResumeBlock {
         self.core.raise(request)
+    }
+
+    /// The safety supervisor clears a block it raised (its `safety_unknown`
+    /// block), emitting `resume_cleared`. Not an operator path: operators
+    /// clear through the gate (`CommandGate::clear_resume_block`).
+    pub fn clear_block_by_id(&self, id: Uuid, by: &CommandSource) -> Option<ResumeBlock> {
+        let block = self.core.resume.clear_by_owner(id, by)?;
+        self.core.cleared(&block, by);
+        Some(block)
     }
 
     /// The safety resume policy (§3.10): a confirmed safe reading clears

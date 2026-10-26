@@ -57,6 +57,11 @@ pub mod resume;
 pub mod ring;
 pub mod worker;
 
+pub mod camera_hook;
+pub mod kinds;
+pub mod spine;
+pub mod status;
+
 pub mod alpaca;
 pub mod astro;
 pub mod filter;

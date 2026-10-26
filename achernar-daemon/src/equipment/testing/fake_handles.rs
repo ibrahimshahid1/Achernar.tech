@@ -62,6 +62,8 @@ pub struct FakeAbortPath {
     calls: AtomicUsize,
     result: Mutex<DeviceResult<()>>,
     delay: Mutex<Option<Duration>>,
+    tracking_calls: AtomicUsize,
+    tracking_result: Mutex<DeviceResult<()>>,
 }
 
 impl FakeAbortPath {
@@ -70,11 +72,22 @@ impl FakeAbortPath {
             calls: AtomicUsize::new(0),
             result: Mutex::new(Ok(())),
             delay: Mutex::new(None),
+            tracking_calls: AtomicUsize::new(0),
+            tracking_result: Mutex::new(Ok(())),
         })
     }
 
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// Out-of-band tracking-off calls (O11 j).
+    pub fn tracking_calls(&self) -> usize {
+        self.tracking_calls.load(Ordering::SeqCst)
+    }
+
+    pub fn set_tracking_result(&self, result: DeviceResult<()>) {
+        *lock(&self.tracking_result) = result;
     }
 
     pub fn set_result(&self, result: DeviceResult<()>) {
@@ -94,6 +107,11 @@ impl AbortPath for FakeAbortPath {
             std::thread::sleep(delay);
         }
         lock(&self.result).clone()
+    }
+
+    fn tracking_off(&self) -> DeviceResult<()> {
+        self.tracking_calls.fetch_add(1, Ordering::SeqCst);
+        lock(&self.tracking_result).clone()
     }
 }
 

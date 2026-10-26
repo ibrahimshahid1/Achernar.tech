@@ -3,13 +3,19 @@
 //! Probes never expose, slew, focus, or move a filter. Each device has at most
 //! one blocking SDK call in flight. A deadline invalidates its public state;
 //! it does not cancel native code or free a handle while native code uses it.
+//!
+//! Only the camera (OLS) is probed here. Every other kind runs behind an
+//! equipment-layer worker, and the worker is the probe (spec §2.8): its
+//! health reaches this registry through the spine's projector, which keeps
+//! the `status` values `"connected"`/`"disconnected"` (D8) and adds `state`,
+//! `failure_class` and `reason`.
 
 use std::collections::BTreeMap;
 use std::sync::{atomic::Ordering, Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::state::{AppState, CameraRuntimeState};
 
@@ -60,6 +66,17 @@ pub struct DeviceHealth {
     pub probe_supported: Option<bool>,
     pub last_checked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub last_error: Option<String>,
+    /// `connecting | ready | degraded | lost | disconnected` (§2.8, D8).
+    /// Null for a device no worker reports on (the camera).
+    #[serde(default)]
+    pub state: Option<String>,
+    /// `disconnected | unsupported | timeout | outcome_unknown | driver |
+    /// driver_panic | invalid`, while the device is degraded or lost.
+    #[serde(default)]
+    pub failure_class: Option<String>,
+    /// Mirrors `last_error`; the frontend reads `device_health[x].reason`.
+    #[serde(default)]
+    pub reason: Option<String>,
     #[serde(skip)]
     pub snapshot: Option<Value>,
 }
@@ -73,9 +90,18 @@ impl Default for DeviceHealth {
             probe_supported: None,
             last_checked_at: None,
             last_error: None,
+            state: None,
+            failure_class: None,
+            reason: None,
             snapshot: None,
         }
     }
+}
+
+fn label<T: Serialize>(value: &T) -> Option<String> {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
 }
 
 #[derive(Debug, Clone)]
@@ -152,7 +178,52 @@ impl DeviceRegistry {
         health.connection_id = None;
         health.snapshot = None;
         health.last_checked_at = Some(chrono::Utc::now());
+        health.reason = error.clone();
         health.last_error = error;
+        if health.state.is_some() {
+            health.state = Some("disconnected".into());
+            health.failure_class = None;
+        }
+        true
+    }
+
+    /// The worker's link state for the current connection `id` (§2.8).
+    pub fn set_link(
+        &mut self,
+        kind: DeviceKind,
+        id: &str,
+        link: &crate::equipment::types::HealthState,
+    ) -> bool {
+        let Some(health) = self.0.get_mut(&kind) else {
+            return false;
+        };
+        if !health.connected || health.connection_id.as_deref() != Some(id) {
+            return false;
+        }
+        health.state = label(&link.state);
+        health.failure_class = link.failure_class.as_ref().and_then(label);
+        health.reason = link.reason.clone();
+        health.last_error = link.reason.clone();
+        true
+    }
+
+    /// A worker declared connection `id` lost: `connected: false`, `status:
+    /// "disconnected"` (D8), `state: "lost"`, with the failure class and
+    /// reason. Guarded by the connection id, so it never touches a
+    /// replacement. True when the entry changed.
+    pub fn lost(
+        &mut self,
+        kind: DeviceKind,
+        id: &str,
+        link: &crate::equipment::types::HealthState,
+    ) -> bool {
+        if !self.disconnected(kind, Some(id), link.reason.clone()) {
+            return false;
+        }
+        if let Some(health) = self.0.get_mut(&kind) {
+            health.state = label(&link.state);
+            health.failure_class = link.failure_class.as_ref().and_then(label);
+        }
         true
     }
 
@@ -210,28 +281,6 @@ impl CameraLossSignals {
     }
 }
 
-pub fn mount_snapshot(name: String, hw: &super::mount::MountStatus) -> Value {
-    json!({"connected": true, "name": name, "ra": hw.position.map(|p| p.ra),
-        "dec": hw.position.map(|p| p.dec), "tracking": hw.tracking,
-        "parked": null, "pier_side": null})
-}
-
-pub fn focuser_snapshot(name: String, hw: &super::focuser::FocuserStatus) -> Value {
-    json!({"connected": true, "name": name, "position": hw.position,
-        "moving": hw.is_moving, "absolute": hw.is_absolute, "max_range": hw.max_range})
-}
-
-/// Call while holding the corresponding device slot, immediately before a
-/// command. A retained native handle is not a current connection after loss.
-pub fn require_connected(state: &AppState, kind: DeviceKind) -> Result<(), String> {
-    if state.devices.read().unwrap().connection_id(kind).is_none() {
-        return Err(format!(
-            "{kind:?} is disconnected; reconnect before issuing commands"
-        ));
-    }
-    Ok(())
-}
-
 pub fn spawn(state: AppState) {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(Duration::from_millis(100));
@@ -283,12 +332,10 @@ pub fn spawn(state: AppState) {
                 continue;
             }
             next_probe = Instant::now() + POLL_INTERVAL;
-            for kind in [
-                DeviceKind::Camera,
-                DeviceKind::Mount,
-                DeviceKind::Focuser,
-                DeviceKind::FilterWheel,
-            ] {
+            // Handle-based kinds are not probed: their workers are the probe
+            // (§2.8), and their health reaches the registry through the
+            // spine's projector.
+            for kind in [DeviceKind::Camera] {
                 if pending.contains_key(&kind) {
                     continue;
                 }
@@ -370,81 +417,15 @@ fn probe_device(state: &AppState, kind: DeviceKind, id: &str) {
             };
             result
         }
-        DeviceKind::Mount => {
-            let Ok(mount) = state.mount.try_lock() else {
-                return;
-            };
+        // Every other kind runs behind an equipment-layer worker, which is
+        // its probe (spec §2.8). A stale call for a connection the registry
+        // has retired still releases the retained handle.
+        DeviceKind::Mount | DeviceKind::Focuser | DeviceKind::FilterWheel => {
             if state.devices.read().unwrap().connection_id(kind).as_deref() != Some(id) {
-                drop(mount);
                 retire_auxiliary(state, kind);
-                return;
             }
-            let Some(mount) = mount.as_ref() else { return };
-            mount
-                .health_status()
-                .map(|hw| {
-                    (
-                        true,
-                        Some(mount_snapshot(
-                            state
-                                .mount_name
-                                .lock()
-                                .unwrap()
-                                .clone()
-                                .unwrap_or_else(|| "Mount".into()),
-                            &hw,
-                        )),
-                    )
-                })
-                .map_err(|e| e.to_string())
+            return;
         }
-        DeviceKind::Focuser => {
-            let Ok(focuser) = state.focuser.try_lock() else {
-                return;
-            };
-            if state.devices.read().unwrap().connection_id(kind).as_deref() != Some(id) {
-                drop(focuser);
-                retire_auxiliary(state, kind);
-                return;
-            }
-            let Some(focuser) = focuser.as_ref() else {
-                return;
-            };
-            focuser
-                .health_status()
-                .map(|hw| {
-                    (
-                        true,
-                        Some(focuser_snapshot(
-                            state
-                                .focuser_name
-                                .lock()
-                                .unwrap()
-                                .clone()
-                                .unwrap_or_else(|| "Focuser".into()),
-                            &hw,
-                        )),
-                    )
-                })
-                .map_err(|e| e.to_string())
-        }
-        DeviceKind::FilterWheel => {
-            let Ok(wheel) = state.filter_wheel.try_lock() else {
-                return;
-            };
-            if state.devices.read().unwrap().connection_id(kind).as_deref() != Some(id) {
-                drop(wheel);
-                retire_auxiliary(state, kind);
-                return;
-            }
-            let Some(wheel) = wheel.as_ref() else { return };
-            wheel
-                .health_status()
-                .map(|snapshot| (true, Some(snapshot)))
-                .map_err(|e| e.to_string())
-        }
-        // Equipment-layer kinds are never probed here: their workers are the
-        // probe (spec §2.8), so the registry entry stays unprobed.
         DeviceKind::Guider
         | DeviceKind::Rotator
         | DeviceKind::CoverCalibrator
@@ -482,10 +463,30 @@ fn probe_device(state: &AppState, kind: DeviceKind, id: &str) {
     }
 }
 
+/// Ask a retired device's worker to disconnect (forced: the registry already
+/// says it is gone, so nothing may refuse) and detach it from the hub.
+fn retire_handle<C, S>(state: &AppState, handle: crate::equipment::handle::DeviceHandle<C, S>)
+where
+    C: Send + 'static,
+    S: Send + Sync + 'static,
+{
+    state
+        .equipment
+        .detach(handle.kind(), handle.connection_id());
+    state.equipment_ctx.forget(handle.kind());
+    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        runtime.spawn(async move {
+            if let Err(err) = handle.disconnect(true).await {
+                tracing::warn!("retiring a lost device's worker failed: {err}");
+            }
+        });
+    }
+}
+
 /// Auxiliary handles are published with their registry connection under the
 /// slot lock (slot -> registry). Recheck after acquiring that same lock: a late
-/// old probe must never destroy a newly connected replacement. Drop native
-/// handles outside registry/slot locks, on this blocking worker.
+/// old probe must never destroy a newly connected replacement. The handle's
+/// worker is told to disconnect off the slot and registry locks.
 pub(crate) fn retire_auxiliary(state: &AppState, kind: DeviceKind) {
     match kind {
         DeviceKind::Mount => {
@@ -498,7 +499,9 @@ pub(crate) fn retire_auxiliary(state: &AppState, kind: DeviceKind) {
                 state.mount_name.lock().unwrap().take();
                 retired
             };
-            drop(retired);
+            if let Some(handle) = retired {
+                retire_handle(state, handle);
+            }
         }
         DeviceKind::Focuser => {
             let retired = {
@@ -510,7 +513,9 @@ pub(crate) fn retire_auxiliary(state: &AppState, kind: DeviceKind) {
                 state.focuser_name.lock().unwrap().take();
                 retired
             };
-            drop(retired);
+            if let Some(handle) = retired {
+                retire_handle(state, handle);
+            }
         }
         DeviceKind::FilterWheel => {
             let retired = {
@@ -520,7 +525,9 @@ pub(crate) fn retire_auxiliary(state: &AppState, kind: DeviceKind) {
                 }
                 slot.take()
             };
-            drop(retired);
+            if let Some(handle) = retired {
+                retire_handle(state, handle);
+            }
         }
         DeviceKind::Camera => {}
         // Equipment-layer handles live in the hub, which retires them itself.
@@ -558,6 +565,7 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn late_probe_cannot_revive_old_device_or_replace_reconnection() {

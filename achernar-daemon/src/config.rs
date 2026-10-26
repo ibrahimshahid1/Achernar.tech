@@ -720,6 +720,10 @@ pub struct FilterWheelConfig {
     /// Filter to switch to for autofocus; empty = none.
     #[serde(default)]
     pub af_filter: String,
+    /// Rolling cap on switches requested by automatic sources within one
+    /// hour (O11 g). Operators are bound only by `min_switch_interval_s`.
+    #[serde(default = "default_max_switches_per_hour")]
+    pub max_switches_per_hour: u32,
 }
 
 impl Default for FilterWheelConfig {
@@ -734,8 +738,13 @@ impl Default for FilterWheelConfig {
             pause_guiding_on_offset: true,
             parallel_offset_move: false,
             af_filter: String::new(),
+            max_switches_per_hour: default_max_switches_per_hour(),
         }
     }
+}
+
+fn default_max_switches_per_hour() -> u32 {
+    60
 }
 
 // ─── Equipment layer (equipment spec §2.11) ─────────────────────────────────
@@ -831,6 +840,9 @@ pub struct SiteConfig {
     pub tolerance_deg: f64,
     #[serde(default = "default_elevation_tolerance_m")]
     pub elevation_tolerance_m: f64,
+    /// UT1 - UTC in seconds for sidereal time (O11 g); |DUT1| <= 0.9 s.
+    #[serde(default)]
+    pub dut1_s: f64,
 }
 
 impl Default for SiteConfig {
@@ -842,6 +854,7 @@ impl Default for SiteConfig {
             sync: SiteSyncMode::default(),
             tolerance_deg: default_site_tolerance_deg(),
             elevation_tolerance_m: default_elevation_tolerance_m(),
+            dut1_s: 0.0,
         }
     }
 }
@@ -1596,6 +1609,22 @@ mod example_config_tests {
         assert_eq!(config.plate_solve.search_radius_deg, 30.0);
         assert_eq!(config.plate_solve.timeout_s, 300);
         assert_eq!(config.plate_solve.astap_path, None);
+    }
+
+    /// O11 g: `[filter_wheel] max_switches_per_hour` (60) and `[site]
+    /// dut1_s` (0.0) have serde defaults and parse when given.
+    #[test]
+    fn the_wave_b_config_keys_default_and_parse() {
+        use super::*;
+        let empty: AchernarConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.filter_wheel.max_switches_per_hour, 60);
+        assert_eq!(empty.site.dut1_s, 0.0);
+        let set: AchernarConfig =
+            toml::from_str("[filter_wheel]\nmax_switches_per_hour = 12\n[site]\ndut1_s = -0.2\n")
+                .unwrap();
+        assert_eq!(set.filter_wheel.max_switches_per_hour, 12);
+        assert_eq!(set.site.dut1_s, -0.2);
+        assert_eq!(set.equipment_configs().site.dut1_s, -0.2);
     }
 
     /// The example documents the equipment defaults, so a copied example

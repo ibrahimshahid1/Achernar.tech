@@ -1305,11 +1305,12 @@ pub(crate) fn read_temperature(
     }
 }
 
+/// The focuser's logical position from its latest snapshot; never a driver
+/// call, and no slot guard is held beyond the clone.
 fn read_focuser_position(state: &AppState) -> Option<i64> {
-    let focuser = state.focuser.lock().ok()?;
-    crate::hardware::health::require_connected(state, crate::hardware::health::DeviceKind::Focuser)
-        .ok()?;
-    focuser.as_ref()?.position().ok().map(|p| p as i64)
+    let handle = crate::api::equipment::focuser_handle(state).ok()?;
+    let position = handle.snapshot().logical_position;
+    position.map(i64::from)
 }
 
 fn disable_auto_exposure(camera: &OlsCamera, options: &[OlsCamOptionId]) -> Result<(), StatusCode> {

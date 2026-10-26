@@ -182,6 +182,7 @@ ring_buffer_minutes = 30
 sync = "verify_only"                # verify_only | to_mount | from_mount | none
 tolerance_deg = 0.001
 elevation_tolerance_m = 10
+dut1_s = 0.0                        # UT1 - UTC (|DUT1| <= 0.9 s) for sidereal time
 
 [mount]                       # Mount control (Section 8.3)
 # Mounts are chosen when connecting, not in this file. Any ASCOM Alpaca telescope
@@ -240,6 +241,7 @@ use_focus_offsets = true            # profile offsets only, never the seeds abov
 pause_guiding_on_offset = true
 parallel_offset_move = false
 af_filter = ""
+max_switches_per_hour = 60          # automatic sources only; 0 disables the cap
 
 [focuser]                           # device behaviour; backlash stays in [focus.backlash]
 stuck_timeout_s = 30

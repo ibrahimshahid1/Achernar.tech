@@ -45,10 +45,13 @@
 //!
 //! Sub-commands get their own command ids (so `equipment_overheads` keeps
 //! one row per operation) and permits that hold no ownership: the parent
-//! permit holds every domain for the whole handshake. Every focuser
-//! sub-command is first run through [`ChildCommandCheck`], which the gate
-//! implements with its registered safety checks, so an offset move obeys the
-//! focuser's travel bounds exactly as a manual move does.
+//! permit holds every domain for the whole handshake. Every sub-command's
+//! permit comes from [`ChildCommandCheck::child_permit`], which the gate
+//! implements with `CommandGate::child_permit_of` (O11 b): the step's own
+//! safety checks run, so an offset move obeys the focuser's travel bounds
+//! exactly as a manual move does, and a parent that lost its domains or was
+//! aborted gets no further permits. Resume blocks are raised through the
+//! hub, which assigns their ids (O11 a).
 //!
 //! Waits use [`HandshakeTimer`]: settle waits are injectable (D22), and a
 //! watchdog bounds a worker that never resolves a ticket. The operation's
@@ -68,8 +71,10 @@ use crate::equipment::commands::{
     Domain, FilterTarget, FilterWheelCmd, FocuserCmd, GateError, GatedCommand, GatedOp, GuiderCmd,
 };
 use crate::equipment::events::{EquipmentEvent, EventKind, FilterSwitchRecord, GroundTruthRecord};
+use crate::equipment::gate::{CommandGate, StepOwner};
 use crate::equipment::handle::{FilterWheelHandle, FocuserHandle, GuiderHandle, OpTicket, Permit};
 use crate::equipment::ops::OpKind;
+use crate::equipment::resume::BlockRequest;
 use crate::equipment::snapshot::{
     FilterWheelSnapshot, GuiderAppState, ResumeBlock, ResumeBlockKind,
 };
@@ -114,20 +119,28 @@ impl HandshakeTimer for TokioTimer {
     }
 }
 
-/// Runs the gate's safety checks for a sub-command of a compound operation
-/// (ownership is already held by the parent permit). The gate (WP1A-2)
-/// implements it over its registered `SafetyCheck`s and current snapshot.
+/// Issues the permit of one step of a compound operation (ownership is
+/// already held by the parent permit). The gate implements it with
+/// `CommandGate::child_permit_of` (O11 b), which runs the step's registered
+/// `SafetyCheck`s and refuses a parent that was preempted or aborted.
 pub trait ChildCommandCheck: Send + Sync {
-    fn check(&self, cmd: &GatedCommand) -> Result<(), GateError>;
+    fn child_permit(&self, parent: &StepOwner, cmd: &GatedCommand) -> Result<Permit, GateError>;
 }
 
-/// Accepts every sub-command (tests, and an inert hub).
+/// The gate as the handshake's permit issuer.
+impl ChildCommandCheck for CommandGate {
+    fn child_permit(&self, parent: &StepOwner, cmd: &GatedCommand) -> Result<Permit, GateError> {
+        self.child_permit_of(parent, cmd)
+    }
+}
+
+/// Accepts every sub-command with a permit that holds no ownership (tests).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoChildChecks;
 
 impl ChildCommandCheck for NoChildChecks {
-    fn check(&self, _cmd: &GatedCommand) -> Result<(), GateError> {
-        Ok(())
+    fn child_permit(&self, _parent: &StepOwner, cmd: &GatedCommand) -> Result<Permit, GateError> {
+        Ok(Permit::new(cmd, None))
     }
 }
 
@@ -279,13 +292,16 @@ impl PermitInfo {
         self.domains.contains(&Domain::Device(kind))
     }
 
-    /// A sub-command id and a permit that holds no ownership.
-    fn child(&self) -> (CommandId, Permit) {
-        let id = CommandId::new();
-        (
-            id,
-            Permit::unmanaged(id, self.priority, self.source.clone()),
-        )
+    fn owner(&self) -> StepOwner {
+        StepOwner {
+            command_id: self.command_id,
+            domains: self.domains.clone(),
+        }
+    }
+
+    /// A sub-command with its own id, from the parent's source and priority.
+    fn step(&self, op: GatedOp) -> GatedCommand {
+        GatedCommand::new(op, self.source.clone(), self.mode, self.priority)
     }
 }
 
@@ -692,7 +708,15 @@ impl FilterChanger {
         cmd: GuiderCmd,
         info: &PermitInfo,
     ) -> GuiderReply {
-        let (_, permit) = info.child();
+        let step = info.step(GatedOp::Guider(cmd.clone()));
+        let permit = match self
+            .services
+            .child_checks
+            .child_permit(&info.owner(), &step)
+        {
+            Ok(permit) => permit,
+            Err(err) => return GuiderReply::Refused(err.to_string()),
+        };
         let budget = self.settings.guider_rpc_timeout().max(GUIDER_PAUSE_WAIT) + WATCHDOG_GRACE;
         let mut watchdog = self.services.timer.watchdog(budget);
         let sent = tokio::select! {
@@ -759,17 +783,12 @@ impl FilterChanger {
         steps: i32,
         info: &PermitInfo,
     ) -> Result<(CommandId, OpTicket), DeviceError> {
-        let (id, permit) = info.child();
-        let mut gated = GatedCommand::new(
-            GatedOp::Focuser(FocuserCmd::MoveBy(steps)),
-            info.source.clone(),
-            info.mode,
-            info.priority,
-        );
-        gated.command_id = id;
-        self.services
+        let gated = info.step(GatedOp::Focuser(FocuserCmd::MoveBy(steps)));
+        let id = gated.command_id;
+        let permit = self
+            .services
             .child_checks
-            .check(&gated)
+            .child_permit(&info.owner(), &gated)
             .map_err(|err| err.to_device_error())?;
         let ticket = focuser.send(FocuserCmd::MoveBy(steps), permit).await?;
         Ok((id, ticket))
@@ -996,8 +1015,17 @@ impl FilterChanger {
             });
         }
 
-        // Step 5: command the position.
-        let (_, wheel_permit) = info.child();
+        // Step 5: command the position, on a permit the gate issues for this
+        // step (O11 b): the wheel's own checks run again.
+        let wheel_step = info.step(GatedOp::FilterWheel(FilterWheelCmd::SetPosition(to_slot)));
+        let wheel_permit = match self
+            .services
+            .child_checks
+            .child_permit(&info.owner(), &wheel_step)
+        {
+            Ok(permit) => permit,
+            Err(err) => return Err(Stop::refused(err.to_device_error())),
+        };
         let wheel_ticket = match self
             .wheel
             .send(FilterWheelCmd::SetPosition(to_slot), wheel_permit)
@@ -1253,7 +1281,6 @@ impl FilterChanger {
         req: &HandshakeRequest,
         model: &ReconciledWheel,
     ) -> HandshakeReport {
-        let clock = Arc::clone(&self.services.clock);
         let duration_ms = self.elapsed_ms(st.started_mono_ns);
         st.report.duration_ms = duration_ms;
 
@@ -1261,17 +1288,12 @@ impl FilterChanger {
             self.emit_verification(&mut st);
         }
         if let Some(reason) = st.block_reason.take() {
-            let block = ResumeBlock {
-                id: Uuid::new_v4(),
-                kind: ResumeBlockKind::FilterHandshakeIncomplete,
-                raised_at: clock.now_utc(),
-                raised_mono_ns: clock.now_mono_ns(),
-                device_kind: Some(DeviceKind::FilterWheel),
-                connection_id: Some(self.wheel.connection_id()),
-                command_id: Some(st.cmd),
-                reason,
-            };
-            self.services.events.raise_resume_block(block.clone());
+            // The hub assigns the id (O11 a); an already active block of this
+            // kind comes back unchanged.
+            let request = BlockRequest::new(ResumeBlockKind::FilterHandshakeIncomplete, reason)
+                .for_device(DeviceKind::FilterWheel, Some(self.wheel.connection_id()))
+                .with_command(Some(st.cmd));
+            let block = self.services.events.raise_resume_block(request);
             st.report.resume_block = Some(block);
         }
         st.report.handshake_ok = st.report.outcome.is_success() && st.report.resume_block.is_none();
@@ -2456,13 +2478,17 @@ mod tests {
     struct RejectFocuser;
 
     impl ChildCommandCheck for RejectFocuser {
-        fn check(&self, cmd: &GatedCommand) -> Result<(), GateError> {
+        fn child_permit(
+            &self,
+            _parent: &StepOwner,
+            cmd: &GatedCommand,
+        ) -> Result<Permit, GateError> {
             match cmd.op {
                 GatedOp::Focuser(_) => Err(GateError::SafetyRejected(SafetyRejection::new(
                     "focuser_travel",
                     "the offset leaves the travel bounds",
                 ))),
-                _ => Ok(()),
+                _ => Ok(Permit::new(cmd, None)),
             }
         }
     }

@@ -592,6 +592,12 @@ impl<C, S> DeviceHandle<C, S> {
         Arc::clone(&self.identity)
     }
 
+    /// The out-of-band abort path, for e-stop steps that must not wait for
+    /// the worker (O11 j).
+    pub fn abort_path(&self) -> Option<Arc<dyn AbortPath>> {
+        self.abort_path.clone()
+    }
+
     pub fn kind(&self) -> DeviceKind {
         self.identity.kind
     }

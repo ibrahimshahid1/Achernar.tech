@@ -26,8 +26,8 @@ use super::snapshot::{
     RotatorState, SafetyReading, SlotInfo, SwitchChannel, TemperatureReading, WeatherReading,
 };
 use super::types::{
-    AltAz, DeviceIdentity, DeviceKind, DeviceResult, DriveRate, EqCoord, EqFrame, GuideDirection,
-    ObsState, Observed, PierSide, Site,
+    AltAz, DeviceError, DeviceIdentity, DeviceKind, DeviceResult, DriveRate, EqCoord, EqFrame,
+    GuideDirection, ObsState, Observed, PierSide, Site,
 };
 
 // ---------------------------------------------------------------------------
@@ -185,6 +185,15 @@ pub trait Device: Send {
 /// `ureq::Agent` with a 5 s timeout).
 pub trait AbortPath: Send + Sync {
     fn abort(&self) -> DeviceResult<()>;
+
+    /// Mount only: tracking off on the out-of-band connection, for an
+    /// e-stop whose mount worker is lost or blocked (O11 j). Best effort;
+    /// the default is `Unsupported`.
+    fn tracking_off(&self) -> DeviceResult<()> {
+        Err(DeviceError::unsupported(
+            "this abort path cannot stop tracking",
+        ))
+    }
 }
 
 pub trait MountDriver: Device {

@@ -440,6 +440,27 @@ impl UnsafePolicy {
     where
         C: Clone,
     {
+        let (id, result, _started) = self
+            .execute_tracked(handle, device_cmd, op, trigger, timeout, busy)
+            .await;
+        (id, result)
+    }
+
+    /// [`Self::execute`], also saying whether the worker accepted the
+    /// command, i.e. whether the operation itself ran (O11 c: a park that
+    /// ran reports its own `park_failed`).
+    async fn execute_tracked<C, S>(
+        &self,
+        handle: &DeviceHandle<C, S>,
+        device_cmd: C,
+        op: GatedOp,
+        trigger: &PolicyTrigger,
+        timeout: Duration,
+        busy: fn(&S) -> bool,
+    ) -> (CommandId, Result<(), DeviceError>, bool)
+    where
+        C: Clone,
+    {
         let cmd = self.command(op, trigger);
         let id = cmd.command_id;
         let mut retried = false;
@@ -447,7 +468,7 @@ impl UnsafePolicy {
             let permit = match self.gate.authorize(&cmd).await {
                 Ok(permit) => permit,
                 // The gate audited the rejection.
-                Err(err) => return (id, Err(err.to_device_error())),
+                Err(err) => return (id, Err(err.to_device_error()), false),
             };
             match handle.send(device_cmd.clone(), permit).await {
                 Ok(ticket) => {
@@ -466,7 +487,7 @@ impl UnsafePolicy {
                         None,
                         Some(outcome.clone()),
                     );
-                    return (id, outcome_result(outcome));
+                    return (id, outcome_result(outcome), true);
                 }
                 Err(err) if err.class == ErrorClass::InvalidOperation && !retried => {
                     retried = true;
@@ -494,7 +515,7 @@ impl UnsafePolicy {
                         Some(err.to_string()),
                         Some(OpOutcome::Failed(err.clone())),
                     );
-                    return (id, Err(err));
+                    return (id, Err(err), false);
                 }
             }
         }
@@ -876,8 +897,8 @@ impl UnsafePolicy {
     }
 
     async fn park(&self, trigger: &PolicyTrigger, mount: &MountHandle, run: &mut PolicyRun) {
-        let (id, result) = self
-            .execute(
+        let (id, result, started) = self
+            .execute_tracked(
                 mount,
                 MountCmd::Park,
                 GatedOp::Mount(MountCmd::Park),
@@ -898,17 +919,22 @@ impl UnsafePolicy {
         };
         // A failed park is recorded and raises `mount_lost`; then tracking
         // is stopped as a fallback so the mount does not drive on.
-        self.events.emit(
-            EquipmentEvent::new(
-                EventKind::ParkFailed {
-                    class: err.class,
-                    reason: format!("safety policy park: {}", err.message),
-                },
-                self.clock.as_ref(),
-            )
-            .for_device(DeviceKind::Mount, mount.connection_id())
-            .with_command(id),
-        );
+        // `park_failed` is emitted once (O11 c): by the park operation when it
+        // ran, and here only when it never started (refused by the gate or
+        // the worker).
+        if !started {
+            self.events.emit(
+                EquipmentEvent::new(
+                    EventKind::ParkFailed {
+                        class: err.class,
+                        reason: format!("safety policy park: {}", err.message),
+                    },
+                    self.clock.as_ref(),
+                )
+                .for_device(DeviceKind::Mount, mount.connection_id())
+                .with_command(id),
+            );
+        }
         self.blocks.raise(
             BlockRequest::new(
                 ResumeBlockKind::MountLost,
@@ -1723,8 +1749,50 @@ mod tests {
         assert_eq!(rig.block_kinds(), vec![ResumeBlockKind::SafetyUnsafe]);
     }
 
+    fn park_failed_events(rig: &Rig) -> Vec<Arc<EquipmentEvent>> {
+        rig.recorder
+            .records()
+            .into_iter()
+            .filter_map(|r| match r {
+                GroundTruthRecord::Event(e) if e.name() == "park_failed" => Some(e),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
-    async fn a_failed_park_emits_park_failed_raises_mount_lost_and_stops_tracking() {
+    async fn a_park_the_worker_refused_emits_park_failed_once_from_the_policy() {
+        // O11 c: the park operation never started, so the policy reports it.
+        let rig = Rig::new(Arc::new(ManualClock::new()));
+        rig.mount_fake
+            .set_responder(|cmd, _snap: &mut MountSnapshot| match cmd {
+                MountCmd::Park => {
+                    FakeResponse::reject(DeviceError::driver("the park initiator was refused"))
+                }
+                _ => FakeResponse::succeed(),
+            });
+        let run = rig
+            .policy(PolicySettings::default())
+            .run(&unsafe_trigger(), &rig.targets())
+            .await;
+        assert!(matches!(
+            run.step(PolicyAction::Park).unwrap().status,
+            StepStatus::Failed { .. }
+        ));
+        let events = park_failed_events(&rig);
+        assert_eq!(events.len(), 1, "park_failed is emitted exactly once");
+        assert_eq!(
+            events[0].command_id,
+            run.step(PolicyAction::Park).unwrap().command_id
+        );
+        assert_eq!(
+            rig.block_kinds(),
+            vec![ResumeBlockKind::SafetyUnsafe, ResumeBlockKind::MountLost]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_park_raises_mount_lost_stops_tracking_and_leaves_park_failed_to_the_op() {
         let rig = Rig::new(Arc::new(ManualClock::new()));
         rig.mount_fake
             .set_responder(|cmd, _snap: &mut MountSnapshot| match cmd {
@@ -1756,20 +1824,9 @@ mod tests {
             rig.block_kinds(),
             vec![ResumeBlockKind::SafetyUnsafe, ResumeBlockKind::MountLost]
         );
-        let park_failed = rig
-            .recorder
-            .records()
-            .into_iter()
-            .find_map(|r| match r {
-                GroundTruthRecord::Event(e) if e.name() == "park_failed" => Some(e),
-                _ => None,
-            })
-            .expect("park_failed recorded");
-        assert_eq!(park_failed.device_kind, Some(DeviceKind::Mount));
-        assert_eq!(
-            park_failed.command_id,
-            run.step(PolicyAction::Park).unwrap().command_id
-        );
+        // The park operation ran (the fake stands in for it), so the
+        // operation reports `park_failed`, never the policy too (O11 c).
+        assert!(park_failed_events(&rig).is_empty());
         // The park's outcome row records the failure.
         assert!(rig
             .audits()

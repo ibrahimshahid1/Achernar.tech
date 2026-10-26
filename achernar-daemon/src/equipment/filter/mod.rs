@@ -27,12 +27,13 @@ use std::time::Duration;
 use crate::config::{EquipmentConfigs, FilterWheelConfig, FocusSafetyConfig, GuiderConfig};
 
 use super::events::EquipmentEvent;
+use super::resume::BlockRequest;
 use super::snapshot::ResumeBlock;
 
 /// Rolling cap on switches requested by automatic sources (policies,
 /// triggers, sequencing) within one hour. Operators are bound only by
-/// `min_switch_interval_s`. A behaviour default, not a rig value; `[filter_wheel]`
-/// has no key for it yet (change note to WP0's config owner).
+/// `min_switch_interval_s`. A behaviour default, not a rig value; configured
+/// by `[filter_wheel] max_switches_per_hour` (O11 g, 0 disables the cap).
 pub const DEFAULT_MAX_AUTOMATIC_SWITCHES_PER_HOUR: u32 = 60;
 
 /// Poll interval while the wheel moves (§2.7: 4 Hz).
@@ -69,7 +70,9 @@ pub fn write_wheel(shared: &SharedWheel, wheel: reconcile::ReconciledWheel) {
 /// resume-block registry (H22), which emits `resume_blocked`.
 pub trait FilterEventSink: Send + Sync {
     fn publish(&self, event: EquipmentEvent);
-    fn raise_resume_block(&self, block: ResumeBlock);
+    /// Raise a block. The hub assigns its id (O11 a); the filter layer
+    /// reports the block it gets back, which may be an already active one.
+    fn raise_resume_block(&self, request: BlockRequest) -> ResumeBlock;
 }
 
 /// Behaviour settings of the filter layer, taken from `[filter_wheel]`, the
@@ -123,7 +126,8 @@ impl FilterSettings {
             settle_ms: wheel.settle_ms,
             max_switch_timeout_ms: wheel.max_switch_timeout_ms,
             min_switch_interval_s: wheel.min_switch_interval_s,
-            max_automatic_switches_per_hour: Some(DEFAULT_MAX_AUTOMATIC_SWITCHES_PER_HOUR),
+            max_automatic_switches_per_hour: Some(wheel.max_switches_per_hour)
+                .filter(|max| *max > 0),
             use_focus_offsets: wheel.use_focus_offsets,
             pause_guiding_on_offset: wheel.pause_guiding_on_offset,
             parallel_offset_move: wheel.parallel_offset_move,
@@ -211,6 +215,20 @@ mod tests {
         );
         assert_eq!(settings.af_filter.as_deref(), Some("L"));
         assert_eq!(settings.min_switch_interval(), Duration::from_millis(2500));
+
+        // O11 g: `[filter_wheel] max_switches_per_hour`, 0 disables the cap.
+        for (configured, expected) in [(12, Some(12)), (0, None)] {
+            let wheel = FilterWheelConfig {
+                max_switches_per_hour: configured,
+                ..FilterWheelConfig::default()
+            };
+            let settings = FilterSettings::from_parts(
+                &wheel,
+                &FocusSafetyConfig::default(),
+                &GuiderConfig::default(),
+            );
+            assert_eq!(settings.max_automatic_switches_per_hour, expected);
+        }
     }
 
     #[test]

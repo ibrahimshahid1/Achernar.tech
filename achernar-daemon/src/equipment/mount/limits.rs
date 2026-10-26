@@ -5,13 +5,14 @@
 //! Owner: WP1A-4.
 //!
 //! The geometry here is the small amount needed for limits (hour angle,
-//! Alt/Az from HA/Dec/latitude, a GMST of about 0.1 s accuracy). The
-//! authoritative astronomy (precession, nutation, ΔT, refraction) is
+//! Alt/Az from HA/Dec/latitude). Sidereal time comes from `astro` (O11 k);
+//! the authoritative astronomy (precession, nutation, ΔT, refraction) is
 //! `astro/*` (WP1A-3), reached through the [`FrameConverter`]. The horizon
 //! profile loader is also `astro/horizon.rs`; it plugs in through
 //! [`HorizonLimit`].
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +20,7 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use crate::config::{EquipmentConfig, MountConfig, MountSafetyConfig};
+use crate::equipment::astro::time::{gmst_rad, TimeScales};
 use crate::equipment::commands::{GatedCommand, GatedOp, MountCmd, SafetyRejection};
 use crate::equipment::events::{EventKind, LimitKind};
 use crate::equipment::ops::OpKind;
@@ -37,22 +39,29 @@ pub const CHECK_NAME: &str = "mount_limits";
 // Geometry
 // ---------------------------------------------------------------------------
 
-/// Days since J2000.0 (2000-01-01T12:00:00), UT taken as UTC.
-pub fn days_since_j2000(utc: DateTime<Utc>) -> f64 {
-    const J2000_UNIX_MS: i64 = 946_728_000_000;
-    (utc.timestamp_millis() - J2000_UNIX_MS) as f64 / 86_400_000.0
+/// `[site] dut1_s` (UT1 - UTC, seconds), installed once by the spine. Stored
+/// as `f64` bits; 0 until set.
+static DUT1_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Install `[site] dut1_s` (O11 g). Values outside |DUT1| <= 0.9 s, or not
+/// finite, are ignored: UTC is kept within 0.9 s of UT1 by definition.
+pub fn set_dut1_s(dut1_s: f64) {
+    if dut1_s.is_finite() && dut1_s.abs() <= 0.9 {
+        DUT1_BITS.store(dut1_s.to_bits(), Ordering::Relaxed);
+    }
 }
 
-/// Greenwich mean sidereal time, hours, from the IAU 1982 expression
-/// (Meeus, *Astronomical Algorithms*, eq. 12.4), with UTC standing in for
-/// UT1 (|UT1 - UTC| < 0.9 s). Enough for limits; WP1A-3 owns the precise
-/// sidereal time.
+/// The installed DUT1 in seconds.
+pub fn dut1_s() -> f64 {
+    f64::from_bits(DUT1_BITS.load(Ordering::Relaxed))
+}
+
+/// Greenwich mean sidereal time, hours `[0, 24)`. Delegates to `astro`
+/// (WP1A-3, IAU 2006 GMST with the installed DUT1) so the limits, the
+/// simulator and the hub share one sidereal time (O11 k).
 pub fn gmst_hours(utc: DateTime<Utc>) -> f64 {
-    let d = days_since_j2000(utc);
-    let t = d / 36_525.0;
-    let deg =
-        280.460_618_37 + 360.985_647_366_29 * d + 0.000_387_933 * t * t - t * t * t / 38_710_000.0;
-    deg.rem_euclid(360.0) / 15.0
+    let ts = TimeScales::from_utc_with_dut1(utc, dut1_s());
+    (gmst_rad(&ts).to_degrees() / 15.0).rem_euclid(24.0)
 }
 
 /// Local mean sidereal time, hours. Longitude is east-positive.
@@ -140,6 +149,16 @@ impl PiecewiseHorizon {
         }
         cleaned.sort_by(|a, b| a.0.total_cmp(&b.0));
         Ok(Self { points: cleaned })
+    }
+}
+
+/// The `astro/horizon.rs` profile (`[mount.safety] horizon_profile_path`).
+impl HorizonLimit for crate::equipment::astro::horizon::HorizonProfile {
+    fn min_altitude_deg(&self, az_deg: f64) -> Option<f64> {
+        az_deg
+            .is_finite()
+            .then(|| self.altitude_at(az_deg))
+            .filter(|alt| alt.is_finite())
     }
 }
 

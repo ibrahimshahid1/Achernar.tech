@@ -542,6 +542,14 @@ impl AbortPath for SimMountAbort {
         core.stop();
         Ok(())
     }
+
+    fn tracking_off(&self) -> DeviceResult<()> {
+        let mut core = lock(&self.core);
+        core.advance(self.clock.as_ref());
+        core.calls.push("abort_path_tracking_off".into());
+        core.tracking = false;
+        Ok(())
+    }
 }
 
 /// Test and server handle: fault injection and "other client" actions.

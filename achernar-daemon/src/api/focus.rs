@@ -3,9 +3,10 @@
 
 use crate::api::api_error::ApiError;
 use crate::control::safety_guard::{FocusSafetyGuard, SafetyVerdict};
+use crate::equipment::commands::{FocuserCmd, GatedOp};
+use crate::equipment::types::{CommandSource, DriverId, OpOutcome, Priority};
 use crate::error::{AchernarError, FocusError, HardwareError};
 use crate::focus::focus_agent::{FocusRunContext, FocusRunState, FocusSample};
-use crate::hardware::focuser::ConnectedFocuser;
 use crate::hardware::ols_ffi::{OlsBayerType, OlsCamOptionId, OlsStreamType};
 use crate::state::{AppState, CameraActivity};
 use crate::storage::capture_archive::ArchiveReservation;
@@ -239,17 +240,13 @@ pub async fn abort_focus_run(State(state): State<AppState>) -> Result<StatusCode
         agent.abort();
     }
 
-    if let Ok(mut focuser) = state.focuser.lock() {
-        if crate::hardware::health::require_connected(
-            &state,
-            crate::hardware::health::DeviceKind::Focuser,
-        )
-        .is_ok()
-        {
-            if let Some(focuser) = focuser.as_mut() {
-                let _ = focuser.abort();
-            }
-        }
+    // The focuser's audited abort (D19): its out-of-band halt plus a cancel
+    // of the running move. No slot guard is held across the call.
+    if let Ok(handle) = crate::api::equipment::focuser_abort_handle(&state) {
+        let _ = state
+            .equipment
+            .gate()
+            .abort(&handle, CommandSource::Operator { overriding: false });
     }
 
     Ok(StatusCode::OK)
@@ -621,11 +618,8 @@ fn simulation_focus_allowed(camera_driver: Option<&str>, simulator_focuser: bool
 
 fn validate_simulation_focus_run(state: &AppState) -> crate::error::Result<()> {
     let simulator_focuser = {
-        let focuser = state.focuser.lock().unwrap();
-        match focuser.as_ref().ok_or(FocusError::NoFocuser)? {
-            ConnectedFocuser::Simulator(_) => true,
-            ConnectedFocuser::Hardware(_) => false,
-        }
+        let handle = crate::api::equipment::focuser_slot(state).ok_or(FocusError::NoFocuser)?;
+        handle.identity().driver == DriverId::Sim
     };
     let camera_driver = state.camera_runtime.read().unwrap().driver_id.clone();
     if !simulation_focus_allowed(camera_driver.as_deref(), simulator_focuser) {
@@ -707,14 +701,13 @@ async fn ensure_streaming(state: &AppState) -> crate::error::Result<()> {
     Ok(())
 }
 
+/// The focuser's logical position from its latest snapshot (the worker
+/// polls it; nothing here enters the driver).
 fn current_focuser_position(state: &AppState) -> crate::error::Result<i32> {
-    let focuser = state.focuser.lock().unwrap();
-    crate::hardware::health::require_connected(state, crate::hardware::health::DeviceKind::Focuser)
-        .map_err(|_| FocusError::NoFocuser)?;
-    let focuser = focuser.as_ref().ok_or(FocusError::NoFocuser)?;
-    focuser
-        .position()
-        .map_err(|err| HardwareError::Communication(err.to_string()).into())
+    let handle = crate::api::equipment::focuser_handle(state).map_err(|_| FocusError::NoFocuser)?;
+    handle.snapshot().logical_position.ok_or_else(|| {
+        HardwareError::Communication("The focuser has not reported a position".to_string()).into()
+    })
 }
 
 async fn measure_at_position(
@@ -1193,82 +1186,114 @@ async fn move_focuser_to_position(
     let tolerance = config.safety.arrival_tolerance_steps.max(0);
     loop {
         abort_if_requested(state)?;
-        {
-            let mut focuser = state.focuser.lock().unwrap();
-            crate::hardware::health::require_connected(
-                state,
-                crate::hardware::health::DeviceKind::Focuser,
-            )
-            .map_err(|_| FocusError::NoFocuser)?;
-            let focuser = focuser.as_mut().ok_or(FocusError::NoFocuser)?;
-            let current = focuser
-                .position()
-                .map_err(|err| HardwareError::Communication(err.to_string()))?;
-            let delta = target - current;
-            if delta.abs() <= tolerance {
-                return Ok(());
-            }
-            if previous_remaining.is_some_and(|previous| delta.abs() >= previous.abs()) {
-                return Err(HardwareError::Communication(format!(
-                    "Focuser stopped at {current} without progressing toward {target}"
-                ))
-                .into());
-            }
-            previous_remaining = Some(delta);
-
-            let verdict = focus_safety
-                .lock()
-                .map_err(|_| {
-                    FocusError::SafetyViolation("Focus safety guard lock was poisoned".to_string())
-                })?
-                .validate_focus_action(current, delta, 1.0)?;
-            let step = match verdict {
-                SafetyVerdict::Approved => delta,
-                SafetyVerdict::Modified { clamped, .. } => clamped,
-                SafetyVerdict::Rejected { reason } => {
-                    return Err(FocusError::SafetyViolation(reason).into());
-                }
-            };
-            let absolute = focuser
-                .is_absolute()
-                .map_err(|err| HardwareError::Communication(err.to_string()))?;
-            if absolute {
-                focuser
-                    .move_absolute(current + step)
-                    .map_err(|err| HardwareError::Communication(err.to_string()))?;
-            } else {
-                focuser
-                    .move_relative(step)
-                    .map_err(|err| HardwareError::Communication(err.to_string()))?;
-            }
+        // The handle is cloned out of its slot; no guard is held across an
+        // await, and the move runs on the focuser's worker (D3).
+        let handle =
+            crate::api::equipment::focuser_handle(state).map_err(|_| FocusError::NoFocuser)?;
+        let snapshot = handle.snapshot();
+        let current = snapshot.logical_position.ok_or_else(|| {
+            HardwareError::Communication("The focuser has not reported a position".to_string())
+        })?;
+        let delta = target - current;
+        if delta.abs() <= tolerance {
+            return Ok(());
         }
+        if previous_remaining.is_some_and(|previous| delta.abs() >= previous.abs()) {
+            return Err(HardwareError::Communication(format!(
+                "Focuser stopped at {current} without progressing toward {target}"
+            ))
+            .into());
+        }
+        previous_remaining = Some(delta);
+
+        let verdict = focus_safety
+            .lock()
+            .map_err(|_| {
+                FocusError::SafetyViolation("Focus safety guard lock was poisoned".to_string())
+            })?
+            .validate_focus_action(current, delta, 1.0)?;
+        let step = match verdict {
+            SafetyVerdict::Approved => delta,
+            SafetyVerdict::Modified { clamped, .. } => clamped,
+            SafetyVerdict::Rejected { reason } => {
+                return Err(FocusError::SafetyViolation(reason).into());
+            }
+        };
+        let cmd = if snapshot.capabilities.absolute {
+            FocuserCmd::MoveTo(current + step)
+        } else {
+            FocuserCmd::MoveBy(step)
+        };
+        // Through the gate: the travel bounds, the A06 exposure check and the
+        // audit apply to every autofocus move (D9).
+        let submitted = crate::api::equipment::submit(
+            state,
+            &handle,
+            GatedOp::Focuser(cmd),
+            CommandSource::Operator { overriding: false },
+            Priority::Autofocus,
+        )
+        .await
+        .map_err(|err| HardwareError::Communication(err.message))?;
+        let mut done = submitted.ticket.done;
+        let mut outcome: Option<OpOutcome> = None;
 
         // A sleep alone is not completion: a slow or belt-reduced focuser can
         // still be moving, which would put the next exposure mid-move. Wait
-        // for the device to report stopped, then settle, then re-read the
-        // position at the top of the loop to check arrival.
+        // for the move operation to resolve (arrival, then settle), then
+        // settle, then re-read the position at the top of the loop.
         let stopped = wait_until_stopped(
             || abort_if_requested(state),
-            || {
-                let focuser = state.focuser.lock().unwrap();
-                let focuser = focuser.as_ref().ok_or(FocusError::NoFocuser)?;
-                focuser
-                    .is_moving()
-                    .map_err(|err| HardwareError::Communication(err.to_string()).into())
+            || match done.try_recv() {
+                Ok(result) => {
+                    outcome = Some(result);
+                    Ok(false)
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => Ok(true),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    Err(HardwareError::Communication(
+                        "The focuser worker stopped before the move resolved".to_string(),
+                    )
+                    .into())
+                }
             },
-            Duration::from_millis(config.safety.move_timeout_ms.max(100)),
+            // The move operation has its own deadline on the worker; this
+            // bound only covers polling and settling on top of it.
+            Duration::from_millis(config.safety.move_timeout_ms.max(100)) + MOVE_WAIT_MARGIN,
             Duration::from_millis(100),
         )
         .await;
         if let Err(err) = stopped {
-            if let Some(focuser) = state.focuser.lock().unwrap().as_mut() {
-                let _ = focuser.abort();
-            }
+            let _ = state
+                .equipment
+                .gate()
+                .abort(&handle, CommandSource::Operator { overriding: false });
             return Err(err);
+        }
+        match outcome {
+            Some(OpOutcome::Succeeded) | None => {}
+            Some(OpOutcome::TimedOut) => {
+                return Err(HardwareError::Timeout(format!(
+                    "Focuser still moving after {} ms",
+                    config.safety.move_timeout_ms.max(100)
+                ))
+                .into());
+            }
+            Some(other) => {
+                return Err(HardwareError::Communication(format!(
+                    "The focuser move ended {}",
+                    other.label()
+                ))
+                .into());
+            }
         }
         tokio::time::sleep(Duration::from_millis(config.safety.settle_ms.max(50))).await;
     }
 }
+
+/// How long past `[focus.safety] move_timeout_ms` a move may take to resolve
+/// on the worker (polling at 10 Hz, settle, verification read).
+const MOVE_WAIT_MARGIN: Duration = Duration::from_secs(2);
 
 /// Poll `is_moving` until it reports false, failing with a timeout after
 /// `timeout`. The first poll waits one interval so a driver that raises
@@ -2099,6 +2124,7 @@ mod tests {
         AppState,
         crate::config::FocusConfig,
         Arc<Mutex<FocusSafetyGuard>>,
+        Arc<Mutex<crate::hardware::focuser::SimFocuser>>,
     ) {
         let directory =
             std::env::temp_dir().join(format!("achernar-focus-move-{}", uuid::Uuid::new_v4()));
@@ -2121,73 +2147,73 @@ mod tests {
             directory.join("data"),
             None,
         );
-        let connected = ConnectedFocuser::Simulator(focuser);
-        let snapshot = crate::hardware::health::focuser_snapshot(
-            "fixture focuser".into(),
-            &connected.health_status().unwrap(),
+        // The daemon's legacy simulator behind the worker (§2.3), connected
+        // through the spine like any focuser.
+        let driver = crate::equipment::legacy::sim_focuser::LegacySimFocuser::from_sim(
+            focuser,
+            state.equipment.clock(),
         );
-        *state.focuser.lock().unwrap() = Some(connected);
-        state.devices.write().unwrap().connected(
-            crate::hardware::health::DeviceKind::Focuser,
-            "fixture".into(),
-            Some(snapshot),
-        );
+        let sim = driver.shared_sim();
+        crate::api::equipment::install_focuser(&state, Box::new(driver), "sim", "")
+            .await
+            .unwrap();
         let guard = Arc::new(Mutex::new(FocusSafetyGuard::new(focus.safety.clone())));
-        (directory, state, focus, guard)
+        (directory, state, focus, guard, sim)
     }
 
-    fn sim_position(state: &AppState) -> i32 {
-        state
-            .focuser
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .position()
-            .unwrap()
+    fn sim_position(sim: &Arc<Mutex<crate::hardware::focuser::SimFocuser>>) -> i32 {
+        sim.lock().unwrap().position().unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn move_reaches_a_distant_target_through_clamped_steps() {
         let sim = crate::hardware::focuser::SimFocuser::new(0);
-        let (directory, state, config, guard) = move_fixture(sim).await;
+        let (directory, state, config, guard, sim) = move_fixture(sim).await;
         move_focuser_to_position(&state, &config, &guard, 1_700)
             .await
             .unwrap();
-        assert_eq!(sim_position(&state), 1_700);
+        assert_eq!(sim_position(&sim), 1_700);
         std::fs::remove_dir_all(directory).ok();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn move_fails_when_the_focuser_stops_short_of_the_target() {
+        // The device's travel ends at 1000: the gate's travel bounds refuse
+        // the step past it, or the move stops short; either way the run
+        // fails at 1000 instead of retrying forever.
         let sim = crate::hardware::focuser::SimFocuser::with_max_range(0, 1_000);
-        let (directory, state, config, guard) = move_fixture(sim).await;
+        let (directory, state, config, guard, sim) = move_fixture(sim).await;
         let err = move_focuser_to_position(&state, &config, &guard, 2_000)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("without progressing"), "{err}");
-        assert_eq!(sim_position(&state), 1_000);
+        let message = err.to_string();
+        assert!(
+            message.contains("without progressing") || message.contains("travel"),
+            "{message}"
+        );
+        assert_eq!(sim_position(&sim), 1_000);
         std::fs::remove_dir_all(directory).ok();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn move_halts_a_focuser_that_never_reports_stopped() {
         let mut sim = crate::hardware::focuser::SimFocuser::new(0);
         sim.set_stuck_moving(true);
-        let (directory, state, config, guard) = move_fixture(sim).await;
+        let (directory, state, config, guard, sim) = move_fixture(sim).await;
         let err = move_focuser_to_position(&state, &config, &guard, 300)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("still moving"), "{err}");
-        let moving = state
-            .focuser
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .is_moving()
-            .unwrap();
-        assert!(!moving, "the timed-out focuser must have been halted");
+        // The halt runs out of band (the abort path) or as the worker's
+        // deadline cancel; give the out-of-band thread a moment.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sim.lock().unwrap().is_moving().unwrap() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !sim.lock().unwrap().is_moving().unwrap(),
+            "the timed-out focuser must have been halted"
+        );
         std::fs::remove_dir_all(directory).ok();
     }
 }

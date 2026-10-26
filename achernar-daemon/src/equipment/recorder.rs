@@ -213,7 +213,16 @@ struct Shared {
     invalidation_pending: AtomicBool,
     session_id: Mutex<Option<String>>,
     last_error: Mutex<Option<String>>,
+    /// O11 c backstop: `(command_id, kind)` of once-per-command events
+    /// already accepted (bounded).
+    once_seen: Mutex<std::collections::VecDeque<(uuid::Uuid, &'static str)>>,
 }
+
+/// Events that happen at most once per command; a second copy with the same
+/// command id is a duplicate report (O11 c), not a second fact.
+const ONCE_PER_COMMAND: &[&str] = &["park_failed"];
+/// How many `(command_id, kind)` pairs the dedupe remembers.
+const ONCE_SEEN_LIMIT: usize = 1024;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
@@ -233,6 +242,27 @@ impl Shared {
 
     fn session_id(&self) -> Option<String> {
         lock(&self.session_id).clone()
+    }
+
+    /// True when `event` repeats a once-per-command event already accepted.
+    fn is_duplicate(&self, event: &EquipmentEvent) -> bool {
+        let name = event.name();
+        let Some(command_id) = event.command_id else {
+            return false;
+        };
+        if !ONCE_PER_COMMAND.contains(&name) {
+            return false;
+        }
+        let key = (command_id.0, name);
+        let mut seen = lock(&self.once_seen);
+        if seen.contains(&key) {
+            return true;
+        }
+        if seen.len() >= ONCE_SEEN_LIMIT {
+            seen.pop_front();
+        }
+        seen.push_back(key);
+        false
     }
 }
 
@@ -268,6 +298,7 @@ impl Recorder {
             invalidation_pending: AtomicBool::new(false),
             session_id: Mutex::new(None),
             last_error: Mutex::new(None),
+            once_seen: Mutex::new(std::collections::VecDeque::new()),
         });
         let recorder = Arc::new(Recorder {
             tx,
@@ -438,6 +469,12 @@ impl RecorderSink for Recorder {
         if !keep {
             shared.counters.downsampled.fetch_add(1, Ordering::Relaxed);
             return;
+        }
+        if let GroundTruthRecord::Event(event) = &rec {
+            if shared.is_duplicate(event) {
+                shared.counters.rejected.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
         if shared.closed.load(Ordering::SeqCst) {
             self.drop_record(&rec);
@@ -937,6 +974,43 @@ mod tests {
     use uuid::Uuid;
 
     const BUDGET: Duration = Duration::from_secs(5);
+
+    /// O11 c backstop: a second `park_failed` for the same command is a
+    /// duplicate report and is not journaled twice; other commands and other
+    /// kinds are untouched.
+    #[test]
+    fn a_duplicate_park_failed_for_one_command_is_dropped() {
+        let (recorder, _writer) = Recorder::channel(config());
+        let clock = ManualClock::new();
+        let command = CommandId::new();
+        let park_failed = |command: CommandId, seq: u64| {
+            let mut event = EquipmentEvent::new(
+                EventKind::ParkFailed {
+                    class: crate::equipment::types::ErrorClass::Driver,
+                    reason: "park sensor fault".into(),
+                },
+                &clock,
+            )
+            .with_command(command);
+            event.seq = seq;
+            GroundTruthRecord::Event(Arc::new(event))
+        };
+        recorder.record(park_failed(command, 1));
+        recorder.record(park_failed(command, 2));
+        recorder.record(park_failed(CommandId::new(), 3));
+        let mut parked = EquipmentEvent::new(
+            EventKind::Parked {
+                method: crate::equipment::events::ParkMethod::Driver,
+            },
+            &clock,
+        )
+        .with_command(command);
+        parked.seq = 4;
+        recorder.record(GroundTruthRecord::Event(Arc::new(parked)));
+        let stats = recorder.stats();
+        assert_eq!(stats.enqueued, 3);
+        assert_eq!(stats.rejected, 1);
+    }
 
     fn config() -> RecorderConfig {
         RecorderConfig {

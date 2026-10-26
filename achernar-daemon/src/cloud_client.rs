@@ -164,6 +164,11 @@ async fn run_gateway(
     let mut heartbeat = interval(Duration::from_secs(10));
     let mut telemetry = interval(Duration::from_secs(1));
     let mut device_rx = state.device_updates.subscribe();
+    // EQUIPMENT_EVENT upstream (§2.13); Django forwards it from WP1B-5 on.
+    let mut equipment_rx = {
+        use crate::equipment::traits::EquipmentReader;
+        state.equipment.subscribe()
+    };
     // Hardware commands may take seconds. Their completion must not block
     // disconnect events, telemetry or heartbeats on the gateway writer.
     let (result_tx, mut result_rx) = tokio::sync::mpsc::channel::<Value>(16);
@@ -189,15 +194,38 @@ async fn run_gateway(
             Some(result) = result_rx.recv() => {
                 write.send(Message::Text(result.to_string())).await.map_err(|e|e.to_string())?;
             }
+            equipment_result = equipment_rx.recv() => {
+                match equipment_result {
+                    Ok(event) => {
+                        let msg = crate::telemetry::equipment_event_message(&event);
+                        write.send(Message::Text(msg.to_string())).await.map_err(|e| e.to_string())?;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::debug!("Relay skipped {skipped} equipment events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        // The hub went away (shutdown); keep serving commands.
+                        equipment_rx = tokio::sync::broadcast::channel(1).1;
+                    }
+                }
+            }
             incoming = read.next() => {
                 let incoming = incoming.ok_or_else(|| "gateway stream ended".to_string())?;
                 match incoming.map_err(|e| e.to_string())? {
                     Message::Text(text) => {
                         let command_state=state.clone();
                         let command_text=text.clone();
-                        let accepted=spawn_bounded_command(&command_slots,result_tx.clone(),async move {
+                        let future = async move {
                             handle_gateway_text(command_state,&command_text).await
-                        });
+                        };
+                        // Aborts, halts and the e-stop never wait for a slot
+                        // (D19): they run even with all 16 slots busy.
+                        let accepted = if is_priority_command(&text) {
+                            spawn_priority_command(result_tx.clone(), future);
+                            Ok(())
+                        } else {
+                            spawn_bounded_command(&command_slots,result_tx.clone(),future)
+                        };
                         if accepted.is_err() {
                                 let parsed=serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
                                 let busy=json!({"type":"COMMAND_RESULT","command_id":parsed.get("command_id"),
@@ -211,6 +239,33 @@ async fn run_gateway(
             }
         }
     }
+}
+
+/// True for a gateway COMMAND whose action is an abort, a halt or the e-stop
+/// (D19: they bypass the command-slot semaphore).
+fn is_priority_command(text: &str) -> bool {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .and_then(|data| {
+            data.get("action")
+                .and_then(Value::as_str)
+                .map(crate::relay_commands::bypasses_slots)
+        })
+        .unwrap_or(false)
+}
+
+/// Run an abort, halt or e-stop without a command slot (D19). Like a bounded
+/// command it is driven on a blocking worker, so the gateway stays free.
+fn spawn_priority_command<F>(completed: tokio::sync::mpsc::Sender<Value>, command: F)
+where
+    F: std::future::Future<Output = Option<Value>> + Send + 'static,
+{
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        if let Some(result) = runtime.block_on(command) {
+            let _ = completed.blocking_send(result);
+        }
+    });
 }
 
 /// Relay arms include synchronous vendor calls and std mutex acquisition.
@@ -306,6 +361,60 @@ mod tests {
         assert!(matches!(received.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
         release.send(()).unwrap();
         assert_eq!(tokio::time::timeout(Duration::from_secs(2), received.recv()).await.unwrap(), Some(json!({"complete":true})));
+    }
+
+    /// D19: an e-stop over the relay runs while all 16 command slots are
+    /// busy, and reaches every attached device's abort.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn estop_over_the_relay_succeeds_while_all_16_slots_are_busy() {
+        use crate::equipment::snapshot::MountSnapshot;
+        use crate::equipment::testing::fake_handles::fake_mount;
+
+        let (directory, state) = crate::api::equipment_tests::state().await;
+        let (mount, mount_fake) = fake_mount(MountSnapshot::default());
+        state.equipment.attach(mount);
+
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+        let (results, mut received) = tokio::sync::mpsc::channel(32);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Arc::new(std::sync::Mutex::new(wait));
+        for _ in 0..16 {
+            let wait = std::sync::Arc::clone(&wait);
+            spawn_bounded_command(&slots, results.clone(), async move {
+                let _ = wait
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10));
+                None
+            })
+            .unwrap();
+        }
+        assert_eq!(slots.available_permits(), 0);
+        // A 17th ordinary command is refused for capacity...
+        assert!(spawn_bounded_command(&slots, results.clone(), async { None }).is_err());
+        // ...but the e-stop is not.
+        let text = json!({
+            "type": "COMMAND",
+            "command_id": "estop-1",
+            "action": "equipment.estop",
+            "payload": {},
+        })
+        .to_string();
+        assert!(is_priority_command(&text));
+        let command_state = state.clone();
+        spawn_priority_command(results.clone(), async move {
+            handle_gateway_text(command_state, &text).await
+        });
+        let result = tokio::time::timeout(Duration::from_secs(3), received.recv())
+            .await
+            .expect("the e-stop answered within its budget")
+            .unwrap();
+        assert_eq!(result["command_id"], "estop-1");
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["payload"]["results"][0]["kind"], "mount");
+        assert_eq!(mount_fake.abort_path().calls(), 1);
+        drop(release);
+        crate::api::equipment_tests::cleanup(directory, state).await;
     }
 
     #[tokio::test(flavor = "current_thread")]

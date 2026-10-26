@@ -40,8 +40,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
+
+use super::devicestate;
 
 use crate::equipment::clock::duration_ns;
 use crate::equipment::snapshot::{FocuserCapabilities, FocuserState};
@@ -86,39 +88,27 @@ fn as_f64(value: &Value) -> Option<f64> {
     value.as_f64().filter(|f| f.is_finite())
 }
 
-/// `{"Name": .., "Value": ..}` entries of a `devicestate` reply, keyed by
-/// lower-case name. `None` when the reply is not such a list.
+/// The operational entries of a `devicestate` reply, keyed by lower-case
+/// name, from WP1A-1's parser (O11 d). `None` when the reply is not a
+/// Name/Value list. The TimeStamp is not an entry; see [`parse_timestamp`].
 pub fn parse_device_state(value: &Value) -> Option<BTreeMap<String, Value>> {
-    let entries = value.as_array()?;
-    let mut out = BTreeMap::new();
-    for entry in entries {
-        let object = entry.as_object()?;
-        let name = object
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("name"))
-            .and_then(|(_, v)| v.as_str())?;
-        let value = object
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("value"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or(Value::Null);
-        out.insert(name.to_ascii_lowercase(), value);
-    }
-    Some(out)
+    devicestate::parse_device_state(value)
+        .ok()
+        .map(|values| entries_by_name(&values))
 }
 
-/// DeviceState `TimeStamp`, parsed permissively (§2.14): an explicit offset
-/// or `Z`, else a local time without offset.
-pub fn parse_timestamp(text: &str) -> Option<DateTime<Utc>> {
-    let text = text.trim();
-    if let Ok(parsed) = DateTime::parse_from_rfc3339(text) {
-        return Some(parsed.with_timezone(&Utc));
-    }
-    ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"]
+fn entries_by_name(values: &devicestate::DeviceStateValues) -> BTreeMap<String, Value> {
+    values
+        .entries
         .iter()
-        .find_map(|format| NaiveDateTime::parse_from_str(text, format).ok())
-        .and_then(|naive| Local.from_local_datetime(&naive).earliest())
-        .map(|local| local.with_timezone(&Utc))
+        .map(|entry| (entry.name.to_ascii_lowercase(), entry.value.clone()))
+        .collect()
+}
+
+/// DeviceState `TimeStamp`, through WP1A-1's permissive parser (§2.14,
+/// O11 d): an explicit offset or `Z`, else a local time without offset.
+pub fn parse_timestamp(text: &str) -> Option<DateTime<Utc>> {
+    devicestate::parse_timestamp(text).map(|stamp| stamp.utc)
 }
 
 /// `(host, port)` of an `http(s)://host:port` base URL.
@@ -676,15 +666,12 @@ impl Device for AlpacaFocuser {
         {
             let (result, timing) = self.timed(|| self.get("devicestate", TimeoutClass::Ordinary));
             match result {
-                Ok(value) => match parse_device_state(&value) {
-                    Some(map) if !map.is_empty() => {
+                Ok(value) => match devicestate::parse_device_state(&value) {
+                    Ok(values) if !values.is_empty() => {
                         method = PollMethod::DeviceState;
-                        device_time = map
-                            .get("timestamp")
-                            .and_then(Value::as_str)
-                            .and_then(parse_timestamp);
+                        device_time = values.timestamp.map(|stamp| stamp.utc);
                         device_state = Some(DeviceStateSample {
-                            values: map,
+                            values: entries_by_name(&values),
                             timing,
                             device_time,
                         });
@@ -925,6 +912,7 @@ mod tests {
     use super::*;
     use crate::equipment::testing::fake_transport::{FakeAlpacaTransport, FakeReply, Method};
     use crate::equipment::testing::manual_clock::ManualClock;
+    use chrono::{Local, NaiveDateTime, TimeZone};
     use serde_json::json;
 
     /// A scripted Platform 6 focuser: InterfaceVersion 3, no DeviceState,

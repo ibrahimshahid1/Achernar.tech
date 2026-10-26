@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Local, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::equipment::snapshot::WeatherReading;
@@ -258,57 +258,26 @@ impl DeviceStateValues {
     }
 }
 
-/// Parse an Alpaca `devicestate` value: an array of `{Name, Value}` objects.
-/// Names are matched without regard to case; malformed entries are skipped.
+/// Parse an Alpaca `devicestate` value with WP1A-1's parser (O11 d): an
+/// array of `{Name, Value}` objects, names matched without regard to case,
+/// malformed entries skipped. `None` when the value is not such an array.
 pub(super) fn parse_device_state(value: &Value) -> Option<DeviceStateValues> {
-    let items = value.as_array()?;
-    let mut parsed = DeviceStateValues::default();
-    for item in items {
-        let Some(object) = item.as_object() else {
-            continue;
-        };
-        let name = object
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("name"))
-            .and_then(|(_, v)| v.as_str());
-        let Some(name) = name else {
-            continue;
-        };
-        let value = object
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case("value"))
-            .map(|(_, v)| v.clone())
-            .unwrap_or(Value::Null);
-        if name.eq_ignore_ascii_case("timestamp") {
-            parsed.timestamp = value.as_str().and_then(parse_device_time);
-        } else {
-            parsed.entries.push((name.to_ascii_lowercase(), value));
-        }
-    }
-    Some(parsed)
+    let shared = super::devicestate::parse_device_state(value).ok()?;
+    Some(DeviceStateValues {
+        entries: shared
+            .entries
+            .into_iter()
+            .map(|entry| (entry.name.to_ascii_lowercase(), entry.value))
+            .collect(),
+        timestamp: shared.timestamp.map(|stamp| stamp.utc),
+    })
 }
 
-/// Parse a device timestamp permissively (§2.14): RFC 3339 with `Z` or an
-/// offset, an offset without a colon, or a local time without any offset.
+/// Parse a device timestamp with WP1A-1's permissive parser (§2.14, O11 d):
+/// RFC 3339 with `Z` or an offset, an offset without a colon, or a local
+/// time without any offset.
 pub(super) fn parse_device_time(text: &str) -> Option<DateTime<Utc>> {
-    let text = text.trim();
-    if let Ok(at) = DateTime::parse_from_rfc3339(text) {
-        return Some(at.with_timezone(&Utc));
-    }
-    for format in ["%Y-%m-%dT%H:%M:%S%.f%z", "%Y-%m-%d %H:%M:%S%.f%z"] {
-        if let Ok(at) = DateTime::parse_from_str(text, format) {
-            return Some(at.with_timezone(&Utc));
-        }
-    }
-    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(text, format) {
-            return Local
-                .from_local_datetime(&naive)
-                .earliest()
-                .map(|at| at.with_timezone(&Utc));
-        }
-    }
-    None
+    super::devicestate::parse_timestamp(text).map(|stamp| stamp.utc)
 }
 
 /// The connection-level half of an Alpaca driver (§2.6 steps 3-5, C-3).
@@ -955,6 +924,7 @@ mod tests {
     use crate::equipment::testing::fake_transport::{FakeAlpacaTransport, FakeReply, Method};
     use crate::equipment::testing::manual_clock::ManualClock;
     use crate::equipment::types::{identity_key, DeviceKind, DriverId, Endpoint};
+    use chrono::{Local, NaiveDateTime, TimeZone};
     use serde_json::json;
 
     fn identity() -> DeviceIdentity {

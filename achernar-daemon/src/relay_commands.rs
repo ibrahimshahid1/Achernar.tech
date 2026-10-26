@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::hardware::{capabilities::driver_capability_report, mount::EqCoord};
+use crate::hardware::capabilities::driver_capability_report;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -20,25 +20,10 @@ fn payload_str(payload: &Value, key: &str, default: &str) -> String {
         .to_string()
 }
 
-fn payload_i32(payload: &Value, key: &str) -> Result<i32, String> {
-    payload
-        .get(key)
-        .and_then(Value::as_i64)
-        .map(|v| v as i32)
-        .ok_or_else(|| format!("payload.{key} is required"))
-}
-
 fn payload_f64(payload: &Value, key: &str) -> Result<f64, String> {
     payload
         .get(key)
         .and_then(Value::as_f64)
-        .ok_or_else(|| format!("payload.{key} is required"))
-}
-
-fn payload_bool(payload: &Value, key: &str) -> Result<bool, String> {
-    payload
-        .get(key)
-        .and_then(Value::as_bool)
         .ok_or_else(|| format!("payload.{key} is required"))
 }
 
@@ -47,12 +32,29 @@ fn payload_bool(payload: &Value, key: &str) -> Result<bool, String> {
 /// `method` and `path` describe the daemon's *own* HTTP route for the same
 /// operation, so a client that cannot use the relay can reach it directly.
 /// Paths are relative to `/api/v1`.
+///
+/// `relay_allowed` is false for commands that are unsafe at relay latency
+/// (jog and pulse guiding, D12): they are published for the direct
+/// transport and refused by the relay dispatcher. Django reads the registry
+/// as a name-keyed dict and ignores the extra key.
 #[derive(Debug, Clone, Serialize)]
 pub struct CommandSpec {
     pub name: &'static str,
     pub method: &'static str,
     pub path: &'static str,
     pub description: &'static str,
+    pub relay_allowed: bool,
+}
+
+/// `direct_only` in a registry entry: published for the direct API,
+/// refused over the relay (D12).
+macro_rules! relay_allowed {
+    () => {
+        true
+    };
+    (direct_only) => {
+        false
+    };
 }
 
 /// Declares the relay commands exactly once.
@@ -74,7 +76,7 @@ pub struct CommandSpec {
 /// supplied by the caller.
 macro_rules! command_registry {
     ($state:ident, $payload:ident; $(
-        $name:literal $method:ident $path:literal
+        $name:literal $method:ident $path:literal $($flag:ident)?
             $description:literal
             => $body:expr
     ),* $(,)?) => {
@@ -87,6 +89,7 @@ macro_rules! command_registry {
                 method: stringify!($method),
                 path: $path,
                 description: $description,
+                relay_allowed: relay_allowed!($($flag)?),
             },)*
         ];
 
@@ -95,6 +98,15 @@ macro_rules! command_registry {
             // use the payload; unused in the arms that take no arguments.
             let $payload = &command.payload;
             let _ = $payload;
+
+            // D12: availability on the direct API does not imply relay
+            // availability.
+            if spec(&command.action).is_some_and(|spec| !spec.relay_allowed) {
+                return Err(format!(
+                    "{} is not available over the relay; use the direct daemon API",
+                    command.action
+                ));
+            }
 
             match command.action.as_str() {
                 $($name => $body,)*
@@ -150,7 +162,8 @@ command_registry! {
         },
 
     "equipment.connect" POST "connect"
-        "Connect a camera, mount or focuser by driver id and device index."
+        "Connect a camera, mount, focuser, filter wheel, guider, weather station or safety \
+         monitor by driver id and option. `driver` is required."
         => connect_equipment(state, payload).await,
 
     "equipment.disconnect" POST "disconnect"
@@ -219,39 +232,164 @@ command_registry! {
         "Latest preview frame as a JPEG payload, for the browser path."
         => camera_snapshot(state),
 
+    "mount.descriptor" GET "mount"
+        "Mount identity, capabilities, native frame, site, can_flip and qualification."
+        => relay(crate::api::mount::descriptor_value(&state)),
+
     "mount.slew" POST "mount/slew"
-        "Slew to equatorial coordinates. Requires `ra` and `dec`."
-        => mount_slew(state, payload),
+        "Slew to equatorial coordinates through the gate. Requires `ra` and `dec`; \
+         optional `frame` (mount, j2000 or jnow)."
+        => relay(crate::api::mount::slew_value(&state, body(payload)?, true).await),
 
     "mount.sync" POST "mount/sync"
         "Tell the mount its current position. Requires `ra` and `dec`; a wrong \
          value here corrupts the pointing model for the rest of the session."
-        => mount_sync(state, payload),
+        => relay(crate::api::mount::sync_value(&state, body(payload)?, true).await),
 
     "mount.set_tracking" POST "mount/tracking"
         "Start or stop sidereal tracking. Requires `enabled`."
-        => mount_set_tracking(state, payload),
+        => relay(crate::api::mount::set_tracking_value(&state, body(payload)?, true).await),
 
     "mount.abort" POST "mount/abort"
-        "Stop any slew immediately."
-        => mount_abort(state),
+        "Stop any slew or jog immediately: AbortSlew out of band, also on a degraded \
+         or lost mount."
+        => relay(crate::api::mount::abort_value(&state, true).await),
+
+    "mount.park" POST "mount/park"
+        "Park the mount, verified through AtPark."
+        => relay(crate::api::mount::park_value(&state, true, false).await),
+
+    "mount.unpark" POST "mount/unpark"
+        "Unpark the mount, verified through AtPark."
+        => relay(crate::api::mount::unpark_value(&state, true, false).await),
+
+    "mount.find_home" POST "mount/home"
+        "Find the mount's home position, verified through AtHome."
+        => relay(crate::api::mount::home_value(&state, true).await),
+
+    "mount.center" POST "mount/center"
+        "Center a target by slew, solve and sync or offset (the loop arrives with WP1B-4)."
+        => relay(crate::api::mount::center_value(&state, body(payload)?).await),
+
+    "mount.move_axis" POST "mount/move-axis" direct_only
+        "Jog one axis at `rate_deg_s`; renew within jog_deadman_ms. Direct API only: a \
+         dead-man is not safe at relay latency."
+        => relay(crate::api::mount::move_axis_value(&state, body(payload)?, true).await),
+
+    "mount.pulse_guide" POST "mount/pulse-guide" direct_only
+        "One guide pulse `{direction, duration_ms}`; refused while PHD2 guides. Direct \
+         API only."
+        => relay(crate::api::mount::pulse_guide_value(&state, body(payload)?, true).await),
+
+    "mount.set_tracking_rate" POST "mount/tracking-rate"
+        "Set the drive rate: sidereal, lunar, solar or king."
+        => relay(crate::api::mount::tracking_rate_value(&state, body(payload)?, true).await),
+
+    "mount.set_guide_rates" POST "mount/guide-rates"
+        "Set the RA and Dec guide rates in arcsec/s."
+        => relay(crate::api::mount::guide_rates_value(&state, body(payload)?, true).await),
+
+    "mount.site_sync" POST "mount/site-sync"
+        "Write [site] to the mount (to_mount) or adopt the mount's site (from_mount)."
+        => relay(crate::api::mount::site_sync_value(&state, body(payload)?, true).await),
+
+    "focuser.descriptor" GET "focuser"
+        "Focuser capabilities, backlash model and owner, and position source."
+        => relay(crate::api::focuser::descriptor_value(&state)),
 
     "focuser.move_relative" POST "focuser/move"
-        "Move the focuser by `steps`, signed."
-        => focuser_move_relative(state, payload),
+        "Move the focuser by `steps`, signed, within the travel bounds."
+        => relay(crate::api::focuser::move_relative_value(&state, body(payload)?, true).await),
 
     "focuser.move_absolute" POST "focuser/moveto"
         "Move the focuser to absolute `position`. Step 0 is a real position, \
          so a missing argument must not default to it."
-        => focuser_move_absolute(state, payload),
+        => relay(crate::api::focuser::move_absolute_value(&state, body(payload)?, true).await),
 
     "focuser.position" GET "focuser/position"
-        "Current focuser position, or null when the encoder has not been read."
-        => focuser_position(state),
+        "Current logical focuser position; an error when it has not been read."
+        => relay(crate::api::focuser::position_value(&state).map(|position| json!({ "position": position }))),
 
     "focuser.abort" POST "focuser/abort"
-        "Stop focuser motion immediately."
-        => focuser_abort(state),
+        "Stop focuser motion immediately (Halt out of band)."
+        => relay(crate::api::focuser::abort_value(&state, true).await),
+
+    "focuser.set_tempcomp" POST "focuser/tempcomp"
+        "Turn the focuser's temperature compensation on or off. Requires `enabled`."
+        => relay(crate::api::focuser::set_tempcomp_value(&state, body(payload)?, true).await),
+
+    "focuser.sync" POST "focuser/sync"
+        "Sync the focuser position where the device supports it (INDI FOCUS_SYNC)."
+        => relay(crate::api::focuser::sync_value(&state, body(payload)?, true).await),
+
+    "focuser.set_position" POST "focuser/set-position"
+        "Declare the origin of an emulated relative focuser; profile only, audited."
+        => relay(crate::api::focuser::set_position_value(&state, body(payload)?, true)),
+
+    "filter_wheel.descriptor" GET "filter-wheel"
+        "Filter-wheel identity, reconciled slots, position and verification."
+        => relay(crate::api::filter_wheel::descriptor_value(&state)),
+
+    "filter_wheel.change" POST "filter-wheel/change"
+        "Change filter by `slot` (0-based) or `name` through the v6 handshake."
+        => relay(crate::api::filter_wheel::change_value(&state, body(payload)?, true)),
+
+    "filter_wheel.abort" POST "filter-wheel/abort"
+        "Cancel the running filter handshake; the wheel itself has no halt."
+        => relay(crate::api::filter_wheel::abort_value(&state, true)),
+
+    "filter_wheel.import_seed" POST "filter-wheel/import-seed"
+        "Copy the [filter_wheel] TOML seeds into the connected wheel's profile, audited."
+        => relay(crate::api::filter_wheel::import_seed_value(&state, true)),
+
+    "guider.descriptor" GET "guider"
+        "Guider state, RMS, settle, calibration and algorithm parameters."
+        => relay(crate::api::guider::descriptor_value(&state)),
+
+    "guider.start" POST "guider/start"
+        "Start guiding with optional `settle` and `recalibrate`."
+        => relay(crate::api::guider::start_value(&state, body(payload)?, true).await),
+
+    "guider.stop" POST "guider/stop"
+        "Stop guiding (stop_capture); never refused while the guider is reachable."
+        => relay(crate::api::guider::stop_value(&state, true).await),
+
+    "guider.pause" POST "guider/pause"
+        "Pause guiding; `full` also pauses looping exposures."
+        => relay(crate::api::guider::pause_value(&state, body(payload)?, true).await),
+
+    "guider.resume" POST "guider/resume"
+        "Resume guiding after a pause."
+        => relay(crate::api::guider::resume_value(&state, true).await),
+
+    "guider.dither" POST "guider/dither"
+        "Dither by `amount_px` guide pixels between exposures, with settle verification."
+        => relay(crate::api::guider::dither_value(&state, body(payload)?, true).await),
+
+    "weather.status" GET "weather"
+        "Weather reading with every field's state and age; null when unknown."
+        => relay(crate::api::weather::status_value(&state)),
+
+    "safety.status" GET "safety"
+        "Combined safety state of every monitor (none without one) and safety blocks."
+        => Ok(crate::api::safety::status_value(&state)),
+
+    "equipment.estop" POST "equipment/estop"
+        "Emergency stop: every device's abort within 2 s, including lost ones; \
+         `abort_exposure` optional. Never waits for a relay slot."
+        => Ok(crate::api::equipment::estop_value(&state, body(payload)?, true).await),
+
+    "equipment.resume_blocks" GET "equipment/resume-blocks"
+        "Active resume blocks that refuse automatic captures and sequencing."
+        => Ok(crate::api::equipment::resume_blocks_value(&state)),
+
+    "equipment.clear_resume_block" POST "equipment/resume-blocks/clear"
+        "Clear one resume block by `id`, audited; safety blocks clear only when safe."
+        => relay(crate::api::equipment::clear_resume_block_value(&state, body(payload)?, true)),
+
+    "equipment.events" GET "equipment/events"
+        "Equipment event journal tail after `since_seq`, at most 500, optionally by `kinds`."
+        => Ok(crate::api::equipment::events_value(&state, &body(payload)?)),
 }
 
 async fn camera_descriptor(state: AppState) -> Result<Value, String> {
@@ -314,7 +452,8 @@ async fn camera_capture(state: AppState, payload: &Value) -> Result<Value, Strin
 
 async fn connect_equipment(state: AppState, payload: &Value) -> Result<Value, String> {
     let equipment_type = payload_str(payload, "equipment_type", "camera").to_ascii_lowercase();
-    let driver = payload_str(payload, "driver", "sim");
+    // No default driver (§2.12): a missing driver gets the direct route's 400.
+    let driver = payload_str(payload, "driver", "");
     let option = payload
         .get("option")
         .and_then(Value::as_str)
@@ -334,7 +473,7 @@ async fn connect_equipment(state: AppState, payload: &Value) -> Result<Value, St
     crate::api::connect_equipment(axum::extract::State(state), axum::Json(request))
         .await
         .map(|axum::Json(value)| value)
-        .map_err(|error| error.message)
+        .map_err(crate::api::equipment::relay_error)
 }
 
 async fn disconnect_equipment(state: AppState, payload: &Value) -> Result<Value, String> {
@@ -342,6 +481,10 @@ async fn disconnect_equipment(state: AppState, payload: &Value) -> Result<Value,
     let axum::Json(response) = crate::api::disconnect_equipment(
         axum::extract::State(state),
         Some(axum::Json(crate::api::DisconnectRequest {
+            force: payload
+                .get("force")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
             equipment_type: Some(equipment_type.clone()),
         })),
     )
@@ -389,114 +532,32 @@ fn camera_snapshot(state: AppState) -> Result<Value, String> {
         .map_err(|status| format!("No current camera preview is available: {status}"))
 }
 
-fn mount_slew(state: AppState, payload: &Value) -> Result<Value, String> {
-    let target = EqCoord {
-        ra: payload_f64(payload, "ra")?,
-        dec: payload_f64(payload, "dec")?,
+/// Decode a relay payload into a route's request body; a null payload is an
+/// empty object, so optional bodies work over the relay too.
+fn body<T: serde::de::DeserializeOwned>(payload: &Value) -> Result<T, String> {
+    let value = if payload.is_null() {
+        json!({})
+    } else {
+        payload.clone()
     };
-    {
-        let mount = state.mount.lock().unwrap();
-        crate::hardware::health::require_connected(
-            &state,
-            crate::hardware::health::DeviceKind::Mount,
-        )?;
-        let mount = mount
-            .as_ref()
-            .ok_or_else(|| "No mount connected".to_string())?;
-        mount.goto(target).map_err(|e| e.to_string())?;
-    }
-    // Same rule as the local route: the post-slew solve waits for arrival.
-    crate::mount::auto_solve::slew_commanded(&state, target);
-    Ok(json!({ "status": "slewing", "ra": target.ra, "dec": target.dec }))
+    serde_json::from_value(value).map_err(|error| format!("invalid payload: {error}"))
 }
 
-fn mount_sync(state: AppState, payload: &Value) -> Result<Value, String> {
-    let coord = EqCoord {
-        ra: payload_f64(payload, "ra")?,
-        dec: payload_f64(payload, "dec")?,
-    };
-    let mount = state.mount.lock().unwrap();
-    crate::hardware::health::require_connected(&state, crate::hardware::health::DeviceKind::Mount)?;
-    let mount = mount
-        .as_ref()
-        .ok_or_else(|| "No mount connected".to_string())?;
-    mount.sync(coord).map_err(|e| e.to_string())?;
-    Ok(json!({ "status": "synced", "ra": coord.ra, "dec": coord.dec }))
+/// The relay's error string for a route error: `code: message`, so the
+/// relay carries the same error meaning as the direct route (D12).
+fn relay(result: Result<Value, crate::api::api_error::ApiError>) -> Result<Value, String> {
+    result.map_err(crate::api::equipment::relay_error)
 }
 
-fn mount_set_tracking(state: AppState, payload: &Value) -> Result<Value, String> {
-    let enabled = payload_bool(payload, "enabled")?;
-    let mount = state.mount.lock().unwrap();
-    crate::hardware::health::require_connected(&state, crate::hardware::health::DeviceKind::Mount)?;
-    let mount = mount
-        .as_ref()
-        .ok_or_else(|| "No mount connected".to_string())?;
-    mount.set_tracking(enabled).map_err(|e| e.to_string())?;
-    Ok(json!({ "status": "tracking_updated", "enabled": enabled }))
+/// True for actions that must never wait for a relay command slot: aborts,
+/// halts and the e-stop (D19).
+pub fn bypasses_slots(action: &str) -> bool {
+    action == "equipment.estop" || action.ends_with(".abort") || action.ends_with(".halt")
 }
 
-fn mount_abort(state: AppState) -> Result<Value, String> {
-    let mount = state.mount.lock().unwrap();
-    crate::hardware::health::require_connected(&state, crate::hardware::health::DeviceKind::Mount)?;
-    let mount = mount
-        .as_ref()
-        .ok_or_else(|| "No mount connected".to_string())?;
-    mount.stop().map_err(|e| e.to_string())?;
-    Ok(json!({ "status": "stopped" }))
-}
-
-fn focuser_move_relative(state: AppState, payload: &Value) -> Result<Value, String> {
-    let steps = payload_i32(payload, "steps")?;
-    let mut focuser = state.focuser.lock().unwrap();
-    crate::hardware::health::require_connected(
-        &state,
-        crate::hardware::health::DeviceKind::Focuser,
-    )?;
-    let focuser = focuser
-        .as_mut()
-        .ok_or_else(|| "No focuser connected".to_string())?;
-    focuser.move_relative(steps).map_err(|e| e.to_string())?;
-    Ok(json!({ "status": "moving", "steps": steps }))
-}
-
-fn focuser_move_absolute(state: AppState, payload: &Value) -> Result<Value, String> {
-    let position = payload_i32(payload, "position")?;
-    let mut focuser = state.focuser.lock().unwrap();
-    crate::hardware::health::require_connected(
-        &state,
-        crate::hardware::health::DeviceKind::Focuser,
-    )?;
-    let focuser = focuser
-        .as_mut()
-        .ok_or_else(|| "No focuser connected".to_string())?;
-    focuser.move_absolute(position).map_err(|e| e.to_string())?;
-    Ok(json!({ "status": "moving", "position": position }))
-}
-
-fn focuser_position(state: AppState) -> Result<Value, String> {
-    let focuser = state.focuser.lock().unwrap();
-    crate::hardware::health::require_connected(
-        &state,
-        crate::hardware::health::DeviceKind::Focuser,
-    )?;
-    let focuser = focuser
-        .as_ref()
-        .ok_or_else(|| "No focuser connected".to_string())?;
-    let position = focuser.position().map_err(|e| e.to_string())?;
-    Ok(json!({ "position": position }))
-}
-
-fn focuser_abort(state: AppState) -> Result<Value, String> {
-    let mut focuser = state.focuser.lock().unwrap();
-    crate::hardware::health::require_connected(
-        &state,
-        crate::hardware::health::DeviceKind::Focuser,
-    )?;
-    let focuser = focuser
-        .as_mut()
-        .ok_or_else(|| "No focuser connected".to_string())?;
-    focuser.abort().map_err(|e| e.to_string())?;
-    Ok(json!({ "status": "stopped" }))
+/// The published spec of `action`, if any.
+pub fn spec(action: &str) -> Option<&'static CommandSpec> {
+    COMMANDS.iter().find(|spec| spec.name == action)
 }
 
 #[cfg(test)]
@@ -562,6 +623,88 @@ mod tests {
                 spec.name,
                 spec.method
             );
+        }
+    }
+
+    /// D12: jog and pulse guiding are published for the direct transport
+    /// and refused by the relay dispatcher; aborts, halts and the e-stop are
+    /// always relayable and skip the command slots (D19).
+    #[test]
+    fn jog_and_pulse_are_not_relayed() {
+        let direct_only: Vec<_> = COMMANDS
+            .iter()
+            .filter(|s| !s.relay_allowed)
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(direct_only, vec!["mount.move_axis", "mount.pulse_guide"]);
+        for name in [
+            "mount.abort",
+            "focuser.abort",
+            "filter_wheel.abort",
+            "equipment.estop",
+        ] {
+            let spec = spec(name).unwrap_or_else(|| panic!("{name} is not registered"));
+            assert!(spec.relay_allowed, "{name} must be relayable");
+            assert!(bypasses_slots(name), "{name} must bypass the relay slots");
+        }
+        assert!(!bypasses_slots("mount.slew"));
+        let json = serde_json::to_value(spec("mount.move_axis").unwrap()).unwrap();
+        assert_eq!(json["relay_allowed"], false);
+    }
+
+    #[tokio::test]
+    async fn the_relay_refuses_direct_only_commands_before_running_them() {
+        let (directory, state) = crate::api::equipment_tests::state().await;
+        for action in ["mount.move_axis", "mount.pulse_guide"] {
+            let err = execute(
+                state.clone(),
+                &RelayCommand {
+                    command_id: "direct-only".into(),
+                    action: action.into(),
+                    payload: json!({"axis": 0, "rate_deg_s": 1.0, "direction": "north", "duration_ms": 100}),
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.contains("not available over the relay; use the direct daemon API"),
+                "{err}"
+            );
+        }
+        crate::api::equipment_tests::cleanup(directory, state).await;
+    }
+
+    #[test]
+    fn every_new_equipment_route_is_registered_once() {
+        for name in [
+            "mount.descriptor",
+            "mount.park",
+            "mount.unpark",
+            "mount.find_home",
+            "mount.center",
+            "mount.set_tracking_rate",
+            "mount.set_guide_rates",
+            "mount.site_sync",
+            "focuser.descriptor",
+            "focuser.set_tempcomp",
+            "focuser.sync",
+            "focuser.set_position",
+            "filter_wheel.descriptor",
+            "filter_wheel.change",
+            "filter_wheel.import_seed",
+            "guider.descriptor",
+            "guider.start",
+            "guider.stop",
+            "guider.pause",
+            "guider.resume",
+            "guider.dither",
+            "weather.status",
+            "safety.status",
+            "equipment.resume_blocks",
+            "equipment.clear_resume_block",
+            "equipment.events",
+        ] {
+            assert!(spec(name).is_some(), "{name} is not registered");
         }
     }
 

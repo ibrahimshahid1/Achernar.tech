@@ -13,12 +13,15 @@
 //!    including degraded and lost handles. Each driver's `AbortPath` does
 //!    its kind's stop: mount AbortSlew then MoveAxis 0 on both axes; focuser
 //!    and rotator Halt; cover HaltCover; dome AbortSlew; guider
-//!    `stop_capture`. With `[equipment] estop_stops_tracking` (default) the
-//!    mount also gets tracking off, as a step of the e-stop that outranks
-//!    any running operation. Its result is part of the mount's entry: a
-//!    mount that refuses it (a lost mount's worker takes no commands) or
-//!    does not answer within the budget (a worker blocked in a driver call)
-//!    is reported failed;
+//!    `stop_capture`. The mount goes through
+//!    [`estop_mount`](super::mount::estop_mount) (O11 j): its abort path,
+//!    then MoveAxis 0 and, with `[equipment] estop_stops_tracking`
+//!    (default), tracking off as e-stop-rank steps that outrank any running
+//!    operation. When the worker refuses tracking off (a lost mount takes no
+//!    commands) or has not confirmed it within half the budget (a worker
+//!    blocked in a driver call), tracking off goes through the mount's
+//!    out-of-band abort path instead, best effort; a failure there is
+//!    audited and fails the mount's entry;
 //! 4. aborts the camera exposure only when `abort_exposure` is true;
 //! 5. returns per-device results within the 2 s budget. It never waits for
 //!    motion to stop; confirmation arrives as events.
@@ -27,6 +30,7 @@
 //! not a park. It skips ownership, the arbiter and the safety checks, and is
 //! always audited.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -35,8 +39,10 @@ use uuid::Uuid;
 
 use super::commands::{GatedCommand, GatedOp, MountCmd};
 use super::events::{EquipmentEvent, EstopDeviceResult, EventKind};
-use super::handle::{AbortTicket, Permit};
+use super::gate::CommandGate;
+use super::handle::{AbortTicket, MountHandle};
 use super::hub::{AnyHandle, EquipmentHub};
+use super::mount::estop_mount_reporting;
 use super::resume::BlockRequest;
 use super::snapshot::{ResumeBlock, ResumeBlockKind};
 use super::types::{
@@ -171,22 +177,123 @@ impl Pending {
 
 enum PendingResult {
     Abort(AbortTicket),
-    Exposure(oneshot::Receiver<DeviceResult<()>>),
+    /// A result delivered by a task: the exposure abort, or the mount's
+    /// abort path inside `estop_mount`.
+    Channel(oneshot::Receiver<DeviceResult<()>>),
 }
 
 impl PendingResult {
     fn try_result(&mut self) -> Option<DeviceResult<()>> {
         match self {
             PendingResult::Abort(ticket) => ticket.try_outcome(),
-            PendingResult::Exposure(rx) => match rx.try_recv() {
+            PendingResult::Channel(rx) => match rx.try_recv() {
                 Ok(result) => Some(result),
                 Err(oneshot::error::TryRecvError::Empty) => None,
                 Err(oneshot::error::TryRecvError::Closed) => Some(Err(
-                    DeviceError::outcome_unknown("the exposure abort stopped without a result"),
+                    DeviceError::outcome_unknown("the abort stopped without a result"),
                 )),
             },
         }
     }
+}
+
+/// Tracking off through the mount's out-of-band abort path (O11 j), on a
+/// blocking thread and bounded by `budget`.
+async fn tracking_off_out_of_band(mount: &MountHandle, budget: Duration) -> DeviceResult<()> {
+    let Some(path) = mount.abort_path() else {
+        return Err(DeviceError::unsupported(
+            "the mount has no out-of-band abort path to stop tracking",
+        ));
+    };
+    let task = tokio::task::spawn_blocking(move || path.tracking_off());
+    match tokio::time::timeout(budget, task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => Err(DeviceError::driver("the out-of-band tracking off panicked")),
+        Err(_) => Err(DeviceError::timeout(format!(
+            "the out-of-band tracking off did not answer within {} ms",
+            budget.as_millis()
+        ))),
+    }
+}
+
+/// The mount's e-stop (O11 j): `estop_mount`, with its abort path reported on
+/// `abort_tx` as soon as it is known, and tracking off on `tracking_tx`.
+/// Tracking off that the worker refused or did not confirm within
+/// `fallback_after` is sent through the abort path; that attempt is audited
+/// as a step of the e-stop, and its failure fails the mount's entry.
+async fn mount_estop(
+    mount: MountHandle,
+    stops_tracking: bool,
+    gate: Arc<CommandGate>,
+    estop: GatedCommand,
+    fallback_after: Duration,
+    abort_tx: oneshot::Sender<DeviceResult<()>>,
+    tracking_tx: Option<oneshot::Sender<DeviceResult<()>>>,
+) {
+    // `estop_mount` runs to its end on its own task, so the abort path's
+    // result is still delivered when tracking off falls back below.
+    let (report_tx, report_rx) = oneshot::channel();
+    let task_mount = mount.clone();
+    tokio::spawn(async move {
+        let report = estop_mount_reporting(&task_mount, stops_tracking, Some(abort_tx)).await;
+        let _ = report_tx.send(report);
+    });
+    let Some(tracking_tx) = tracking_tx else {
+        return;
+    };
+    let in_band = match tokio::time::timeout(fallback_after, report_rx).await {
+        Ok(Ok(report)) => report
+            .tracking_off()
+            .cloned()
+            .unwrap_or_else(|| Err(DeviceError::outcome_unknown("tracking off was not sent"))),
+        Ok(Err(_)) => Err(DeviceError::outcome_unknown(
+            "the mount e-stop stopped without a report",
+        )),
+        Err(_) => Err(DeviceError::timeout(format!(
+            "the mount worker did not confirm tracking off within {} ms",
+            fallback_after.as_millis()
+        ))),
+    };
+    let result = match in_band {
+        Ok(()) => Ok(()),
+        Err(worker_err) => {
+            let step = GatedCommand::new(
+                GatedOp::Mount(MountCmd::SetTracking(false)),
+                CommandSource::Safety,
+                AutonomyMode::Manual,
+                Priority::EStop,
+            )
+            .with_params(serde_json::json!({
+                "estop": estop.command_id,
+                "path": "abort_path",
+                "worker_error": worker_err.to_string(),
+            }));
+            gate.record_executed(
+                &step,
+                vec![
+                    format!("estop={}", estop.command_id),
+                    "via=abort_path".into(),
+                ],
+            );
+            let out_of_band = tracking_off_out_of_band(&mount, fallback_after).await;
+            match out_of_band {
+                Ok(()) => {
+                    gate.record_outcome(&step, &OpOutcome::Succeeded);
+                    Ok(())
+                }
+                Err(path_err) => {
+                    let err = DeviceError {
+                        message: format!("{}; abort path: {}", worker_err.message, path_err),
+                        ..worker_err
+                    };
+                    gate.record_outcome(&step, &OpOutcome::Failed(err.clone()));
+                    tracing::warn!("e-stop could not turn the mount's tracking off: {err}");
+                    Err(err)
+                }
+            }
+        }
+    };
+    let _ = tracking_tx.send(result);
 }
 
 /// Run the emergency stop. Must run inside a tokio runtime.
@@ -217,40 +324,43 @@ pub async fn run_estop(hub: &EquipmentHub, request: EstopRequest) -> EstopReport
         // Before the cancel is queued: every permit issued so far is now
         // older than the abort, and its worker refuses it (D19).
         epochs.bump(handle.kind());
-        let mut entry = Pending::new(
-            handle.kind(),
-            Some(handle.connection_id()),
-            PendingResult::Abort(handle.abort()),
-        );
-        if let AnyHandle::Mount(mount) = &handle {
-            if hub.config().estop_stops_tracking && !mount.is_retired() {
-                // A step of the e-stop: it outranks any running operation, so
-                // it is never refused as a conflict, and it is not a motion
-                // command, so the abort leaves it queued behind the cancel.
-                let mount = mount.clone();
-                let permit =
-                    Permit::unmanaged(cmd.command_id, Priority::EStop, CommandSource::Safety);
-                let (tx, rx) = oneshot::channel();
-                tokio::spawn(async move {
-                    let result = match mount.send(MountCmd::SetTracking(false), permit).await {
-                        Ok(ticket) => match ticket.wait().await {
-                            OpOutcome::Succeeded => Ok(()),
-                            OpOutcome::Failed(err) | OpOutcome::Unknown(err) => Err(err),
-                            other => Err(DeviceError::outcome_unknown(format!(
-                                "tracking off ended {}",
-                                other.label()
-                            ))),
-                        },
-                        Err(err) => Err(err),
-                    };
-                    if let Err(err) = &result {
-                        tracing::warn!("e-stop could not turn tracking off: {err}");
-                    }
-                    let _ = tx.send(result);
-                });
-                entry.tracking = Some(rx);
+        let entry = match &handle {
+            AnyHandle::Mount(mount) if !mount.is_retired() => {
+                // `estop_mount` (O11 j): the abort path plus e-stop-rank
+                // stops that outrank any running operation, so they are never
+                // refused as a conflict; tracking off is not a motion command,
+                // so the abort leaves it queued behind the cancel.
+                let stops_tracking = hub.config().estop_stops_tracking;
+                let (abort_tx, abort_rx) = oneshot::channel();
+                let (tracking_tx, tracking_rx) = if stops_tracking {
+                    let (tx, rx) = oneshot::channel();
+                    (Some(tx), Some(rx))
+                } else {
+                    (None, None)
+                };
+                tokio::spawn(mount_estop(
+                    mount.clone(),
+                    stops_tracking,
+                    Arc::clone(hub.gate()),
+                    cmd.clone(),
+                    budget / 2,
+                    abort_tx,
+                    tracking_tx,
+                ));
+                let mut entry = Pending::new(
+                    handle.kind(),
+                    Some(handle.connection_id()),
+                    PendingResult::Channel(abort_rx),
+                );
+                entry.tracking = tracking_rx;
+                entry
             }
-        }
+            _ => Pending::new(
+                handle.kind(),
+                Some(handle.connection_id()),
+                PendingResult::Abort(handle.abort()),
+            ),
+        };
         pending.push(entry);
     }
 
@@ -264,7 +374,7 @@ pub async fn run_estop(hub: &EquipmentHub, request: EstopRequest) -> EstopReport
             exposure = Some(Pending::new(
                 DeviceKind::Camera,
                 None,
-                PendingResult::Exposure(rx),
+                PendingResult::Channel(rx),
             ));
         }
     }
@@ -483,13 +593,14 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn tracking_off_is_part_of_the_mount_result() {
-        // A lost mount's worker refuses commands: the abort path still runs,
-        // and the refused tracking-off fails the mount's entry.
-        let (lost_hub, _sink) = hub(Duration::from_secs(2));
+    fn lost_mount_refusing_tracking_off() -> (
+        EquipmentHub,
+        Arc<RecordingSink>,
+        crate::equipment::testing::fake_handles::FakeDevice<MountCmd, MountSnapshot>,
+    ) {
+        let (hub, sink) = hub(Duration::from_secs(2));
         let (mount, mount_fake) = fake_mount(MountSnapshot::default());
-        lost_hub.attach(mount);
+        hub.attach(mount);
         mount_fake.set_link(LinkState::Lost);
         mount_fake.set_responder(|cmd, _snap: &mut MountSnapshot| match cmd {
             MountCmd::SetTracking(false) => {
@@ -497,8 +608,57 @@ mod tests {
             }
             _ => FakeResponse::succeed(),
         });
+        (hub, sink, mount_fake)
+    }
+
+    fn abort_path_steps(sink: &RecordingSink) -> Vec<(AuditStage, bool)> {
+        sink.records()
+            .iter()
+            .filter_map(|r| match r {
+                GroundTruthRecord::Audit(a)
+                    if a.annotations.iter().any(|n| n == "via=abort_path")
+                        || (a.stage == AuditStage::Outcome
+                            && a.params.get("path").and_then(|p| p.as_str())
+                                == Some("abort_path")) =>
+                {
+                    Some((a.stage, a.accepted))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lost_mount_gets_tracking_off_through_its_abort_path() {
+        // O11 j: a lost mount's worker refuses the in-band tracking off, so
+        // the e-stop sends it through the out-of-band abort path.
+        let (hub, sink, mount_fake) = lost_mount_refusing_tracking_off();
         let report = run_estop(
-            &lost_hub,
+            &hub,
+            EstopRequest {
+                abort_exposure: false,
+                source: CommandSource::Operator { overriding: false },
+            },
+        )
+        .await;
+        assert!(report.all_ok(), "{report:?}");
+        assert_eq!(mount_fake.abort_path().calls(), 1, "the abort path ran");
+        assert_eq!(mount_fake.abort_path().tracking_calls(), 1);
+        assert_eq!(report.block.kind, ResumeBlockKind::Estop);
+        assert_eq!(
+            abort_path_steps(&sink),
+            vec![(AuditStage::Executed, true), (AuditStage::Outcome, true)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_out_of_band_tracking_off_fails_the_entry_and_is_audited() {
+        let (hub, sink, mount_fake) = lost_mount_refusing_tracking_off();
+        mount_fake
+            .abort_path()
+            .set_tracking_result(Err(DeviceError::transport("socket closed")));
+        let report = run_estop(
+            &hub,
             EstopRequest {
                 abort_exposure: false,
                 source: CommandSource::Operator { overriding: false },
@@ -511,15 +671,24 @@ mod tests {
         let err = entry.error.as_ref().unwrap();
         assert_eq!(err.class, ErrorClass::Disconnected);
         assert!(err.message.starts_with("tracking off:"), "{err}");
-        assert_eq!(mount_fake.abort_path().calls(), 1, "the abort path ran");
-        assert_eq!(report.block.kind, ResumeBlockKind::Estop);
+        assert!(err.message.contains("socket closed"), "{err}");
+        assert_eq!(
+            abort_path_steps(&sink),
+            vec![(AuditStage::Executed, true), (AuditStage::Outcome, false)]
+        );
+    }
 
-        // A tracking-off that never completes (the worker is stuck) is
-        // reported within the budget, not assumed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_blocked_mount_worker_falls_back_to_the_abort_path_within_the_budget() {
+        // The worker never answers (blocked in a driver call): the in-band
+        // tracking off is not waited for past half the budget.
         let (stuck_hub, _sink) = hub(Duration::from_millis(300));
         let (mount, mount_fake) = fake_mount(MountSnapshot::default());
         stuck_hub.attach(mount);
-        mount_fake.set_responder(|_, _snap: &mut MountSnapshot| FakeResponse::hold());
+        mount_fake.set_responder(|_, _snap: &mut MountSnapshot| {
+            std::thread::sleep(Duration::from_millis(600));
+            FakeResponse::succeed()
+        });
         let started = Instant::now();
         let report = run_estop(
             &stuck_hub,
@@ -530,6 +699,29 @@ mod tests {
         )
         .await;
         assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(report.results[0].ok, "{report:?}");
+        assert_eq!(mount_fake.abort_path().tracking_calls(), 1);
+
+        // Neither the worker nor the abort path can stop tracking: reported
+        // within the budget, never assumed.
+        let (stuck_hub, _sink) = hub(Duration::from_millis(300));
+        let (mount, mount_fake) = fake_mount(MountSnapshot::default());
+        stuck_hub.attach(mount);
+        mount_fake.set_responder(|_, _snap: &mut MountSnapshot| {
+            std::thread::sleep(Duration::from_millis(600));
+            FakeResponse::hold()
+        });
+        mount_fake
+            .abort_path()
+            .set_tracking_result(Err(DeviceError::unsupported("no tracking off")));
+        let report = run_estop(
+            &stuck_hub,
+            EstopRequest {
+                abort_exposure: false,
+                source: CommandSource::Safety,
+            },
+        )
+        .await;
         let err = report.results[0].error.as_ref().unwrap();
         assert_eq!(err.class, ErrorClass::Timeout);
         assert!(err.message.contains("tracking off"), "{err}");

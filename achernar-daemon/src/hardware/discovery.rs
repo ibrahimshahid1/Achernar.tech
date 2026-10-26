@@ -85,6 +85,15 @@ pub struct DiscoveryReport {
     pub mounts: Vec<DiscoveredDevice>,
     pub focusers: Vec<DiscoveredDevice>,
     pub filter_wheels: Vec<DiscoveredDevice>,
+    // Additive arrays (spec §2.12): every Alpaca device type the equipment
+    // layer knows. `guiders` stays empty: PHD2 is addressed by host:port.
+    pub rotators: Vec<DiscoveredDevice>,
+    pub weather: Vec<DiscoveredDevice>,
+    pub safety_monitors: Vec<DiscoveredDevice>,
+    pub switches: Vec<DiscoveredDevice>,
+    pub cover_calibrators: Vec<DiscoveredDevice>,
+    pub domes: Vec<DiscoveredDevice>,
+    pub guiders: Vec<DiscoveredDevice>,
     pub device_probes: Vec<DeviceProbeOutcome>,
     pub scanned_at: chrono::DateTime<chrono::Utc>,
     /// Human-readable caveats (what was deliberately not scanned, and why).
@@ -126,32 +135,90 @@ pub struct DiscoveryRequest {
     pub option: Option<String>,
 }
 
+/// `(equipment_type, Alpaca DeviceType)` for every auxiliary kind the
+/// equipment layer knows (§2.12). Cameras stay on OLS (O1).
+const AUXILIARY_TYPES: &[(&str, &str)] = &[
+    ("mount", "telescope"),
+    ("focuser", "focuser"),
+    ("filter_wheel", "filterwheel"),
+    ("rotator", "rotator"),
+    ("weather", "observingconditions"),
+    ("safety_monitor", "safetymonitor"),
+    ("switch", "switch"),
+    ("cover_calibrator", "covercalibrator"),
+    ("dome", "dome"),
+];
+
+/// The `equipment_type` values `/discover` accepts.
+const DISCOVERY_TYPES: &[&str] = &[
+    "all",
+    "camera",
+    "mount",
+    "focuser",
+    "filter_wheel",
+    "rotator",
+    "weather",
+    "safety_monitor",
+    "switch",
+    "cover_calibrator",
+    "dome",
+    "guider",
+];
+
+fn report_array<'a>(
+    report: &'a mut DiscoveryReport,
+    equipment_type: &str,
+) -> &'a mut Vec<DiscoveredDevice> {
+    match equipment_type {
+        "mount" => &mut report.mounts,
+        "focuser" => &mut report.focusers,
+        "filter_wheel" => &mut report.filter_wheels,
+        "rotator" => &mut report.rotators,
+        "weather" => &mut report.weather,
+        "safety_monitor" => &mut report.safety_monitors,
+        "switch" => &mut report.switches,
+        "cover_calibrator" => &mut report.cover_calibrators,
+        "dome" => &mut report.domes,
+        _ => &mut report.guiders,
+    }
+}
+
 /// Scan local cameras or query one explicitly supplied Alpaca server. Native
-/// mount/focuser driver lists contain driver definitions, not attached devices,
-/// and must never be presented as discovered hardware.
+/// driver lists contain driver definitions, not attached devices, and must
+/// never be presented as discovered hardware. `driver = "alpaca_broadcast"`
+/// runs Alpaca UDP discovery, and is refused unless `[equipment]
+/// allow_broadcast_discovery = true` (D13).
 pub async fn discover_equipment(
     state: &AppState,
     request: DiscoveryRequest,
 ) -> Result<DiscoveryReport, String> {
     let kind = request.equipment_type.as_deref().unwrap_or("all");
-    if !matches!(
-        kind,
-        "all" | "camera" | "mount" | "focuser" | "filter_wheel"
-    ) {
-        return Err("equipment_type must be all, camera, mount, focuser or filter_wheel".into());
+    if !DISCOVERY_TYPES.contains(&kind) {
+        return Err(format!(
+            "equipment_type must be one of {}",
+            DISCOVERY_TYPES.join(", ")
+        ));
     }
-    if request
-        .driver
-        .as_deref()
-        .is_some_and(|driver| driver != "alpaca")
-    {
-        return Err("Only an explicit Alpaca endpoint supports auxiliary discovery; INDI and serial drivers require manual configuration".into());
-    }
-    let endpoint = request
-        .option
-        .as_deref()
-        .map(validate_alpaca_endpoint)
-        .transpose()?;
+    let broadcast = match request.driver.as_deref() {
+        None | Some("alpaca") => false,
+        Some("alpaca_broadcast") => {
+            if !state.equipment_ctx.configs.equipment.allow_broadcast_discovery {
+                return Err("Alpaca broadcast discovery is disabled; set [equipment] allow_broadcast_discovery = true or give an explicit Alpaca server URL".into());
+            }
+            true
+        }
+        Some("indi") => return Err("INDI discovery needs the native INDI client, which is planned for Tier 2; INDI devices require manual configuration".into()),
+        Some(_) => return Err("Only an explicit Alpaca endpoint (alpaca) or opt-in Alpaca broadcast (alpaca_broadcast) supports auxiliary discovery; INDI and serial drivers require manual configuration".into()),
+    };
+    let endpoint = if broadcast {
+        None
+    } else {
+        request
+            .option
+            .as_deref()
+            .map(validate_alpaca_endpoint)
+            .transpose()?
+    };
     let mut report = if matches!(kind, "all" | "camera") {
         discover_cameras(state).await
     } else {
@@ -160,28 +227,36 @@ pub async fn discover_equipment(
             ..Default::default()
         }
     };
-    let wants_mount = matches!(kind, "all" | "mount");
-    let wants_focuser = matches!(kind, "all" | "focuser");
-    if wants_mount || wants_focuser {
+    let wanted: Vec<(&'static str, &'static str)> = AUXILIARY_TYPES
+        .iter()
+        .copied()
+        .filter(|(equipment_type, _)| kind == "all" || kind == *equipment_type)
+        .collect();
+    if !wanted.is_empty() {
         let result = if let Some(base) = endpoint {
             Some(
-                tokio::task::spawn_blocking(move || query_alpaca_devices(&base))
+                tokio::task::spawn_blocking(move || query_alpaca_devices_by_kind(&base))
                     .await
                     .map_err(|_| "Alpaca enumeration worker failed".to_string())
+                    .and_then(|result| result),
+            )
+        } else if broadcast {
+            let port = state.equipment_ctx.configs.equipment.alpaca_discovery_port;
+            Some(
+                tokio::task::spawn_blocking(move || broadcast_alpaca_devices(port))
+                    .await
+                    .map_err(|_| "Alpaca discovery worker failed".to_string())
                     .and_then(|result| result),
             )
         } else {
             None
         };
-        for (wanted, equipment_type) in [(wants_mount, "mount"), (wants_focuser, "focuser")] {
-            if !wanted {
-                continue;
-            }
+        for (equipment_type, _) in wanted {
             let (devices, status, detail) = match &result {
-                Some(Ok((mounts, focusers))) => {
-                    let devices = if equipment_type == "mount" { mounts.clone() } else { focusers.clone() };
+                Some(Ok(by_kind)) => {
+                    let devices = by_kind.get(equipment_type).cloned().unwrap_or_default();
                     let status = if devices.is_empty() { "empty" } else { "reported" };
-                    (devices, status, "Configured devices reported by the addressed Alpaca server; physical availability is verified only on connect".to_string())
+                    (devices, status, "Configured devices reported by the Alpaca server(s); physical availability is verified only on connect".to_string())
                 }
                 Some(Err(error)) => (Vec::new(), "failed", error.clone()),
                 None => (Vec::new(), "manual_required", "Supply an explicit Alpaca server URL to list its configured devices. INDI/serial devices require manual configuration; no network broadcast or port scan was run".into()),
@@ -193,25 +268,42 @@ pub async fn discover_equipment(
                 device_count: devices.len(),
                 detail,
             });
-            if equipment_type == "mount" {
-                report.mounts = devices;
-            } else {
-                report.focusers = devices;
-            }
+            *report_array(&mut report, equipment_type) = devices;
         }
     }
-    if matches!(kind, "all" | "filter_wheel") {
+    if matches!(kind, "all" | "guider") {
         report.device_probes.push(DeviceProbeOutcome {
-            equipment_type: "filter_wheel",
-            driver_id: "none",
-            status: "unavailable",
+            equipment_type: "guider",
+            driver_id: "phd2",
+            status: "manual_required",
             device_count: 0,
-            detail:
-                "Filter-wheel discovery and hardware connection are not implemented in this build"
-                    .into(),
+            detail: "PHD2 is addressed by host:port (instance n listens on 4400 + n - 1); it is not discovered".into(),
         });
     }
     Ok(report)
+}
+
+/// Alpaca UDP discovery (opt-in, D13), then each server's configured
+/// devices. Blocking.
+fn broadcast_alpaca_devices(
+    port: u16,
+) -> Result<std::collections::BTreeMap<&'static str, Vec<DiscoveredDevice>>, String> {
+    use crate::equipment::alpaca::discovery::{discover, DiscoveryOptions};
+    let options = DiscoveryOptions {
+        port,
+        ..DiscoveryOptions::default()
+    };
+    let found = discover(true, &options).map_err(|error| error.to_string())?;
+    let mut merged: std::collections::BTreeMap<&'static str, Vec<DiscoveredDevice>> =
+        std::collections::BTreeMap::new();
+    for server in found.servers {
+        if let Ok(by_kind) = query_alpaca_devices_by_kind(&server.base_url()) {
+            for (kind, devices) in by_kind {
+                merged.entry(kind).or_default().extend(devices);
+            }
+        }
+    }
+    Ok(merged)
 }
 
 fn validate_alpaca_endpoint(value: &str) -> Result<String, String> {
@@ -237,9 +329,27 @@ fn validate_alpaca_endpoint(value: &str) -> Result<String, String> {
     ))
 }
 
+#[cfg(test)]
 fn query_alpaca_devices(
     base: &str,
 ) -> Result<(Vec<DiscoveredDevice>, Vec<DiscoveredDevice>), String> {
+    let by_kind = query_alpaca_devices_by_kind(base)?;
+    Ok(mounts_and_focusers(by_kind))
+}
+
+#[cfg(test)]
+fn mounts_and_focusers(
+    mut by_kind: std::collections::BTreeMap<&'static str, Vec<DiscoveredDevice>>,
+) -> (Vec<DiscoveredDevice>, Vec<DiscoveredDevice>) {
+    (
+        by_kind.remove("mount").unwrap_or_default(),
+        by_kind.remove("focuser").unwrap_or_default(),
+    )
+}
+
+fn query_alpaca_devices_by_kind(
+    base: &str,
+) -> Result<std::collections::BTreeMap<&'static str, Vec<DiscoveredDevice>>, String> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(PROBE_TIMEOUT))
         .max_redirects(0)
@@ -257,13 +367,23 @@ fn query_alpaca_devices(
         .map_err(|error| format!("Could not read Alpaca device list: {error}"))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)
         .map_err(|_| "Alpaca server returned an invalid JSON device list".to_string())?;
-    parse_alpaca_devices(base, &value)
+    parse_alpaca_devices_by_kind(base, &value)
 }
 
+#[cfg(test)]
 fn parse_alpaca_devices(
     base: &str,
     value: &serde_json::Value,
 ) -> Result<(Vec<DiscoveredDevice>, Vec<DiscoveredDevice>), String> {
+    parse_alpaca_devices_by_kind(base, value).map(mounts_and_focusers)
+}
+
+/// Every configured device of a type the equipment layer knows, by
+/// `equipment_type`.
+fn parse_alpaca_devices_by_kind(
+    base: &str,
+    value: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<&'static str, Vec<DiscoveredDevice>>, String> {
     if let Some(code) = value.get("ErrorNumber") {
         let code = code
             .as_i64()
@@ -276,8 +396,8 @@ fn parse_alpaca_devices(
         .get("Value")
         .and_then(|v| v.as_array())
         .ok_or("Alpaca device list is missing its Value array")?;
-    let mut mounts = Vec::new();
-    let mut focusers = Vec::new();
+    let mut by_kind: std::collections::BTreeMap<&'static str, Vec<DiscoveredDevice>> =
+        std::collections::BTreeMap::new();
     let mut seen = std::collections::HashSet::new();
     for item in items {
         let device_type = item
@@ -285,10 +405,12 @@ fn parse_alpaca_devices(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        let kind = match device_type.as_str() {
-            "telescope" => "mount",
-            "focuser" => "focuser",
-            _ => continue,
+        let Some(kind) = AUXILIARY_TYPES
+            .iter()
+            .find(|(_, alpaca)| *alpaca == device_type)
+            .map(|(kind, _)| *kind)
+        else {
+            continue;
         };
         let index = item
             .get("DeviceNumber")
@@ -321,13 +443,9 @@ fn parse_alpaca_devices(
             availability: "reported",
             option: format!("{base}#device={index}"),
         };
-        if kind == "mount" {
-            mounts.push(device);
-        } else {
-            focusers.push(device);
-        }
+        by_kind.entry(kind).or_default().push(device);
     }
-    Ok((mounts, focusers))
+    Ok(by_kind)
 }
 
 /// Locally-attached camera drivers worth probing, with the build-capability
@@ -667,6 +785,54 @@ mod tests {
         )
         .unwrap();
         assert!(mounts.is_empty() && focusers.is_empty());
+    }
+
+    #[test]
+    fn every_alpaca_device_type_lands_in_its_own_array() {
+        let value = serde_json::json!({"Value": [
+            {"DeviceType":"Telescope", "DeviceName":"Mount", "DeviceNumber":0},
+            {"DeviceType":"FilterWheel", "DeviceName":"Wheel", "DeviceNumber":0},
+            {"DeviceType":"ObservingConditions", "DeviceName":"Weather", "DeviceNumber":1},
+            {"DeviceType":"SafetyMonitor", "DeviceName":"Safety", "DeviceNumber":0},
+            {"DeviceType":"Rotator", "DeviceName":"Rotator", "DeviceNumber":0},
+            {"DeviceType":"Switch", "DeviceName":"Switch", "DeviceNumber":0},
+            {"DeviceType":"CoverCalibrator", "DeviceName":"Panel", "DeviceNumber":0},
+            {"DeviceType":"Dome", "DeviceName":"Dome", "DeviceNumber":0},
+            {"DeviceType":"Camera", "DeviceName":"Stays on OLS", "DeviceNumber":0}
+        ]});
+        let by_kind = parse_alpaca_devices_by_kind("http://localhost:11111", &value).unwrap();
+        for kind in [
+            "mount",
+            "filter_wheel",
+            "weather",
+            "safety_monitor",
+            "rotator",
+            "switch",
+            "cover_calibrator",
+            "dome",
+        ] {
+            assert_eq!(by_kind[kind].len(), 1, "{kind}");
+        }
+        assert_eq!(
+            by_kind["weather"][0].option,
+            "http://localhost:11111#device=1"
+        );
+        assert!(!by_kind.contains_key("camera"), "cameras stay on OLS");
+        let mut report = DiscoveryReport::default();
+        *report_array(&mut report, "safety_monitor") = by_kind["safety_monitor"].clone();
+        let json = serde_json::to_value(&report).unwrap();
+        for key in [
+            "rotators",
+            "weather",
+            "safety_monitors",
+            "switches",
+            "cover_calibrators",
+            "domes",
+            "guiders",
+        ] {
+            assert!(json[key].is_array(), "{key}");
+        }
+        assert_eq!(json["safety_monitors"][0]["name"], "Safety");
     }
 
     #[test]

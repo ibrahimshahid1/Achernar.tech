@@ -70,6 +70,12 @@ impl LegacySimFocuser {
         f(&mut lock(&self.sim))
     }
 
+    /// The wrapped simulator, shared (test hooks after the driver moved into
+    /// its worker).
+    pub fn shared_sim(&self) -> Arc<Mutex<SimFocuser>> {
+        Arc::clone(&self.sim)
+    }
+
     fn require_connected(&self) -> DeviceResult<()> {
         if self.connected {
             Ok(())

@@ -231,11 +231,19 @@ pub fn native_frame_policy(
 // Events
 // ---------------------------------------------------------------------------
 
+/// Where an [`EventOutbox`] forwards its events once the spine wires it to
+/// the hub.
+pub type EventForward = Arc<dyn Fn(EquipmentEvent) + Send + Sync>;
+
 /// Stamps and buffers events raised on the worker thread. The worker drains
-/// them into the hub, which assigns `seq`.
+/// them into the hub, which assigns `seq`; once a forwarder is installed
+/// ([`EventOutbox::set_forward`], the spine's `MountKind`), events go to the
+/// hub as they are raised, so an operation's `slew_settled` or `unparked`
+/// is published when it happens rather than at the next poll.
 #[derive(Clone)]
 pub struct EventOutbox {
     events: Arc<Mutex<Vec<EquipmentEvent>>>,
+    forward: Arc<Mutex<Option<EventForward>>>,
     clock: Arc<dyn Clock>,
     connection_id: Uuid,
 }
@@ -244,8 +252,20 @@ impl EventOutbox {
     pub fn new(clock: Arc<dyn Clock>, connection_id: Uuid) -> Self {
         Self {
             events: Arc::new(Mutex::new(Vec::new())),
+            forward: Arc::new(Mutex::new(None)),
             clock,
             connection_id,
+        }
+    }
+
+    /// Forward every event to `forward` from now on (the buffered ones
+    /// first, in order); `None` buffers again.
+    pub fn set_forward(&self, forward: Option<EventForward>) {
+        *lock(&self.forward) = forward.clone();
+        if let Some(forward) = forward {
+            for event in self.drain() {
+                forward(event);
+            }
         }
     }
 
@@ -253,7 +273,11 @@ impl EventOutbox {
         let mut event = EquipmentEvent::new(kind, self.clock.as_ref())
             .for_device(DeviceKind::Mount, self.connection_id);
         event.command_id = command_id;
-        lock(&self.events).push(event);
+        let forward = lock(&self.forward).clone();
+        match forward {
+            Some(forward) => forward(event),
+            None => lock(&self.events).push(event),
+        }
     }
 
     /// Everything emitted since the last drain, in order.
@@ -1029,6 +1053,17 @@ async fn within_estop_budget<T>(
 /// reports `outcome_unknown`, though its command still runs. Confirmation
 /// that motion stopped arrives as events.
 pub async fn estop_mount(handle: &MountHandle, stops_tracking: bool) -> MountEstopReport {
+    estop_mount_reporting(handle, stops_tracking, None).await
+}
+
+/// [`estop_mount`], also sending the abort path's result on `abort_done` as
+/// soon as it arrives, so the e-stop (`estop.rs`) can report it within its
+/// own budget while the stops are still being confirmed.
+pub async fn estop_mount_reporting(
+    handle: &MountHandle,
+    stops_tracking: bool,
+    abort_done: Option<tokio::sync::oneshot::Sender<DeviceResult<()>>>,
+) -> MountEstopReport {
     let ticket = handle.abort();
     let caps = handle.snapshot().capabilities.clone();
     let cmds: Vec<MountCmd> = if stops_tracking {
@@ -1042,7 +1077,13 @@ pub async fn estop_mount(handle: &MountHandle, stops_tracking: bool) -> MountEst
             })
             .collect()
     };
-    let abort = within_estop_budget("the abort path", ticket.outcome());
+    let abort = async move {
+        let result = within_estop_budget("the abort path", ticket.outcome()).await;
+        if let Some(tx) = abort_done {
+            let _ = tx.send(result.clone());
+        }
+        result
+    };
     // `join_all` polls in order, so the commands are queued in that order.
     let stops = futures::future::join_all(cmds.into_iter().map(|cmd| {
         let permit = Permit::unmanaged(CommandId::new(), Priority::EStop, CommandSource::Safety);

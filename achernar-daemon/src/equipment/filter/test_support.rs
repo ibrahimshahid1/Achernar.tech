@@ -22,6 +22,7 @@ use crate::equipment::commands::FilterWheelCmd;
 use crate::equipment::events::EquipmentEvent;
 use crate::equipment::handle::{DeviceHandle, EnvelopeBody, FilterWheelHandle, Permit};
 use crate::equipment::ops::{ActiveOp, OpPhase, OpProgress, Operation};
+use crate::equipment::resume::BlockRequest;
 use crate::equipment::snapshot::{FilterWheelSnapshot, ResumeBlock};
 use crate::equipment::testing::manual_clock::ManualClock;
 use crate::equipment::traits::{Clock, FilterWheelDriver, PollPlan};
@@ -91,11 +92,23 @@ impl FilterEventSink for CollectingSink {
         lock(&self.events).push(event);
     }
 
-    fn raise_resume_block(&self, block: ResumeBlock) {
+    /// Stands in for the hub, which assigns block ids (O11 a).
+    fn raise_resume_block(&self, request: BlockRequest) -> ResumeBlock {
         if let Some(timeline) = &self.timeline {
             push(timeline, "resume_block");
         }
-        lock(&self.blocks).push(block);
+        let block = ResumeBlock {
+            id: uuid::Uuid::new_v4(),
+            kind: request.kind,
+            raised_at: chrono::Utc::now(),
+            raised_mono_ns: 0,
+            device_kind: request.device_kind,
+            connection_id: request.connection_id,
+            command_id: request.command_id,
+            reason: request.reason,
+        };
+        lock(&self.blocks).push(block.clone());
+        block
     }
 }
 

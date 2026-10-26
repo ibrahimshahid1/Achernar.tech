@@ -4,11 +4,10 @@
 //! via `axum::extract::State`. It holds references to hardware (camera, mount, focuser)
 //! and the latest captured frame for streaming.
 
-use crate::hardware::{
-    camera::{FrameData, OlsCamera, OlsCameraDriver},
-    focuser::ConnectedFocuser,
-    mount::Mount,
-};
+use crate::equipment::handle::{FilterWheelHandle, FocuserHandle, MountHandle};
+use crate::equipment::hub::EquipmentHub;
+use crate::equipment::spine::SpineContext;
+use crate::hardware::camera::{FrameData, OlsCamera, OlsCameraDriver};
 use crate::vision::observed_frame::ObservedFrame;
 use crate::vision::shared_observation::SharedObservation;
 use crate::{
@@ -110,7 +109,15 @@ impl CameraRuntimeState {
 /// acquisition → camera_driver → camera → camera_name → streaming
 ///             → camera_observation_barrier → latest_frame → camera_runtime
 ///             → focus_agent → focus_drift
+///
+/// equipment slots (mount, focuser, filter_wheel) → *_name → devices
+///             → hub internals (leaves)
 /// ```
+///
+/// The equipment slots hold cheap cloneable handles: clone the handle out,
+/// drop the guard, then await (`let h = state.mount.lock().unwrap().clone()`).
+/// No slot guard is ever held across an `.await`, and no handle call enters
+/// a driver: the device's worker thread does (D3).
 ///
 /// `focus_drift` is deliberately last. The forecaster is a leaf: it needs no
 /// camera, no focuser and no agent to do its work, so putting it at the tail
@@ -151,21 +158,22 @@ pub struct AppState {
     /// Currently active camera
     pub camera: Arc<Mutex<Option<OlsCamera>>>,
 
-    /// Currently active telescope mount
-    pub mount: Arc<Mutex<Option<Mount>>>,
+    /// The connected mount's handle (spec §2.10). Its worker owns the
+    /// driver; the slot only holds the cloneable front.
+    pub mount: Arc<Mutex<Option<MountHandle>>>,
 
     /// Human-readable mount name/driver for status reporting
     pub mount_name: Arc<Mutex<Option<String>>>,
 
-    /// Currently active focuser
-    pub focuser: Arc<Mutex<Option<ConnectedFocuser>>>,
+    /// The connected focuser's handle (spec §2.10).
+    pub focuser: Arc<Mutex<Option<FocuserHandle>>>,
 
     /// Human-readable focuser name/driver for status reporting
     pub focuser_name: Arc<Mutex<Option<String>>>,
 
-    /// Filter-wheel drivers are not implemented yet. The lifecycle slot still
-    /// participates in the same null-inclusive status/health protocol.
-    pub filter_wheel: Arc<Mutex<Option<crate::hardware::filter_wheel::FilterWheel>>>,
+    /// The connected filter wheel's handle (spec §2.10). It takes part in the
+    /// same null-inclusive status/health protocol as the other devices.
+    pub filter_wheel: Arc<Mutex<Option<FilterWheelHandle>>>,
 
     /// Passive liveness and cached auxiliary-device measurements. Telemetry
     /// never enters a vendor SDK or waits for an unresponsive device.
@@ -289,6 +297,19 @@ pub struct AppState {
     /// Which archived frames get solved without being asked (startup and
     /// post-slew rules). Disabled until [`AppState::with_auto_solve`].
     pub plate_solve_trigger: Arc<Mutex<crate::mount::plate_solve_trigger::PlateSolveTrigger>>,
+
+    /// The equipment hub (spec §2.10, D11): every device kind's handle, the
+    /// event bus, the command gate, resume blocks and the busy set. Inert
+    /// (no task, no database writer) until [`AppState::with_equipment`].
+    pub equipment: Arc<EquipmentHub>,
+
+    /// What the spine keeps beside the hub: configuration, the Alpaca
+    /// ClientID, per-connection runtimes and the swappable gate checks.
+    pub equipment_ctx: Arc<SpineContext>,
+
+    /// Where mutable, rig-specific runtime state lives (the persisted Alpaca
+    /// ClientID among it).
+    pub data_dir: std::path::PathBuf,
 }
 
 impl AppState {
@@ -340,6 +361,16 @@ impl AppState {
             Self::build_focus_drift(&focus_config.drift, rig_optics.as_ref(), &data_dir);
         let coc_shadow = Arc::new(crate::vision::coc_shadow::CocShadowService::from_env(&data_dir));
 
+        // The inert hub (D11): nothing is spawned or opened, and every reader
+        // answers "nothing connected" until a device connects.
+        let devices = Arc::new(RwLock::new(
+            crate::hardware::health::DeviceRegistry::default(),
+        ));
+        let camera_runtime = Arc::new(RwLock::new(CameraRuntimeState::default()));
+        let equipment = Arc::new(EquipmentHub::empty());
+        Self::install_camera_hook(&equipment, &camera_runtime, &devices);
+        let equipment_ctx = Arc::new(SpineContext::inert(&equipment));
+
         Self {
             acquisition: Arc::new(tokio::sync::Mutex::new(())),
             camera_driver: Arc::new(Mutex::new(None)),
@@ -349,7 +380,7 @@ impl AppState {
             focuser: Arc::new(Mutex::new(None)),
             focuser_name: Arc::new(Mutex::new(None)),
             filter_wheel: Arc::new(Mutex::new(None)),
-            devices: Arc::new(RwLock::new(crate::hardware::health::DeviceRegistry::default())),
+            devices,
             device_updates,
             latest_frame: Arc::new(Mutex::new(None)),
             camera_generation: Arc::new(AtomicU64::new(0)),
@@ -359,7 +390,7 @@ impl AppState {
             vision_updates,
             camera_name: Arc::new(Mutex::new(None)),
             streaming: Arc::new(Mutex::new(false)),
-            camera_runtime: Arc::new(RwLock::new(CameraRuntimeState::default())),
+            camera_runtime,
             focus_agent: Arc::new(tokio::sync::Mutex::new(FocusAgent::new())),
             focus_abort_requested: Arc::new(AtomicBool::new(false)),
             focus_drift,
@@ -380,7 +411,67 @@ impl AppState {
             plate_solve_trigger: Arc::new(Mutex::new(
                 crate::mount::plate_solve_trigger::PlateSolveTrigger::disabled(),
             )),
+            equipment,
+            equipment_ctx,
+            data_dir,
         }
+    }
+
+    /// The `CameraActivity` adapter over `camera_runtime` (§2.4, A06).
+    fn install_camera_hook(
+        hub: &EquipmentHub,
+        camera_runtime: &Arc<RwLock<CameraRuntimeState>>,
+        devices: &Arc<RwLock<crate::hardware::health::DeviceRegistry>>,
+    ) {
+        hub.set_camera(Some(Arc::new(
+            crate::equipment::camera_hook::OlsCameraHook::new(
+                Arc::clone(camera_runtime),
+                Arc::clone(devices),
+                hub.clock(),
+            ),
+        )));
+    }
+
+    /// Install the equipment layer (spec §2.10): the configuration, the
+    /// recorder (on `store`, when given), the astro frame converter and
+    /// ephemeris, the `CameraActivity` adapter and the hub's 250 ms
+    /// publisher. Still opens no device and broadcasts nothing (D13).
+    /// Called from `main.rs` next to `with_plate_solver`; must run inside a
+    /// tokio runtime for the recorder and publisher to start.
+    pub fn with_equipment(
+        mut self,
+        configs: &crate::config::EquipmentConfigs,
+        site: Option<crate::equipment::types::Site>,
+        store: Option<LocalStore>,
+    ) -> Self {
+        use crate::equipment::recorder::{Recorder, RecorderConfig};
+        use crate::equipment::traits::{NullRecorder, RecorderSink};
+        let started = match &store {
+            Some(store) if tokio::runtime::Handle::try_current().is_ok() => Some(Recorder::start(
+                store.pool().clone(),
+                RecorderConfig::from_configs(configs),
+            )),
+            _ => None,
+        };
+        let recorder: Arc<dyn RecorderSink> = match &started {
+            Some(recorder) => Arc::clone(recorder) as Arc<dyn RecorderSink>,
+            None => Arc::new(NullRecorder::new()),
+        };
+        let hub = Arc::new(EquipmentHub::from_configs(configs, site, recorder));
+        Self::install_camera_hook(&hub, &self.camera_runtime, &self.devices);
+        crate::equipment::mount::limits::set_dut1_s(configs.site.dut1_s);
+        hub.start();
+        let profiles =
+            store.map(|store| crate::equipment::profile::ProfileStore::new(store.pool().clone()));
+        self.equipment_ctx = Arc::new(SpineContext::new(
+            &hub,
+            configs.clone(),
+            Some(self.data_dir.clone()),
+            profiles,
+        ));
+        self.equipment_ctx.set_recorder(started);
+        self.equipment = hub;
+        self
     }
 
     /// Arm the automatic solve rules from `[plate_solve]`, with the startup
