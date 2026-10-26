@@ -17,12 +17,15 @@
 //!
 //! [`Phd2AbortPath`] is the out-of-band stop (D4, D19): a separate,
 //! short-lived connection that sends `stop_capture`, so an e-stop never
-//! queues behind the service.
+//! queues behind the service. It connects first to the address the main
+//! connection reached ([`Phd2Client::peer_addr`]), then to every resolved
+//! address, IPv4 first: PHD2's event server listens on IPv4 only, while
+//! `localhost` usually resolves to `::1` first.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::io::{Read, Write};
-use std::net::{TcpStream as StdTcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream as StdTcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -41,6 +44,15 @@ use super::phd2_proto::{
 use crate::equipment::clock::duration_ns;
 use crate::equipment::traits::{AbortPath, Clock};
 use crate::equipment::types::{DeviceError, DeviceResult};
+
+/// `host:port` for messages, with an IPv6 literal in brackets.
+fn display_peer(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
 
 /// Real-time granularity of every clock-measured wait.
 pub const TICK: Duration = Duration::from_millis(20);
@@ -105,6 +117,8 @@ struct Inner {
     /// Set once the connection is closed; both tasks watch it.
     shutdown: watch::Sender<bool>,
     peer: String,
+    /// The address the TCP connect actually reached.
+    peer_addr: Option<SocketAddr>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -179,21 +193,25 @@ impl Phd2Client {
         rpc_timeout: Duration,
         clock: Arc<dyn Clock>,
     ) -> DeviceResult<(Self, mpsc::UnboundedReceiver<ClientEvent>, ClientTasks)> {
-        let peer = format!("{host}:{port}");
-        let stream = match tokio::time::timeout(connect_timeout, TcpStream::connect(&peer)).await {
-            Ok(Ok(stream)) => stream,
-            Ok(Err(err)) => {
-                return Err(DeviceError::disconnected(format!(
-                    "cannot reach PHD2 at {peer}: {err}"
-                )))
-            }
-            Err(_) => {
-                return Err(DeviceError::timeout(format!(
-                    "PHD2 at {peer} did not accept a connection within {connect_timeout:?}"
-                )))
-            }
-        };
+        let peer = display_peer(host, port);
+        let stream =
+            match tokio::time::timeout(connect_timeout, TcpStream::connect((host, port))).await {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(err)) => {
+                    return Err(DeviceError::disconnected(format!(
+                        "cannot reach PHD2 at {peer}: {err}"
+                    )))
+                }
+                Err(_) => {
+                    return Err(DeviceError::timeout(format!(
+                        "PHD2 at {peer} did not accept a connection within {connect_timeout:?}"
+                    )))
+                }
+            };
         let _ = stream.set_nodelay(true);
+        // `connect` tried every resolved address; keep the one that worked
+        // so the abort path does not have to guess (`localhost` → `::1`).
+        let peer_addr = stream.peer_addr().ok();
         let (read_half, write_half) = stream.into_split();
         let (line_tx, line_rx) = mpsc::unbounded_channel();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -209,6 +227,7 @@ impl Phd2Client {
             close_reason: Mutex::new(None),
             shutdown,
             peer,
+            peer_addr,
         });
         let reader = tokio::spawn(read_loop(read_half, Arc::clone(&inner), event_tx));
         let writer = tokio::spawn(write_loop(write_half, Arc::clone(&inner), line_rx));
@@ -217,6 +236,12 @@ impl Phd2Client {
 
     pub fn peer(&self) -> &str {
         &self.inner.peer
+    }
+
+    /// The socket address the connection reached (one of the addresses
+    /// `host` resolved to).
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.inner.peer_addr
     }
 
     pub fn is_closed(&self) -> bool {
@@ -387,6 +412,26 @@ pub struct Phd2AbortPath {
     host: String,
     port: u16,
     timeout: Duration,
+    /// The address the main connection reached; tried first.
+    peer_addr: Option<SocketAddr>,
+}
+
+/// Connect order for the abort path: `known` (the address the main
+/// connection reached), then the resolved addresses with IPv4 first and the
+/// resolver's order kept within each family, without repeats.
+fn abort_candidates(
+    known: Option<SocketAddr>,
+    resolved: impl IntoIterator<Item = SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut resolved: Vec<SocketAddr> = resolved.into_iter().collect();
+    resolved.sort_by_key(SocketAddr::is_ipv6);
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for addr in known.into_iter().chain(resolved) {
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
+    }
+    out
 }
 
 impl Phd2AbortPath {
@@ -395,19 +440,66 @@ impl Phd2AbortPath {
             host: host.into(),
             port,
             timeout,
+            peer_addr: None,
         }
+    }
+
+    /// Try `addr` (normally [`Phd2Client::peer_addr`]) before resolving the
+    /// host again.
+    pub fn with_peer_addr(mut self, addr: Option<SocketAddr>) -> Self {
+        self.peer_addr = addr;
+        self
+    }
+
+    /// Connect within `deadline`: the known address first, then every
+    /// resolved address, IPv4 first. Each attempt gets an equal share of
+    /// the time left, so one address that drops packets cannot use it all.
+    fn open(&self, peer: &str, deadline: Instant) -> DeviceResult<StdTcpStream> {
+        fn attempt(addr: SocketAddr, budget: Duration) -> Result<StdTcpStream, String> {
+            if budget.is_zero() {
+                return Err(format!("{addr}: no time left"));
+            }
+            StdTcpStream::connect_timeout(&addr, budget).map_err(|e| format!("{addr}: {e}"))
+        }
+        let left = || deadline.saturating_duration_since(Instant::now());
+        let mut failures: Vec<String> = Vec::new();
+        if let Some(addr) = self.peer_addr {
+            // Leave half the budget for the other addresses.
+            match attempt(addr, left() / 2) {
+                Ok(stream) => return Ok(stream),
+                Err(e) => failures.push(e),
+            }
+        }
+        match (self.host.as_str(), self.port).to_socket_addrs() {
+            Ok(resolved) => {
+                // The known address was tried above.
+                let candidates: Vec<SocketAddr> = abort_candidates(self.peer_addr, resolved)
+                    .into_iter()
+                    .filter(|a| Some(*a) != self.peer_addr)
+                    .collect();
+                for (i, addr) in candidates.iter().enumerate() {
+                    let n = u32::try_from(candidates.len() - i).unwrap_or(u32::MAX);
+                    match attempt(*addr, left() / n.max(1)) {
+                        Ok(stream) => return Ok(stream),
+                        Err(e) => failures.push(e),
+                    }
+                }
+            }
+            Err(e) => failures.push(format!("cannot resolve: {e}")),
+        }
+        if failures.is_empty() {
+            failures.push("no address".into());
+        }
+        Err(DeviceError::disconnected(format!(
+            "cannot reach PHD2 at {peer}: {}",
+            failures.join("; ")
+        )))
     }
 
     fn stop_capture(&self) -> DeviceResult<()> {
         let deadline = Instant::now() + self.timeout;
-        let peer = format!("{}:{}", self.host, self.port);
-        let addr = peer
-            .to_socket_addrs()
-            .map_err(|e| DeviceError::disconnected(format!("cannot resolve PHD2 at {peer}: {e}")))?
-            .next()
-            .ok_or_else(|| DeviceError::disconnected(format!("no address for PHD2 at {peer}")))?;
-        let mut stream = StdTcpStream::connect_timeout(&addr, self.timeout)
-            .map_err(|e| DeviceError::disconnected(format!("cannot reach PHD2 at {peer}: {e}")))?;
+        let peer = display_peer(&self.host, self.port);
+        let mut stream = self.open(&peer, deadline)?;
         let _ = stream.set_nodelay(true);
         let io_err = |e: std::io::Error| DeviceError::transport(format!("PHD2 at {peer}: {e}"));
         stream
@@ -685,5 +777,101 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert_eq!(err.class, ErrorClass::Disconnected);
+    }
+
+    #[test]
+    fn abort_candidates_put_the_known_address_first_then_ipv4() {
+        let v6: SocketAddr = "[::1]:4400".parse().unwrap();
+        let v4: SocketAddr = "127.0.0.1:4400".parse().unwrap();
+        let lan: SocketAddr = "192.168.1.5:4400".parse().unwrap();
+        // getaddrinfo("localhost") on macOS, Linux and Windows: ::1 first.
+        assert_eq!(abort_candidates(None, [v6, v4]), vec![v4, v6]);
+        assert_eq!(abort_candidates(Some(v4), [v6, v4]), vec![v4, v6]);
+        assert_eq!(abort_candidates(Some(v6), [v6, v4]), vec![v6, v4]);
+        assert_eq!(
+            abort_candidates(Some(lan), [v6, lan, v4]),
+            vec![lan, v4, v6],
+            "no repeats; resolver order kept within a family"
+        );
+        assert!(abort_candidates(None, []).is_empty());
+        assert_eq!(display_peer("::1", 4400), "[::1]:4400");
+        assert_eq!(display_peer("localhost", 4401), "localhost:4401");
+    }
+
+    /// PHD2's event server (like the mock) listens on IPv4 only, and
+    /// `localhost` (the default `/connect` host) usually resolves to `::1`
+    /// first. Both the main connection and the abort path must still reach
+    /// it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn localhost_reaches_an_ipv4_only_phd2_on_both_connections() {
+        let mock = Phd2Mock::start().await;
+        mock.with_state(|s| s.app_state = "Guiding".into());
+        let clock: Arc<dyn Clock> = Arc::new(ManualClock::new());
+        let (client, _rx, tasks) = Phd2Client::connect(
+            "localhost",
+            mock.port(),
+            Duration::from_secs(5),
+            Duration::from_secs(10),
+            clock,
+        )
+        .await
+        .unwrap();
+        let reached = client.peer_addr().expect("the connected address");
+        assert!(reached.is_ipv4(), "{reached}");
+        assert_eq!(reached.port(), mock.port());
+        assert_eq!(client.peer(), format!("localhost:{}", mock.port()));
+
+        // Resolving again, without the address the main connection used.
+        let path = Phd2AbortPath::new("localhost", mock.port(), Duration::from_secs(5));
+        let result = tokio::task::spawn_blocking(move || path.abort())
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(mock.method_count("stop_capture"), 1);
+
+        // With the address the main connection reached.
+        let path = Phd2AbortPath::new("localhost", mock.port(), Duration::from_secs(5))
+            .with_peer_addr(client.peer_addr());
+        let result = tokio::task::spawn_blocking(move || path.abort())
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(mock.method_count("stop_capture"), 2);
+        client.close();
+        tasks.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_abort_path_falls_back_to_resolution_when_the_known_address_fails() {
+        let mock = Phd2Mock::start().await;
+        let dead: SocketAddr = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+        let path = Phd2AbortPath::new("127.0.0.1", mock.port(), Duration::from_secs(5))
+            .with_peer_addr(Some(dead));
+        let result = tokio::task::spawn_blocking(move || path.abort())
+            .await
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(mock.method_count("stop_capture"), 1);
+        // Every address refused: the message names each attempt.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let path = Phd2AbortPath::new("127.0.0.1", closed, Duration::from_secs(2))
+            .with_peer_addr(Some(dead));
+        let err = tokio::task::spawn_blocking(move || path.abort())
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.class, ErrorClass::Disconnected);
+        assert!(err.message.contains(&dead.to_string()), "{}", err.message);
+        assert!(
+            err.message.contains(&format!("127.0.0.1:{closed}")),
+            "{}",
+            err.message
+        );
     }
 }

@@ -8,11 +8,16 @@
 //! the specification; NINA's PHD2 guider is a behaviour reference only (§6).
 //!
 //! Sequence and rules:
-//! - **G-a connect** ([`connect`]): consume `Version` and `AppState`; call
-//!   `get_connected`, and `set_connected [true]` only when
-//!   `[guider] connect_equipment = true`; read the session context
+//! - **G-a connect** ([`connect`], [`connect_with_id`]): consume `Version`
+//!   and `AppState`; call `get_connected`, and `set_connected [true]` only
+//!   when `[guider] connect_equipment = true`; read the session context
 //!   (profile, equipment, pixel scale, calibration, Dec guide mode, exposure,
 //!   algorithm parameter names and values). No profile switching.
+//! - **§2.6 steps 9-10**: `connect` emits and records nothing. The caller
+//!   publishes the slot and registers the `connection_id` with the hub, then
+//!   calls [`Phd2Connection::start`], which emits `device_connected`, the
+//!   `capability_unsupported` events and what the connect burst produced,
+//!   inserts the `device_connections` row and starts the service task.
 //! - **G-b state** follows events and is reconciled with `get_app_state`
 //!   every 5 s, which wins.
 //! - **G-c start**: `guide {settle, recalibrate}`, then exactly one
@@ -29,6 +34,11 @@
 //!   and the `guider_state_log` row through [`GuiderWindows`] (H9).
 //! - **G-j read side**: aggressiveness names are discovered, never assumed.
 //!   `SetAlgoParam` (the M-1 actuator) is Tier 2 (WP2-7) and is refused here.
+//! - **Cancel** (abort, e-stop, preemption): the abort path already sent
+//!   `stop_capture` out of band (D4). The service sends it in band too
+//!   (D19: always attempted), then resolves the operation `Aborted { by }`
+//!   once PHD2 reports Stopped, or `Unknown` if it does not stop within the
+//!   G-d stop timeout.
 //! - **D16**: Achernar never sends `set_connected [false]`; disconnecting
 //!   leaves PHD2 guiding as it is.
 //! - **Loss**: EOF or a socket error makes the device `Lost` (`device_lost`,
@@ -98,6 +108,12 @@ fn secs(value: f64) -> Duration {
     } else {
         0.0
     })
+}
+
+/// The settle timeout plus margin for a settle Achernar did not request
+/// (the step tracker's bound, and the G-f wait for someone else's settle).
+fn default_settle_bound(settings: &Phd2Settings) -> Duration {
+    secs(proto::sent_settle(&settings.default_settle).timeout_s) + settings.settle_margin
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +310,14 @@ pub struct GuiderContext {
     pub events: EventEmitter,
 }
 
-/// A connected PHD2 guider.
+/// A connected PHD2 guider, not yet started.
+///
+/// §2.6 steps 9-10: publish the slot and register `handle`'s
+/// `connection_id` with the hub, then call [`Phd2Connection::start`]. Until
+/// then nothing is emitted or recorded, PHD2's events wait in the client's
+/// queue, and commands wait in the handle's queue (`abort` still runs its
+/// out-of-band path at once). Dropping a connection that was never started
+/// closes the socket.
 pub struct Phd2Connection {
     pub handle: GuiderHandle,
     /// Per-exposure statistics and `guider_state_log` rows (H9).
@@ -302,8 +325,95 @@ pub struct Phd2Connection {
     pub report: ConnectReport,
     /// The `device_connected` capabilities payload.
     pub capabilities: Value,
-    /// The service task. It ends after a disconnect; aborting it is safe.
-    pub task: JoinHandle<()>,
+    identity: DeviceIdentity,
+    connected_at: DateTime<Utc>,
+    recorder: Arc<dyn RecorderSink>,
+    /// The service until [`Phd2Connection::start`] spawns it.
+    pending: Mutex<Option<Service>>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl Phd2Connection {
+    pub fn connection_id(&self) -> Uuid {
+        self.identity.connection_id
+    }
+
+    /// The identity `device_connected` will carry.
+    pub fn identity(&self) -> &DeviceIdentity {
+        &self.identity
+    }
+
+    pub fn is_started(&self) -> bool {
+        self.task.is_some()
+    }
+
+    /// §2.6 steps 9-10, after the caller published the slot: emit
+    /// `device_connected`, then `capability_unsupported` per unsupported
+    /// member, then the events the connect burst produced (the initial
+    /// `guider_state`); insert the `device_connections` row; start the
+    /// service task. Must run inside a tokio runtime. Returns `false` when
+    /// already started.
+    pub fn start(&mut self) -> bool {
+        let Some(mut service) = self
+            .pending
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        else {
+            return false;
+        };
+        let buffered = std::mem::take(&mut service.core.outbox);
+        service.core.emit(
+            EventKind::DeviceConnected {
+                identity: Box::new(self.identity.clone()),
+                capabilities: self.capabilities.clone(),
+            },
+            None,
+            None,
+        );
+        for member in &self.report.unsupported_members {
+            service.core.emit(
+                EventKind::CapabilityUnsupported {
+                    member: member.clone(),
+                },
+                None,
+                None,
+            );
+        }
+        service.core.outbox.extend(buffered);
+        service.flush();
+        self.recorder
+            .record(GroundTruthRecord::ConnectionOpened(Box::new(
+                DeviceConnectionRecord {
+                    identity: self.identity.clone(),
+                    capabilities: self.capabilities.clone(),
+                    connected_at: self.connected_at,
+                    session_id: None,
+                    night_id: None,
+                },
+            )));
+        self.task = Some(tokio::spawn(service.run()));
+        true
+    }
+
+    /// The service task once started. It ends after a disconnect; aborting
+    /// it is safe (the socket closes).
+    pub fn task_mut(&mut self) -> Option<&mut JoinHandle<()>> {
+        self.task.as_mut()
+    }
+
+    /// Abort the service task, or drop the service that was never started.
+    pub fn abort_task(&mut self) {
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        drop(
+            self.pending
+                .get_mut()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
+    }
 }
 
 /// Read side of the guide-step history, for exposure windows (G-i, H9).
@@ -419,6 +529,7 @@ impl Core {
     ) -> Self {
         let retention = chrono::Duration::from_std(settings.history_retention)
             .unwrap_or_else(|_| chrono::Duration::minutes(30));
+        let tracker_bound = default_settle_bound(&settings);
         let snap = GuiderSnapshot {
             connection_id,
             app_state: Observed::not_set(Source::Phd2Event),
@@ -432,7 +543,7 @@ impl Core {
             clock,
             recorder,
             snap,
-            tracker: PhaseTracker::new(),
+            tracker: PhaseTracker::new(tracker_bound),
             sliding: SlidingRms::default(),
             history: Arc::new(Mutex::new(StepHistory::new(retention, 20_000))),
             offset: ClockOffset::new(),
@@ -465,6 +576,27 @@ impl Core {
 
     fn state(&self) -> GuiderAppState {
         self.snap.app_state.value.unwrap_or_default()
+    }
+
+    /// Drop a dither or settle tag that ran out of time (a dither nobody
+    /// settles, an unanswered dither, a lost `SettleDone`), with the
+    /// snapshot's settle flags. Returns `true` when one was dropped.
+    fn expire_settle_tags(&mut self, now_mono_ns: u64) -> bool {
+        if !self.tracker.expire(now_mono_ns) {
+            return false;
+        }
+        tracing::debug!(
+            connection_id = %self.connection_id,
+            "PHD2 dither/settle tag lapsed without SettleDone; steps are tagged guiding again"
+        );
+        self.snap.settling = false;
+        self.snap.settle = None;
+        true
+    }
+
+    /// A dither or settle is in progress (G-f step 1).
+    fn settle_in_progress(&self, now_mono_ns: u64) -> bool {
+        self.tracker.is_settling(now_mono_ns) || self.snap.settling
     }
 
     fn set_state(&mut self, to: GuiderAppState, stamp: Stamp) {
@@ -535,8 +667,11 @@ impl Core {
                 );
             }
             EventBody::Settling(settling) => {
-                self.tracker
-                    .on_settling(settling.distance, self.settings.default_settle.pixels);
+                self.tracker.on_settling(
+                    settling.distance,
+                    self.settings.default_settle.pixels,
+                    stamp.mono,
+                );
                 self.snap.settling = true;
                 if let (Some(distance), Some(time), Some(settle_time)) =
                     (settling.distance, settling.time, settling.settle_time)
@@ -554,7 +689,7 @@ impl Core {
                 }
             }
             EventBody::SettleBegin => {
-                self.tracker.on_settle_begin();
+                self.tracker.on_settle_begin(stamp.mono);
                 self.snap.settling = true;
                 self.marker(at, Marker::SettleBegin);
                 self.emit(EventKind::SettleBegin, None, device_time);
@@ -582,7 +717,8 @@ impl Core {
                 );
             }
             EventBody::GuidingDithered { dx, dy } => {
-                self.tracker.on_dithered();
+                let grace = PhaseTracker::unsolicited_grace(self.snap.exposure_ms.map(u64::from));
+                self.tracker.on_dithered(stamp.mono, grace);
                 self.marker(at, Marker::Dither);
                 self.snap.last_dither = Some(LastDither {
                     at: received_at,
@@ -738,7 +874,8 @@ impl Core {
 
     fn on_guide_step(&mut self, step: &GuideStepEvent, timestamp: Option<f64>, stamp: Stamp) {
         let state = self.state();
-        let phase = self.tracker.phase_for_step(state);
+        self.expire_settle_tags(stamp.mono);
+        let phase = self.tracker.phase_for_step(state, stamp.mono);
         let Some(sample) = sample_from_event(
             step,
             timestamp,
@@ -979,10 +1116,23 @@ async fn read_algo_only(client: &Phd2Client, core: &mut Core) {
 // Connect (G-a)
 // ---------------------------------------------------------------------------
 
-/// Connect to PHD2 and start the service task. Must run inside a tokio
+/// Connect to PHD2 with a new `connection_id`. See [`connect_with_id`].
+pub async fn connect(settings: Phd2Settings, ctx: GuiderContext) -> DeviceResult<Phd2Connection> {
+    connect_with_id(settings, ctx, Uuid::new_v4()).await
+}
+
+/// Connect to PHD2 and run the G-a sequence. Must run inside a tokio
 /// runtime. Never moves hardware; never switches PHD2's profile; connects
 /// PHD2's equipment only when `connect_equipment` is set.
-pub async fn connect(settings: Phd2Settings, ctx: GuiderContext) -> DeviceResult<Phd2Connection> {
+///
+/// `connection_id` is the caller's, so the hub can register it before any
+/// event is emitted (§2.8). Nothing is emitted or recorded and the service
+/// does not run until [`Phd2Connection::start`] (§2.6 steps 9-10).
+pub async fn connect_with_id(
+    settings: Phd2Settings,
+    ctx: GuiderContext,
+    connection_id: Uuid,
+) -> DeviceResult<Phd2Connection> {
     let started_mono = ctx.clock.now_mono_ns();
     let (client, mut events_rx, tasks) = Phd2Client::connect(
         &settings.host,
@@ -992,7 +1142,6 @@ pub async fn connect(settings: Phd2Settings, ctx: GuiderContext) -> DeviceResult
         Arc::clone(&ctx.clock),
     )
     .await?;
-    let connection_id = Uuid::new_v4();
     let mut core = Core::new(
         settings.clone(),
         Arc::clone(&ctx.clock),
@@ -1018,11 +1167,12 @@ pub async fn connect(settings: Phd2Settings, ctx: GuiderContext) -> DeviceResult
     let now_mono = ctx.clock.now_mono_ns();
     core.snap.published_at = now;
     core.snap.published_mono_ns = now_mono;
-    let abort_path: Arc<dyn AbortPath> = Arc::new(Phd2AbortPath::new(
-        settings.host.clone(),
-        settings.port,
-        settings.abort_timeout,
-    ));
+    // The abort path connects first to the address this connection reached
+    // (`localhost` may resolve to `::1` first; PHD2 listens on IPv4 only).
+    let abort_path: Arc<dyn AbortPath> = Arc::new(
+        Phd2AbortPath::new(settings.host.clone(), settings.port, settings.abort_timeout)
+            .with_peer_addr(client.peer_addr()),
+    );
     let (handle, end) = DeviceHandle::new_pair(
         identity.clone(),
         Some(abort_path),
@@ -1036,38 +1186,9 @@ pub async fn connect(settings: Phd2Settings, ctx: GuiderContext) -> DeviceResult
         clock: Arc::clone(&ctx.clock),
         connection_id,
     };
-    ctx.recorder
-        .record(GroundTruthRecord::ConnectionOpened(Box::new(
-            DeviceConnectionRecord {
-                identity: identity.clone(),
-                capabilities: capabilities.clone(),
-                connected_at: now,
-                session_id: None,
-                night_id: None,
-            },
-        )));
-    // device_connected first, then what the connect burst produced.
-    let buffered = std::mem::take(&mut core.outbox);
-    core.emit(
-        EventKind::DeviceConnected {
-            identity: Box::new(identity),
-            capabilities: capabilities.clone(),
-        },
-        None,
-        None,
-    );
-    for member in &report.unsupported_members {
-        core.emit(
-            EventKind::CapabilityUnsupported {
-                member: member.clone(),
-            },
-            None,
-            None,
-        );
-    }
-    core.outbox.extend(buffered);
+    // The connect burst's events stay in the outbox until start().
     let next_reconcile_ns = now_mono.saturating_add(duration_ns(settings.reconcile_interval));
-    let mut service = Service {
+    let service = Service {
         core,
         client,
         tasks,
@@ -1083,14 +1204,16 @@ pub async fn connect(settings: Phd2Settings, ctx: GuiderContext) -> DeviceResult
         next_reconcile_ns,
         failures: 0,
     };
-    service.flush();
-    let task = tokio::spawn(service.run());
     Ok(Phd2Connection {
         handle,
         windows,
         report,
         capabilities,
-        task,
+        identity,
+        connected_at: now,
+        recorder: Arc::clone(&ctx.recorder),
+        pending: Mutex::new(Some(service)),
+        task: None,
     })
 }
 
@@ -1260,6 +1383,9 @@ struct GuiderOp {
     /// The settle actually sent (whole seconds, §phd2_proto::sent_settle).
     settle: Settle,
     dither: Option<DitherRecord>,
+    /// Set by `Cancel`: the op now waits for PHD2 to report Stopped and
+    /// resolves `Aborted { by }` (or `Unknown` if PHD2 never stops).
+    aborted_by: Option<CommandId>,
     done: Option<oneshot::Sender<OpOutcome>>,
     /// Held for the operation's lifetime; dropping it releases ownership.
     _permit: Permit,
@@ -1388,7 +1514,7 @@ impl Service {
                 self.on_command(command_id, cmd, permit, accepted, done)
                     .await
             }
-            EnvelopeBody::Cancel { by } => self.on_cancel(by),
+            EnvelopeBody::Cancel { by } => self.on_cancel(by).await,
             EnvelopeBody::Disconnect { done, .. } => self.on_disconnect(done),
         }
     }
@@ -1453,6 +1579,8 @@ impl Service {
         }
         let _ = accepted.send(Ok(()));
         let (now, now_mono) = self.now();
+        self.core.expire_settle_tags(now_mono);
+        let settle_in_progress = self.core.settle_in_progress(now_mono);
         let settings = &self.core.settings;
         let settle = match &cmd {
             GuiderCmd::Start { settle, .. } | GuiderCmd::Dither { settle, .. } => {
@@ -1460,12 +1588,11 @@ impl Service {
             }
             _ => proto::sent_settle(&settings.default_settle),
         };
-        let waits_for_settle = matches!(kind, OpKind::GuiderStart | OpKind::Dither)
-            && (self.core.tracker.is_settling() || self.core.snap.settling);
+        let waits_for_settle =
+            matches!(kind, OpKind::GuiderStart | OpKind::Dither) && settle_in_progress;
         let budget = match kind {
             OpKind::GuiderStart | OpKind::Dither if waits_for_settle => {
-                secs(proto::sent_settle(&settings.default_settle).timeout_s)
-                    + settings.settle_margin
+                default_settle_bound(settings)
             }
             OpKind::GuiderStart | OpKind::Dither => secs(settle.timeout_s) + settings.settle_margin,
             OpKind::GuiderStop => settings.stop_timeout,
@@ -1520,6 +1647,7 @@ impl Service {
             },
             settle,
             dither,
+            aborted_by: None,
             done: Some(done),
             _permit: permit,
         });
@@ -1614,9 +1742,15 @@ impl Service {
             ),
             GuiderCmd::SetAlgoParam { .. } | GuiderCmd::Refresh => return,
         };
+        let settle_bound = secs(settle.timeout_s) + self.core.settings.settle_margin;
+        let sent_mono = self.core.clock.now_mono_ns();
         match kind {
-            OpKind::Dither => self.core.tracker.on_dither_sent(settle.pixels),
-            OpKind::GuiderStart => self.core.tracker.on_guide_sent(settle.pixels),
+            OpKind::Dither => {
+                self.core
+                    .tracker
+                    .on_dither_sent(settle.pixels, settle_bound, sent_mono)
+            }
+            OpKind::GuiderStart => self.core.tracker.on_guide_sent(settle.pixels, settle_bound),
             _ => {}
         }
         let result = self.client.call(name, params).await;
@@ -1672,14 +1806,40 @@ impl Service {
         }
     }
 
-    fn on_cancel(&mut self, by: CommandId) {
-        // The abort path already sent stop_capture out of band (D4).
-        if let Some(record) = self.op.as_mut().and_then(|op| op.dither.as_mut()) {
-            record.settle_error.get_or_insert_with(|| "aborted".into());
+    /// `Cancel` (abort, e-stop or preemption; the WP0 contract): the
+    /// operation resolves `Aborted { by }` only once PHD2 reports Stopped.
+    /// The abort path already sent `stop_capture` out of band (D4); it is
+    /// sent in band as well, because the out-of-band connection can fail
+    /// (D19: always attempted). PHD2 that does not stop within the G-d stop
+    /// timeout leaves the outcome unknown.
+    async fn on_cancel(&mut self, by: CommandId) {
+        if self.lost {
+            // The loss already resolved any operation; nothing to send on.
+            return;
         }
-        if self.op.is_some() {
-            self.finish(OpOutcome::Aborted { by: Some(by) });
+        // A settle that ended before the cancel must not start the op now.
+        self.pending_initiator = false;
+        if let Some(op) = self.op.as_mut() {
+            op.aborted_by = Some(by);
+            op.stage = Stage::AwaitState(Target::Stopped);
+            op.phase = OpPhase::Cancelling;
         }
+        let result = self.client.call(method::STOP_CAPTURE, None).await;
+        self.note_rpc(&result);
+        if let Err(err) = &result {
+            tracing::warn!(
+                connection_id = %self.core.connection_id,
+                error = %err,
+                "in-band stop_capture after an abort failed; waiting for PHD2 to report Stopped"
+            );
+        }
+        let (_, now) = self.now();
+        let stop_timeout = self.core.settings.stop_timeout;
+        if let Some(op) = self.op.as_mut() {
+            op.deadline_ns = now.saturating_add(duration_ns(stop_timeout));
+            op.next_poll_ns = now;
+        }
+        self.check_state_target();
     }
 
     fn on_disconnect(&mut self, done: oneshot::Sender<DeviceResult<()>>) {
@@ -1774,7 +1934,11 @@ impl Service {
             _ => false,
         };
         if reached {
-            self.finish(OpOutcome::Succeeded);
+            let outcome = match self.op.as_ref().and_then(|op| op.aborted_by) {
+                Some(by) => OpOutcome::Aborted { by: Some(by) },
+                None => OpOutcome::Succeeded,
+            };
+            self.finish(outcome);
         }
     }
 
@@ -1913,20 +2077,38 @@ impl Service {
             return false;
         }
         let mut changed = false;
-        if self.pending_initiator {
+        let (_, now) = self.now();
+        if self.core.expire_settle_tags(now) {
+            changed = true;
+        }
+        // G-f step 1: go ahead once the settle waited for is over, whether
+        // its SettleDone arrived or its tag lapsed (a dither PHD2 never
+        // settles).
+        let waiting = self
+            .op
+            .as_ref()
+            .is_some_and(|op| op.stage == Stage::WaitSettleClear);
+        if waiting && (self.pending_initiator || !self.core.settle_in_progress(now)) {
             self.pending_initiator = false;
             self.send_initiator().await;
             changed = true;
         }
+        self.pending_initiator = false;
         let (_, now) = self.now();
-        if let Some((stage, deadline, next_poll)) = self
+        if let Some((stage, deadline, next_poll, aborted)) = self
             .op
             .as_ref()
-            .map(|op| (op.stage, op.deadline_ns, op.next_poll_ns))
+            .map(|op| (op.stage, op.deadline_ns, op.next_poll_ns, op.aborted_by))
         {
             if now >= deadline {
                 changed = true;
-                if stage == Stage::WaitSettleClear {
+                if aborted.is_some() {
+                    let waited = self.core.settings.stop_timeout;
+                    self.finish(OpOutcome::Unknown(DeviceError::outcome_unknown(format!(
+                        "PHD2 did not report Stopped within {waited:?} of the abort; it may \
+                         still be guiding"
+                    ))));
+                } else if stage == Stage::WaitSettleClear {
                     // The settle we waited for never reported done; go ahead
                     // (PHD2 refuses the request if it is still settling).
                     self.core.tracker.on_settle_done();
@@ -2170,9 +2352,10 @@ mod tests {
             let mut settings = Phd2Settings::new("127.0.0.1", mock.port());
             tweak(&mut settings);
             let ctx = context(&clock, &sink, &events);
-            let conn = connect(settings, ctx)
+            let mut conn = connect(settings, ctx)
                 .await
                 .expect("connect to the PHD2 mock");
+            assert!(conn.start());
             Self {
                 mock,
                 clock,
@@ -2257,6 +2440,10 @@ mod tests {
         async fn advance(&self, by: Duration) {
             self.clock.advance(by);
             tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+
+        fn phases(&self) -> Vec<GuidePhase> {
+            self.step_records().iter().map(|r| r.step.phase).collect()
         }
 
         fn step_records(&self) -> Vec<GuideStepRecord> {
@@ -2905,6 +3092,64 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("did not answer dither"));
+        // PHD2 may have dithered, so the next step is still tagged; but with
+        // no GuidingDithered within the settle bound (40 s + 10 s from the
+        // request) the tag lapses.
+        rig.mock.send_event(Phd2Mock::guide_step(1, 0.1, 0.1));
+        assert!(rig.wait_frame(1).await);
+        rig.advance(Duration::from_secs(41)).await;
+        rig.mock.send_event(Phd2Mock::guide_step(2, 0.1, 0.1));
+        assert!(rig.wait_frame(2).await);
+        assert_eq!(
+            rig.phases(),
+            vec![GuidePhase::Dithering, GuidePhase::Guiding]
+        );
+        assert_eq!(rig.handle().snapshot().rms.unwrap().steps_n, 1);
+    }
+
+    /// A dither from PHD2's Manual Guide dialog or legacy socket server:
+    /// `GuidingDithered` and no settle events at all.
+    #[tokio::test]
+    async fn a_dither_phd2_never_settles_does_not_tag_every_later_step() {
+        let rig = Rig::start(guiding()).await;
+        rig.mock
+            .send_event(json!({"Event": "GuidingDithered", "dx": 3.0, "dy": -2.0}));
+        rig.mock.send_event(Phd2Mock::guide_step(1, 2.0, -1.5));
+        assert!(rig.wait_frame(1).await);
+        // An Achernar dither now waits for that dither's settle (G-f 1)...
+        let ticket = rig.send(dither_cmd(3.0)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(rig.mock.method_count("dither"), 0);
+        // ...but only for the grace (5 s at a 2 s exposure), not 50 s.
+        rig.advance(Duration::from_secs(6)).await;
+        assert!(rig.mock.wait_for_request("dither", WAIT).await);
+        assert_eq!(outcome(ticket).await, OpOutcome::Succeeded);
+        assert!(!rig.handle().snapshot().settling);
+
+        // Another unsettled dither: tagged within the grace, guiding after.
+        rig.mock
+            .send_event(json!({"Event": "GuidingDithered", "dx": -1.0, "dy": 2.5}));
+        rig.mock.send_event(Phd2Mock::guide_step(2, -0.9, 2.0));
+        assert!(rig.wait_frame(2).await);
+        rig.advance(Duration::from_secs(6)).await;
+        for frame in 3..=5 {
+            rig.mock.send_event(Phd2Mock::guide_step(frame, 0.1, -0.1));
+        }
+        assert!(rig.wait_frame(5).await);
+        assert_eq!(
+            rig.phases(),
+            vec![
+                GuidePhase::Dithering,
+                GuidePhase::Dithering,
+                GuidePhase::Guiding,
+                GuidePhase::Guiding,
+                GuidePhase::Guiding
+            ]
+        );
+        // The telemetry RMS is current, not frozen at the dither.
+        let snap = rig.handle().snapshot();
+        assert_eq!(snap.rms.unwrap().steps_n, 3);
+        assert!(!snap.settling);
     }
 
     #[tokio::test]
@@ -3428,13 +3673,180 @@ mod tests {
             outcome(ticket).await,
             OpOutcome::Aborted { by: Some(abort_id) }
         );
-        assert_eq!(rig.mock.method_count("stop_capture"), 1);
+        // Out of band (the abort path) and in band (the service's cancel).
+        assert_eq!(rig.mock.method_count("stop_capture"), 2);
         assert_eq!(rig.mock.state().app_state, "Stopped");
         assert_eq!(
             rig.dither_records()[0].settle_error.as_deref(),
             Some("aborted")
         );
         assert!(rig.wait_state(GuiderAppState::Stopped).await);
+    }
+
+    /// The default `/connect` host is `localhost`, which usually resolves to
+    /// `::1` first; PHD2 (and the mock) listen on IPv4 only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_reaches_phd2_when_the_host_is_localhost() {
+        let mut state = guiding();
+        state.dither_script.done = None;
+        let rig = Rig::start_with(state, |s| s.host = "localhost".into()).await;
+        assert_eq!(
+            rig.handle().identity().endpoint,
+            Endpoint::Phd2 {
+                host: "localhost".into(),
+                port: rig.mock.port()
+            }
+        );
+        let ticket = rig.send(dither_cmd(3.0)).await.unwrap();
+        assert!(rig.mock.wait_for_request("dither", WAIT).await);
+        let abort = rig.handle().abort();
+        let abort_id = abort.command_id;
+        let result = tokio::time::timeout(WAIT, abort.outcome()).await.unwrap();
+        assert!(
+            result.is_ok(),
+            "the out-of-band stop reached PHD2: {result:?}"
+        );
+        assert_eq!(
+            outcome(ticket).await,
+            OpOutcome::Aborted { by: Some(abort_id) }
+        );
+        assert_eq!(rig.mock.method_count("stop_capture"), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_abort_resolves_only_once_phd2_reports_stopped() {
+        let mut state = guiding();
+        state.dither_script.done = None;
+        state.stop_ignored = true;
+        let rig = Rig::start(state).await;
+        let ticket = rig.send(dither_cmd(3.0)).await.unwrap();
+        assert!(rig.mock.wait_for_request("dither", WAIT).await);
+        let abort = rig.handle().abort();
+        let abort_id = abort.command_id;
+        assert!(tokio::time::timeout(WAIT, abort.outcome()).await.is_ok());
+        assert!(rig.mock.wait_for_count("stop_capture", 2, WAIT).await);
+        assert!(
+            rig.wait_snapshot(|s| s
+                .active_op
+                .as_ref()
+                .is_some_and(|op| op.phase == OpPhase::Cancelling))
+                .await
+        );
+        // PHD2 acknowledged both stops but is still guiding: not Aborted.
+        let mut ticket = ticket;
+        rig.advance(Duration::from_secs(3)).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut ticket.done)
+                .await
+                .is_err(),
+            "no Aborted before PHD2 stops"
+        );
+        // PHD2 stops: now Aborted { by }.
+        rig.mock.with_state(|s| s.app_state = "Stopped".into());
+        rig.mock.send_event(json!({"Event": "GuidingStopped"}));
+        assert_eq!(
+            outcome(ticket).await,
+            OpOutcome::Aborted { by: Some(abort_id) }
+        );
+        assert_eq!(
+            rig.dither_records()[0].settle_error.as_deref(),
+            Some("aborted")
+        );
+
+        // A PHD2 that never stops: the outcome is unknown after 10 s.
+        rig.mock.with_state(|s| s.app_state = "Guiding".into());
+        rig.mock.send_event(Phd2Mock::guide_step(1, 0.1, 0.1));
+        assert!(rig.wait_state(GuiderAppState::Guiding).await);
+        let ticket = rig.send(dither_cmd(3.0)).await.unwrap();
+        assert!(rig.mock.wait_for_count("dither", 2, WAIT).await);
+        let abort = rig.handle().abort();
+        assert!(tokio::time::timeout(WAIT, abort.outcome()).await.is_ok());
+        assert!(rig.mock.wait_for_count("stop_capture", 4, WAIT).await);
+        for _ in 0..11 {
+            rig.advance(Duration::from_secs(1)).await;
+        }
+        let OpOutcome::Unknown(err) = outcome(ticket).await else {
+            panic!("PHD2 never stopped: the outcome is unknown, not aborted");
+        };
+        assert_eq!(err.class, ErrorClass::OutcomeUnknown);
+        assert!(err.message.contains("did not report Stopped"), "{err:?}");
+        assert_eq!(rig.events_named("outcome_unknown").len(), 1);
+        assert!(rig.dither_records()[1]
+            .settle_error
+            .as_deref()
+            .unwrap()
+            .contains("did not report Stopped"));
+    }
+
+    #[tokio::test]
+    async fn nothing_is_emitted_or_recorded_until_start() {
+        let mock = Phd2Mock::start_with(guiding()).await;
+        let clock = Arc::new(ManualClock::new());
+        let sink = RecordingSink::new();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let id = Uuid::new_v4();
+        let mut conn = connect_with_id(
+            Phd2Settings::new("127.0.0.1", mock.port()),
+            context(&clock, &sink, &events),
+            id,
+        )
+        .await
+        .unwrap();
+        // The caller's id, so the hub can register it before any event.
+        assert_eq!(conn.connection_id(), id);
+        assert_eq!(conn.handle.connection_id(), id);
+        assert_eq!(conn.handle.identity().connection_id, id);
+        assert_eq!(conn.windows.connection_id(), id);
+        assert!(!conn.is_started());
+        // PHD2 events that arrive before start wait in the queue.
+        mock.send_event(Phd2Mock::guide_step(1, 0.1, 0.1));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(lock(&events).is_empty(), "nothing before start");
+        assert!(sink.is_empty(), "no device_connections row before start");
+        assert!(conn.start());
+        assert!(!conn.start(), "start runs once");
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while sink.records().len() < 2 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let names: Vec<&str> = lock(&events).iter().map(EquipmentEvent::name).collect();
+        assert_eq!(names[0], "device_connected");
+        assert_eq!(names[1], "guider_state", "the connect burst follows");
+        assert!(names.contains(&"guide_step"), "{names:?}");
+        assert!(lock(&events).iter().all(|e| e.connection_id == Some(id)));
+        let records = sink.records();
+        assert!(matches!(
+            records.first(),
+            Some(GroundTruthRecord::ConnectionOpened(row)) if row.identity.connection_id == id
+        ));
+        assert!(matches!(
+            records.get(1),
+            Some(GroundTruthRecord::GuideStep(_))
+        ));
+
+        // A connection that is never started closes its socket when dropped.
+        let before = mock.client_count();
+        let unstarted = connect(
+            Phd2Settings::new("127.0.0.1", mock.port()),
+            context(&clock, &sink, &events),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mock.client_count(), before + 1);
+        let recorded = sink.records().len();
+        drop(unstarted);
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while mock.client_count() > before && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(mock.client_count(), before);
+        assert_eq!(sink.records().len(), recorded, "nothing recorded");
+    }
+
+    #[test]
+    fn a_connection_can_move_between_threads_and_be_shared() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Phd2Connection>();
     }
 
     #[tokio::test]
@@ -3459,14 +3871,15 @@ mod tests {
         ));
         let err = rig.send(GuiderCmd::Refresh).await.unwrap_err();
         assert_eq!(err.class, ErrorClass::NotConnected);
-        assert!(tokio::time::timeout(WAIT, &mut rig.conn.task).await.is_ok());
+        let task = rig.conn.task_mut().expect("started");
+        assert!(tokio::time::timeout(WAIT, task).await.is_ok());
     }
 
     #[tokio::test]
     async fn aborting_the_service_task_closes_the_socket() {
-        let rig = Rig::start(MockState::default()).await;
+        let mut rig = Rig::start(MockState::default()).await;
         assert_eq!(rig.mock.client_count(), 1);
-        rig.conn.task.abort();
+        rig.conn.abort_task();
         let deadline = tokio::time::Instant::now() + WAIT;
         while rig.mock.client_count() > 0 && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(5)).await;

@@ -5,7 +5,9 @@
 //!   signs, `Time`, the event `Timestamp`, the daemon receive time and every
 //!   optional field as sent. Nothing missing is filled in.
 //! - [`PhaseTracker`] tags each step `guiding`, `dithering`, `settling`,
-//!   `paused` or `recovering`. Steps are tagged, never dropped.
+//!   `paused` or `recovering`. Steps are tagged, never dropped. Dither and
+//!   settle tags are bounded on the injected clock, so a dither PHD2 never
+//!   settles cannot tag every later step.
 //! - [`ClockOffset`] estimates `received - Timestamp` as an EWMA (§2.14) and
 //!   reports whether it is stable enough to place steps on the daemon clock.
 //! - [`StepHistory`] keeps recent steps plus the markers (dither, settle,
@@ -14,12 +16,14 @@
 //!   the per-exposure [`GuideWindowStats`] and `guider_state_log` record.
 
 use std::collections::VecDeque;
+use std::time::Duration;
 
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use uuid::Uuid;
 
 use super::phd2_proto::GuideStepEvent;
 use super::rms::{window_rms, PhaseFilter};
+use crate::equipment::clock::duration_ns;
 use crate::equipment::events::{GuideStepRecord, GuiderStateRecord};
 use crate::equipment::snapshot::{
     AlgoParam, GuidePhase, GuideStepSample, GuideWindowStats, GuiderAppState,
@@ -87,47 +91,125 @@ pub fn step_record(connection_id: Uuid, step: GuideStepSample) -> GuideStepRecor
 /// - `recovering`: the first step after `StarLost` or `LockPositionLost`,
 ///   and any step while PHD2 reports LostLock.
 /// - `guiding`: everything else.
-#[derive(Debug, Clone, Default, PartialEq)]
+///
+/// The `dithering` and `settling` tags are bounded on the injected clock
+/// (all times are `now_mono_ns`), because the event that ends them may never
+/// come:
+/// - PHD2 runs a settle only for event-server `guide` and `dither`. A dither
+///   from its Manual Guide dialog or legacy socket server sends
+///   `GuidingDithered` with no `SettleBegin`, `Settling` or `SettleDone`. A
+///   dither Achernar did not request therefore lapses after a short grace
+///   unless a settle event follows.
+/// - An Achernar dither that got no answer may never have happened.
+/// - A lost `SettleDone` would otherwise tag every later step.
+///
+/// Each sign of a settle in progress (Achernar's request, `GuidingDithered`
+/// for it, `SettleBegin`, `Settling`) renews the tag for the settle timeout
+/// plus margin: Achernar's own settle's, or the default for another
+/// client's. A lapsed tag returns to `guiding`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct PhaseTracker {
     dithering: bool,
     settling: bool,
     paused: bool,
     recovering: bool,
     settle_pixels: Option<f64>,
+    /// Settle timeout plus margin of Achernar's own settle, in ns.
+    own_settle_ns: Option<u64>,
+    /// Settle timeout plus margin for a settle Achernar did not request.
+    default_settle_ns: u64,
+    /// Achernar sent `dither`; its `GuidingDithered` has not arrived.
+    dither_requested: bool,
+    /// When the `dithering` / `settling` tag lapses (clock mono ns).
+    expires_mono_ns: Option<u64>,
+}
+
+impl Default for PhaseTracker {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_SETTLE_BOUND)
+    }
 }
 
 impl PhaseTracker {
-    pub fn new() -> Self {
-        Self::default()
+    /// The `[guider]` default settle timeout (40 s) plus the 10 s margin.
+    pub const DEFAULT_SETTLE_BOUND: Duration = Duration::from_secs(50);
+    /// How long a `GuidingDithered` Achernar did not request stays tagged
+    /// without a settle event, at the least ([`Self::unsolicited_grace`]).
+    pub const UNSOLICITED_DITHER_GRACE: Duration = Duration::from_secs(5);
+
+    /// `default_settle_bound`: the settle timeout plus margin applied to a
+    /// settle Achernar did not request.
+    pub fn new(default_settle_bound: Duration) -> Self {
+        Self {
+            dithering: false,
+            settling: false,
+            paused: false,
+            recovering: false,
+            settle_pixels: None,
+            own_settle_ns: None,
+            default_settle_ns: duration_ns(default_settle_bound),
+            dither_requested: false,
+            expires_mono_ns: None,
+        }
     }
 
-    /// Achernar sent `dither` with this settle tolerance.
-    pub fn on_dither_sent(&mut self, settle_pixels: f64) {
+    /// The grace for a dither Achernar did not request: at least
+    /// [`Self::UNSOLICITED_DITHER_GRACE`], and two guide exposures, so a
+    /// settle event that comes with the next frame is not missed.
+    pub fn unsolicited_grace(exposure_ms: Option<u64>) -> Duration {
+        let two_frames = Duration::from_millis(exposure_ms.unwrap_or(0).saturating_mul(2));
+        Self::UNSOLICITED_DITHER_GRACE.max(two_frames)
+    }
+
+    fn renew(&mut self, now_mono_ns: u64) {
+        let bound = self.own_settle_ns.unwrap_or(self.default_settle_ns);
+        self.expires_mono_ns = Some(now_mono_ns.saturating_add(bound));
+    }
+
+    fn lapsed(&self, now_mono_ns: u64) -> bool {
+        self.expires_mono_ns.is_some_and(|t| now_mono_ns >= t)
+    }
+
+    /// Achernar sent `dither` with this settle tolerance; `settle_bound`
+    /// is its settle timeout plus margin.
+    pub fn on_dither_sent(&mut self, settle_pixels: f64, settle_bound: Duration, now_mono_ns: u64) {
         self.dithering = true;
         self.settling = false;
         self.settle_pixels = Some(settle_pixels);
+        self.own_settle_ns = Some(duration_ns(settle_bound));
+        self.dither_requested = true;
+        self.renew(now_mono_ns);
     }
 
-    /// Achernar sent `guide`; its settle starts now.
-    pub fn on_guide_sent(&mut self, settle_pixels: f64) {
+    /// Achernar sent `guide`; its settle starts with `SettleBegin`.
+    pub fn on_guide_sent(&mut self, settle_pixels: f64, settle_bound: Duration) {
         self.settle_pixels = Some(settle_pixels);
+        self.own_settle_ns = Some(duration_ns(settle_bound));
     }
 
-    /// `GuidingDithered` (also a dither another client requested).
-    pub fn on_dithered(&mut self) {
+    /// `GuidingDithered`. For Achernar's own dither PHD2 runs the settle;
+    /// for any other the tag lapses after `grace` unless a settle event
+    /// follows.
+    pub fn on_dithered(&mut self, now_mono_ns: u64, grace: Duration) {
         self.dithering = true;
         self.settling = false;
+        if std::mem::take(&mut self.dither_requested) {
+            self.renew(now_mono_ns);
+        } else {
+            self.expires_mono_ns = Some(now_mono_ns.saturating_add(duration_ns(grace)));
+        }
     }
 
-    pub fn on_settle_begin(&mut self) {
+    pub fn on_settle_begin(&mut self, now_mono_ns: u64) {
         if !self.dithering {
             self.settling = true;
         }
+        self.renew(now_mono_ns);
     }
 
     /// `Settling`. `default_pixels` is used when the settle was not
     /// Achernar's own.
-    pub fn on_settling(&mut self, distance_px: Option<f64>, default_pixels: f64) {
+    pub fn on_settling(&mut self, distance_px: Option<f64>, default_pixels: f64, now_mono_ns: u64) {
         let tolerance = self.settle_pixels.unwrap_or(default_pixels);
         if self.dithering {
             if distance_px.is_some_and(|d| d <= tolerance) {
@@ -137,12 +219,17 @@ impl PhaseTracker {
         } else {
             self.settling = true;
         }
+        self.renew(now_mono_ns);
     }
 
+    /// `SettleDone`, a refused dither, or a settle given up on.
     pub fn on_settle_done(&mut self) {
         self.dithering = false;
         self.settling = false;
         self.settle_pixels = None;
+        self.own_settle_ns = None;
+        self.dither_requested = false;
+        self.expires_mono_ns = None;
     }
 
     pub fn on_star_lost(&mut self) {
@@ -159,15 +246,32 @@ impl PhaseTracker {
 
     /// Guiding stopped: nothing carries over to the next run.
     pub fn on_guiding_stopped(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            default_settle_ns: self.default_settle_ns,
+            ..Self::new(Duration::ZERO)
+        };
     }
 
-    pub fn is_settling(&self) -> bool {
-        self.settling || self.dithering
+    /// Drop a `dithering` or `settling` tag whose time ran out. Returns
+    /// `true` when a tag was dropped.
+    pub fn expire(&mut self, now_mono_ns: u64) -> bool {
+        if !self.lapsed(now_mono_ns) {
+            return false;
+        }
+        let tagged = self.dithering || self.settling;
+        self.on_settle_done();
+        tagged
     }
 
-    /// The tag for the step that just arrived, with PHD2's current state.
-    pub fn phase_for_step(&mut self, state: GuiderAppState) -> GuidePhase {
+    /// A dither or settle is in progress at `now_mono_ns`.
+    pub fn is_settling(&self, now_mono_ns: u64) -> bool {
+        (self.settling || self.dithering) && !self.lapsed(now_mono_ns)
+    }
+
+    /// The tag for the step that arrived at `now_mono_ns`, with PHD2's
+    /// current state.
+    pub fn phase_for_step(&mut self, state: GuiderAppState, now_mono_ns: u64) -> GuidePhase {
+        self.expire(now_mono_ns);
         if self.paused || state == GuiderAppState::Paused {
             GuidePhase::Paused
         } else if self.dithering {
@@ -555,71 +659,120 @@ mod tests {
         assert!(sample_from_event(&missing, None, at, GuidePhase::Guiding, None).is_none());
     }
 
+    const S: u64 = 1_000_000_000;
+
     #[test]
     fn phases_follow_dither_settle_pause_and_star_loss() {
-        let mut p = PhaseTracker::new();
-        assert_eq!(
-            p.phase_for_step(GuiderAppState::Guiding),
-            GuidePhase::Guiding
-        );
-        p.on_dither_sent(1.5);
-        p.on_dithered();
-        assert_eq!(
-            p.phase_for_step(GuiderAppState::Guiding),
-            GuidePhase::Dithering
-        );
-        p.on_settling(Some(3.0), 1.5);
-        assert_eq!(
-            p.phase_for_step(GuiderAppState::Guiding),
-            GuidePhase::Dithering
-        );
-        p.on_settling(Some(1.2), 1.5);
-        assert_eq!(
-            p.phase_for_step(GuiderAppState::Guiding),
-            GuidePhase::Settling
-        );
-        assert!(p.is_settling());
+        let mut p = PhaseTracker::default();
+        let guiding = GuiderAppState::Guiding;
+        let bound = Duration::from_secs(50);
+        assert_eq!(p.phase_for_step(guiding, 0), GuidePhase::Guiding);
+        p.on_dither_sent(1.5, bound, 0);
+        p.on_dithered(S, PhaseTracker::UNSOLICITED_DITHER_GRACE);
+        assert_eq!(p.phase_for_step(guiding, 2 * S), GuidePhase::Dithering);
+        p.on_settling(Some(3.0), 1.5, 3 * S);
+        assert_eq!(p.phase_for_step(guiding, 4 * S), GuidePhase::Dithering);
+        p.on_settling(Some(1.2), 1.5, 5 * S);
+        assert_eq!(p.phase_for_step(guiding, 6 * S), GuidePhase::Settling);
+        assert!(p.is_settling(6 * S));
         p.on_settle_done();
-        assert!(!p.is_settling());
-        assert_eq!(
-            p.phase_for_step(GuiderAppState::Guiding),
-            GuidePhase::Guiding
-        );
+        assert!(!p.is_settling(7 * S));
+        assert_eq!(p.phase_for_step(guiding, 7 * S), GuidePhase::Guiding);
         // A guide start settles without a dither.
-        p.on_guide_sent(1.0);
-        p.on_settle_begin();
-        assert_eq!(
-            p.phase_for_step(GuiderAppState::Guiding),
-            GuidePhase::Settling
-        );
+        p.on_guide_sent(1.0, bound);
+        p.on_settle_begin(8 * S);
+        assert_eq!(p.phase_for_step(guiding, 9 * S), GuidePhase::Settling);
         p.on_settle_done();
         p.on_star_lost();
+        assert_eq!(p.phase_for_step(guiding, 10 * S), GuidePhase::Recovering);
+        assert_eq!(p.phase_for_step(guiding, 11 * S), GuidePhase::Guiding);
         assert_eq!(
-            p.phase_for_step(GuiderAppState::Guiding),
-            GuidePhase::Recovering
-        );
-        assert_eq!(
-            p.phase_for_step(GuiderAppState::Guiding),
-            GuidePhase::Guiding
-        );
-        assert_eq!(
-            p.phase_for_step(GuiderAppState::LostLock),
+            p.phase_for_step(GuiderAppState::LostLock, 12 * S),
             GuidePhase::Recovering
         );
         p.on_paused();
+        assert_eq!(p.phase_for_step(guiding, 13 * S), GuidePhase::Paused);
+        p.on_resumed();
+        assert_eq!(p.phase_for_step(guiding, 14 * S), GuidePhase::Guiding);
         assert_eq!(
-            p.phase_for_step(GuiderAppState::Guiding),
+            p.phase_for_step(GuiderAppState::Paused, 15 * S),
             GuidePhase::Paused
         );
-        p.on_resumed();
-        assert_eq!(
-            p.phase_for_step(GuiderAppState::Guiding),
-            GuidePhase::Guiding
-        );
-        assert_eq!(p.phase_for_step(GuiderAppState::Paused), GuidePhase::Paused);
-        p.on_dithered();
+        p.on_dithered(16 * S, PhaseTracker::UNSOLICITED_DITHER_GRACE);
         p.on_guiding_stopped();
         assert_eq!(p, PhaseTracker::default());
+        // The configured default settle bound survives a stop.
+        let mut q = PhaseTracker::new(Duration::from_secs(70));
+        q.on_guiding_stopped();
+        assert_eq!(q, PhaseTracker::new(Duration::from_secs(70)));
+    }
+
+    /// PHD2's Manual Guide dialog and legacy socket server dither without a
+    /// settle: `GuidingDithered` and nothing else. The tag must not stick.
+    #[test]
+    fn a_dither_nobody_settles_returns_to_guiding_after_the_grace() {
+        let guiding = GuiderAppState::Guiding;
+        let grace = PhaseTracker::unsolicited_grace(Some(2000));
+        assert_eq!(grace, Duration::from_secs(5));
+        assert_eq!(
+            PhaseTracker::unsolicited_grace(Some(4000)),
+            Duration::from_secs(8),
+            "two guide frames"
+        );
+        assert_eq!(PhaseTracker::unsolicited_grace(None), grace);
+        let mut p = PhaseTracker::default();
+        p.on_dithered(10 * S, grace);
+        assert_eq!(p.phase_for_step(guiding, 12 * S), GuidePhase::Dithering);
+        assert!(p.is_settling(14 * S));
+        assert!(!p.is_settling(15 * S), "lapsed, before any step");
+        assert_eq!(p.phase_for_step(guiding, 15 * S), GuidePhase::Guiding);
+        for i in 0..1000 {
+            assert_eq!(p.phase_for_step(guiding, (16 + i) * S), GuidePhase::Guiding);
+        }
+        assert!(!p.expire(2000 * S), "nothing left to drop");
+
+        // A settle event within the grace makes it a settle PHD2 runs: the
+        // tag then lasts for the default settle bound after the last one.
+        let mut p = PhaseTracker::default();
+        p.on_dithered(0, grace);
+        p.on_settle_begin(3 * S);
+        p.on_settling(Some(4.0), 1.5, 20 * S);
+        assert_eq!(p.phase_for_step(guiding, 30 * S), GuidePhase::Dithering);
+        assert_eq!(p.phase_for_step(guiding, 69 * S), GuidePhase::Dithering);
+        // No SettleDone ever came: dropped 50 s after the last Settling.
+        assert!(p.is_settling(69 * S));
+        assert!(p.expire(70 * S));
+        assert_eq!(p.phase_for_step(guiding, 71 * S), GuidePhase::Guiding);
+    }
+
+    #[test]
+    fn an_unanswered_dither_and_a_lost_settle_done_lapse_on_the_clock() {
+        let guiding = GuiderAppState::Guiding;
+        // Achernar's dither got no answer, so PHD2 may never have dithered.
+        let mut p = PhaseTracker::default();
+        p.on_dither_sent(1.5, Duration::from_secs(30), 0);
+        assert_eq!(p.phase_for_step(guiding, 29 * S), GuidePhase::Dithering);
+        assert_eq!(p.phase_for_step(guiding, 30 * S), GuidePhase::Guiding);
+
+        // Achernar's own dither keeps its settle bound through
+        // GuidingDithered (not the short grace).
+        let mut p = PhaseTracker::default();
+        p.on_dither_sent(1.5, Duration::from_secs(30), 0);
+        p.on_dithered(S, PhaseTracker::UNSOLICITED_DITHER_GRACE);
+        assert_eq!(p.phase_for_step(guiding, 20 * S), GuidePhase::Dithering);
+        assert_eq!(p.phase_for_step(guiding, 31 * S), GuidePhase::Guiding);
+
+        // A guide start whose SettleDone was lost.
+        let mut p = PhaseTracker::default();
+        p.on_guide_sent(1.5, Duration::from_secs(20));
+        p.on_settle_begin(0);
+        p.on_settling(Some(0.5), 1.5, 5 * S);
+        assert_eq!(p.phase_for_step(guiding, 24 * S), GuidePhase::Settling);
+        assert_eq!(p.phase_for_step(guiding, 25 * S), GuidePhase::Guiding);
+        // The next run starts clean.
+        p.on_settle_begin(30 * S);
+        assert_eq!(p.phase_for_step(guiding, 31 * S), GuidePhase::Settling);
+        assert!(!p.is_settling(30 * S + 50 * S), "default bound again");
     }
 
     #[test]
