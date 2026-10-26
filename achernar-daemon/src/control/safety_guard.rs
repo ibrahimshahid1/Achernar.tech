@@ -133,36 +133,6 @@ impl FocusSafetyGuard {
     }
 }
 
-/// Mount safety guard — Section 8.3.
-pub struct MountSafetyGuard {
-    config: crate::config::MountSafetyConfig,
-}
-
-impl MountSafetyGuard {
-    pub fn new(config: crate::config::MountSafetyConfig) -> Self {
-        Self { config }
-    }
-
-    /// Validate a slew target against altitude and hour-angle limits.
-    pub fn validate_slew(&self, alt: f64, hour_angle: f64) -> SafetyVerdict {
-        if alt < self.config.min_altitude {
-            return SafetyVerdict::Rejected {
-                reason: format!(
-                    "Altitude {:.1}° below minimum {:.1}°",
-                    alt, self.config.min_altitude
-                ),
-            };
-        }
-
-        if hour_angle.abs() > self.config.max_hour_angle {
-            return SafetyVerdict::Rejected {
-                reason: format!(
-                    "Hour angle {:.2}h exceeds limit {:.2}h",
-                    hour_angle, self.config.max_hour_angle
-                ),
-            };
-        }
-
-        SafetyVerdict::Approved
-    }
-}
+// The unwired `MountSafetyGuard` that lived here was deleted (equipment spec
+// §2.2, WP1A-2). Mount limits are a gate `SafetyCheck` registered by
+// `equipment/mount/limits.rs` (WP1A-4).
