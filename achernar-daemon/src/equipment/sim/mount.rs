@@ -211,6 +211,9 @@ impl SimMountProfile {
 pub struct SimFaults {
     /// Park motion completes but AtPark never reads true.
     pub park_never_sets_atpark: bool,
+    /// Park is refused with ASCOM InvalidOperation (0x40B), as a mount that
+    /// cannot park now would.
+    pub park_refused: bool,
     pub unpark_never_clears_atpark: bool,
     /// GoTo never arrives (Slewing stays true).
     pub slew_hangs: bool,
@@ -1059,6 +1062,13 @@ impl MountDriver for SimMount {
         }
         if core.at_park {
             return Ok(());
+        }
+        if core.faults.park_refused {
+            return Err(DeviceError::with_code(
+                ErrorClass::InvalidOperation,
+                crate::equipment::types::ascom_error::INVALID_OPERATION,
+                "the simulated mount refuses to park",
+            ));
         }
         let (ha_h, dec_deg) = core.park_position;
         core.at_home = false;

@@ -443,6 +443,42 @@ async fn disconnect_auxiliary(
     Ok(())
 }
 
+/// `disconnect all` (§2.6). The mount goes first: a slewing mount refuses
+/// without `force` (409), and that refusal then leaves every device
+/// connected. After it, every kind is tried even if one refuses, and the
+/// error names what is still connected.
+async fn disconnect_all(state: &AppState, force: bool) -> Result<(), ApiError> {
+    if let Err(err) = disconnect_auxiliary(state, DeviceKind::Mount, force).await {
+        return Err(ApiError {
+            message: format!("{}; nothing was disconnected", err.message),
+            ..err
+        });
+    }
+    disconnect_camera(state).await?;
+    let mut refused = Vec::new();
+    let mut first = None;
+    for kind in equipment::AUXILIARY_KINDS {
+        if kind == DeviceKind::Mount {
+            continue;
+        }
+        if let Err(err) = disconnect_auxiliary(state, kind, force).await {
+            refused.push(crate::equipment::types::kind_name(kind));
+            first.get_or_insert(err);
+        }
+    }
+    match first {
+        None => Ok(()),
+        Some(err) => Err(ApiError {
+            message: format!(
+                "{}; still connected: {}; every other device was disconnected",
+                err.message,
+                refused.join(", ")
+            ),
+            ..err
+        }),
+    }
+}
+
 pub async fn disconnect_equipment(
     State(state): State<AppState>,
     request: Option<Json<DisconnectRequest>>,
@@ -457,10 +493,7 @@ pub async fn disconnect_equipment(
         .to_ascii_lowercase();
 
     if equipment_type == "all" {
-        disconnect_camera(&state).await?;
-        for kind in equipment::AUXILIARY_KINDS {
-            disconnect_auxiliary(&state, kind, force).await?;
-        }
+        disconnect_all(&state, force).await?;
     } else {
         match equipment::kind_from_str(&equipment_type) {
             Some(DeviceKind::Camera) => disconnect_camera(&state).await?,

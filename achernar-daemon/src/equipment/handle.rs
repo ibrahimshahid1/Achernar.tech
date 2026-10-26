@@ -388,6 +388,33 @@ fn run_blocking(f: impl FnOnce() + Send + 'static) {
     }
 }
 
+/// How many start failures a handle remembers ([`StartFailures`]).
+const START_FAILURES_KEPT: usize = 16;
+
+/// The commands whose operation `start` ran on the worker and failed, so
+/// the operation reported its own failure events (O11 c: a park that ran
+/// emits its own `park_failed`). Bounded: a caller asks right after its
+/// refusal, so the newest few are enough.
+#[derive(Debug, Default)]
+struct StartFailures(Mutex<VecDeque<CommandId>>);
+
+impl StartFailures {
+    fn note(&self, command_id: CommandId) {
+        let mut ids = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        ids.push_back(command_id);
+        while ids.len() > START_FAILURES_KEPT {
+            ids.pop_front();
+        }
+    }
+
+    fn contains(&self, command_id: CommandId) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&command_id)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Handles
 // ---------------------------------------------------------------------------
@@ -400,6 +427,7 @@ pub struct DeviceHandle<C, S> {
     identity: Arc<DeviceIdentity>,
     health: watch::Receiver<HealthState>,
     retired: Arc<AtomicBool>,
+    start_failures: Arc<StartFailures>,
 }
 
 impl<C, S> Clone for DeviceHandle<C, S> {
@@ -411,6 +439,7 @@ impl<C, S> Clone for DeviceHandle<C, S> {
             identity: Arc::clone(&self.identity),
             health: self.health.clone(),
             retired: Arc::clone(&self.retired),
+            start_failures: Arc::clone(&self.start_failures),
         }
     }
 }
@@ -439,6 +468,7 @@ impl<C, S> DeviceHandle<C, S> {
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(initial));
         let (health_tx, health_rx) = watch::channel(health);
         let retired = Arc::new(AtomicBool::new(false));
+        let start_failures = Arc::new(StartFailures::default());
         let handle = Self {
             commands: commands.clone(),
             snapshot: snapshot_rx,
@@ -446,6 +476,7 @@ impl<C, S> DeviceHandle<C, S> {
             identity: Arc::clone(&identity),
             health: health_rx,
             retired: Arc::clone(&retired),
+            start_failures: Arc::clone(&start_failures),
         };
         let end = WorkerEnd {
             commands,
@@ -453,6 +484,7 @@ impl<C, S> DeviceHandle<C, S> {
             health: health_tx,
             identity,
             retired,
+            start_failures,
         };
         (handle, end)
     }
@@ -614,6 +646,14 @@ impl<C, S> DeviceHandle<C, S> {
         self.retired.load(Ordering::Acquire)
     }
 
+    /// True when [`Self::send`] refused `command_id` after the worker ran
+    /// its operation's `start`, which failed: the operation itself reported
+    /// the failure (O11 c). False for a refusal before the operation ran
+    /// (lost, superseded, busy, no gate permit) and for a driver panic.
+    pub fn operation_start_failed(&self, command_id: CommandId) -> bool {
+        self.start_failures.contains(command_id)
+    }
+
     /// A receiver that wakes on every snapshot publish.
     pub fn watch_snapshot(&self) -> watch::Receiver<Arc<S>> {
         self.snapshot.clone()
@@ -632,9 +672,16 @@ pub struct WorkerEnd<C, S> {
     pub health: watch::Sender<HealthState>,
     pub identity: Arc<DeviceIdentity>,
     retired: Arc<AtomicBool>,
+    start_failures: Arc<StartFailures>,
 }
 
 impl<C, S> WorkerEnd<C, S> {
+    /// Record that `command_id`'s operation `start` ran and failed, before
+    /// the refusal is sent ([`DeviceHandle::operation_start_failed`]).
+    pub fn note_start_failed(&self, command_id: CommandId) {
+        self.start_failures.note(command_id);
+    }
+
     pub fn publish(&self, snapshot: S) {
         self.snapshot.send_replace(Arc::new(snapshot));
     }

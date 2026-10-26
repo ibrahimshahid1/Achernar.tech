@@ -45,6 +45,8 @@ pub struct ParkOp {
     direction: ParkDirection,
     stopped_since_mono_ns: Option<u64>,
     finished: Option<OpOutcome>,
+    /// `park_failed` was emitted: it is emitted once per park (O11 c).
+    failure_reported: bool,
 }
 
 impl ParkOp {
@@ -63,6 +65,7 @@ impl ParkOp {
             direction,
             stopped_since_mono_ns: None,
             finished: None,
+            failure_reported: false,
         }
     }
 
@@ -71,7 +74,8 @@ impl ParkOp {
     }
 
     fn fail(&mut self, err: DeviceError) -> DeviceError {
-        if self.direction == ParkDirection::Park {
+        if self.direction == ParkDirection::Park && !self.failure_reported {
+            self.failure_reported = true;
             self.emit(EventKind::ParkFailed {
                 class: err.class,
                 reason: err.message.clone(),
@@ -153,7 +157,9 @@ impl Operation<DynMount> for ParkOp {
 
     fn start(&mut self, drv: &mut DynMount, _clock: &dyn Clock) -> DeviceResult<()> {
         let caps = self.shared.capabilities();
-        let state = drv.state()?;
+        // Every failed start of a park reports `park_failed` here, since the
+        // operation ran (O11 c); the caller does not report it again.
+        let state = drv.state().map_err(|err| self.fail(err))?;
         match self.direction {
             ParkDirection::Park => {
                 if !caps.can_park {
@@ -193,7 +199,13 @@ impl Operation<DynMount> for ParkOp {
     }
 
     fn cancel(&mut self, drv: &mut DynMount) -> DeviceResult<()> {
-        if self.direction == ParkDirection::Park && self.finished.is_none() {
+        // An initiator whose outcome is unknown already reported its error
+        // (the worker cancels it right after, O11 e).
+        if self.direction == ParkDirection::Park
+            && self.finished.is_none()
+            && !self.failure_reported
+        {
+            self.failure_reported = true;
             self.emit(EventKind::ParkFailed {
                 class: ErrorClass::Cancelled,
                 reason: "the park was cancelled or timed out before AtPark read true".into(),

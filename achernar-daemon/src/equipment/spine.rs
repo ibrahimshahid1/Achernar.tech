@@ -735,6 +735,123 @@ fn transports(client: AlpacaClient) -> (Arc<dyn AlpacaTransport>, Arc<dyn Alpaca
 }
 
 // ---------------------------------------------------------------------------
+// Connect targets (§2.6 step 1)
+// ---------------------------------------------------------------------------
+
+/// What a validated `/connect` option names, known before anything is
+/// opened.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectTarget {
+    /// A native Alpaca device at a known address.
+    Alpaca(AlpacaAddress),
+    /// Alpaca broadcast discovery (opted in, D13): the server is found
+    /// during the connect.
+    Discovery,
+    /// PHD2's event server.
+    Phd2 { host: String, port: u16 },
+    /// The in-process simulator, or an OLS legacy adapter (the OLS bridge
+    /// opens its own connection).
+    Local,
+}
+
+/// §2.6 step 1: parse and validate a `/connect` option without opening
+/// anything (no socket, no OLS call): the Alpaca URL and `#device=N`, the
+/// D13 refusal of an empty or `"auto"` option (also for the OLS Alpaca
+/// adapter, whose `"auto"` broadcasts), and PHD2's `host:port`. The API
+/// runs it before it touches a connected device, so a refused or malformed
+/// option leaves that device connected.
+pub fn validate_connect_option(
+    ctx: &SpineContext,
+    choice: DriverChoice,
+    option: &str,
+) -> DeviceResult<ConnectTarget> {
+    let allow = ctx.configs.equipment.allow_broadcast_discovery;
+    Ok(match choice {
+        DriverChoice::Alpaca => match discovery::parse_option(option, allow)? {
+            AlpacaOption::Address(address) => ConnectTarget::Alpaca(address),
+            AlpacaOption::Broadcast => ConnectTarget::Discovery,
+        },
+        DriverChoice::OlsAlpaca => {
+            discovery::parse_option(option, allow)?;
+            ConnectTarget::Local
+        }
+        DriverChoice::Phd2 => {
+            let (host, port) = super::guider::service::parse_option(option)?;
+            ConnectTarget::Phd2 { host, port }
+        }
+        DriverChoice::Sim | DriverChoice::OlsIndi => ConnectTarget::Local,
+    })
+}
+
+/// Before a connected device of `kind` is let go for a replacement, check
+/// that the replacement's server answers (blocking; `timeout` bounds each
+/// step): a TCP connection to the Alpaca server or to PHD2, closed at once,
+/// and for Alpaca the management API's device list, which must include the
+/// requested type and number when the server provides one. A mistyped
+/// address or device number is then refused while the current device stays
+/// connected. Nothing is sent to a device (D16). Discovery, the simulator
+/// and the OLS adapters are not checked.
+pub fn preflight_replacement(
+    ctx: &SpineContext,
+    kind: DeviceKind,
+    target: &ConnectTarget,
+    timeout: Duration,
+) -> DeviceResult<()> {
+    match target {
+        ConnectTarget::Alpaca(address) => {
+            reachable(&address.host, address.port, timeout)?;
+            let Some(device_type) = super::alpaca::device_type_for_kind(kind) else {
+                return Ok(());
+            };
+            // Best effort: an old server without the management API is
+            // checked by the connect itself.
+            let listed = discovery::ManagementClient::new(&address.base, ctx.client_id, timeout)
+                .and_then(|management| management.configured_devices());
+            if let Ok(devices) = listed {
+                if devices.skipped.is_empty() && devices.find(device_type, address.number).is_none()
+                {
+                    return Err(DeviceError::invalid_value(format!(
+                        "{} lists no {device_type} with device number {} (POST /api/v1/discover \
+                         lists what it serves)",
+                        address.base, address.number
+                    )));
+                }
+            }
+            Ok(())
+        }
+        ConnectTarget::Phd2 { host, port } => reachable(host, *port, timeout),
+        ConnectTarget::Discovery | ConnectTarget::Local => Ok(()),
+    }
+}
+
+/// A TCP connection to `host:port` within `timeout`, closed at once.
+fn reachable(host: &str, port: u16, timeout: Duration) -> DeviceResult<()> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    let addresses = (bare, port).to_socket_addrs().map_err(|err| {
+        DeviceError::transport(format!("{host}:{port} cannot be resolved: {err}"))
+    })?;
+    let mut last = None;
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(err) => last = Some(err),
+        }
+    }
+    Err(match last {
+        Some(err) if err.kind() == std::io::ErrorKind::TimedOut => DeviceError::timeout(format!(
+            "{host}:{port} did not answer within {} ms",
+            timeout.as_millis()
+        )),
+        Some(err) => DeviceError::transport(format!("{host}:{port} cannot be reached: {err}")),
+        None => DeviceError::transport(format!("{host}:{port} resolves to no address")),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Prepared connections (§2.6 steps 2-8, run on a blocking thread)
 // ---------------------------------------------------------------------------
 

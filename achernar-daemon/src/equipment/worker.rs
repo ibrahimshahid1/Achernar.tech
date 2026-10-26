@@ -1890,6 +1890,9 @@ impl<K: WorkerKind> Worker<K> {
             }
             Ok(Err(err)) => {
                 self.emit_ended(op_kind, command_id, OpOutcome::Failed(err.clone()), 0);
+                // The operation ran and reported its own failure (O11 c);
+                // noted before the caller hears of the refusal.
+                self.end.note_start_failed(command_id);
                 self.refuse(accepted, err);
             }
             Ok(Ok(())) => {

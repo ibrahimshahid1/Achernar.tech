@@ -812,3 +812,285 @@ async fn native_alpaca_mount_and_focuser_connect_through_the_spine() {
     cleanup(directory, state).await;
     drop(server);
 }
+
+/// The connected mount's connection id, or `None` when nothing is connected
+/// or its handle is retired.
+fn live_mount_id(state: &AppState) -> Option<uuid::Uuid> {
+    eq::mount_handle(state).ok().map(|h| h.connection_id())
+}
+
+async fn connect_err(state: &AppState, kind: &str, driver: &str, option: &str) -> super::ApiError {
+    super::connect_equipment(
+        State(state.clone()),
+        Json(super::ConnectRequest {
+            equipment_type: Some(kind.into()),
+            driver: driver.into(),
+            option: Some(option.into()),
+            index: None,
+        }),
+    )
+    .await
+    .err()
+    .unwrap_or_else(|| panic!("connect {kind}/{driver} {option:?} should fail"))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_or_unreachable_replacement_leaves_the_connected_mount_connected() {
+    use crate::equipment::testing::alpaca_server::{ScriptedDevice, TestAlpacaServer};
+    let (directory, state) = state().await;
+    connect(&state, "mount", "sim", "").await;
+    wait_status(&state, "a polled sim mount", |v| {
+        v["mount"]["ra"].is_number()
+    })
+    .await;
+    let sim = live_mount_id(&state).expect("the sim mount is connected");
+    let still_connected = |what: &str| {
+        assert_eq!(live_mount_id(&state), Some(sim), "{what}");
+        assert_eq!(
+            status(&state)["device_health"]["mount"]["status"],
+            "connected",
+            "{what}"
+        );
+        assert!(!state.equipment.attached().is_empty(), "{what}");
+    };
+
+    // §2.6 step 1 before anything is touched: the D13 refusal, a malformed
+    // URL and a malformed device fragment.
+    for option in ["", "auto"] {
+        let err = connect_err(&state, "mount", "alpaca", option).await;
+        assert_eq!(err.code, "broadcast_discovery_disabled", "{option:?}");
+        still_connected(option);
+    }
+    for option in ["not a url", "http://127.0.0.1:11111#device=x"] {
+        let err = connect_err(&state, "mount", "alpaca", option).await;
+        assert_eq!(err.status.as_u16(), 400, "{option:?}: {}", err.message);
+        still_connected(option);
+    }
+    // The legacy OLS adapter gets the same D13 refusal.
+    let err = connect_err(&state, "mount", "ols_alpaca", "auto").await;
+    assert_eq!(err.code, "broadcast_discovery_disabled");
+    still_connected("ols_alpaca auto");
+    // The relay too (D12).
+    let relayed = crate::relay_commands::execute(
+        state.clone(),
+        &crate::relay_commands::RelayCommand {
+            command_id: "auto-mount".into(),
+            action: "equipment.connect".into(),
+            payload: json!({"equipment_type": "mount", "driver": "alpaca", "option": "auto"}),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        relayed.starts_with("broadcast_discovery_disabled"),
+        "{relayed}"
+    );
+    still_connected("relay auto");
+
+    // A well-formed address nothing listens on (a port just released).
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let err = connect_err(
+        &state,
+        "mount",
+        "alpaca",
+        &format!("http://127.0.0.1:{port}"),
+    )
+    .await;
+    assert!(
+        matches!(err.status.as_u16(), 502 | 504),
+        "{}: {}",
+        err.code,
+        err.message
+    );
+    still_connected("unreachable address");
+
+    // A server that answers but serves no telescope with that number.
+    let focuser_only = TestAlpacaServer::start(vec![ScriptedDevice::platform6_focuser(0)]);
+    let err = connect_err(
+        &state,
+        "mount",
+        "alpaca",
+        &format!("{}#device=0", focuser_only.base_url()),
+    )
+    .await;
+    assert_eq!(err.status.as_u16(), 400, "{}", err.message);
+    assert!(
+        err.message.contains("lists no telescope"),
+        "{}",
+        err.message
+    );
+    still_connected("no such device");
+    drop(focuser_only);
+
+    // A good replacement retires the sim and connects the Alpaca mount.
+    let server = TestAlpacaServer::start(vec![ScriptedDevice::esp32_like_mount(0)]);
+    let old = eq::mount_handle(&state).unwrap();
+    let body = connect(
+        &state,
+        "mount",
+        "alpaca",
+        &format!("{}#device=0", server.base_url()),
+    )
+    .await;
+    assert_eq!(body["identity"]["driver"], "alpaca");
+    assert!(old.is_retired(), "the replaced sim handle is retired");
+    let replacement = live_mount_id(&state).expect("the Alpaca mount is connected");
+    assert_ne!(replacement, sim);
+    cleanup(directory, state).await;
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_safety_park_the_mount_refuses_reports_park_failed_once() {
+    use crate::equipment::safety::monitor_hub::PolicyTrigger;
+    use crate::equipment::safety::policy::{PolicyAction, PolicyTargetSource, StepStatus};
+    use crate::equipment::snapshot::{ResumeBlockKind, SafetyLevel};
+    let (directory, state) = state().await;
+    connect(&state, "mount", "sim", "").await;
+    wait_status(&state, "a polled sim mount", |v| {
+        v["mount"]["parked"] == false
+    })
+    .await;
+    // The real ParkOp runs on the real worker; the device refuses the
+    // initiator with a definite error (ASCOM InvalidOperation).
+    state
+        .equipment_ctx
+        .sims()
+        .mount
+        .expect("the sim's control")
+        .update_faults(|faults| faults.park_refused = true);
+    let supervisor = state.equipment_ctx.ensure_safety(&state.equipment);
+    let trigger = PolicyTrigger::ConfirmedUnsafe {
+        connection_id: uuid::Uuid::new_v4(),
+        name: "roof sensor".into(),
+        level: SafetyLevel::Unsafe,
+        detail: Some("rain".into()),
+    };
+    let targets = state.equipment_ctx.targets().targets();
+    let run = supervisor.policy().run(&trigger, &targets).await;
+    let park = run.step(PolicyAction::Park).expect("a park step");
+    assert!(
+        matches!(&park.status, StepStatus::Failed { error } if error.class
+            == crate::equipment::types::ErrorClass::InvalidOperation),
+        "{:?}",
+        park.status
+    );
+    let park_id = park.command_id.expect("the park's command id");
+    // O11 c: once on the bus (the journal, `/equipment/events`, the
+    // telemetry stream and the relay all read it), with the park's id: the
+    // operation ran, so neither the policy nor a retry reports it again.
+    let failed = state
+        .equipment
+        .events_since(0, &["park_failed".to_string()], 500);
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].command_id, Some(park_id));
+    // The fallback still runs: mount_lost, then tracking off.
+    assert!(state
+        .equipment
+        .resume()
+        .active()
+        .iter()
+        .any(|b| b.kind == ResumeBlockKind::MountLost));
+    assert!(run
+        .step(PolicyAction::StopTracking)
+        .is_some_and(|s| s.status.is_done()));
+    cleanup(directory, state).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn disconnect_all_refused_by_a_slewing_mount_leaves_every_device_connected() {
+    use crate::equipment::sim::mount::SimFaults;
+    use crate::equipment::testing::phd2_mock::Phd2Mock;
+    let (directory, state) = state().await;
+    // The guider is taken before the mount in AUXILIARY_KINDS order, so it
+    // shows whether the mount's refusal comes first.
+    let mock = Phd2Mock::start().await;
+    connect(
+        &state,
+        "guider",
+        "phd2",
+        &format!("127.0.0.1:{}", mock.port()),
+    )
+    .await;
+    connect(&state, "mount", "sim", "").await;
+    connect(&state, "focuser", "sim", "").await;
+    connect(&state, "filter_wheel", "sim", "").await;
+    let value = wait_status(&state, "a polled sim mount", |v| {
+        v["mount"]["ra"].is_number()
+    })
+    .await;
+    state
+        .equipment_ctx
+        .sims()
+        .mount
+        .expect("the sim's control")
+        .set_faults(SimFaults {
+            slew_hangs: true,
+            ..SimFaults::default()
+        });
+    let ra = value["mount"]["ra"].as_f64().unwrap();
+    super::mount::slew_value(
+        &state,
+        super::mount::SlewRequest {
+            ra: (ra + 6.0) % 24.0,
+            dec: 5.0,
+            frame: None,
+            overriding: false,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    wait_status(&state, "slewing", |v| v["mount"]["slewing"] == true).await;
+
+    // A body-less disconnect means "all": the mount refuses first, so
+    // nothing is disconnected.
+    let err = super::disconnect_equipment(State(state.clone()), None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.status.as_u16(), 409, "{}", err.message);
+    assert!(
+        err.message.contains("nothing was disconnected"),
+        "{}",
+        err.message
+    );
+    assert!(eq::guider_handle(&state).is_ok());
+    assert!(eq::mount_handle(&state).is_ok());
+    assert!(eq::focuser_handle(&state).is_ok());
+    assert!(eq::wheel_handle(&state).is_ok());
+    // The relay default is "all" too, with the same refusal.
+    let relayed = crate::relay_commands::execute(
+        state.clone(),
+        &crate::relay_commands::RelayCommand {
+            command_id: "disconnect-all".into(),
+            action: "equipment.disconnect".into(),
+            payload: json!({}),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(relayed.contains("nothing was disconnected"), "{relayed}");
+    assert!(eq::focuser_handle(&state).is_ok());
+
+    // force=true aborts the slew and disconnects everything.
+    let Json(body) = super::disconnect_equipment(
+        State(state.clone()),
+        Some(Json(super::DisconnectRequest {
+            equipment_type: None,
+            force: true,
+        })),
+    )
+    .await
+    .unwrap();
+    assert_eq!(body["status"], "disconnected");
+    assert!(eq::guider_handle(&state).is_err());
+    assert!(eq::mount_handle(&state).is_err());
+    assert!(eq::focuser_handle(&state).is_err());
+    assert!(eq::wheel_handle(&state).is_err());
+    assert!(state.equipment.attached().is_empty());
+    assert_eq!(mock.method_count("set_connected"), 0, "D16");
+    cleanup(directory, state).await;
+}

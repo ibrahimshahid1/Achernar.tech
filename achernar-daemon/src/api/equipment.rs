@@ -463,6 +463,9 @@ fn connect_error(kind: DeviceKind, err: &DeviceError) -> ApiError {
 // Connect (§2.6, §2.12)
 // ---------------------------------------------------------------------------
 
+/// The longest a replacement's reachability check may take per step.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// `/connect` for every kind but the camera.
 pub async fn connect_device(
     state: &AppState,
@@ -479,9 +482,29 @@ pub async fn connect_device(
     }
     let choice = spine::resolve_driver(kind, &driver).map_err(refusal)?;
     let option = req.option.clone().unwrap_or_default();
-    // Replacing a device disconnects the old one first (never forced: a
-    // slewing mount refuses, 409).
-    disconnect_device(state, kind, false).await?;
+    // §2.6 step 1 runs before the connected device is touched, so a refused
+    // or malformed option (the D13 "auto" refusal, a bad URL, `#device=N`
+    // or PHD2 host:port) leaves it connected.
+    let target = spine::validate_connect_option(&state.equipment_ctx, choice, &option)
+        .map_err(|err| connect_error(kind, &err))?;
+    if any_handle(state, kind).is_some() {
+        // The replacement's server must answer, and list the device, before
+        // the current one is let go: a mistyped address or device number is
+        // refused with the current device still connected.
+        let ctx = Arc::clone(&state.equipment_ctx);
+        let timeout = ctx.connect_timeout().min(PREFLIGHT_TIMEOUT);
+        blocking(kind, move || {
+            spine::preflight_replacement(&ctx, kind, &target, timeout)
+        })
+        .await?;
+        // Then the old device goes first (never forced: a slewing mount
+        // refuses, 409). Both cannot be up at once: the daemon has one
+        // Alpaca ClientID, so the old device's Connected=false would cut a
+        // second connection to the same server (D16), and the hub drops the
+        // new device's connect-time events (`focuser_position_reset`,
+        // `filter_config_mismatch`) while the old connection is live.
+        disconnect_device(state, kind, false).await?;
+    }
     match kind {
         DeviceKind::Mount => connect_mount(state, choice, &driver, option).await,
         DeviceKind::Focuser => connect_focuser(state, choice, &driver, option).await,
@@ -860,7 +883,9 @@ pub async fn disconnect_device(
     Ok(true)
 }
 
-/// Every non-camera kind, in the order `disconnect all` takes them.
+/// Every non-camera kind. `disconnect all` takes the mount first (its
+/// refusal then leaves everything connected), then the camera, then the
+/// rest in this order.
 pub const AUXILIARY_KINDS: [DeviceKind; 10] = [
     DeviceKind::Guider,
     DeviceKind::Mount,

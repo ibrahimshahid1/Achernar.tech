@@ -446,9 +446,12 @@ impl UnsafePolicy {
         (id, result)
     }
 
-    /// [`Self::execute`], also saying whether the worker accepted the
-    /// command, i.e. whether the operation itself ran (O11 c: a park that
-    /// ran reports its own `park_failed`).
+    /// [`Self::execute`], also saying whether the operation itself ran: the
+    /// worker accepted the command, or refused it after the operation's
+    /// `start` ran and failed (O11 c: a park that ran reports its own
+    /// `park_failed`). Only a refusal that came before the operation ran
+    /// (another operation active) is cancelled and retried once; retrying a
+    /// failed start would run the operation, and its failure events, again.
     async fn execute_tracked<C, S>(
         &self,
         handle: &DeviceHandle<C, S>,
@@ -489,7 +492,11 @@ impl UnsafePolicy {
                     );
                     return (id, outcome_result(outcome), true);
                 }
-                Err(err) if err.class == ErrorClass::InvalidOperation && !retried => {
+                Err(err)
+                    if err.class == ErrorClass::InvalidOperation
+                        && !retried
+                        && !handle.operation_start_failed(id) =>
+                {
                     retried = true;
                     self.audit(
                         &cmd,
@@ -515,7 +522,8 @@ impl UnsafePolicy {
                         Some(err.to_string()),
                         Some(OpOutcome::Failed(err.clone())),
                     );
-                    return (id, Err(err), false);
+                    let ran = handle.operation_start_failed(id);
+                    return (id, Err(err), ran);
                 }
             }
         }
@@ -920,8 +928,9 @@ impl UnsafePolicy {
         // A failed park is recorded and raises `mount_lost`; then tracking
         // is stopped as a fallback so the mount does not drive on.
         // `park_failed` is emitted once (O11 c): by the park operation when it
-        // ran, and here only when it never started (refused by the gate or
-        // the worker).
+        // ran (accepted, or its start failed on the device), and here only
+        // when it never ran (refused by the gate, or by the worker before
+        // the operation started).
         if !started {
             self.events.emit(
                 EquipmentEvent::new(
