@@ -10,12 +10,23 @@
 //!    rules the gate plug-in runs).
 //! 2. Ownership: the permit must hold the wheel; the focuser and guider are
 //!    used only when the permit holds them too.
-//! 3. Read and verify the current slot. Unknown: `prev_offset_unknown`, and
-//!    focus verification is required.
+//! 3. Read and verify the current slot. The offset the focuser holds is
+//!    known only for a slot the wheel has verified; an unknown or unverified
+//!    slot (after a wrong slot, an unknown outcome or a move nobody
+//!    commanded) gives `prev_offset_unknown`, no offset move, and focus
+//!    verification is required. The wheel move itself still goes ahead, even
+//!    to the slot the wheel already reports, so the slot is verified again.
+//!    A verified slot equal to the target is a no-op that publishes no
+//!    `filter_*` event (H2 and the window builder reset on those).
 //! 4. If PHD2 is guiding, the offset Δ ≠ 0 and `pause_guiding_on_offset` is
 //!    set: pause guiding (`set_paused [true]`; NINA stops guiding, pausing is
-//!    lighter).
-//! 5. Command the position (the worker polls at 4 Hz).
+//!    lighter). The pause is awaited to its outcome even across an abort, and
+//!    a pause that was sent and not definitely refused is always followed by
+//!    a resume; a resume that fails raises a resume block.
+//! 5. Command the position (the worker polls at 4 Hz). An acceptance error
+//!    that may come after the initiator reached the wheel (timeout,
+//!    transport, driver, a worker that stopped) is `OutcomeUnknown` with a
+//!    resume block, not a refusal.
 //! 6. On timeout: `OutcomeUnknown` and a `filter_handshake_incomplete`
 //!    resume block. Unlike NINA, a timeout is never silent.
 //! 7. Verify Position == target; otherwise `Failed{wrong_slot}` plus a
@@ -180,9 +191,14 @@ pub struct HandshakeReport {
     pub outcome: OpOutcome,
     /// Succeeded and no resume block.
     pub handshake_ok: bool,
-    /// The verified current slot already was the target; nothing moved.
+    /// The verified current slot already was the target; nothing moved and
+    /// no `filter_*` event was published.
     pub noop: bool,
+    /// The slot the wheel reported before the change (it may be unverified;
+    /// see `from_verified`).
     pub from_slot: Option<u32>,
+    /// `from_slot` was verified, so the focuser holds its offset.
+    pub from_verified: bool,
     pub to_slot: Option<u32>,
     /// The slot the wheel reported at the end.
     pub arrived_slot: Option<u32>,
@@ -193,6 +209,9 @@ pub struct HandshakeReport {
     pub offset_applied_steps: Option<i32>,
     /// Command id of the focuser offset move (`focuser_moves.command_id`).
     pub focuser_command_id: Option<CommandId>,
+    /// PHD2 was paused, or a pause was sent and may have taken effect
+    /// (`guider_pause_unconfirmed`). Either way a resume is sent on every
+    /// path.
     pub guiding_paused: bool,
     /// Why focus must be verified (W-c step 10); empty when it need not be.
     pub focus_verification: Vec<String>,
@@ -211,6 +230,7 @@ impl HandshakeReport {
             handshake_ok: false,
             noop: false,
             from_slot: None,
+            from_verified: false,
             to_slot: None,
             arrived_slot: None,
             offset_from: None,
@@ -318,11 +338,71 @@ struct RunState {
     block_reason: Option<String>,
 }
 
+/// The longest a guider pause or resume may take (G-e: the guider waits up
+/// to 60 s for `Paused`, or for the state to leave it). The watchdog on a
+/// guider command never fires before this.
+const GUIDER_PAUSE_WAIT: Duration = Duration::from_secs(60);
+
+/// The slot the wheel reports: a fresh, stationary read. It may be
+/// unverified.
 fn current_slot(snap: &FilterWheelSnapshot, health: &HealthState) -> Option<u32> {
     if !health.state.is_connected() || snap.moving {
         return None;
     }
     snap.position.fresh_value().copied()
+}
+
+/// The current slot only when the wheel has verified it (W-c step 3): the
+/// read equals the slot that the last successful move, or the first
+/// stationary read after connect, established. After a wrong slot, an
+/// unknown outcome or a move nobody commanded the wheel stays unverified,
+/// and the focuser cannot be assumed to hold that slot's offset.
+fn verified_current_slot(snap: &FilterWheelSnapshot, health: &HealthState) -> Option<u32> {
+    current_slot(snap, health).filter(|slot| snap.verified && snap.verified_slot == Some(*slot))
+}
+
+/// True when a command that `DeviceHandle::send` refused with `err` may still
+/// have reached the device (§2.8 `outcome_unknown`, C-6). Only errors raised
+/// before anything is sent (validation, ownership, safety, a retired handle)
+/// and a device's definite refusal are excluded. A timeout, transport or
+/// driver error on the initiator, or a worker that stopped while starting
+/// the operation (`Disconnected`), leaves the outcome unknown.
+fn may_have_reached_device(err: &DeviceError) -> bool {
+    !matches!(
+        err.class,
+        ErrorClass::NotConnected
+            | ErrorClass::Unsupported
+            | ErrorClass::InvalidValue
+            | ErrorClass::InvalidWhileParked
+            | ErrorClass::InvalidOperation
+            | ErrorClass::SafetyRejected
+            | ErrorClass::OwnershipConflict
+    )
+}
+
+/// True for an outcome that says the command did not take effect: a failure
+/// the device answered with, not a lost answer.
+fn definitely_not_applied(outcome: &OpOutcome) -> bool {
+    matches!(
+        outcome,
+        OpOutcome::Failed(err) if !matches!(
+            err.class,
+            ErrorClass::Timeout
+                | ErrorClass::Transport
+                | ErrorClass::Disconnected
+                | ErrorClass::OutcomeUnknown
+                | ErrorClass::Cancelled
+        )
+    )
+}
+
+/// What a guider command did (steps 4 and 11).
+enum GuiderReply {
+    Done,
+    /// It certainly did not take effect.
+    Refused(String),
+    /// It may have taken effect: the answer was lost or never came.
+    Unconfirmed(String),
 }
 
 fn is_guiding(guider: &GuiderHandle) -> bool {
@@ -370,12 +450,17 @@ struct OffsetPlan {
 }
 
 impl OffsetPlan {
+    /// `from_slot` is the slot the wheel reports; its offset is used only
+    /// when `from_verified` (W-c step 3).
     fn new(
         settings: &FilterSettings,
         wheel: &ReconciledWheel,
         from_slot: Option<u32>,
+        from_verified: bool,
         to_slot: u32,
     ) -> Self {
+        let reported = from_slot;
+        let from_slot = from_slot.filter(|_| from_verified);
         let to_entry = wheel.slot(to_slot);
         let from_entry = from_slot.and_then(|slot| wheel.slot(slot));
         let to = to_entry.and_then(|s| s.slot.offset);
@@ -391,7 +476,12 @@ impl OffsetPlan {
         }
         let delta = match (from_slot, from, to) {
             (None, _, _) => {
-                reasons.push("prev_offset_unknown".to_string());
+                reasons.push(match reported {
+                    Some(slot) => {
+                        format!("prev_offset_unknown: slot {} is not verified", slot + 1)
+                    }
+                    None => "prev_offset_unknown".to_string(),
+                });
                 None
             }
             (Some(slot), None, _) => {
@@ -589,32 +679,56 @@ impl FilterChanger {
         }
     }
 
-    /// Run a guider command and wait for it (step 4 pause, step 11 resume).
+    /// Run a guider command and wait for its outcome (step 4 pause, step 11
+    /// resume). An abort does not cut the wait short: a pause that was sent
+    /// must be followed by a resume, and a resume sent while the pause is
+    /// still outstanding would be refused or overtaken by it. Nothing moves
+    /// meanwhile. A watchdog bounds the acceptance and the outcome together.
     async fn guider_command(
         &self,
         guider: &GuiderHandle,
         cmd: GuiderCmd,
         info: &PermitInfo,
-        cancel: Option<&mut watch::Receiver<Option<CommandId>>>,
-    ) -> Result<(), String> {
+    ) -> GuiderReply {
         let (_, permit) = info.child();
-        let ticket = guider
-            .send(cmd, permit)
-            .await
-            .map_err(|err| err.to_string())?;
-        let budget = self.settings.guider_rpc_timeout() + WATCHDOG_GRACE;
-        match self.wait(ticket, budget, cancel).await {
-            Waited::Done(OpOutcome::Succeeded) => Ok(()),
-            Waited::Done(other) => Err(outcome_text(&other)),
-            Waited::Watchdog => Err("the guider did not answer".into()),
-            Waited::Cancelled(_) => Err("cancelled".into()),
+        let budget = self.settings.guider_rpc_timeout().max(GUIDER_PAUSE_WAIT) + WATCHDOG_GRACE;
+        let mut watchdog = self.services.timer.watchdog(budget);
+        let sent = tokio::select! {
+            biased;
+            sent = guider.send(cmd, permit) => sent,
+            () = &mut watchdog => {
+                return GuiderReply::Unconfirmed(
+                    "the guider worker did not accept the command".into(),
+                );
+            }
+        };
+        let ticket = match sent {
+            Ok(ticket) => ticket,
+            Err(err) if may_have_reached_device(&err) => {
+                return GuiderReply::Unconfirmed(err.to_string())
+            }
+            Err(err) => return GuiderReply::Refused(err.to_string()),
+        };
+        tokio::select! {
+            biased;
+            outcome = ticket.wait() => match outcome {
+                OpOutcome::Succeeded => GuiderReply::Done,
+                other if definitely_not_applied(&other) => {
+                    GuiderReply::Refused(outcome_text(&other))
+                }
+                other => GuiderReply::Unconfirmed(outcome_text(&other)),
+            },
+            () = &mut watchdog => GuiderReply::Unconfirmed("the guider did not answer".into()),
         }
     }
 
     /// Step 11: resume, then wait for the guider to report it has settled.
     async fn resume_guider(&self, guider: &GuiderHandle, info: &PermitInfo) -> Result<(), String> {
-        self.guider_command(guider, GuiderCmd::Resume, info, None)
-            .await?;
+        match self.guider_command(guider, GuiderCmd::Resume, info).await {
+            GuiderReply::Done => {}
+            GuiderReply::Refused(why) => return Err(why),
+            GuiderReply::Unconfirmed(why) => return Err(format!("unconfirmed: {why}")),
+        }
         let mut rx = guider.watch_snapshot();
         let mut watchdog = self
             .services
@@ -708,12 +822,19 @@ impl FilterChanger {
             }
         }
 
-        // Step 11 on every other path: never leave PHD2 paused.
+        // Step 11 on every other path: never leave PHD2 paused. A resume that
+        // fails or cannot be confirmed leaves guiding in doubt, so it blocks
+        // automatic resumption until the operator clears it.
         if st.report.guiding_paused && !st.guider_resumed {
             if let Some(guider) = &peers.guider {
                 st.guider_resumed = true;
                 if let Err(why) = self.resume_guider(guider, &info).await {
                     st.report.notes.push(format!("guider_resume_failed: {why}"));
+                    if st.block_reason.is_none() {
+                        st.block_reason = Some(format!(
+                            "guiding did not resume after the filter change: {why}"
+                        ));
+                    }
                 }
             }
         }
@@ -745,10 +866,23 @@ impl FilterChanger {
         };
         st.report.to_slot = Some(to_slot);
 
-        // Step 3: read the current slot (first, so the request names it).
+        // Step 3: read and verify the current slot (first, so the request
+        // names it).
         let wheel_snap = self.wheel.snapshot();
-        let from_slot = current_slot(&wheel_snap, &self.wheel.health());
+        let wheel_health = self.wheel.health();
+        let from_slot = current_slot(&wheel_snap, &wheel_health);
+        let verified_from = verified_current_slot(&wheel_snap, &wheel_health);
         st.report.from_slot = from_slot;
+        st.report.from_verified = verified_from.is_some();
+        if verified_from == Some(to_slot) {
+            // Nothing moves, so nothing is published: every `filter_*` event
+            // resets observation baselines and discards inference (H2,
+            // §7.2.1), and a sequencer may assert the filter before every
+            // frame. NINA does nothing here either.
+            st.report.noop = true;
+            st.report.arrived_slot = Some(to_slot);
+            return Ok(());
+        }
         st.requested = true;
         self.emit(
             EventKind::FilterChangeRequested {
@@ -758,18 +892,6 @@ impl FilterChanger {
             },
             cmd,
         );
-        if from_slot == Some(to_slot) && wheel_snap.verified {
-            st.report.noop = true;
-            st.report.arrived_slot = Some(to_slot);
-            self.emit(
-                EventKind::FilterArrived {
-                    slot: Some(to_slot),
-                    verified: true,
-                },
-                cmd,
-            );
-            return Ok(());
-        }
         self.mark_commanded(st);
         st.record = true;
 
@@ -803,7 +925,13 @@ impl FilterChanger {
         }
 
         // Offsets and focus-verification reasons (steps 9 and 10).
-        let offsets = OffsetPlan::new(&self.settings, model, from_slot, to_slot);
+        let offsets = OffsetPlan::new(
+            &self.settings,
+            model,
+            from_slot,
+            st.report.from_verified,
+            to_slot,
+        );
         st.report.offset_from = offsets.from;
         st.report.offset_to = offsets.to;
         st.report.focus_verification.extend(offsets.reasons);
@@ -837,16 +965,20 @@ impl FilterChanger {
             if self.settings.pause_guiding_on_offset && is_guiding(guider) {
                 if info.owns(DeviceKind::Guider) {
                     match self
-                        .guider_command(
-                            guider,
-                            GuiderCmd::Pause { full: false },
-                            info,
-                            Some(&mut *cancel),
-                        )
+                        .guider_command(guider, GuiderCmd::Pause { full: false }, info)
                         .await
                     {
-                        Ok(()) => st.report.guiding_paused = true,
-                        Err(why) => st.report.notes.push(format!("guider_pause_failed: {why}")),
+                        GuiderReply::Done => st.report.guiding_paused = true,
+                        GuiderReply::Refused(why) => {
+                            st.report.notes.push(format!("guider_pause_failed: {why}"))
+                        }
+                        GuiderReply::Unconfirmed(why) => {
+                            // PHD2 may have applied it: resume on every path.
+                            st.report.guiding_paused = true;
+                            st.report
+                                .notes
+                                .push(format!("guider_pause_unconfirmed: {why}"));
+                        }
                     }
                 } else {
                     st.report
@@ -864,11 +996,38 @@ impl FilterChanger {
 
         // Step 5: command the position.
         let (_, wheel_permit) = info.child();
-        let wheel_ticket = self
+        let wheel_ticket = match self
             .wheel
             .send(FilterWheelCmd::SetPosition(to_slot), wheel_permit)
             .await
-            .map_err(Stop::refused)?;
+        {
+            Ok(ticket) => ticket,
+            Err(err) if may_have_reached_device(&err) => {
+                // The initiator may be in flight: the wheel may be moving or
+                // at another slot, and no offset is applied.
+                self.history.record(clock.now_mono_ns());
+                self.emit(EventKind::FilterMoving { to_slot }, cmd);
+                self.emit(
+                    EventKind::FilterArrived {
+                        slot: None,
+                        verified: false,
+                    },
+                    cmd,
+                );
+                let outcome = OpOutcome::Unknown(DeviceError::outcome_unknown(format!(
+                    "the command to slot {to_slot} may have reached the wheel ({}: {}); \
+                     its position is unknown",
+                    err.class.as_str(),
+                    err.message
+                )));
+                let reason = format!(
+                    "the filter wheel did not verify slot {to_slot}: {}",
+                    outcome_text(&outcome)
+                );
+                return Err(Stop::blocked(outcome, reason));
+            }
+            Err(err) => return Err(Stop::refused(err)),
+        };
         self.history.record(clock.now_mono_ns());
         self.emit(EventKind::FilterMoving { to_slot }, cmd);
 
@@ -1786,20 +1945,327 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_verified_current_slot_is_a_noop() {
+    async fn the_verified_current_slot_is_a_silent_noop() {
         let rig = sim_rig(Options::default());
         let report = rig.change("L").await;
         assert!(report.noop && report.handshake_ok, "{report:?}");
+        assert!(report.from_verified);
+        assert_eq!(report.arrived_slot, Some(0));
         assert!(rig.sim().commanded().is_empty());
-        assert_eq!(
-            rig.events.names(),
-            vec![
-                "filter_change_requested",
-                "filter_arrived",
-                "filter_change_ended"
-            ]
-        );
+        // No `filter_*` event: H2 and the window builder reset on those, and
+        // a sequencer may assert the filter before every frame.
+        assert!(rig.events.names().is_empty(), "{:?}", rig.events.names());
         assert!(rig.switch_records().is_empty());
+        assert!(rig.focuser_fake.commands().is_empty());
+        assert!(rig.guider_fake.commands().is_empty());
+    }
+
+    /// Review: after a failed handshake the wheel reports a slot it has not
+    /// verified, and the focuser still holds the offset of the slot before.
+    /// The next change must not compute Δ from the unverified slot.
+    #[tokio::test]
+    async fn an_unverified_current_slot_gives_no_offset_and_requires_verification() {
+        let rig = sim_rig(Options::default());
+        rig.sim().wrong_slot_next_move(2);
+        let first = rig.change("Ha").await;
+        assert!(is_wrong_slot(&first.outcome), "{first:?}");
+        assert!(rig.focuser_fake.commands().is_empty());
+        let snap = rig.changer.wheel().snapshot();
+        assert_eq!(snap.position.value, Some(2));
+        assert!(!snap.verified);
+
+        rig.clear_timeline();
+        let second = rig.change("R").await;
+        assert!(second.handshake_ok, "the wheel move itself succeeds");
+        assert_eq!(second.from_slot, Some(2), "the reported slot is kept");
+        assert!(!second.from_verified);
+        assert_eq!(second.offset_from, None, "the held offset is unknown");
+        assert_eq!(second.offset_to, Some(12));
+        assert_eq!(second.offset_applied_steps, None);
+        assert_eq!(
+            second.focus_verification,
+            vec!["prev_offset_unknown: slot 3 is not verified".to_string()]
+        );
+        assert!(rig.focuser_fake.commands().is_empty(), "no offset move");
+        assert!(entries(&rig.timeline).contains(&"event:focus_verification_required".to_string()));
+        // No offset move, so guiding was not paused for this change.
+        assert_eq!(
+            rig.guider_fake.commands(),
+            vec![GuiderCmd::Pause { full: false }, GuiderCmd::Resume]
+        );
+        let snap = rig.changer.wheel().snapshot();
+        assert!(snap.verified && snap.verified_slot == Some(1));
+        let rec = rig.switch_records().pop().unwrap();
+        assert_eq!((rec.from_slot, rec.offset_from), (Some(2), None));
+        assert_eq!(rec.offset_applied_steps, None);
+    }
+
+    /// Review: a target equal to the unverified current slot is moved to and
+    /// verified, not treated as Δ = 0.
+    #[tokio::test]
+    async fn a_target_equal_to_the_unverified_current_slot_is_reverified() {
+        let rig = sim_rig(Options::default());
+        rig.sim().wrong_slot_next_move(2);
+        assert!(is_wrong_slot(&rig.change("Ha").await.outcome));
+
+        let report = rig.change("G").await;
+        assert!(!report.noop, "an unverified slot is never a no-op");
+        assert!(report.handshake_ok, "{report:?}");
+        assert_eq!((report.from_slot, report.to_slot), (Some(2), Some(2)));
+        assert_eq!(rig.sim().commanded(), vec![4, 2]);
+        assert_eq!(report.offset_applied_steps, None, "not Some(0)");
+        assert!(report
+            .focus_verification
+            .iter()
+            .any(|r| r.starts_with("prev_offset_unknown")));
+        assert!(rig.events.names().contains(&"focus_verification_required"));
+        assert!(rig.focuser_fake.commands().is_empty());
+        let snap = rig.changer.wheel().snapshot();
+        assert!(snap.verified && snap.verified_slot == Some(2));
+
+        // Now verified: asking for it again is a no-op.
+        let before = rig.events.names().len();
+        let again = rig.change("G").await;
+        assert!(again.noop && again.from_verified);
+        assert_eq!(rig.events.names().len(), before);
+    }
+
+    fn holding_guider(rig: &Rig, resume: FakeResponse) {
+        let log = Arc::clone(&rig.timeline);
+        rig.guider_fake.set_responder(move |cmd, _| match cmd {
+            GuiderCmd::Pause { .. } => {
+                push(&log, "guider:pause");
+                FakeResponse::hold()
+            }
+            GuiderCmd::Resume => {
+                push(&log, "guider:resume");
+                resume.clone()
+            }
+            _ => FakeResponse::succeed(),
+        });
+    }
+
+    fn spawn_change(rig: &Rig, name: &str) -> tokio::task::JoinHandle<HandshakeReport> {
+        let changer = Arc::clone(&rig.changer);
+        let peers = rig.peers();
+        let target = FilterTarget::Name(name.into());
+        tokio::spawn(async move {
+            let permit = permit(&target, operator(), Priority::Exposure);
+            changer
+                .change(peers, HandshakeRequest::new(target), permit)
+                .await
+        })
+    }
+
+    async fn until_pending<C, S>(fake: &FakeDevice<C, S>)
+    where
+        C: Clone + Send + 'static,
+        S: Clone + Send + Sync + 'static,
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fake.has_pending() {
+            assert!(Instant::now() < deadline, "the command never arrived");
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Review: an abort while the pause is outstanding must not leave PHD2
+    /// paused. The handshake waits for the pause to resolve, never commands
+    /// the wheel, and resumes.
+    #[tokio::test]
+    async fn an_abort_during_the_pause_still_resumes_guiding() {
+        let rig = sim_rig(Options::default());
+        holding_guider(&rig, FakeResponse::succeed());
+        let task = spawn_change(&rig, "Ha");
+        until_pending(&rig.guider_fake).await;
+        let by = rig.changer.abort();
+        // The handshake sees the abort but keeps waiting for the pause.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!task.is_finished(), "the pause outcome is awaited");
+        // PHD2 applies set_paused [true] after the abort.
+        assert!(rig.guider_fake.complete_pending(OpOutcome::Succeeded));
+        let report = task.await.unwrap();
+        assert!(
+            matches!(report.outcome, OpOutcome::Aborted { by: Some(id) } if id == by),
+            "{report:?}"
+        );
+        assert!(report.guiding_paused);
+        assert_eq!(
+            rig.guider_fake.commands(),
+            vec![GuiderCmd::Pause { full: false }, GuiderCmd::Resume]
+        );
+        assert!(rig.sim().commanded().is_empty(), "the wheel never moved");
+        assert!(rig.focuser_fake.commands().is_empty());
+        assert!(report.resume_block.is_none(), "nothing moved, PHD2 resumed");
+
+        // The same abort when the resume then fails: guiding is in doubt,
+        // so automatic resumption is blocked.
+        let rig = sim_rig(Options::default());
+        holding_guider(
+            &rig,
+            FakeResponse::finish(OpOutcome::Failed(DeviceError::driver(
+                "PHD2 refused set_paused",
+            ))),
+        );
+        let task = spawn_change(&rig, "Ha");
+        until_pending(&rig.guider_fake).await;
+        rig.changer.abort();
+        assert!(rig.guider_fake.complete_pending(OpOutcome::Succeeded));
+        let report = task.await.unwrap();
+        assert!(matches!(report.outcome, OpOutcome::Aborted { .. }));
+        let block = report.resume_block.expect("a resume block");
+        assert_eq!(block.kind, ResumeBlockKind::FilterHandshakeIncomplete);
+        assert!(block.reason.contains("guiding did not resume"), "{block:?}");
+        assert!(report
+            .notes
+            .iter()
+            .any(|n| n.starts_with("guider_resume_failed")));
+    }
+
+    /// Review: a pause whose answer is lost may still have taken effect, so
+    /// it is followed by a resume like a confirmed one.
+    #[tokio::test]
+    async fn an_unconfirmed_pause_is_resumed() {
+        let rig = sim_rig(Options::default());
+        holding_guider(&rig, FakeResponse::succeed());
+        let task = spawn_change(&rig, "Ha");
+        until_pending(&rig.guider_fake).await;
+        assert!(rig.guider_fake.complete_pending(OpOutcome::TimedOut));
+        let report = task.await.unwrap();
+        assert!(report.handshake_ok, "{report:?}");
+        assert!(report.guiding_paused);
+        assert!(report
+            .notes
+            .iter()
+            .any(|n| n.starts_with("guider_pause_unconfirmed")));
+        assert_eq!(rig.focuser_fake.commands(), vec![FocuserCmd::MoveBy(120)]);
+        let timeline = entries(&rig.timeline);
+        let applied = timeline
+            .iter()
+            .position(|e| e == "event:filter_offset_applied")
+            .unwrap();
+        let resumed = timeline.iter().position(|e| e == "guider:resume").unwrap();
+        assert!(applied < resumed, "{timeline:?}");
+
+        // A pause PHD2 refused outright is not followed by a resume.
+        let rig = sim_rig(Options::default());
+        rig.guider_fake.set_responder(|cmd, _| match cmd {
+            GuiderCmd::Pause { .. } => FakeResponse::finish(OpOutcome::Failed(
+                DeviceError::driver("PHD2 is not guiding"),
+            )),
+            _ => FakeResponse::succeed(),
+        });
+        let report = rig.change("Ha").await;
+        assert!(report.handshake_ok, "{report:?}");
+        assert!(!report.guiding_paused);
+        assert_eq!(
+            rig.guider_fake.commands(),
+            vec![GuiderCmd::Pause { full: false }]
+        );
+    }
+
+    /// Review: an acceptance error that may come after the initiator reached
+    /// the wheel is an unknown outcome with a resume block, not a refusal.
+    #[tokio::test]
+    async fn an_initiator_that_may_have_reached_the_wheel_blocks_resumption() {
+        for err in [
+            DeviceError::timeout("PUT position timed out"),
+            DeviceError::transport("connection reset"),
+            DeviceError::disconnected("the worker stopped while starting"),
+            DeviceError::driver("HTTP 500"),
+        ] {
+            let class = err.class;
+            let rig = rig(Wheel::Fake(fresh_slot(0)), Options::default());
+            let fake = rig.wheel_fake.as_ref().unwrap();
+            let reject = err.clone();
+            fake.set_responder(move |_, _| FakeResponse::reject(reject.clone()));
+            let report = rig.change("Ha").await;
+            match &report.outcome {
+                OpOutcome::Unknown(e) => {
+                    assert_eq!(e.class, ErrorClass::OutcomeUnknown);
+                    assert!(e.message.contains(class.as_str()), "{e}");
+                }
+                other => panic!("{class:?}: expected Unknown, got {other:?}"),
+            }
+            let block = report.resume_block.clone().expect("a resume block");
+            assert_eq!(block.kind, ResumeBlockKind::FilterHandshakeIncomplete);
+            assert_eq!(rig.events.blocks(), vec![block]);
+            assert!(rig.events.events().iter().any(|e| matches!(
+                &e.event,
+                EventKind::FilterArrived {
+                    slot: None,
+                    verified: false
+                }
+            )));
+            assert!(rig.events.names().contains(&"filter_moving"));
+            assert_eq!(report.arrived_slot, None);
+            assert!(rig.focuser_fake.commands().is_empty(), "no offset");
+            assert_eq!(
+                rig.guider_fake.commands(),
+                vec![GuiderCmd::Pause { full: false }, GuiderCmd::Resume]
+            );
+            let rec = &rig.switch_records()[0];
+            assert!(!rec.handshake_ok);
+            assert_eq!(rec.outcome.label(), "unknown");
+        }
+
+        // A refusal raised before anything is sent stays a refusal.
+        let rig = rig(Wheel::Fake(fresh_slot(0)), Options::default());
+        rig.wheel_fake
+            .as_ref()
+            .unwrap()
+            .set_responder(|_, _| FakeResponse::reject(DeviceError::invalid_value("no slot 9")));
+        let report = rig.change("Ha").await;
+        assert!(
+            matches!(&report.outcome, OpOutcome::Failed(e) if e.class == ErrorClass::InvalidValue),
+            "{report:?}"
+        );
+        assert!(report.resume_block.is_none());
+        assert!(!rig.events.names().contains(&"filter_moving"));
+    }
+
+    #[test]
+    fn acceptance_errors_are_sorted_by_whether_the_initiator_may_have_been_sent() {
+        for class in [
+            ErrorClass::NotConnected,
+            ErrorClass::Unsupported,
+            ErrorClass::InvalidValue,
+            ErrorClass::InvalidWhileParked,
+            ErrorClass::InvalidOperation,
+            ErrorClass::SafetyRejected,
+            ErrorClass::OwnershipConflict,
+        ] {
+            assert!(
+                !may_have_reached_device(&DeviceError::new(class, "x")),
+                "{class:?}"
+            );
+        }
+        for class in [
+            ErrorClass::Disconnected,
+            ErrorClass::Timeout,
+            ErrorClass::OutcomeUnknown,
+            ErrorClass::Transport,
+            ErrorClass::Driver,
+            ErrorClass::Cancelled,
+        ] {
+            assert!(
+                may_have_reached_device(&DeviceError::new(class, "x")),
+                "{class:?}"
+            );
+        }
+        assert!(definitely_not_applied(&OpOutcome::Failed(
+            DeviceError::driver("no")
+        )));
+        assert!(!definitely_not_applied(&OpOutcome::Failed(
+            DeviceError::timeout("lost")
+        )));
+        assert!(!definitely_not_applied(&OpOutcome::TimedOut));
+        assert!(!definitely_not_applied(&OpOutcome::Aborted { by: None }));
+        assert!(!definitely_not_applied(&OpOutcome::Succeeded));
     }
 
     #[tokio::test]

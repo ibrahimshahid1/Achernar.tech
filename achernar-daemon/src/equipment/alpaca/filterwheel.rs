@@ -266,6 +266,28 @@ impl AlpacaFilterWheel {
         self.confirm_connected()
     }
 
+    /// The connect request and its confirmation (§2.6): Platform 7 when
+    /// `platform7` is set and the server knows `connect`, else Platform 6
+    /// (`platform7` is then cleared).
+    fn open_connection(
+        &mut self,
+        timeout: Duration,
+        started: u64,
+        report: &mut ConnectReport,
+    ) -> DeviceResult<()> {
+        if self.platform7 {
+            if self.connect_platform7(timeout, started)? {
+                return Ok(());
+            }
+            report
+                .warnings
+                .push("the server does not implement connect; using Connected=true".into());
+            self.unsupported.insert("connect".into());
+            self.platform7 = false;
+        }
+        self.connect_platform6()
+    }
+
     /// PUT `connect`, then poll `connecting`. `Ok(false)` means the server
     /// does not know `connect` and the Platform 6 path should be used.
     fn connect_platform7(&self, timeout: Duration, started: u64) -> DeviceResult<bool> {
@@ -554,19 +576,14 @@ impl Device for AlpacaFilterWheel {
         self.interface_version = Some(version);
         report.interface_version = Some(version);
 
-        self.platform7 = false;
-        if version >= PLATFORM7_INTERFACE_VERSION {
-            if self.connect_platform7(timeout, started)? {
-                self.platform7 = true;
-            } else {
-                report
-                    .warnings
-                    .push("the server does not implement connect; using Connected=true".into());
-                self.unsupported.insert("connect".into());
-                self.connect_platform6()?;
-            }
-        } else {
-            self.connect_platform6()?;
+        // From the first connect request on, any failure disconnects the
+        // device (§2.6), so a server that finishes connecting late keeps no
+        // stray connection for this ClientID. `platform7` is set before the
+        // attempt so that cleanup uses PUT `disconnect` on Platform 7.
+        self.platform7 = version >= PLATFORM7_INTERFACE_VERSION;
+        if let Err(err) = self.open_connection(timeout, started, &mut report) {
+            let _ = self.disconnect();
+            return Err(err);
         }
         report.path = if self.platform7 {
             ConnectPath::Platform7
@@ -885,6 +902,88 @@ mod tests {
         let report = wheel.connect(Duration::from_secs(1)).unwrap();
         assert_eq!(report.path, ConnectPath::Platform6);
         assert!(report.unsupported_members.contains(&"connect".to_string()));
+    }
+
+    /// Review: every failure after the first connect request disconnects
+    /// (§2.6), with the platform's own member.
+    #[test]
+    fn every_connect_failure_disconnects_the_device() {
+        let clock = Arc::new(ManualClock::new());
+        let disconnects = |fake: &FakeAlpacaTransport| {
+            (
+                fake.calls_to(Method::Put, "disconnect"),
+                fake.calls()
+                    .into_iter()
+                    .filter(|c| {
+                        c.method == Method::Put
+                            && c.member == "connected"
+                            && c.params == vec![("Connected".into(), "false".into())]
+                    })
+                    .count(),
+            )
+        };
+
+        // Platform 7: still connecting at the deadline.
+        let fake = platform6();
+        fake.on_get("interfaceversion", FakeReply::value(3))
+            .on_put("connect", FakeReply::ok())
+            .on_put("disconnect", FakeReply::ok())
+            .on_get("connecting", FakeReply::value(true));
+        let mut wheel = driver(&fake, &clock);
+        let err = wheel.connect(Duration::from_secs(1)).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Timeout);
+        assert_eq!(disconnects(&fake), (1, 0));
+
+        // Platform 7: the connect request itself times out.
+        let fake = platform6();
+        fake.on_get("interfaceversion", FakeReply::value(3))
+            .on_put("connect", FakeReply::Timeout)
+            .on_put("disconnect", FakeReply::ok());
+        let mut wheel = driver(&fake, &clock);
+        assert_eq!(
+            wheel.connect(Duration::from_secs(1)).unwrap_err().class,
+            ErrorClass::Timeout
+        );
+        assert_eq!(disconnects(&fake), (1, 0));
+
+        // Platform 7: connected, but Connected reads false.
+        let fake = platform6();
+        fake.on_get("interfaceversion", FakeReply::value(3))
+            .on_put("connect", FakeReply::ok())
+            .on_put("disconnect", FakeReply::ok())
+            .on_get("connecting", FakeReply::value(false))
+            .on_get("connected", FakeReply::value(false));
+        let mut wheel = driver(&fake, &clock);
+        assert!(wheel.connect(Duration::from_secs(1)).is_err());
+        assert_eq!(disconnects(&fake), (1, 0));
+
+        // Platform 6: Connected=true is not confirmed.
+        let fake = platform6();
+        fake.on_get("connected", FakeReply::value(false));
+        let mut wheel = driver(&fake, &clock);
+        assert_eq!(
+            wheel.connect(Duration::from_secs(1)).unwrap_err().class,
+            ErrorClass::Driver
+        );
+        assert_eq!(disconnects(&fake), (0, 1));
+
+        // Platform 6: the Connected=true request fails.
+        let fake = platform6();
+        fake.queue_put("connected", [FakeReply::Transport("reset".into())]);
+        let mut wheel = driver(&fake, &clock);
+        assert_eq!(
+            wheel.connect(Duration::from_secs(1)).unwrap_err().class,
+            ErrorClass::Transport
+        );
+        assert_eq!(disconnects(&fake), (0, 1));
+
+        // No connect request was sent yet: nothing to undo. A failed
+        // interfaceversion read is version 1 and connects normally.
+        let fake = platform6();
+        fake.on_get("interfaceversion", FakeReply::Timeout);
+        let mut wheel = driver(&fake, &clock);
+        wheel.connect(Duration::from_secs(1)).unwrap();
+        assert_eq!(disconnects(&fake), (0, 0));
     }
 
     #[test]
