@@ -3,9 +3,10 @@
 //! An in-process `SafetyDriver`, also selectable as driver `sim`. A
 //! [`SimSafetyControl`] (cloneable) scripts it: safe, unsafe or warning (the
 //! INDI Busy level, so the `warning_is_unsafe` rule is testable without
-//! INDI), injected read failures, and a dropped connection. Like the Alpaca
-//! driver it never caches: `is_safe` returns the latest poll's reading once,
-//! and a failed read is an error, never "safe".
+//! INDI), injected read failures, an `IsSafe` that is not set (ValueNotSet),
+//! and a dropped connection. Like the Alpaca driver it never caches:
+//! `is_safe` returns the latest poll's reading once, and a failed or unset
+//! read is an error, never "safe". A not-set read does not fail the poll.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -16,8 +17,8 @@ use crate::equipment::traits::{
     SafetyDriver,
 };
 use crate::equipment::types::{
-    identity_key, DeviceError, DeviceIdentity, DeviceKind, DeviceResult, DriverId, Endpoint,
-    ObsState,
+    ascom_error, identity_key, DeviceError, DeviceIdentity, DeviceKind, DeviceResult, DriverId,
+    Endpoint, ObsState,
 };
 
 #[derive(Debug)]
@@ -26,6 +27,7 @@ struct SimSafetyState {
     detail: Option<String>,
     fail_reads: u32,
     failing: bool,
+    not_set: bool,
     reachable: bool,
     reads: u64,
 }
@@ -37,6 +39,7 @@ impl Default for SimSafetyState {
             detail: None,
             fail_reads: 0,
             failing: false,
+            not_set: false,
             reachable: true,
             reads: 0,
         }
@@ -82,6 +85,11 @@ impl SimSafetyControl {
     /// Every read fails until cleared.
     pub fn set_failing(&self, failing: bool) {
         self.state().failing = failing;
+    }
+
+    /// True: `IsSafe` answers ValueNotSet (a monitor still warming up).
+    pub fn set_not_set(&self, not_set: bool) {
+        self.state().not_set = not_set;
     }
 
     /// False: the monitor drops the connection.
@@ -162,6 +170,12 @@ impl SimSafetyMonitor {
                 "simulated safety monitor: injected read failure",
             ));
         }
+        if state.not_set {
+            return Err(DeviceError::from_alpaca_error(
+                ascom_error::VALUE_NOT_SET,
+                "simulated safety monitor: IsSafe is not set",
+            ));
+        }
         Ok(SafetyReading {
             level: state.level,
             detail: state.detail.clone(),
@@ -213,10 +227,10 @@ impl Device for SimSafetyMonitor {
                 .as_ref()
                 .ok()
                 .map(|r| serde_json::Value::Bool(r.level == SafetyLevel::Safe)),
-            state: if reading.is_ok() {
-                ObsState::Fresh
-            } else {
-                ObsState::Error
+            state: match &reading {
+                Ok(_) => ObsState::Fresh,
+                Err(err) if err.is_not_set() => ObsState::NotSet,
+                Err(_) => ObsState::Error,
             },
             observed_at: Some(now),
             mono_ns: Some(mono),
@@ -224,7 +238,12 @@ impl Device for SimSafetyMonitor {
             error: reading.as_ref().err().map(|e| e.to_string()),
         };
         self.latest = Some(reading.clone());
-        reading?;
+        // ValueNotSet is an unknown level, not a link failure (C-2).
+        if let Err(err) = reading {
+            if !err.is_not_set() {
+                return Err(err);
+            }
+        }
         Ok(RawPoll {
             method: PollMethod::InProcess,
             started_mono_ns: mono,
@@ -291,12 +310,21 @@ mod tests {
         sim.poll(&PollPlan::default()).unwrap();
         assert_eq!(sim.is_safe().unwrap().level, SafetyLevel::Unsafe);
 
+        control.set_not_set(true);
+        let raw = sim.poll(&PollPlan::default()).unwrap();
+        assert_eq!(raw.members[0].state, ObsState::NotSet);
+        assert!(
+            sim.is_safe().unwrap_err().is_not_set(),
+            "not set is not safe"
+        );
+        control.set_not_set(false);
+
         control.set_reachable(false);
         assert_eq!(
             sim.poll(&PollPlan::default()).unwrap_err().class,
             ErrorClass::Disconnected
         );
         assert!(!sim.is_connected().unwrap());
-        assert_eq!(control.reads(), 5);
+        assert_eq!(control.reads(), 6);
     }
 }

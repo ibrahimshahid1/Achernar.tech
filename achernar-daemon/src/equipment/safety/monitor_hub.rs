@@ -22,7 +22,8 @@
 //! failed poll or a stale value only makes the state `Unknown`; it never
 //! triggers the policy, so a Wi-Fi blip never parks the mount (§9.3 item 1).
 //! The hub reports raw edges; the supervisor latches them so the policy runs
-//! once per unsafe episode.
+//! once per unsafe episode while the rig stays secured (see
+//! [`super::policy`]).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -348,9 +349,10 @@ fn op_name(cmd: &GatedCommand) -> String {
 
 /// The gate plug-in for §2.8 and §3.10 "Gating": while safety is not `Safe`
 /// or `None`, new automatic actions are refused (autofocus triggers,
-/// dithers, flips, automatic captures and slews). Operator commands are not
-/// refused here (the mount's own limits check handles them), and neither is
-/// anything that stops or secures the rig ([`super::is_safing_op`]).
+/// dithers, flips, automatic captures and slews, and automatic resume-block
+/// clears). Operator commands are not refused here (the mount's own limits
+/// check handles them), and neither is anything that stops or secures the
+/// rig ([`super::is_safing_op`]).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SafetyGateCheck;
 
@@ -743,6 +745,57 @@ mod tests {
             check.check(&dither, &snap).is_ok(),
             "other blocks are the gate's own resume-block rule, not this check"
         );
+    }
+
+    #[test]
+    fn an_automatic_resume_block_clear_is_refused_unless_safe() {
+        let check = SafetyGateCheck;
+        let block_id = Uuid::new_v4();
+        let clear = |source: CommandSource| {
+            GatedCommand::new(
+                GatedOp::ClearResumeBlock { id: block_id },
+                source,
+                AutonomyMode::Bounded,
+                Priority::Exposure,
+            )
+        };
+        let automatic = clear(CommandSource::System);
+        let by_policy = clear(CommandSource::Policy {
+            model: "resume".into(),
+            version: "1".into(),
+        });
+        let by_operator = clear(CommandSource::Operator { overriding: false });
+        assert!(check.applies_to(&automatic));
+        assert!(check.applies_to(&by_policy));
+        assert!(!check.applies_to(&by_operator), "the operator's resume");
+
+        let mut snap = EquipmentSnapshot::default();
+        for state in [SafetyGate::Unsafe, SafetyGate::Unknown] {
+            snap.safety.state = state;
+            for cmd in [&automatic, &by_policy] {
+                let rejection = check.check(cmd, &snap).unwrap_err();
+                assert!(
+                    rejection.reason.contains("automatic clear_resume_block"),
+                    "{}",
+                    rejection.reason
+                );
+            }
+        }
+        // Safe, with the safety block from the episode still active: an
+        // automatic clear is still refused (Tier 1 resume is manual).
+        snap.safety.state = SafetyGate::Safe;
+        snap.resume_blocks
+            .push(crate::equipment::snapshot::ResumeBlock {
+                id: block_id,
+                kind: ResumeBlockKind::SafetyUnsafe,
+                raised_at: clock_now(),
+                raised_mono_ns: 0,
+                device_kind: None,
+                connection_id: None,
+                command_id: None,
+                reason: "rain".into(),
+            });
+        assert!(check.check(&automatic, &snap).is_err());
     }
 
     fn clock_now() -> chrono::DateTime<chrono::Utc> {

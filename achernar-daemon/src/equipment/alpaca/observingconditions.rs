@@ -471,9 +471,13 @@ impl AlpacaLink {
         .map(|_| ())
     }
 
-    /// Poll `connecting` every `connect_poll` until false, at most `timeout`.
-    /// The budget is counted in polls so a manual test clock cannot stall it.
+    /// Poll `connecting` every `connect_poll` until false, for at most
+    /// `timeout` of elapsed time (§2.6), however long each GET takes. The
+    /// budget is wall time from `std::time::Instant`, not the injectable
+    /// clock, so a manual test clock cannot stall it; a poll count derived
+    /// from the timeout is a second cap.
     fn wait_for_connecting(&self, timeout: Duration) -> DeviceResult<()> {
+        let started = std::time::Instant::now();
         let step = self.connect_poll.max(Duration::from_millis(1));
         let max_polls = (timeout.as_millis() / step.as_millis()).max(1) + 1;
         for poll in 0..max_polls {
@@ -487,9 +491,11 @@ impl AlpacaLink {
                 }
                 Err(err) => return Err(err),
             }
-            if poll + 1 < max_polls {
-                std::thread::sleep(self.connect_poll);
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() || poll + 1 >= max_polls {
+                break;
             }
+            std::thread::sleep(self.connect_poll.min(remaining));
         }
         Err(DeviceError::timeout(format!(
             "the device was still connecting after {} s",
@@ -1228,6 +1234,21 @@ mod tests {
         let err = oc.connect(Duration::from_millis(5)).unwrap_err();
         assert_eq!(err.class, ErrorClass::Timeout);
         assert!(oc.poll(&PollPlan::default()).is_err(), "not connected");
+
+        // Slow `connecting` replies: the wait is bounded by elapsed time,
+        // not by a poll count (61 polls of 25 ms here would take 1.5 s).
+        let slow = FakeAlpacaTransport::new().shared();
+        slow.on_get("interfaceversion", FakeReply::value(2))
+            .on_put("connect", FakeReply::ok())
+            .on_get(
+                "connecting",
+                FakeReply::Delay(Duration::from_millis(25), Box::new(FakeReply::value(true))),
+            );
+        let mut oc = driver(&slow, &clock);
+        let err = oc.connect(Duration::from_millis(60)).unwrap_err();
+        assert_eq!(err.class, ErrorClass::Timeout);
+        let polls = slow.calls_to(Method::Get, "connecting");
+        assert!((1..=3).contains(&polls), "{polls} connecting polls");
 
         let fake = platform6_fake();
         fake.on_put("refresh", FakeReply::not_implemented());

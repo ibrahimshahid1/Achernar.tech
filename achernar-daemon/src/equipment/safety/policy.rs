@@ -5,8 +5,12 @@
 //! going `Lost` (see [`super::monitor_hub`]). One `Degraded` poll, a failed
 //! read or a stale value never runs it; they only make safety `Unknown`,
 //! which refuses new automatic actions. The supervisor latches the policy so
-//! it runs once per unsafe episode, and re-arms it only on a confirmed safe
-//! state (or once no monitor is configured).
+//! it runs once per unsafe episode while the rig stays secured, and re-arms
+//! it on a confirmed safe state (or once no monitor is configured). A new
+//! confirmed edge in the same episode runs it again when the rig is no
+//! longer secured (for example, unparked by the operator while safety was
+//! unknown), and a trigger that arrives during a run is looked at again
+//! once that run ends.
 //!
 //! **What it does, in order** (the §5.3 and §5.7 acceptance order; §3.10
 //! lists the exposure abort before stopping the guider, see the change notes):
@@ -507,6 +511,54 @@ impl UnsafePolicy {
         }
     }
 
+    /// True when a run now would leave every device alone: it reads the
+    /// same snapshots and applies the same skip rules as [`Self::run`]. The
+    /// supervisor uses it to re-run the policy on a new confirmed edge when
+    /// the rig was unsecured after an earlier run (for example, unparked by
+    /// the operator while safety was unknown). Reads handles only.
+    pub fn rig_secured(&self, targets: &PolicyTargets) -> bool {
+        let guider_secured = match targets.guider.as_ref().filter(|g| !g.is_retired()) {
+            None => true,
+            Some(guider) => {
+                guider.snapshot().app_state.fresh_value() == Some(&GuiderAppState::Stopped)
+            }
+        };
+        let camera_secured = !self.settings.abort_exposure
+            || targets
+                .camera
+                .as_ref()
+                .is_none_or(|camera| camera.exposing().fresh_value() == Some(&false));
+        guider_secured && camera_secured && self.mount_secured(targets.mount.as_ref())
+    }
+
+    fn mount_secured(&self, mount: Option<&MountHandle>) -> bool {
+        let Some(mount) = mount.filter(|m| !m.is_retired()) else {
+            return true;
+        };
+        if self.settings.on_unsafe == OnUnsafe::Notify {
+            return true;
+        }
+        let snap = mount.snapshot();
+        if snap
+            .active_op
+            .as_ref()
+            .is_some_and(|op| op.kind == OpKind::Park)
+        {
+            return true;
+        }
+        if mount_may_be_moving(&snap) {
+            return false;
+        }
+        if snap.state.at_park.fresh_value() == Some(&true) {
+            return true;
+        }
+        let parks = matches!(
+            self.settings.on_unsafe,
+            OnUnsafe::Park | OnUnsafe::FromMountConfig
+        ) && snap.capabilities.can_park;
+        !parks && snap.state.tracking.fresh_value() == Some(&false)
+    }
+
     /// Run the sequence for `trigger` against `targets`.
     pub async fn run(&self, trigger: &PolicyTrigger, targets: &PolicyTargets) -> PolicyRun {
         let started_at = self.clock.now_utc();
@@ -911,8 +963,10 @@ impl UnsafePolicy {
 pub struct StepReport {
     pub evaluation: Evaluation,
     pub run: Option<PolicyRun>,
-    /// Triggers ignored because the policy already ran for this episode or
-    /// is still running.
+    /// Triggers not run now: the policy already ran for this episode and
+    /// the rig is still secured, or a run is in progress. The latest trigger
+    /// that arrived during a run is retried once the run ends, if the rig is
+    /// then still not secured.
     pub suppressed: Vec<PolicyTrigger>,
 }
 
@@ -925,8 +979,11 @@ enum BlockAction {
 struct SupervisorState {
     hub: SafetyMonitorHub,
     monitors: Vec<SafetyMonitorHandle>,
-    /// The policy may run on the next trigger.
+    /// No run yet in this unsafe episode: the next trigger runs the policy
+    /// even on a secured rig (it still raises the block).
     armed: bool,
+    /// A trigger that arrived while a run was in progress.
+    pending: Option<PolicyTrigger>,
     /// The `safety_unknown` block this supervisor raised.
     unknown_block: Option<Uuid>,
 }
@@ -970,6 +1027,7 @@ impl SafetySupervisor {
                 hub: SafetyMonitorHub::new(hub),
                 monitors: Vec::new(),
                 armed: true,
+                pending: None,
                 unknown_block: None,
             }),
             policy,
@@ -1060,11 +1118,31 @@ impl SafetySupervisor {
         lock(&self.runs).clone()
     }
 
+    /// Set the running flag if no run is in progress.
+    fn try_start(&self) -> bool {
+        self.running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Evaluate the monitors; emit `safety_changed`; manage the
     /// `safety_unknown` block; pick at most one trigger to run. A trigger
     /// that is returned has the running flag set, and the caller must run
     /// it ([`Self::execute_run`] clears the flag).
+    ///
+    /// Trigger selection. The first trigger of an unsafe episode always
+    /// runs. A later one in the same episode runs only if the rig is no
+    /// longer secured ([`UnsafePolicy::rig_secured`]): an edge that finds
+    /// the mount unparked or tracking again (say, after an operator unpark
+    /// while safety was unknown) secures it again, while an edge on a still
+    /// secured rig is latched. A trigger that arrives during a run is kept
+    /// and looked at again once the run has ended.
     fn assess(&self) -> (Evaluation, Option<PolicyTrigger>, Vec<PolicyTrigger>) {
+        // Read the rig before taking the state lock: the target source and
+        // the handles take their own locks. `running` is read first, so a
+        // run that had ended by then is reflected in `secured`.
+        let was_running = self.running.load(Ordering::Acquire);
+        let secured = self.policy.rig_secured(&self.targets.targets());
         let (evaluation, trigger, suppressed, action) = {
             let mut state = lock(&self.state);
             state.monitors.retain(|h| !h.is_retired());
@@ -1078,22 +1156,36 @@ impl SafetySupervisor {
                 evaluation.summary.state,
                 SafetyGate::Safe | SafetyGate::None
             ) {
+                // The episode is over.
                 state.armed = true;
+                state.pending = None;
             }
             let mut trigger = None;
             let mut suppressed = Vec::new();
             for candidate in &evaluation.triggers {
-                let free = trigger.is_none()
-                    && state.armed
-                    && self
-                        .running
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok();
-                if free {
-                    state.armed = false;
-                    trigger = Some(candidate.clone());
-                } else {
-                    suppressed.push(candidate.clone());
+                if trigger.is_none() && (state.armed || !secured) {
+                    if self.try_start() {
+                        state.armed = false;
+                        state.pending = None;
+                        trigger = Some(candidate.clone());
+                        continue;
+                    }
+                    // A run is in progress: look again once it ends.
+                    state.pending = Some(candidate.clone());
+                }
+                suppressed.push(candidate.clone());
+            }
+            if trigger.is_none() && !was_running {
+                // Dropped when the run that was in progress secured the rig.
+                if let Some(pending) = state.pending.take() {
+                    if state.armed || !secured {
+                        if self.try_start() {
+                            state.armed = false;
+                            trigger = Some(pending);
+                        } else {
+                            state.pending = Some(pending);
+                        }
+                    }
                 }
             }
             let action = match evaluation.summary.state {
@@ -1256,7 +1348,8 @@ mod tests {
     use crate::equipment::testing::manual_clock::ManualClock;
     use crate::equipment::traits::{Device, PollPlan, RecorderSink};
     use crate::equipment::types::{
-        DeviceIdentity, DeviceResult, DriverId, Endpoint, HealthState, LinkState, Observed, Source,
+        DeviceIdentity, DeviceResult, DriverId, Endpoint, HealthState, LinkState, ObsState,
+        Observed, Source,
     };
     use futures::future::BoxFuture;
 
@@ -2059,6 +2152,199 @@ mod tests {
         stopper.join().unwrap();
         assert!(matches!(run.trigger, PolicyTrigger::MonitorLost { .. }));
         assert_eq!(rig.mount_fake.commands(), vec![MountCmd::Park]);
+    }
+
+    #[tokio::test]
+    async fn a_new_edge_parks_again_when_the_rig_was_unparked_during_the_episode() {
+        let manual = Arc::new(ManualClock::new());
+        let rig = Rig::new(Arc::clone(&manual) as Arc<dyn Clock>);
+        let control = SimSafetyControl::new();
+        let mut monitor = MonitorHarness::new(Arc::clone(&rig.clock), control.clone(), "roof");
+        let supervisor = rig.supervisor(PolicySettings::default());
+        supervisor.add_monitor(monitor.handle.clone());
+        monitor.tick();
+        supervisor.step().await;
+
+        // Unsafe: the policy parks.
+        control.set_safe(false);
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        let stopper = rig.stop_mount_on_cancel();
+        supervisor.step().await.run.expect("the first edge runs");
+        stopper.join().unwrap();
+        assert_eq!(rig.mount_fake.commands(), vec![MountCmd::Park]);
+
+        // The monitor is lost. The rig is secured, so the Lost edge is
+        // latched rather than run again.
+        control.set_failing(true);
+        for _ in 0..3 {
+            manual.advance(SAFETY_POLL_INTERVAL);
+            monitor.tick();
+        }
+        assert_eq!(monitor.handle.health().state, LinkState::Lost);
+        let step = supervisor.step().await;
+        assert_eq!(step.evaluation.summary.state, SafetyGate::Unknown);
+        assert!(step.run.is_none());
+        assert!(matches!(
+            step.suppressed.as_slice(),
+            [PolicyTrigger::MonitorLost { .. }]
+        ));
+
+        // While safety is unknown the operator unparks and tracks again
+        // (operator commands pass the safety check).
+        rig.mount_fake.update(|snap| {
+            snap.state.at_park = Observed::fresh_at(false, Source::DeviceState, rig.clock.as_ref());
+            snap.state.tracking = Observed::fresh_at(true, Source::DeviceState, rig.clock.as_ref());
+        });
+
+        // The link recovers and the sky is still unsafe: the new confirmed
+        // edge finds the rig unsecured and parks it again.
+        control.set_failing(false);
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        let step = supervisor.step().await;
+        let run = step.run.expect("an unsecured rig is secured again");
+        assert!(matches!(run.trigger, PolicyTrigger::ConfirmedUnsafe { .. }));
+        assert!(run.step(PolicyAction::Park).unwrap().status.is_done());
+        assert_eq!(
+            rig.mount_fake.commands(),
+            vec![MountCmd::Park, MountCmd::Park]
+        );
+        assert_eq!(supervisor.runs().len(), 2);
+
+        // Secured again: a later edge in the same episode is latched.
+        control.fail_next_reads(1);
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        assert!(supervisor.step().await.run.is_none());
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        let step = supervisor.step().await;
+        assert!(step.run.is_none());
+        assert_eq!(step.suppressed.len(), 1);
+        assert_eq!(rig.mount_fake.commands().len(), 2);
+
+        // on_unsafe = stop_tracking: tracking turned back on while unknown
+        // is stopped again on the next edge.
+        let rig = Rig::new(Arc::clone(&manual) as Arc<dyn Clock>);
+        rig.mount_fake.update(|snap| {
+            snap.state.slewing = Observed::fresh_at(false, Source::DeviceState, rig.clock.as_ref());
+        });
+        let control = SimSafetyControl::new();
+        let mut monitor = MonitorHarness::new(Arc::clone(&rig.clock), control.clone(), "rain");
+        let supervisor = rig.supervisor(PolicySettings {
+            on_unsafe: OnUnsafe::StopTracking,
+            ..PolicySettings::default()
+        });
+        supervisor.add_monitor(monitor.handle.clone());
+        monitor.tick();
+        supervisor.step().await;
+        control.set_safe(false);
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        supervisor.step().await.run.expect("the first edge runs");
+        control.fail_next_reads(1);
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        assert!(supervisor.step().await.run.is_none(), "degraded");
+        rig.mount_fake.update(|snap| {
+            snap.state.tracking = Observed::fresh_at(true, Source::DeviceState, rig.clock.as_ref());
+        });
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        supervisor
+            .step()
+            .await
+            .run
+            .expect("tracking was turned back on");
+        assert_eq!(
+            rig.mount_fake.commands(),
+            vec![MountCmd::SetTracking(false), MountCmd::SetTracking(false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_trigger_during_a_run_is_retried_once_the_run_ends() {
+        let manual = Arc::new(ManualClock::new());
+        let rig = Rig::new(Arc::clone(&manual) as Arc<dyn Clock>);
+        let control = SimSafetyControl::new();
+        let mut monitor = MonitorHarness::new(Arc::clone(&rig.clock), control.clone(), "roof");
+        let supervisor = rig.supervisor(PolicySettings::default());
+        supervisor.add_monitor(monitor.handle.clone());
+        monitor.tick();
+        supervisor.step().await;
+
+        // Hold the running flag as a run in progress would.
+        supervisor.running.store(true, Ordering::Release);
+        control.set_safe(false);
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        let step = supervisor.step().await;
+        assert!(step.run.is_none());
+        assert_eq!(step.suppressed.len(), 1);
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        assert!(supervisor.step().await.run.is_none(), "still running");
+        assert!(rig.mount_fake.commands().is_empty());
+
+        // The run ends with the rig still unsecured: the kept trigger runs.
+        supervisor.running.store(false, Ordering::Release);
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        let stopper = rig.stop_mount_on_cancel();
+        let run = supervisor
+            .step()
+            .await
+            .run
+            .expect("the kept trigger runs after the run");
+        stopper.join().unwrap();
+        assert!(matches!(run.trigger, PolicyTrigger::ConfirmedUnsafe { .. }));
+        assert_eq!(rig.mount_fake.commands(), vec![MountCmd::Park]);
+
+        // Once only.
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        assert!(supervisor.step().await.run.is_none());
+        assert_eq!(supervisor.runs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn value_not_set_is_unknown_but_never_a_lost_link() {
+        let manual = Arc::new(ManualClock::new());
+        let rig = Rig::new(Arc::clone(&manual) as Arc<dyn Clock>);
+        let control = SimSafetyControl::new();
+        let mut monitor = MonitorHarness::new(Arc::clone(&rig.clock), control.clone(), "allsky");
+        let supervisor = rig.supervisor(PolicySettings::default());
+        supervisor.add_monitor(monitor.handle.clone());
+        monitor.tick();
+        supervisor.step().await;
+
+        // A monitor that answers ValueNotSet: unknown, gated fail-safe, but
+        // the link stays Ready, so it never goes Lost and never parks.
+        control.set_not_set(true);
+        for _ in 0..5 {
+            manual.advance(SAFETY_POLL_INTERVAL);
+            monitor.tick();
+            assert_eq!(monitor.handle.health().state, LinkState::Ready);
+            assert_eq!(monitor.handle.snapshot().level.state, ObsState::NotSet);
+            assert_eq!(monitor.handle.snapshot().level.value, None);
+            let step = supervisor.step().await;
+            assert_eq!(step.evaluation.summary.state, SafetyGate::Unknown);
+            assert!(step.run.is_none() && step.evaluation.triggers.is_empty());
+        }
+        assert!(!supervisor.summary().state.allows_automatic());
+        assert_eq!(rig.block_kinds(), vec![ResumeBlockKind::SafetyUnknown]);
+        assert!(rig.mount_fake.commands().is_empty());
+        assert!(rig.guider_fake.commands().is_empty());
+
+        control.set_not_set(false);
+        manual.advance(SAFETY_POLL_INTERVAL);
+        monitor.tick();
+        assert_eq!(
+            supervisor.step().await.evaluation.summary.state,
+            SafetyGate::Safe
+        );
+        assert!(rig.block_kinds().is_empty());
     }
 
     #[tokio::test]

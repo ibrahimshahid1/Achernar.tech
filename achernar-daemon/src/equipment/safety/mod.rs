@@ -292,7 +292,10 @@ pub fn weather_snapshot(
 
 /// The `SafetySnapshot` a worker publishes after a safety poll. Never
 /// cached (§3.10): a failed poll or read publishes an unknown level in state
-/// `Error`, never the previous level.
+/// `Error`, never the previous level. A successful poll whose `IsSafe` is
+/// not set (ValueNotSet, C-2) publishes an unknown level in state `NotSet`;
+/// the hub counts it as `Unknown`, so gating stays fail-safe, but the link is
+/// not charged with a failure.
 pub fn safety_snapshot(
     driver: &mut dyn SafetyDriver,
     poll: &DeviceResult<RawPoll>,
@@ -335,7 +338,11 @@ pub fn safety_snapshot(
         }
         Err(err) => SafetySnapshot {
             connection_id,
-            level: Observed::error(source),
+            level: if poll.is_ok() && err.is_not_set() {
+                Observed::not_set(source)
+            } else {
+                Observed::error(source)
+            },
             detail: Some(err.to_string()),
             published_at,
             published_mono_ns,
@@ -504,9 +511,15 @@ fn current(observed: &Observed<f64>, clock: &dyn Clock, max_age: Duration) -> Ob
 
 /// Independent sky corroboration for COC (H14, R18-R19), with per-sensor
 /// ages kept in each `Observed`. With no weather device every field is
-/// `Unsupported`. Level: `None` when nothing is known; `Full` when a direct
-/// sky sensor (cloud cover, sky temperature or sky quality) is current and
-/// safety is confirmed; `Partial` otherwise.
+/// `Unsupported`.
+///
+/// The level depends on the direct sky sensors only (cloud cover, sky
+/// temperature, sky quality). Without a current one it is `None`, so COC
+/// infers nothing (§7.2.4 gap 2). This holds whatever humidity, dew point,
+/// rain rate or `IsSafe` report: a temperature/humidity station or a
+/// safety monitor alone is not a sky sensor. Those values are still passed
+/// through as `Observed` fields. With a current direct sensor the level is
+/// `Full` when safety is also confirmed, and `Partial` otherwise.
 pub fn coc_corroboration(
     weather: Option<&WeatherReading>,
     safety: &SafetySummary,
@@ -530,27 +543,25 @@ pub fn coc_corroboration(
     let direct = out.cloud_cover_pct.is_fresh()
         || out.sky_temperature_c.is_fresh()
         || out.sky_quality_mag_arcsec2.is_fresh();
-    let indirect =
-        out.rain_rate_mm_h.is_fresh() || out.humidity_pct.is_fresh() || out.dew_point_c.is_fresh();
-    let safety_known = out.is_safe.is_fresh();
-    out.level = if direct && safety_known {
-        CorroborationLevel::Full
-    } else if direct || indirect || safety_known {
-        CorroborationLevel::Partial
-    } else {
-        CorroborationLevel::None
+    out.level = match (direct, out.is_safe.is_fresh()) {
+        (false, _) => CorroborationLevel::None,
+        (true, true) => CorroborationLevel::Full,
+        (true, false) => CorroborationLevel::Partial,
     };
     out
 }
 
 /// Operations that stop or secure the rig. They stay allowed while safety
 /// is unknown or unsafe: refusing them would make the rig less safe.
+///
+/// `ClearResumeBlock` is not one of them. Clearing a block secures nothing;
+/// it lets automatic sequencing resume, so an automatic clear stays subject
+/// to the safety check (§2.8, §3.10 Gating; Tier 1 resume is manual).
 pub fn is_safing_op(op: &GatedOp) -> bool {
     op.bypasses_gate_checks()
         || matches!(
             op,
-            GatedOp::ClearResumeBlock { .. }
-                | GatedOp::Mount(MountCmd::Park | MountCmd::SetTracking(false))
+            GatedOp::Mount(MountCmd::Park | MountCmd::SetTracking(false))
                 | GatedOp::Guider(GuiderCmd::Stop | GuiderCmd::Pause { .. })
                 | GatedOp::CoverCalibrator(
                     CoverCalibratorCmd::Close | CoverCalibratorCmd::CalibratorOff
@@ -765,21 +776,38 @@ mod tests {
         assert_eq!(full.level, CorroborationLevel::Full);
         assert_eq!(full.is_safe.value, Some(true));
 
-        // A sensor that last updated 10 minutes ago is not current.
+        // A sensor that last updated 10 minutes ago is not current. The
+        // fresh humidity and the confirmed safety are not sky sensors.
         reading.cloud_cover_pct.device_time = Some(clock.now_utc() - chrono::Duration::minutes(10));
-        let partial = coc_corroboration(
+        let old_sky = coc_corroboration(
             Some(&reading),
             &safe,
             clock.as_ref(),
             Duration::from_secs(300),
         );
-        assert_eq!(partial.cloud_cover_pct.state, ObsState::Stale);
-        assert_eq!(partial.level, CorroborationLevel::Partial);
+        assert_eq!(old_sky.cloud_cover_pct.state, ObsState::Stale);
+        assert_eq!(old_sky.humidity_pct.value, Some(90.0), "passed through");
+        assert_eq!(old_sky.level, CorroborationLevel::None);
 
+        // A current direct sensor without confirmed safety is partial.
         let unknown = SafetySummary {
             state: SafetyGate::Unknown,
             ..SafetySummary::default()
         };
+        let sky_temp = WeatherReading {
+            sky_temperature_c: Observed::fresh_at(-18.0, Source::Property, clock.as_ref()),
+            ..WeatherReading::default()
+        };
+        for summary in [&unknown, &SafetySummary::default()] {
+            let partial = coc_corroboration(
+                Some(&sky_temp),
+                summary,
+                clock.as_ref(),
+                Duration::from_secs(300),
+            );
+            assert_eq!(partial.level, CorroborationLevel::Partial);
+        }
+
         clock.advance(Duration::from_secs(600));
         let old = coc_corroboration(
             Some(&reading),
@@ -793,6 +821,46 @@ mod tests {
     }
 
     #[test]
+    fn a_rig_without_a_sky_sensor_records_no_corroboration() {
+        let clock = clock();
+        let max_age = Duration::from_secs(300);
+        let safe = SafetySummary {
+            state: SafetyGate::Safe,
+            ..SafetySummary::default()
+        };
+        let unsafe_state = SafetySummary {
+            state: SafetyGate::Unsafe,
+            ..SafetySummary::default()
+        };
+
+        // A temperature/humidity station (a BME280 on the ESP32): fresh
+        // humidity, dew point, temperature and rain, but no sky sensor.
+        let station = WeatherReading {
+            temperature_c: Observed::fresh_at(8.0, Source::Property, clock.as_ref()),
+            humidity_pct: Observed::fresh_at(85.0, Source::Property, clock.as_ref()),
+            dew_point_c: Observed::fresh_at(5.6, Source::Property, clock.as_ref()),
+            rain_rate_mm_h: Observed::fresh_at(0.0, Source::Property, clock.as_ref()),
+            ..WeatherReading::default()
+        };
+        for summary in [&SafetySummary::default(), &safe, &unsafe_state] {
+            let c = coc_corroboration(Some(&station), summary, clock.as_ref(), max_age);
+            assert_eq!(c.level, CorroborationLevel::None, "{:?}", summary.state);
+            assert_eq!(c.humidity_pct.value, Some(85.0), "still passed through");
+            assert_eq!(c.dew_point_c.value, Some(5.6));
+            assert_eq!(c.rain_rate_mm_h.value, Some(0.0));
+            assert_eq!(c.cloud_cover_pct.state, ObsState::NotSet);
+        }
+
+        // A safety monitor alone, with no weather device.
+        for summary in [&safe, &unsafe_state] {
+            let c = coc_corroboration(None, summary, clock.as_ref(), max_age);
+            assert_eq!(c.level, CorroborationLevel::None, "{:?}", summary.state);
+            assert!(c.is_safe.is_fresh(), "IsSafe is still passed through");
+            assert_eq!(c.sky_temperature_c.state, ObsState::Unsupported);
+        }
+    }
+
+    #[test]
     fn safing_ops_and_block_clearing_rules() {
         assert!(is_safing_op(&GatedOp::Mount(MountCmd::Park)));
         assert!(is_safing_op(&GatedOp::Mount(MountCmd::SetTracking(false))));
@@ -802,6 +870,10 @@ mod tests {
         assert!(is_safing_op(&GatedOp::Focuser(FocuserCmd::Halt)));
         assert!(is_safing_op(&GatedOp::Dome(DomeCmd::CloseShutter)));
         assert!(!is_safing_op(&GatedOp::Mount(MountCmd::Unpark)));
+        assert!(
+            !is_safing_op(&GatedOp::ClearResumeBlock { id: Uuid::new_v4() }),
+            "clearing a block resumes automation; it secures nothing"
+        );
         assert!(!is_safing_op(&GatedOp::Guider(GuiderCmd::Dither {
             amount: 5.0,
             unit: PixelUnit::GuidePx,

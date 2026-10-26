@@ -7,8 +7,13 @@
 //! - `IsSafe` is read on every poll (§2.7: every 2 s) and **never cached**:
 //!   [`SafetyDriver::is_safe`] returns only what the latest poll read, and
 //!   consumes it, so a later call without a new poll reads the device again.
-//! - A failed read, including ValueNotSet, is an error. It is never reported
-//!   as safe; the hub treats it as not safe for gating (§2.8 fail-safe rule).
+//! - A failed read is an error and fails the poll, so the worker counts it
+//!   against the link (§2.8). ValueNotSet (0x402), or a `null` value, is not
+//!   a link failure (C-2): the poll succeeds with the `issafe` member in
+//!   state `NotSet`, and `is_safe` returns the not-set error, which the
+//!   snapshot builder publishes as an unknown level. Neither is ever
+//!   reported as safe; the hub treats both as not safe for gating (§2.8
+//!   fail-safe rule).
 //! - Alpaca `IsSafe` is a boolean: `true` is `Safe`, `false` is `Unsafe`.
 //!   Alpaca has no warning level (INDI Busy maps to `Warning` in Tier 2).
 //! - Platform 7 (InterfaceVersion >= 3) connects with `connect` and
@@ -26,7 +31,7 @@ use crate::equipment::traits::{
     AbortPath, AlpacaTransport, Clock, ConnectReport, Device, PollMethod, PollPlan, RawPoll,
     SafetyDriver, TimeoutClass,
 };
-use crate::equipment::types::{DeviceError, DeviceIdentity, DeviceResult, ObsState};
+use crate::equipment::types::{ascom_error, DeviceError, DeviceIdentity, DeviceResult, ObsState};
 
 /// SafetyMonitor interface version at which Platform 7 connect and
 /// `devicestate` apply (ASCOM Library `DeviceCapabilities`).
@@ -49,8 +54,14 @@ pub fn parse_is_safe(value: &Value) -> DeviceResult<SafetyLevel> {
     }
 }
 
+/// The reading of one `IsSafe` value. ValueNotSet and `null` give an error
+/// for which [`DeviceError::is_not_set`] is true: the level is unknown.
 fn reading_from(result: &DeviceResult<Value>) -> DeviceResult<SafetyReading> {
     match result {
+        Ok(Value::Null) => Err(DeviceError::from_alpaca_error(
+            ascom_error::VALUE_NOT_SET,
+            "IsSafe returned null; counted as not safe",
+        )),
         Ok(value) => parse_is_safe(value).map(|level| SafetyReading {
             level,
             detail: None,
@@ -169,16 +180,20 @@ impl Device for AlpacaSafetyMonitor {
         // Per-member read, or DeviceState without an IsSafe entry.
         let timed = timed.unwrap_or_else(|| self.read_member());
         let reading = reading_from(&timed.result);
-        let member = timed.raw_member(
-            "issafe",
-            if reading.is_ok() {
-                ObsState::Fresh
-            } else {
-                ObsState::Error
-            },
-        );
+        let state = match &reading {
+            Ok(_) => ObsState::Fresh,
+            Err(err) if err.is_not_set() => ObsState::NotSet,
+            Err(_) => ObsState::Error,
+        };
+        let member = timed.raw_member("issafe", state);
         self.latest = Some(reading.clone());
-        reading?;
+        // ValueNotSet is an unknown level, not a link failure (C-2): the
+        // poll succeeds and the snapshot publishes the level as not set.
+        if let Err(err) = reading {
+            if !err.is_not_set() {
+                return Err(err);
+            }
+        }
         Ok(RawPoll {
             method,
             started_mono_ns,
@@ -291,11 +306,21 @@ mod tests {
         assert_eq!(err.class, ErrorClass::Timeout);
         assert_eq!(sm.is_safe().unwrap_err().class, ErrorClass::Timeout);
 
+        // ValueNotSet is not a link failure (C-2): the poll succeeds with
+        // the member NotSet, and is_safe reports an unknown level, not safe.
         fake.queue_get("issafe", [FakeReply::value_not_set()]);
-        assert!(sm.poll(&PollPlan::default()).is_err());
+        let raw = sm.poll(&PollPlan::default()).unwrap();
+        assert_eq!(raw.members[0].state, ObsState::NotSet);
+        assert_eq!(raw.members[0].value, None);
         let err = sm.is_safe().unwrap_err();
         assert!(err.is_not_set());
         assert!(err.message.contains("not safe"));
+
+        // A null value is the same unknown level.
+        fake.queue_get("issafe", [FakeReply::value(Value::Null)]);
+        let raw = sm.poll(&PollPlan::default()).unwrap();
+        assert_eq!(raw.members[0].state, ObsState::NotSet);
+        assert!(sm.is_safe().unwrap_err().is_not_set());
 
         fake.queue_get("issafe", [FakeReply::value(json!(1))]);
         assert_eq!(
