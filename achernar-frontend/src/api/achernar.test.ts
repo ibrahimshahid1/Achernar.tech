@@ -17,6 +17,21 @@ const REGISTRY = [
     { name: "camera.descriptor", method: "GET", path: "camera", description: "Camera descriptor." },
     { name: "focuser.position", method: "GET", path: "focuser/position", description: "Position." },
     { name: "mount.sync", method: "POST", path: "mount/sync", description: "Sync." },
+    { name: "mount.slew", method: "POST", path: "mount/slew", description: "Slew." },
+    { name: "mount.abort", method: "POST", path: "mount/abort", description: "Abort." },
+    { name: "mount.park", method: "POST", path: "mount/park", description: "Park." },
+    { name: "mount.center", method: "POST", path: "mount/center", description: "Center." },
+    { name: "mount.site_sync", method: "POST", path: "mount/site-sync", description: "Site sync." },
+    { name: "mount.descriptor", method: "GET", path: "mount", description: "Mount descriptor." },
+    { name: "mount.move_axis", method: "POST", path: "mount/move-axis", description: "Jog.", relay_allowed: false },
+    { name: "filter_wheel.change", method: "POST", path: "filter-wheel/change", description: "Change." },
+    { name: "guider.dither", method: "POST", path: "guider/dither", description: "Dither." },
+    { name: "guider.stop", method: "POST", path: "guider/stop", description: "Stop." },
+    { name: "equipment.estop", method: "POST", path: "equipment/estop", description: "E-stop." },
+    { name: "equipment.events", method: "GET", path: "equipment/events", description: "Journal." },
+    { name: "equipment.resume_blocks", method: "GET", path: "equipment/resume-blocks", description: "Blocks." },
+    { name: "equipment.clear_resume_block", method: "POST", path: "equipment/resume-blocks/clear", description: "Clear." },
+    { name: "focuser.set_position", method: "POST", path: "focuser/set-position", description: "Origin." },
 ];
 
 let transport: "django" | "daemon" = "daemon";
@@ -182,7 +197,8 @@ describe("django transport", () => {
         await achernarApi.syncMount({ ra: 5.5, dec: -5.4 });
 
         const body = JSON.parse(String(callFor("/equipment/command/")![1]!.body));
-        expect(body).toEqual({ action: "mount.sync", payload: { ra: 5.5, dec: -5.4 } });
+        // Catalogue coordinates are J2000; the daemon converts them (§2.12).
+        expect(body).toEqual({ action: "mount.sync", payload: { ra: 5.5, dec: -5.4, frame: "j2000" } });
     });
 });
 
@@ -288,5 +304,152 @@ describe("camera descriptor transport", () => {
         }
         expect(callFor("camera/parameters")).toBeUndefined();
         expect(callFor("camera/formats")).toBeUndefined();
+    });
+});
+
+describe("equipment layer commands (WP1B-5)", () => {
+    const bodyOf = (fragment: string) => JSON.parse(String(callFor(fragment)![1]!.body));
+    const relayBody = () => JSON.parse(String(callFor("/equipment/command/")![1]!.body));
+
+    it("sends GoTo coordinates as J2000 by default and keeps an explicit frame", async () => {
+        const { achernarApi } = await loadApi();
+        await achernarApi.slewMount({ ra: 5.588, dec: -5.391 });
+        expect(bodyOf("mount/slew")).toEqual({ ra: 5.588, dec: -5.391, frame: "j2000" });
+
+        fetchMock.mockClear();
+        await achernarApi.slewMount({ ra: 1, dec: 2, frame: "mount" });
+        expect(bodyOf("mount/slew")).toEqual({ ra: 1, dec: 2, frame: "mount" });
+    });
+
+    it("refuses an out-of-range or unframed target before anything is sent", async () => {
+        const { achernarApi } = await loadApi();
+        await expect(achernarApi.slewMount({ ra: 24, dec: 0 })).rejects.toThrow(/0 <= ra < 24/);
+        await expect(achernarApi.slewMount({ ra: 1, dec: 91 })).rejects.toThrow(/-90 <= dec <= 90/);
+        await expect(achernarApi.centerMount({ ra: 1, dec: 1, frame: "b1950" as never })).rejects.toThrow(/frame/);
+        expect(callFor("mount/slew")).toBeUndefined();
+        expect(callFor("mount/center")).toBeUndefined();
+    });
+
+    it("centers through the same J2000 target contract", async () => {
+        const { achernarApi } = await loadApi();
+        await achernarApi.centerMount({ ra: 0, dec: 0 });
+        expect(bodyOf("mount/center")).toEqual({ ra: 0, dec: 0, frame: "j2000" });
+    });
+
+    it("carries a GET command's arguments as the direct route's query string", async () => {
+        const { achernarApi } = await loadApi();
+        fetchMock.mockImplementation(async (url: string) => String(url).endsWith("/commands")
+            ? jsonResponse(REGISTRY) : jsonResponse({ events: [{ seq: 42, kind: "slew_settled" }], next_seq: 42 }));
+        const page = await achernarApi.getEquipmentEvents({ since_seq: 41, kinds: ["slew_settled", "parked"] });
+        const call = callFor("equipment/events")!;
+        const url = new URL(String(call[0]));
+        expect(url.searchParams.get("since_seq")).toBe("41");
+        expect(url.searchParams.get("kinds")).toBe("slew_settled,parked");
+        expect(call[1]?.method ?? "GET").toBe("GET");
+        expect(call[1]?.body).toBeUndefined();
+        expect(page).toEqual({ events: [{ seq: 42, kind: "slew_settled" }], next_seq: 42 });
+    });
+
+    it("relays the journal query as the payload the daemon reads", async () => {
+        transport = "django";
+        const { achernarApi } = await loadApi();
+        fetchMock.mockImplementation(async () => jsonResponse({ ok: true, payload: { events: [], next_seq: 41 } }));
+        const page = await achernarApi.getEquipmentEvents({ since_seq: 41, kinds: ["guide_step"] });
+        expect(relayBody()).toEqual({ action: "equipment.events", payload: { since_seq: 41, kinds: "guide_step" } });
+        expect(page.next_seq).toBe(41);
+    });
+
+    it("gives the relayed e-stop room for its 2 s abort budget and returns a pending result instead of throwing", async () => {
+        transport = "django";
+        const { achernarApi } = await loadApi();
+        fetchMock.mockImplementation(async () => jsonResponse({ ok: null, pending: true, command_id: "c1" }));
+        const result = await achernarApi.emergencyStop();
+        expect(relayBody()).toEqual({ action: "equipment.estop", payload: { abort_exposure: false }, wait_seconds: 8 });
+        expect(result.pending).toBe(true);
+    });
+
+    it("asks the relay to wait for equipment aborts, but not for the camera abort", async () => {
+        transport = "django";
+        const { achernarApi } = await loadApi();
+        await achernarApi.abortMount();
+        expect(relayBody()).toEqual({ action: "mount.abort", payload: {}, wait_seconds: 6 });
+        fetchMock.mockClear();
+        await achernarApi.stopGuiding();
+        expect(relayBody()).toEqual({ action: "guider.stop", payload: {}, wait_seconds: 6 });
+        fetchMock.mockClear();
+        await achernarApi.abortCamera();
+        expect(relayBody()).toEqual({ action: "camera.abort", payload: {} });
+    });
+
+    it("posts the e-stop on the direct route with the exposure choice", async () => {
+        const { achernarApi } = await loadApi();
+        await achernarApi.emergencyStop({ abort_exposure: true });
+        expect(bodyOf("equipment/estop")).toEqual({ abort_exposure: true });
+    });
+
+    it("changes filter by 0-based slot or by name and refuses an invalid target", async () => {
+        const { achernarApi } = await loadApi();
+        await achernarApi.changeFilter({ slot: 0 });
+        expect(bodyOf("filter-wheel/change")).toEqual({ slot: 0 });
+        fetchMock.mockClear();
+        await achernarApi.changeFilter({ name: " Ha " });
+        expect(bodyOf("filter-wheel/change")).toEqual({ name: "Ha" });
+        fetchMock.mockClear();
+        await expect(achernarApi.changeFilter({ slot: -1 })).rejects.toThrow(/0-based slot/);
+        await expect(achernarApi.changeFilter({ slot: 1.5 })).rejects.toThrow(/0-based slot/);
+        await expect(achernarApi.changeFilter({ name: "  " })).rejects.toThrow(/non-empty "name"/);
+        expect(callFor("filter-wheel/change")).toBeUndefined();
+    });
+
+    it("dithers with only the fields given, in guide pixels, and refuses a non-positive amount", async () => {
+        const { achernarApi } = await loadApi();
+        await achernarApi.dither();
+        expect(bodyOf("guider/dither")).toEqual({});
+        fetchMock.mockClear();
+        await achernarApi.dither({ amount_px: 3, ra_only: true, settle: { pixels: 1.5 } });
+        expect(bodyOf("guider/dither")).toEqual({ amount_px: 3, ra_only: true, settle: { pixels: 1.5 } });
+        fetchMock.mockClear();
+        await expect(achernarApi.dither({ amount_px: 0 })).rejects.toThrow(/positive amount_px/);
+        await expect(achernarApi.dither({ settle: { time_s: -1 } })).rejects.toThrow(/settle.time_s/);
+        expect(callFor("guider/dither")).toBeUndefined();
+    });
+
+    it("clears a resume block by id and declares a focuser origin as an integer", async () => {
+        const { achernarApi } = await loadApi();
+        await achernarApi.clearResumeBlock("8f9e");
+        expect(bodyOf("resume-blocks/clear")).toEqual({ id: "8f9e" });
+        await expect(achernarApi.clearResumeBlock("")).rejects.toThrow(/non-empty "id"/);
+        await achernarApi.declareFocuserPosition(0);
+        expect(bodyOf("focuser/set-position")).toEqual({ position: 0 });
+        await expect(achernarApi.declareFocuserPosition(1.5)).rejects.toThrow(/integer/);
+    });
+
+    it("validates the site-sync direction and reads the mount descriptor with a GET", async () => {
+        const { achernarApi } = await loadApi();
+        await achernarApi.syncMountSite("from_mount");
+        expect(bodyOf("mount/site-sync")).toEqual({ direction: "from_mount" });
+        await expect(achernarApi.syncMountSite("sideways" as never)).rejects.toThrow(/direction/);
+        await achernarApi.getMountDescriptor();
+        const call = fetchMock.mock.calls.find((entry) => String(entry[0]).endsWith("/mount"))!;
+        expect(call[1]?.method ?? "GET").toBe("GET");
+    });
+
+    it("reads resume blocks as an empty list when the daemon reports none", async () => {
+        const { achernarApi } = await loadApi();
+        expect(await achernarApi.getResumeBlocks()).toEqual([]);
+    });
+
+    it("requires a driver for a connect, as the relay no longer defaults it to the simulator", async () => {
+        const { achernarApi } = await loadApi();
+        await expect(achernarApi.connectDevice("filter_wheel", "")).rejects.toThrow(/non-empty "driver"/);
+    });
+});
+
+describe("GET query strings", () => {
+    it("skips missing values, joins lists and drops non-finite numbers", async () => {
+        const { queryString } = await loadApi();
+        expect(queryString({})).toBe("");
+        expect(queryString({ a: undefined, b: null, c: Number.NaN, d: 0, e: false, f: ["x", "y"], g: [] })).toBe("d=0&e=false&f=x%2Cy");
+        expect(queryString({ q: "a b&c" })).toBe("q=a+b%26c");
     });
 });

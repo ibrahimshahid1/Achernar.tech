@@ -1,12 +1,26 @@
 import { env } from "../env";
 import { httpJson } from "./http";
 import type {
+    AlignmentMode,
     CaptureParams,
     CaptureRetentionDecision,
     DaemonSummary,
+    DriveRate,
+    EqFrame,
+    EquipmentEvent,
     EquipmentState,
+    FilterSlotView,
+    GuidingBlock,
     ImagingSession,
+    LinkState,
+    Qualification,
+    QualificationState,
     RelayCommandResult,
+    ResumeBlock,
+    SafetyGate,
+    SafetyMonitorBlock,
+    Site,
+    WeatherBlock,
 } from "../types/achernar";
 import { getHardwareTransport } from "../lib/runtime";
 
@@ -111,14 +125,157 @@ export interface DriverCapability {
     enabled: boolean;
     reason?: string;
     option_hint?: string;
+    /** D21. Absent from daemons older than the equipment layer. */
+    qualification?: QualificationState;
 }
 
+/**
+ * `GET /drivers`. The kinds beyond camera, mount and focuser are additive
+ * (§2.12), so an older daemon simply omits them.
+ */
 export interface DriverCapabilityReport {
     bridge_version: string;
     camera: DriverCapability[];
     mount: DriverCapability[];
     focuser: DriverCapability[];
+    filter_wheel?: DriverCapability[];
+    guider?: DriverCapability[];
+    weather?: DriverCapability[];
+    safety_monitor?: DriverCapability[];
+    rotator?: DriverCapability[];
+    cover_calibrator?: DriverCapability[];
+    switch?: DriverCapability[];
+    dome?: DriverCapability[];
 }
+
+/** A connected device's identity (§2.6), as `/connect` and descriptors return it. */
+export interface DeviceIdentityInfo {
+    kind: string;
+    driver: string;
+    identity_key: string;
+    connection_id: string;
+    name: string;
+    description?: string | null;
+    driver_info?: string | null;
+    driver_version?: string | null;
+    interface_version?: number | null;
+    unique_id?: string | null;
+    /** Alpaca `/setup/v1/{type}/{n}/setup`. */
+    setup_url?: string | null;
+    qualification?: Qualification | null;
+    endpoint?: string;
+}
+
+/** The mount's capability flags (§2.4 `MountCapabilities`). */
+export interface MountCapabilities {
+    can_park?: boolean;
+    can_unpark?: boolean;
+    can_set_park?: boolean;
+    can_find_home?: boolean;
+    /** False on every compliant Alpaca mount (O10); never gate on it. */
+    can_slew?: boolean;
+    /** GoTo is gated on this (O10). */
+    can_slew_async?: boolean;
+    can_slew_altaz?: boolean;
+    can_slew_altaz_async?: boolean;
+    can_sync?: boolean;
+    can_sync_altaz?: boolean;
+    can_set_tracking?: boolean;
+    can_set_pier_side?: boolean;
+    can_pulse_guide?: boolean;
+    can_set_guide_rates?: boolean;
+    can_move_axis?: boolean[];
+    alignment_mode?: AlignmentMode | null;
+    equatorial_system?: number | null;
+    native_frame?: EqFrame;
+    frame_reason?: string | null;
+    does_refraction?: boolean | null;
+    tracking_rates?: DriveRate[];
+    interface_version?: number | null;
+    device_state?: boolean;
+    unsupported_members?: string[];
+}
+
+/** `GET mount` (§2.12). */
+export interface MountDescriptor {
+    identity: DeviceIdentityInfo;
+    capabilities: MountCapabilities;
+    frame: EqFrame;
+    site: Site | null;
+    can_flip: boolean | null;
+    qualification?: Qualification | null;
+    health?: { state?: LinkState; failure_class?: string | null; reason?: string | null };
+    jog_deadman_ms?: number;
+    max_pulse_ms?: number;
+}
+
+/** `GET filter-wheel`. */
+export interface FilterWheelDescriptor {
+    identity: DeviceIdentityInfo;
+    slots: Array<Partial<FilterSlotView> & { index: number; name: string }>;
+    position: number | null;
+    moving: boolean;
+    verified: boolean;
+    verified_slot: number | null;
+    qualification?: Qualification | null;
+}
+
+/** `GET guider`: the guiding block plus algorithm parameters (R25). */
+export interface GuiderDescriptor {
+    identity: DeviceIdentityInfo;
+    guiding: GuidingBlock;
+    algo_params?: Array<{ axis: string; name: string; value: number }>;
+    actuation_disabled_reason?: string | null;
+    dec_guide_mode?: string | null;
+    qualification?: Qualification | null;
+}
+
+/** `GET safety`: the combined state of every monitor. */
+export interface SafetyStatus {
+    /** `none` when no monitor is configured. */
+    state: SafetyGate;
+    sources?: Array<{ connection_id: string; [key: string]: unknown }>;
+    changed_at?: string | null;
+    monitor?: SafetyMonitorBlock | null;
+    resume_blocks?: ResumeBlock[];
+    policy_running?: boolean;
+    on_unsafe?: string;
+}
+
+/** Per-device e-stop result (§2.9). */
+export interface EstopDeviceResult {
+    kind: string;
+    connection_id?: string | null;
+    ok: boolean;
+    error?: { class?: string; message?: string } | null;
+    latency_ms?: number | null;
+}
+
+/** `POST equipment/estop`. */
+export interface EstopReport {
+    status: "stopped" | "partial";
+    command_id?: string;
+    results: EstopDeviceResult[];
+    exposure?: EstopDeviceResult | null;
+    block?: ResumeBlock;
+    elapsed_ms?: number;
+}
+
+/** `GET equipment/events`. */
+export interface EquipmentEventsPage {
+    events: EquipmentEvent[];
+    next_seq: number;
+}
+
+/** The accepted-command body the mount, focuser, wheel and guider routes return. */
+export interface AcceptedCommand {
+    status: string;
+    command_id?: string;
+    [key: string]: unknown;
+}
+
+/** Frames `/mount/slew`, `/mount/sync` and `/mount/center` accept. */
+export type MountFrame = "mount" | "j2000" | "jnow";
 
 /** A camera actually attached to a local bus, found by a discovery scan. */
 export interface DiscoveredCamera {
@@ -134,7 +291,19 @@ export interface DiscoveredCamera {
     transport?: string;
 }
 
-export type DiscoverableEquipment = "camera" | "mount" | "focuser" | "filter_wheel";
+/** `/discover` `equipment_type` values (§2.12), in `/drivers` key spelling. */
+export type DiscoverableEquipment =
+    | "camera"
+    | "mount"
+    | "focuser"
+    | "filter_wheel"
+    | "guider"
+    | "weather"
+    | "safety_monitor"
+    | "rotator"
+    | "cover_calibrator"
+    | "switch"
+    | "dome";
 
 /** A device reported by an explicitly configured Alpaca server. */
 export interface DiscoveredAuxiliaryDevice {
@@ -152,7 +321,8 @@ export interface DiscoveredAuxiliaryDevice {
 
 export interface DiscoveryRequest {
     equipment_type?: DiscoverableEquipment | "all";
-    driver?: "alpaca";
+    /** `alpaca_broadcast` is refused unless the daemon enables it (D13). */
+    driver?: "alpaca" | "alpaca_broadcast";
     /** An operator-supplied endpoint, never an invented network target. */
     option?: string;
 }
@@ -184,6 +354,14 @@ export interface DiscoveryReport {
     mounts?: DiscoveredAuxiliaryDevice[];
     focusers?: DiscoveredAuxiliaryDevice[];
     filter_wheels?: DiscoveredAuxiliaryDevice[];
+    // Additive arrays (§2.12); absent from older daemons.
+    weather?: DiscoveredAuxiliaryDevice[];
+    safety_monitors?: DiscoveredAuxiliaryDevice[];
+    guiders?: DiscoveredAuxiliaryDevice[];
+    rotators?: DiscoveredAuxiliaryDevice[];
+    switches?: DiscoveredAuxiliaryDevice[];
+    cover_calibrators?: DiscoveredAuxiliaryDevice[];
+    domes?: DiscoveredAuxiliaryDevice[];
     device_probes?: DeviceDiscoveryProbe[];
     probes: DiscoveryProbe[];
     scanned_at: string;
@@ -290,6 +468,50 @@ function requireBoolean(payload: Record<string, unknown>, key: string, action: s
     return value;
 }
 
+const MOUNT_FRAMES: readonly MountFrame[] = ["mount", "j2000", "jnow"];
+export const DRIVE_RATES: readonly DriveRate[] = ["sidereal", "lunar", "solar", "king"];
+
+/**
+ * An equatorial target with its frame. RA is in hours [0, 24), Dec in
+ * degrees [-90, 90]; the frame defaults to J2000, the frame catalogues and
+ * plate solves use.
+ */
+function mountTarget(
+    action: string,
+    payload: { ra: number; dec: number; frame?: MountFrame },
+): { ra: number; dec: number; frame: MountFrame } {
+    const ra = requireNumber({ ra: payload.ra }, "ra", action);
+    const dec = requireNumber({ dec: payload.dec }, "dec", action);
+    if (ra < 0 || ra >= 24) throw new Error(`${action} requires ra in hours, 0 <= ra < 24 (got ${ra}).`);
+    if (dec < -90 || dec > 90) throw new Error(`${action} requires dec in degrees, -90 <= dec <= 90 (got ${dec}).`);
+    const frame = payload.frame ?? "j2000";
+    if (!MOUNT_FRAMES.includes(frame)) {
+        throw new Error(`${action} requires frame ${MOUNT_FRAMES.join(", ")} (got ${JSON.stringify(frame)}).`);
+    }
+    return { ra, dec, frame };
+}
+
+/** PHD2 settle criteria; the daemon's `[guider]` values fill any omitted field. */
+export interface GuiderSettle {
+    pixels?: number;
+    time_s?: number;
+    timeout_s?: number;
+}
+
+function settlePayload(action: string, settle: GuiderSettle | undefined): { settle?: GuiderSettle } {
+    if (!settle) return {};
+    const out: GuiderSettle = {};
+    for (const key of ["pixels", "time_s", "timeout_s"] as const) {
+        const value = settle[key];
+        if (value === undefined) continue;
+        if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+            throw new Error(`${action} requires a positive settle.${key} (got ${JSON.stringify(value)}).`);
+        }
+        out[key] = value;
+    }
+    return Object.keys(out).length ? { settle: out } : {};
+}
+
 export interface FocusRunResponse {
     run_id: string;
     state: string;
@@ -316,6 +538,11 @@ export interface CommandSpec {
     /** Path relative to /api/v1, with no leading slash. */
     path: string;
     description: string;
+    /**
+     * False for commands that are unsafe at relay latency (jog, pulse guide;
+     * D12): published for the direct transport, refused by the relay.
+     */
+    relay_allowed?: boolean;
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -359,6 +586,53 @@ const QUERY_PARAM_COMMANDS: Record<string, string> = {
 };
 
 /**
+ * A GET command's arguments, as the query string of its direct route.
+ *
+ * The relay hands the payload to the same handler as a body, so the direct
+ * route has to carry it too or `equipment.events?since_seq=` would replay
+ * the journal from the start on every poll. Only scalar values travel;
+ * arrays are joined with commas (the daemon's `kinds` format).
+ */
+export function queryString(payload: Record<string, unknown>): string {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(payload)) {
+        if (value == null) continue;
+        if (Array.isArray(value)) {
+            const parts = value.filter((part) => typeof part === "string" || typeof part === "number");
+            if (parts.length) params.set(key, parts.join(","));
+        } else if (typeof value === "string" || typeof value === "boolean"
+            || (typeof value === "number" && Number.isFinite(value))) {
+            params.set(key, String(value));
+        }
+    }
+    return params.toString();
+}
+
+/** The equipment layer's abort paths (D19): each reports its own outcome. */
+const EQUIPMENT_ABORTS = new Set(["mount.abort", "focuser.abort", "filter_wheel.abort", "guider.stop"]);
+
+/**
+ * How long the relay should wait for a result before answering "pending".
+ *
+ * The e-stop and the aborts wait up to 2 s on the daemon for each abort
+ * path's own result (§2.9). Their outcome is the one thing the operator must
+ * see, so they get room for that budget plus relay latency instead of the
+ * relay's three-second default.
+ */
+function relayWaitSeconds(action: string, payload: Record<string, unknown>): number | undefined {
+    if (action === "camera.capture" && typeof payload.exposure === "number" && Number.isFinite(payload.exposure)) {
+        // Opening a DSLR, changing its configuration and downloading a still
+        // can exceed the relay's default three-second acknowledgement window.
+        return Math.min(140, Math.max(15, payload.exposure + 65));
+    }
+    if (action === "equipment.connect" || action === "equipment.discover") return 90;
+    if (action === "camera.set_parameter") return 15;
+    if (action === "equipment.estop") return 8;
+    if (EQUIPMENT_ABORTS.has(action)) return 6;
+    return undefined;
+}
+
+/**
  * Deliver one command, by whichever transport this runtime uses.
  *
  * Browser → Django relay, which forwards `{action, payload}` verbatim.
@@ -377,15 +651,9 @@ async function send(
     payload: Record<string, unknown> = {},
 ): Promise<RelayCommandResult> {
     if (usesDjangoRelay()) {
-        // Opening a DSLR, changing its configuration and downloading a still
-        // can exceed the relay's default three-second acknowledgement window.
         // Wait for the result rather than treating a queued acknowledgement as
-        // a failed operation while the camera continues in the background.
-        const waitSeconds = action === "camera.capture" && typeof payload.exposure === "number"
-            && Number.isFinite(payload.exposure)
-            ? Math.min(140, Math.max(15, payload.exposure + 65))
-            : action === "equipment.connect" || action === "equipment.discover" ? 90
-                : action === "camera.set_parameter" ? 15 : undefined;
+        // a failed operation while the device continues in the background.
+        const waitSeconds = relayWaitSeconds(action, payload);
         return httpJson<RelayCommandResult>(`${env.cloudApiBase}/equipment/command/`, {
             method: "POST",
             body: { action, payload, ...(waitSeconds === undefined ? {} : { wait_seconds: waitSeconds }) },
@@ -402,7 +670,8 @@ async function send(
     const base = `${env.daemonApiBase}/${spec.path}`;
 
     if (spec.method === "GET") {
-        return { ok: true, payload: await httpJson<Record<string, unknown>>(base) };
+        const query = queryString(payload);
+        return { ok: true, payload: await httpJson<Record<string, unknown>>(query ? `${base}?${query}` : base) };
     }
 
     const queryKey = QUERY_PARAM_COMMANDS[action];
@@ -509,18 +778,58 @@ export const achernarApi = {
         return sendFor("camera.snapshot");
     },
 
-    async slewMount(payload: { ra: number; dec: number }): Promise<Record<string, unknown>> {
-        return sendFor("mount.slew", {
-            ra: requireNumber({ ra: payload.ra }, "ra", "mount.slew"),
-            dec: requireNumber({ dec: payload.dec }, "dec", "mount.slew"),
-        });
+    /**
+     * GoTo. Coordinates are J2000 unless `frame` says otherwise (§2.12): the
+     * daemon converts them to the mount's native frame, which is usually
+     * JNow, about 22' away. Sending catalogue coordinates as "mount" would
+     * put that error into every slew and every M-4 pointing sample.
+     */
+    async slewMount(payload: { ra: number; dec: number; frame?: MountFrame }): Promise<AcceptedCommand> {
+        return sendFor("mount.slew", mountTarget("mount.slew", payload));
     },
 
-    async syncMount(payload: { ra: number; dec: number }): Promise<Record<string, unknown>> {
-        return sendFor("mount.sync", {
-            ra: requireNumber({ ra: payload.ra }, "ra", "mount.sync"),
-            dec: requireNumber({ dec: payload.dec }, "dec", "mount.sync"),
-        });
+    /** Tell the mount where it points; J2000 by default, as for slews. */
+    async syncMount(payload: { ra: number; dec: number; frame?: MountFrame }): Promise<AcceptedCommand> {
+        return sendFor("mount.sync", mountTarget("mount.sync", payload));
+    },
+
+    /** Identity, capabilities (the O10 gates), native frame, site and qualification. */
+    async getMountDescriptor(): Promise<MountDescriptor> {
+        return sendFor<MountDescriptor>("mount.descriptor");
+    },
+
+    /** Park, verified through AtPark. */
+    async parkMount(): Promise<AcceptedCommand> {
+        return sendFor("mount.park");
+    },
+
+    async unparkMount(): Promise<AcceptedCommand> {
+        return sendFor("mount.unpark");
+    },
+
+    /** FindHome, verified through AtHome. */
+    async findMountHome(): Promise<AcceptedCommand> {
+        return sendFor("mount.find_home");
+    },
+
+    /** Slew, solve, sync or offset, re-slew until within tolerance (M-n). */
+    async centerMount(payload: { ra: number; dec: number; frame?: MountFrame }): Promise<AcceptedCommand> {
+        return sendFor("mount.center", mountTarget("mount.center", payload));
+    },
+
+    /** `to_mount` writes `[site]` to the mount; `from_mount` adopts the mount's site. */
+    async syncMountSite(direction: "to_mount" | "from_mount"): Promise<AcceptedCommand> {
+        if (direction !== "to_mount" && direction !== "from_mount") {
+            throw new Error(`mount.site_sync requires direction "to_mount" or "from_mount" (got ${JSON.stringify(direction)}).`);
+        }
+        return sendFor("mount.site_sync", { direction });
+    },
+
+    async setMountTrackingRate(rate: DriveRate): Promise<AcceptedCommand> {
+        if (!DRIVE_RATES.includes(rate)) {
+            throw new Error(`mount.set_tracking_rate requires one of ${DRIVE_RATES.join(", ")} (got ${JSON.stringify(rate)}).`);
+        }
+        return sendFor("mount.set_tracking_rate", { rate });
     },
 
     async setTracking(enabled: boolean): Promise<Record<string, unknown>> {
@@ -553,6 +862,144 @@ export const achernarApi = {
 
     async abortFocuser(): Promise<Record<string, unknown>> {
         return sendFor("focuser.abort");
+    },
+
+    async setFocuserTempComp(enabled: boolean): Promise<AcceptedCommand> {
+        requireBoolean({ enabled }, "enabled", "focuser.set_tempcomp");
+        return sendFor("focuser.set_tempcomp", { enabled });
+    },
+
+    /**
+     * Declare the origin of an emulated relative focuser. A profile write
+     * only: nothing moves, and the daemon audits it.
+     */
+    async declareFocuserPosition(position: number): Promise<AcceptedCommand> {
+        const value = requireNumber({ position }, "position", "focuser.set_position");
+        if (!Number.isSafeInteger(value)) throw new Error(`focuser.set_position requires an integer step (got ${value}).`);
+        return sendFor("focuser.set_position", { position: value });
+    },
+
+    // ── Filter wheel ─────────────────────────────────────────────────────
+
+    async getFilterWheel(): Promise<FilterWheelDescriptor> {
+        return sendFor<FilterWheelDescriptor>("filter_wheel.descriptor");
+    },
+
+    /** Runs the v6 §8.2.1 handshake. `slot` is 0-based. */
+    async changeFilter(target: { slot: number } | { name: string }): Promise<AcceptedCommand> {
+        if ("slot" in target) {
+            const slot = requireNumber({ slot: target.slot }, "slot", "filter_wheel.change");
+            if (!Number.isSafeInteger(slot) || slot < 0) {
+                throw new Error(`filter_wheel.change requires a 0-based slot (got ${slot}).`);
+            }
+            return sendFor("filter_wheel.change", { slot });
+        }
+        return sendFor("filter_wheel.change", { name: requireString({ name: target.name?.trim() }, "name", "filter_wheel.change") });
+    },
+
+    /** Cancel the running handshake; the wheel itself has no halt. */
+    async abortFilterChange(): Promise<AcceptedCommand> {
+        return sendFor("filter_wheel.abort");
+    },
+
+    /** Copy the TOML seeds into the connected wheel's profile (D17), audited. */
+    async importFilterSeed(): Promise<AcceptedCommand> {
+        return sendFor("filter_wheel.import_seed");
+    },
+
+    // ── Guider (PHD2) ────────────────────────────────────────────────────
+
+    async getGuider(): Promise<GuiderDescriptor> {
+        return sendFor<GuiderDescriptor>("guider.descriptor");
+    },
+
+    async startGuiding(options: { recalibrate?: boolean; settle?: GuiderSettle } = {}): Promise<AcceptedCommand> {
+        return sendFor("guider.start", {
+            ...(options.recalibrate === undefined ? {} : { recalibrate: options.recalibrate }),
+            ...settlePayload("guider.start", options.settle),
+        });
+    },
+
+    /** The guider's abort (`stop_capture`); never refused while PHD2 answers. */
+    async stopGuiding(): Promise<AcceptedCommand> {
+        return sendFor("guider.stop");
+    },
+
+    async pauseGuiding(full = false): Promise<AcceptedCommand> {
+        return sendFor("guider.pause", { full });
+    },
+
+    async resumeGuiding(): Promise<AcceptedCommand> {
+        return sendFor("guider.resume");
+    },
+
+    /** Dither in guide-camera pixels; the daemon's `[guider]` defaults apply to omitted fields. */
+    async dither(options: { amount_px?: number; ra_only?: boolean; settle?: GuiderSettle } = {}): Promise<AcceptedCommand> {
+        if (options.amount_px !== undefined) {
+            const amount = requireNumber({ amount_px: options.amount_px }, "amount_px", "guider.dither");
+            if (amount <= 0) throw new Error(`guider.dither requires a positive amount_px (got ${amount}).`);
+        }
+        return sendFor("guider.dither", {
+            ...(options.amount_px === undefined ? {} : { amount_px: options.amount_px }),
+            ...(options.ra_only === undefined ? {} : { ra_only: options.ra_only }),
+            ...settlePayload("guider.dither", options.settle),
+        });
+    },
+
+    // ── Environment ──────────────────────────────────────────────────────
+
+    async getWeather(): Promise<WeatherBlock> {
+        return sendFor<WeatherBlock>("weather.status");
+    },
+
+    async getSafety(): Promise<SafetyStatus> {
+        return sendFor<SafetyStatus>("safety.status");
+    },
+
+    // ── Equipment-wide: e-stop, resume blocks, journal ───────────────────
+
+    /**
+     * Emergency stop: every device's abort path within 2 s, degraded and
+     * lost ones included (§2.9, D19). The camera exposure is aborted only
+     * when asked. This is not a park.
+     */
+    async emergencyStop(options: { abort_exposure?: boolean } = {}): Promise<RelayCommandResult & { payload?: EstopReport }> {
+        return send("equipment.estop", { abort_exposure: options.abort_exposure === true }) as Promise<RelayCommandResult & { payload?: EstopReport }>;
+    },
+
+    async getResumeBlocks(): Promise<ResumeBlock[]> {
+        const body = await sendFor<{ blocks?: ResumeBlock[] }>("equipment.resume_blocks");
+        return Array.isArray(body.blocks) ? body.blocks : [];
+    },
+
+    /** Operator clear, audited. Safety blocks clear only on a confirmed safe reading. */
+    async clearResumeBlock(id: string): Promise<AcceptedCommand> {
+        return sendFor("equipment.clear_resume_block", { id: requireString({ id }, "id", "equipment.clear_resume_block") });
+    },
+
+    /** The journal tail after `since_seq` (at most 500), optionally by event kind. */
+    async getEquipmentEvents(query: { since_seq?: number; kinds?: string[]; limit?: number } = {}): Promise<EquipmentEventsPage> {
+        const body = await sendFor<Partial<EquipmentEventsPage>>("equipment.events", {
+            ...(query.since_seq === undefined ? {} : { since_seq: query.since_seq }),
+            ...(query.kinds?.length ? { kinds: query.kinds.join(",") } : {}),
+            ...(query.limit === undefined ? {} : { limit: query.limit }),
+        });
+        return {
+            events: Array.isArray(body.events) ? body.events : [],
+            next_seq: typeof body.next_seq === "number" ? body.next_seq : query.since_seq ?? 0,
+        };
+    },
+
+    /**
+     * Connect any equipment-layer device. `driver` is required (§2.12): the
+     * relay no longer defaults it to the simulator.
+     */
+    async connectDevice(equipmentType: string, driver: string, option?: string): Promise<Record<string, unknown>> {
+        return sendFor("equipment.connect", {
+            equipment_type: requireString({ equipmentType }, "equipmentType", "equipment.connect"),
+            driver: requireString({ driver }, "driver", "equipment.connect"),
+            ...(option ? { option } : {}),
+        });
     },
 
     // ── Daemon resources ─────────────────────────────────────────────────

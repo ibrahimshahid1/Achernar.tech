@@ -19,7 +19,9 @@ export type DaemonWsEventType =
     | "FOCUS_RUN_CONVERGED"
     | "FOCUS_RUN_FAILED"
     | "FOCUS_DRIFT_ALERT"
-    | "VISION_UPDATE";
+    | "VISION_UPDATE"
+    // One equipment journal event (daemon spec §2.13, §4.2), guide steps included.
+    | "EQUIPMENT_EVENT";
 
 export interface DaemonWsMessage {
     type: DaemonWsEventType;

@@ -6,8 +6,14 @@ const TYPE_LABELS: Record<EquipmentCardModel["type"], string> = {
     focuser: "FOC",
     camera: "CAM",
     "filter-wheel": "FLT",
+    guider: "GDR",
+    weather: "WX",
+    "safety-monitor": "SAF",
     dome: "DOM",
 };
+
+/** D21 tags the card builder adds; shown as a badge, not mixed into the tag row. */
+const QUALIFICATION_TAGS = new Set(["qualified", "unqualified", "planned", "qualification unknown"]);
 
 export default function EquipmentCard({
     model,
@@ -26,6 +32,8 @@ export default function EquipmentCard({
 }) {
     const metrics: NonNullable<EquipmentCardModel["metrics"]> = model.metrics
         ?? Object.entries(model.meta ?? {}).map(([label, value]) => ({ label, value }));
+    const qualification = model.tags.find((tag) => QUALIFICATION_TAGS.has(tag));
+    const tags = model.tags.filter((tag) => !QUALIFICATION_TAGS.has(tag));
 
     return (
         <article
@@ -49,8 +57,15 @@ export default function EquipmentCard({
 
             {model.summary && <div className="card-summary">{model.summary}</div>}
 
+            {qualification && (
+                <div className={`qual-badge tone-${qualification === "qualified" ? "good" : qualification === "unqualified" ? "warn" : "muted"}`}
+                    title="D21: only a rig acceptance record makes a device qualified">
+                    {qualification}
+                </div>
+            )}
+
             <div className="tag-row">
-                {model.tags.slice(0, 4).map((t) => (
+                {tags.slice(0, 4).map((t) => (
                     <span key={t} className="tag">
                         {t}
                     </span>
