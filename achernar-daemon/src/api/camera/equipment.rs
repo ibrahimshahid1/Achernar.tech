@@ -30,6 +30,12 @@
 //!   label, marked unverified. **Focuser position** comes from the window's
 //!   start and end, never from a read after the commit, and only while the
 //!   position is reliable (v6 §7.6.2).
+//! - **End state (D7).** The end state of the focuser and the wheel is the
+//!   last sample at or before the exposure end, confirmed by the first
+//!   sample after it. When that sample differs and nothing shows the change
+//!   began after the end, or when it never arrived (`Stale`), the end state
+//!   is unknown: no verified filter, no end position, `focuser_moved` null.
+//!   Motion at the start sample (a move already running) counts as motion.
 //!
 //! A value that is not known is omitted (FITS) or null (rows); it is never
 //! written as 0 (D5).
@@ -50,15 +56,16 @@ use crate::equipment::events::{EquipmentEvent, EventKind, ExposureWindowRow, Gro
 use crate::equipment::guider::service::GuiderWindows;
 use crate::equipment::handle::Permit;
 use crate::equipment::hub::{max_read_age, motion_kinds, EquipmentHub};
-use crate::equipment::ring::{midpoint, Timestamped};
+use crate::equipment::ring::{midpoint, DeviceSnapshot, Ring, Timestamped};
 use crate::equipment::snapshot::{
     CoverCalibratorSnapshot, DeviceWindow, ExposureRef, FilterWheelSnapshot, FocuserSnapshot,
     GuideWindowStats, MotionInterval, MountSnapshot, PositionSource, Quiescence, ResumeBlock,
+    WindowSamples,
 };
 use crate::equipment::traits::EquipmentReader;
 use crate::equipment::types::{
     kind_name, AutonomyMode, ClockQuality, CommandId, CommandSource, DeviceKind, EqCoord, EqFrame,
-    Observed, PierSide, Priority, Site, TemperatureRole,
+    Observed, PierSide, Priority, Site, SiteSource, TemperatureRole,
 };
 use crate::fits::FitsCard;
 use crate::state::{AppState, CameraRuntimeState};
@@ -241,13 +248,14 @@ impl ExposureInterval {
         }
     }
 
-    /// A stream frame seen at `seen_unix` (host clock). Its arrival time can
-    /// lag the end of its exposure by up to a frame interval, so the window
-    /// reaches back `exposure + frame interval` from the arrival (the H3
-    /// rule for `host_arrival`). Without a measured interval the exposure
-    /// stands in for it (a stream's frame period is at least its exposure).
+    /// A stream frame that arrived at `arrived_unix` (OLS's host-clock
+    /// delivery stamp, the frame's DATE-OBS). Its arrival can lag the end
+    /// of its exposure by up to a frame interval, so the window reaches back
+    /// `exposure + frame interval` from the arrival (the H3 rule for
+    /// `host_arrival`). Without a measured interval the exposure stands in
+    /// for it (a stream's frame period is at least its exposure).
     pub fn stream(
-        seen_unix: f64,
+        arrived_unix: f64,
         exposure_s: f64,
         frame_interval_s: Option<f64>,
         clock_quality: ClockQuality,
@@ -258,7 +266,7 @@ impl ExposureInterval {
             0.0
         };
         let frame_interval_s = frame_interval_s.filter(|s| s.is_finite() && *s > 0.0);
-        let end = utc_of(seen_unix);
+        let end = utc_of(arrived_unix);
         let lead = exposure_s + frame_interval_s.unwrap_or(exposure_s);
         Self {
             start: end - seconds(lead),
@@ -486,8 +494,10 @@ pub(crate) struct AssemblyInput {
 
 /// The hub's window plus the ring facts a frame needs and the window does
 /// not hold: the last focuser and wheel samples at or before the exposure
-/// end (the window's `end` may be the first sample after it, D7), and
-/// whether a sample inside the exposure reported motion.
+/// end (the window's `end` is the first sample after it once one exists,
+/// D7), whether a sample inside the exposure reported motion, and whether
+/// a change that the first sample after the end shows is known to have
+/// begun after the end.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WindowView {
     pub window: DeviceWindow,
@@ -496,8 +506,33 @@ pub(crate) struct WindowView {
     pub guide: Option<GuideWindowStats>,
     pub focuser_end: Option<FocuserSnapshot>,
     pub focuser_moving_inside: bool,
+    pub focuser_changed_after_end: bool,
     pub wheel_end: Option<FilterWheelSnapshot>,
     pub wheel_moving_inside: bool,
+    pub wheel_changed_after_end: bool,
+}
+
+/// True when whatever the first sample after `end` shows is known to have
+/// begun after `end`: the sample's operation, or a motion event of its
+/// kind, started after the end and no later than the sample. Without
+/// either, a difference between that sample and the last one inside the
+/// exposure could have happened at any time between them.
+fn began_after_end<S: DeviceSnapshot>(
+    hub: &EquipmentHub,
+    ring: &Ring<S>,
+    end: DateTime<Utc>,
+) -> bool {
+    let Some(post) = ring.at_or_after(end) else {
+        return false;
+    };
+    let post_at = post.at_utc();
+    let after = |at: DateTime<Utc>| at > end && at <= post_at;
+    post.active_op().is_some_and(|op| after(op.started_at))
+        || hub
+            .bus()
+            .events_between(end, post_at)
+            .iter()
+            .any(|e| after(e.at_utc) && motion_kinds(e).contains(&S::KIND))
 }
 
 impl WindowView {
@@ -509,7 +544,6 @@ impl WindowView {
         guide: Option<&GuiderWindows>,
         interval: &ExposureInterval,
     ) -> Self {
-        use crate::equipment::ring::DeviceSnapshot;
         let (start, end) = (interval.start, interval.end);
         let rings = hub.rings();
         Self {
@@ -523,13 +557,82 @@ impl WindowView {
                 .range(start, end)
                 .iter()
                 .any(|s| s.in_motion()),
+            focuser_changed_after_end: began_after_end(hub, &rings.focuser, end),
             wheel_end: rings.filter_wheel.at_or_before(end).map(|s| (*s).clone()),
             wheel_moving_inside: rings
                 .filter_wheel
                 .range(start, end)
                 .iter()
                 .any(|s| s.in_motion()),
+            wheel_changed_after_end: began_after_end(hub, &rings.filter_wheel, end),
         }
+    }
+}
+
+/// How a device's state at the exposure end is known (D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum EndState {
+    /// The first sample after the end agrees with the last one at or before
+    /// it.
+    Confirmed,
+    /// The first sample after the end differs, and the change is shown to
+    /// have begun after the end (an operation or motion event started
+    /// after it): the last sample at or before the end is the end state.
+    ChangedAfterEnd,
+    /// No sample after the end yet: the last one at or before it stands in
+    /// until the window is final.
+    Provisional,
+    /// The first sample after the end differs and nothing shows when the
+    /// change happened: the end state is unknown.
+    ChangedAtOrAfterEnd,
+    /// No sample after the end arrived within the D7 grace: the end state
+    /// is `Stale`.
+    Stale,
+    /// No sample near the end.
+    Missing,
+}
+
+impl EndState {
+    /// The last sample at or before the end is the device's end state.
+    fn known(self) -> bool {
+        matches!(
+            self,
+            EndState::Confirmed | EndState::ChangedAfterEnd | EndState::Provisional
+        )
+    }
+}
+
+/// The D7 end state of one kind: `last` is its last sample at or before the
+/// exposure end (within read age), `samples.end` the first one after it once
+/// it exists, and `agrees(last, post)` whether the two describe the same
+/// state.
+fn end_state<S: Timestamped>(
+    samples: &WindowSamples<S>,
+    last: Option<&S>,
+    interval_end: DateTime<Utc>,
+    kind: DeviceKind,
+    changed_after_end: bool,
+    agrees: impl Fn(&S, &S) -> bool,
+) -> EndState {
+    let Some(last) = last else {
+        return EndState::Missing;
+    };
+    if samples.end_stale {
+        return EndState::Stale;
+    }
+    let Some(post) = samples.end.as_ref().filter(|s| s.at_utc() >= interval_end) else {
+        return EndState::Provisional;
+    };
+    if near(Some(post), interval_end, kind).is_none() {
+        return EndState::Stale;
+    }
+    if agrees(last, post) {
+        EndState::Confirmed
+    } else if changed_after_end {
+        EndState::ChangedAfterEnd
+    } else {
+        EndState::ChangedAtOrAfterEnd
     }
 }
 
@@ -571,8 +674,18 @@ struct Pointing {
     altaz_source: Option<&'static str>,
     pier_side: Option<PierSide>,
     site: Option<Site>,
-    /// `config` (`[site]`) or `mount`.
+    /// Where the site came from: the hub site's own source (`config` for
+    /// `[site]`, `mount` when it was taken from the mount, `operator`), or
+    /// `mount` for the mount's site when the hub has none.
     site_source: Option<&'static str>,
+}
+
+fn site_source_name(source: SiteSource) -> &'static str {
+    match source {
+        SiteSource::Config => "config",
+        SiteSource::Mount => "mount",
+        SiteSource::Operator => "operator",
+    }
 }
 
 fn pointing(
@@ -584,7 +697,7 @@ fn pointing(
     let mut p = Pointing::default();
     if let Some(site) = configured_site {
         p.site = Some(site);
-        p.site_source = Some("config");
+        p.site_source = Some(site_source_name(site.source));
     } else if let Some(site) = mid_sample.and_then(|m| m.state.site.fresh_value().copied()) {
         p.site = Some(site);
         p.site_source = Some("mount");
@@ -656,9 +769,18 @@ struct FocuserFacts {
     raw_start: Option<i32>,
     raw_end: Option<i32>,
     position_source: Option<PositionSource>,
-    /// The position is a reliable absolute position (v6 §7.6.2).
+    /// The start position is a reliable absolute position (v6 §7.6.2).
+    reliable_start: bool,
+    /// The end position is known (D7) and a reliable absolute position.
+    reliable_end: bool,
+    /// Both are.
     reliable: bool,
+    /// `true` if motion was seen at the start or inside the exposure,
+    /// `false` only when the start and end states are both known and
+    /// nothing moved, else unknown.
     moved: Option<bool>,
+    /// How the end state is known (D7).
+    end_state: Option<EndState>,
     temperature_c: Option<f64>,
     temperature_role: Option<TemperatureRole>,
     /// What `frames.focuser_position` and `FOCPOS` carry: the position when
@@ -666,34 +788,66 @@ struct FocuserFacts {
     frame_position: Option<i32>,
 }
 
+/// The same focuser state: not moving, at the same logical position, from
+/// the same position source.
+fn focuser_agrees(last: &FocuserSnapshot, post: &FocuserSnapshot) -> bool {
+    !post.in_motion()
+        && post.logical_position == last.logical_position
+        && post.position_source == last.position_source
+}
+
 fn focuser_facts(view: &WindowView, interval: &ExposureInterval) -> FocuserFacts {
     let w = &view.window;
     let kind = DeviceKind::Focuser;
     let start = near(w.focuser.start.as_ref(), interval.start, kind);
-    let end = near(view.focuser_end.as_ref(), interval.end, kind)
-        .or_else(|| near(w.focuser.end.as_ref(), interval.end, kind));
+    let last = near(view.focuser_end.as_ref(), interval.end, kind);
+    let post = near(
+        w.focuser
+            .end
+            .as_ref()
+            .filter(|s| s.at_utc() >= interval.end),
+        interval.end,
+        kind,
+    );
     let mid = near(
         w.focuser.mid.as_ref(),
         midpoint(interval.start, interval.end),
         kind,
     );
-    if start.is_none() && end.is_none() && mid.is_none() {
+    if start.is_none() && last.is_none() && mid.is_none() && post.is_none() {
         return FocuserFacts::default();
     }
+    let end_state = end_state(
+        &w.focuser,
+        last,
+        interval.end,
+        kind,
+        view.focuser_changed_after_end,
+        focuser_agrees,
+    );
+    // The end state is the last sample at or before the end only while D7
+    // says it is known; otherwise there is no end position.
+    let end = last.filter(|_| end_state.known());
     let position_start = start.and_then(|s| s.logical_position);
     let position_end = end.and_then(|s| s.logical_position);
-    let reliable = start.is_some()
-        && end.is_some()
-        && [start, end]
-            .iter()
-            .flatten()
-            .all(|s| s.position_source.is_reliable());
-    let moved = view.focuser_moving_inside
-        || w.events
-            .iter()
-            .any(|e| motion_kinds(e).contains(&DeviceKind::Focuser))
-        || (position_start.is_some() && position_end.is_some() && position_start != position_end);
-    let temperature_c = [mid, start, end]
+    let position_last = last.and_then(|s| s.logical_position);
+    // Motion at the start (a move already running) or anywhere inside.
+    let motion_seen = start.is_some_and(|s| s.in_motion())
+        || last.is_some_and(|s| s.in_motion())
+        || view.focuser_moving_inside
+        || w.events.iter().any(|e| motion_kinds(e).contains(&kind))
+        || matches!((position_start, position_last), (Some(a), Some(b)) if a != b);
+    let moved = if motion_seen {
+        Some(true)
+    } else if start.is_some() && end.is_some() {
+        Some(false)
+    } else {
+        None
+    };
+    let reliable_start = start.is_some_and(|s| s.position_source.is_reliable());
+    let reliable_end = end.is_some_and(|s| s.position_source.is_reliable());
+    let reliable = reliable_start && reliable_end;
+    let temperature_c = [mid, start, last]
         .into_iter()
         .flatten()
         .find_map(|s| s.state.temperature_c.fresh_value().copied())
@@ -704,12 +858,15 @@ fn focuser_facts(view: &WindowView, interval: &ExposureInterval) -> FocuserFacts
         position_end,
         raw_start: start.and_then(|s| s.state.position.known().copied()),
         raw_end: end.and_then(|s| s.state.position.known().copied()),
-        position_source: start.or(end).map(|s| s.position_source),
+        position_source: start.or(last).map(|s| s.position_source),
+        reliable_start,
+        reliable_end,
         reliable,
-        moved: Some(moved),
+        moved,
+        end_state: Some(end_state),
         temperature_c,
-        temperature_role: start.or(end).or(mid).map(|s| s.temperature_role),
-        frame_position: (reliable && !moved && position_start == position_end)
+        temperature_role: start.or(last).or(mid).map(|s| s.temperature_role),
+        frame_position: (reliable && moved == Some(false) && position_start == position_end)
             .then_some(position_start)
             .flatten(),
     }
@@ -730,6 +887,19 @@ struct FilterFacts {
     wheel_slot_name: Option<String>,
     /// Why a connected wheel did not verify this exposure.
     unverified_reason: Option<&'static str>,
+    /// How the wheel's end state is known (D7).
+    end_state: Option<EndState>,
+}
+
+/// The same wheel state: not moving, at the same known slot, with the same
+/// verification.
+fn wheel_agrees(last: &FilterWheelSnapshot, post: &FilterWheelSnapshot) -> bool {
+    let slot = post.position.known().copied();
+    !post.in_motion()
+        && slot.is_some()
+        && slot == last.position.known().copied()
+        && post.verified == last.verified
+        && post.verified_slot == last.verified_slot
 }
 
 fn slot_name(wheel: &FilterWheelSnapshot, slot: u32) -> Option<String> {
@@ -752,35 +922,68 @@ fn filter_facts(
         .filter(|label| !label.is_empty())
         .map(str::to_string);
     let start = near(w.filter_wheel.start.as_ref(), interval.start, kind);
-    let end = near(view.wheel_end.as_ref(), interval.end, kind)
-        .or_else(|| near(w.filter_wheel.end.as_ref(), interval.end, kind));
+    let last = near(view.wheel_end.as_ref(), interval.end, kind);
+    let post = near(
+        w.filter_wheel
+            .end
+            .as_ref()
+            .filter(|s| s.at_utc() >= interval.end),
+        interval.end,
+        kind,
+    );
     let mut facts = FilterFacts {
         client_label: client_label.clone(),
         ..FilterFacts::default()
     };
-    if let Some(wheel) = end.or(start) {
+    if let Some(wheel) = last.or(start).or(post) {
         facts.wheel_present = true;
         facts.wheel_slot = wheel.position.known().copied();
         facts.wheel_slot_name = facts.wheel_slot.and_then(|slot| slot_name(wheel, slot));
     }
-    let moved = view.wheel_moving_inside
-        || w.events
-            .iter()
-            .any(|e| motion_kinds(e).contains(&DeviceKind::FilterWheel));
+    let end_state = end_state(
+        &w.filter_wheel,
+        last,
+        interval.end,
+        kind,
+        view.wheel_changed_after_end,
+        wheel_agrees,
+    );
+    if facts.wheel_present {
+        facts.end_state = Some(end_state);
+    }
+    // The end state is the last sample at or before the end only while D7
+    // says it is known.
+    let end = last.filter(|_| end_state.known());
+    let slot_of = |s: &FilterWheelSnapshot| s.position.known().copied();
+    // Motion at the start (a change already running) or anywhere inside.
+    let moved = start.is_some_and(|s| s.in_motion())
+        || last.is_some_and(|s| s.in_motion())
+        || view.wheel_moving_inside
+        || w.events.iter().any(|e| motion_kinds(e).contains(&kind))
+        || matches!(
+            (start.and_then(slot_of), last.and_then(slot_of)),
+            (Some(a), Some(b)) if a != b
+        );
     let verified_slot = match (start, end) {
         (Some(s), Some(e))
             if s.verified
                 && e.verified
                 && s.verified_slot.is_some()
                 && s.verified_slot == e.verified_slot
-                && !s.moving
-                && !e.moving
                 && !moved =>
         {
             s.verified_slot
         }
-        (Some(_), Some(_)) if moved => {
+        _ if moved => {
             facts.unverified_reason = Some("wheel_moved_during_exposure");
+            None
+        }
+        _ if end_state == EndState::ChangedAtOrAfterEnd => {
+            facts.unverified_reason = Some("changed_at_or_after_end");
+            None
+        }
+        _ if end_state == EndState::Stale => {
+            facts.unverified_reason = Some("end_state_stale");
             None
         }
         (Some(_), Some(_)) => {
@@ -995,6 +1198,19 @@ pub(crate) fn derive(
     }
     if focuser.present && focuser.moved == Some(true) {
         warnings.push("The focuser moved during the exposure".into());
+    } else if let Some(state @ (EndState::ChangedAtOrAfterEnd | EndState::Stale)) =
+        focuser.end_state
+    {
+        let why = match state {
+            EndState::Stale => "no focuser sample after the end arrived in time",
+            _ => {
+                "the first focuser sample after the end differs, and nothing shows when it changed"
+            }
+        };
+        warnings.push(format!(
+            "The focuser's state at the end of the exposure is unknown ({why}); no focuser \
+             position is recorded"
+        ));
     }
     let rotator_angle_deg = near(w.rotator.mid.as_ref(), mid, DeviceKind::Rotator)
         .and_then(|r| r.state.position_deg.fresh_value().copied());
@@ -1072,8 +1288,14 @@ pub(crate) fn derive(
         } else {
             any_known(&w.motion, covered, |i| i.pulse_guiding)
         },
-        focuser_pos_start: focuser.reliable.then_some(focuser.position_start).flatten(),
-        focuser_pos_end: focuser.reliable.then_some(focuser.position_end).flatten(),
+        focuser_pos_start: focuser
+            .reliable_start
+            .then_some(focuser.position_start)
+            .flatten(),
+        focuser_pos_end: focuser
+            .reliable_end
+            .then_some(focuser.position_end)
+            .flatten(),
         focuser_moved: focuser.moved,
         focuser_temperature_c: focuser.temperature_c,
         filter_slot: filter.slot,
@@ -1418,6 +1640,19 @@ mod tests {
         Arc::new(snap)
     }
 
+    /// A focuser move Achernar started at `started_at`.
+    fn focuser_op(started_at: DateTime<Utc>) -> crate::equipment::ops::ActiveOp {
+        use crate::equipment::ops::{ActiveOp, OpKind, OpPhase};
+        ActiveOp {
+            command_id: CommandId::new(),
+            kind: OpKind::FocuserMove,
+            phase: OpPhase::InProgress,
+            started_at,
+            started_mono_ns: 0,
+            deadline_mono_ns: u64::MAX,
+        }
+    }
+
     fn wheel_at(clock: &ManualClock, slot: u32, verified: bool) -> Arc<FilterWheelSnapshot> {
         let mut snap = FilterWheelSnapshot {
             position: fresh(slot, clock),
@@ -1685,15 +1920,22 @@ mod tests {
         let (interval, _) = still(&clock, 4.0);
         clock.advance_ms(2_000);
         ring.push(focuser_at(&clock, 1_000, false, PositionSource::Device));
-        // After the exposure the focuser moves on (the next autofocus step):
-        // the live snapshot says 2000, the frame keeps 1000.
-        clock.advance_ms(2_500);
-        ring.push(focuser_at(&clock, 1_400, true, PositionSource::Device));
+        // After the exposure the focuser moves on (the next autofocus step,
+        // an operation started after the end): the live snapshot says 2000,
+        // the frame keeps 1000.
+        clock.advance_ms(2_100);
+        let op_started = clock.now_utc();
+        clock.advance_ms(400);
+        let mut stepping = (*focuser_at(&clock, 1_400, true, PositionSource::Device)).clone();
+        stepping.active_op = Some(focuser_op(op_started));
+        ring.push(Arc::new(stepping));
         clock.advance_ms(1_000);
         ring.push(focuser_at(&clock, 2_000, false, PositionSource::Device));
         let equipment = assemble(&hub, None, &interval, &input("frame-f", None));
         assert_eq!(equipment.focuser_position, Some(1_000));
         assert_eq!(equipment.row.focuser_moved, Some(false));
+        assert_eq!(equipment.row.focuser_pos_end, Some(1_000));
+        assert_eq!(equipment.block["focuser"]["end_state"], "changed_after_end");
         assert_eq!(
             card(&equipment.cards, "FOCPOS"),
             Some(&FitsValue::Int(1_000))
@@ -1781,6 +2023,191 @@ mod tests {
         assert_eq!(unverified.filter_name, None);
         assert_eq!(unverified.filter_verified, Some(false));
         assert_eq!(unverified.block["filter"]["wheel_slot_name"], "Ha");
+    }
+
+    #[test]
+    fn a_change_only_the_sample_after_a_short_exposure_shows_leaves_the_end_unknown() {
+        // A 0.5 s stream exposure on a shared wheel and focuser publishing at
+        // their 2 s idle cadence: the only samples before the end were taken
+        // before the exposure began.
+        let (hub, clock, _sink) = hub();
+        let (wheel, _w) = fake_filter_wheel(FilterWheelSnapshot::default());
+        let (focuser, _f) = fake_focuser(FocuserSnapshot::default());
+        let wheel_ring = hub.attach(wheel);
+        let focuser_ring = hub.attach(focuser);
+        wheel_ring.push(wheel_at(&clock, 2, true));
+        focuser_ring.push(focuser_at(&clock, 1_000, false, PositionSource::Device));
+        clock.advance_ms(1_000);
+        let (interval, _) = still(&clock, 0.5);
+        clock.advance_ms(500);
+        // At the commit no sample after the end exists yet: the window is
+        // provisional and the last samples stand in.
+        let provisional = assemble(&hub, None, &interval, &input("frame-s", Some("Ha")));
+        assert!(!provisional.row.finalised);
+        assert_eq!(provisional.filter_verified, Some(true));
+        assert_eq!(provisional.block["filter"]["end_state"], "provisional");
+        assert_eq!(provisional.focuser_position, Some(1_000));
+
+        // 0.5 s after the end the next samples show both devices moving
+        // (another client, a handset): nothing shows when that began.
+        clock.advance_ms(500);
+        let mut moving = (*wheel_at(&clock, 2, false)).clone();
+        moving.moving = true;
+        moving.position = Observed::default();
+        wheel_ring.push(Arc::new(moving));
+        focuser_ring.push(focuser_at(&clock, 1_000, true, PositionSource::Device));
+        let plan = FinalisePlan {
+            input: input("frame-s", Some("Ha")),
+            interval: interval.clone(),
+            finalised_at_commit: false,
+        };
+        let done = try_finalise(&hub, None, &plan).expect("a sample after the end exists");
+        assert!(done.row.finalised);
+        assert!(
+            hub.window(interval.start, interval.end).moved.wheel,
+            "the hub's window sees the change too"
+        );
+        assert_eq!(done.row.filter_verified, Some(false));
+        assert_eq!(done.row.filter_slot, None);
+        assert_eq!(done.filter_name.as_deref(), Some("Ha"), "the client label");
+        assert_eq!(
+            done.block["filter"]["unverified_reason"],
+            "changed_at_or_after_end"
+        );
+        assert_eq!(done.block["filter"]["end_state"], "changed_at_or_after_end");
+        assert_eq!(
+            card(&done.cards, "FILTER"),
+            Some(&FitsValue::Str("Ha".into()))
+        );
+        assert_eq!(done.row.focuser_moved, None, "unknown, not unmoved");
+        assert_eq!(done.row.focuser_pos_start, Some(1_000));
+        assert_eq!(done.row.focuser_pos_end, None);
+        assert_eq!(done.focuser_position, None);
+        assert!(card(&done.cards, "FOCPOS").is_none());
+        assert!(done
+            .warnings
+            .iter()
+            .any(|w| w.contains("end of the exposure is unknown")));
+
+        // The same sample after a move shown to have begun after the end (a
+        // filter change started then): the wheel held its slot throughout.
+        let (hub, clock, _sink) = self::hub();
+        let (wheel, _w) = fake_filter_wheel(FilterWheelSnapshot::default());
+        let id = wheel.connection_id();
+        let wheel_ring = hub.attach(wheel);
+        wheel_ring.push(wheel_at(&clock, 2, true));
+        clock.advance_ms(1_000);
+        let (interval, _) = still(&clock, 0.5);
+        clock.advance_ms(700);
+        hub.emit(
+            EquipmentEvent::new(EventKind::FilterMoving { to_slot: 0 }, clock.as_ref())
+                .for_device(DeviceKind::FilterWheel, id),
+        );
+        clock.advance_ms(300);
+        let mut moving = (*wheel_at(&clock, 2, false)).clone();
+        moving.moving = true;
+        moving.position = Observed::default();
+        wheel_ring.push(Arc::new(moving));
+        let after = assemble(&hub, None, &interval, &input("frame-a", None));
+        assert!(after.row.finalised);
+        assert_eq!(after.filter_verified, Some(true));
+        assert_eq!(after.row.filter_slot, Some(2));
+        assert_eq!(after.block["filter"]["end_state"], "changed_after_end");
+    }
+
+    #[test]
+    fn a_move_already_running_at_the_start_is_a_move() {
+        // The last focuser sample before the exposure shows it moving (a
+        // TempComp step, another client); the next one, after the end, shows
+        // it settled where it started.
+        let (hub, clock, _sink) = hub();
+        let (focuser, _f) = fake_focuser(FocuserSnapshot::default());
+        let ring = hub.attach(focuser);
+        ring.push(focuser_at(&clock, 1_000, true, PositionSource::Device));
+        clock.advance_ms(500);
+        let (interval, _) = still(&clock, 1.0);
+        clock.advance_ms(1_500);
+        ring.push(focuser_at(&clock, 1_000, false, PositionSource::Device));
+        let equipment = assemble(&hub, None, &interval, &input("frame-r", None));
+        assert!(equipment.row.finalised);
+        assert_eq!(equipment.row.quiescent, Some(false));
+        assert_eq!(
+            equipment.row.focuser_moved,
+            Some(true),
+            "agrees with the hub's quiescence"
+        );
+        assert_eq!(equipment.focuser_position, None);
+        assert!(card(&equipment.cards, "FOCPOS").is_none());
+
+        // A wheel still changing slots at the start does not verify.
+        let (hub, clock, _sink) = self::hub();
+        let (wheel, _w) = fake_filter_wheel(FilterWheelSnapshot::default());
+        let ring = hub.attach(wheel);
+        let mut moving = (*wheel_at(&clock, 1, false)).clone();
+        moving.moving = true;
+        moving.position = Observed::default();
+        ring.push(Arc::new(moving));
+        clock.advance_ms(500);
+        let (interval, _) = still(&clock, 1.0);
+        clock.advance_ms(1_500);
+        ring.push(wheel_at(&clock, 1, true));
+        let wheel = assemble(&hub, None, &interval, &input("frame-q", Some("R")));
+        assert_eq!(wheel.filter_verified, Some(false));
+        assert_eq!(
+            wheel.block["filter"]["unverified_reason"],
+            "wheel_moved_during_exposure"
+        );
+    }
+
+    #[test]
+    fn a_device_silent_after_the_end_has_a_stale_end_state() {
+        let (hub, clock, _sink) = hub();
+        let (focuser, _f) = fake_focuser(FocuserSnapshot::default());
+        let (wheel, _w) = fake_filter_wheel(FilterWheelSnapshot::default());
+        let focuser_ring = hub.attach(focuser);
+        let wheel_ring = hub.attach(wheel);
+        focuser_ring.push(focuser_at(&clock, 1_000, false, PositionSource::Device));
+        wheel_ring.push(wheel_at(&clock, 1, true));
+        clock.advance_ms(100);
+        let (interval, _) = still(&clock, 3.0);
+        clock.advance_ms(1_000);
+        focuser_ring.push(focuser_at(&clock, 1_000, false, PositionSource::Device));
+        wheel_ring.push(wheel_at(&clock, 1, true));
+        // Both fall silent. Past the D7 grace (2 x the 2 s idle cadence)
+        // their end states are stale: no position, no verified filter.
+        clock.advance_ms(6_100);
+        let window = hub.window(interval.start, interval.end);
+        assert!(window.focuser.end_stale && window.filter_wheel.end_stale);
+        let stale = assemble(&hub, None, &interval, &input("frame-x", None));
+        assert!(stale.row.finalised, "a stale end state is final");
+        assert_eq!(stale.block["focuser"]["end_state"], "stale");
+        assert_eq!(stale.row.focuser_moved, None);
+        assert_eq!(stale.row.focuser_pos_start, Some(1_000));
+        assert_eq!(stale.row.focuser_pos_end, None);
+        assert_eq!(stale.focuser_position, None);
+        assert!(card(&stale.cards, "FOCPOS").is_none());
+        assert_eq!(stale.filter_verified, Some(false));
+        assert_eq!(stale.row.filter_slot, None);
+        assert_eq!(
+            stale.block["filter"]["unverified_reason"],
+            "end_state_stale"
+        );
+    }
+
+    #[test]
+    fn the_site_source_is_the_sites_own() {
+        let now = Utc::now();
+        let mut from_mount = site();
+        from_mount.source = SiteSource::Mount;
+        let p = pointing(&DeviceWindow::default(), None, Some(from_mount), now);
+        assert_eq!(p.site_source, Some("mount"));
+        assert_eq!(json!(p)["site"]["source"], "mount");
+        let p = pointing(&DeviceWindow::default(), None, Some(site()), now);
+        assert_eq!(p.site_source, Some("config"));
+        let mut operator = site();
+        operator.source = SiteSource::Operator;
+        let p = pointing(&DeviceWindow::default(), None, Some(operator), now);
+        assert_eq!(p.site_source, Some("operator"));
     }
 
     #[test]

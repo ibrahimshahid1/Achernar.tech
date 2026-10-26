@@ -1023,8 +1023,6 @@ fn remove_partials(root: &Path) -> usize {
 //  Helpers
 // ═══════════════════════════════════════════════════════════════════
 
-/// Observing night under the same local-noon boundary used by every dataset
-/// grouping key. A directory and its catalogue row must never disagree.
 /// Why a frame's window row holds no equipment state.
 const WINDOW_NOT_ASSEMBLED: &str = "equipment_window_not_assembled";
 
@@ -1055,6 +1053,8 @@ fn exposure_window_row(capture: &PendingCapture) -> crate::equipment::events::Ex
     }
 }
 
+/// Observing night under the same local-noon boundary used by every dataset
+/// grouping key. A directory and its catalogue row must never disagree.
 fn night_of(unix_seconds: f64) -> String {
     crate::storage::night::night_id(unix_to_datetime(unix_seconds))
 }

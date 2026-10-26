@@ -177,29 +177,40 @@ impl FreshFrameGate {
     }
 }
 
-/// When each stream frame was first seen, by the host clock: the accepted
-/// frame's arrival, and the stream's frame period once two consecutive
-/// counters were seen. Together they bound a stream exposure's window,
-/// because OLS stamps a stream frame on delivery, not at exposure start.
+/// When each stream frame arrived, by the host clock: the accepted frame's
+/// arrival, and the stream's frame period once two consecutive counters
+/// were seen. Together they bound a stream exposure's window, because OLS
+/// stamps a stream frame on delivery (`FrameData::unix_timestamp`, the
+/// `host_arrival` clock), not at exposure start. The daemon's poll time
+/// stands in only for a frame without a usable stamp.
 #[derive(Debug, Default)]
 struct FrameArrivals {
-    last: Option<(i32, f64)>,
+    /// The last counter seen, its arrival, and whether that is OLS's stamp.
+    last: Option<(i32, f64, bool)>,
     interval_s: Option<f64>,
 }
 
 impl FrameArrivals {
-    /// Note `counter` as seen at `now`; returns when it was first seen.
-    fn observe(&mut self, counter: i32, now: f64) -> f64 {
+    /// Note `counter`, stamped `stamp` by OLS and polled at `polled_at`;
+    /// returns its arrival: the stamp, or the first poll that saw it when
+    /// the stamp is not a usable time.
+    fn observe(&mut self, counter: i32, stamp: f64, polled_at: f64) -> f64 {
         match self.last {
-            Some((seen, at)) if seen == counter => at,
+            Some((seen, at, _)) if seen == counter => at,
             previous => {
-                if let Some((seen, at)) = previous {
-                    if i64::from(counter) - i64::from(seen) == 1 && now > at {
-                        self.interval_s = Some(now - at);
+                let stamped = stamp.is_finite() && stamp > 0.0;
+                let at = if stamped { stamp } else { polled_at };
+                // A period only from two arrivals on the same clock basis.
+                if let Some((seen, before, before_stamped)) = previous {
+                    if i64::from(counter) - i64::from(seen) == 1
+                        && before_stamped == stamped
+                        && at > before
+                    {
+                        self.interval_s = Some(at - before);
                     }
                 }
-                self.last = Some((counter, now));
-                now
+                self.last = Some((counter, at, stamped));
+                at
             }
         }
     }
@@ -1378,19 +1389,20 @@ async fn capture_from_stream(
     let timeout = Duration::from_secs_f64((actual_exposure_s * 3.0 + 20.0).clamp(20.0, 900.0));
     let deadline = Instant::now() + timeout;
     let mut fresh_gate = FreshFrameGate::new(baseline);
-    // When each frame of this generation was first seen (host clock): the
-    // accepted frame's arrival, and the stream's frame period when two
+    // When each frame of this generation arrived (OLS's host-clock stamp):
+    // the accepted frame's arrival, and the stream's frame period when two
     // consecutive frames were seen, bound its exposure window (H3 rule for
-    // `host_arrival`).
+    // `host_arrival`). The same stamp is the frame's DATE-OBS.
     let mut arrivals = FrameArrivals::default();
-    let (frame, seen_at) = loop {
+    let (frame, arrived_at) = loop {
         {
             let guard = state.latest_frame.lock().unwrap();
             if let Some(f) = guard.as_ref() {
                 if f.stream_generation == stream_generation {
-                    let seen_at = arrivals.observe(f.frame_counter, unix_now());
+                    let arrived_at =
+                        arrivals.observe(f.frame_counter, f.unix_timestamp, unix_now());
                     if fresh_gate.accepts(f.frame_counter) {
-                        break (f.clone(), seen_at);
+                        break (f.clone(), arrived_at);
                     }
                 }
             }
@@ -1413,7 +1425,7 @@ async fn capture_from_stream(
     // The equipment window: from `arrival - (exposure + frame interval)` to
     // the arrival, by the host clock (H1, D7).
     let interval = ExposureInterval::stream(
-        seen_at,
+        arrived_at,
         actual_exposure_s,
         arrivals.interval_s(),
         link.hooks.clock_quality(AcquisitionPath::Stream),
@@ -2948,14 +2960,32 @@ mod tests {
     #[test]
     fn frame_arrivals_measure_the_period_of_consecutive_frames_only() {
         let mut arrivals = FrameArrivals::default();
-        assert_eq!(arrivals.observe(41, 100.0), 100.0);
-        assert_eq!(arrivals.observe(41, 100.05), 100.0, "first sight wins");
+        // OLS's arrival stamp is the arrival, not the (later) poll.
+        assert_eq!(arrivals.observe(41, 99.8, 100.0), 99.8);
+        assert_eq!(
+            arrivals.observe(41, 99.8, 100.05),
+            99.8,
+            "one frame, one time"
+        );
         assert_eq!(arrivals.interval_s(), None);
-        assert_eq!(arrivals.observe(42, 104.1), 104.1);
+        assert_eq!(arrivals.observe(42, 103.9, 104.1), 103.9);
         assert!((arrivals.interval_s().unwrap() - 4.1).abs() < 1e-9);
         // A counter the poll skipped measures nothing new.
-        assert_eq!(arrivals.observe(44, 112.5), 112.5);
+        assert_eq!(arrivals.observe(44, 112.1, 112.5), 112.1);
         assert!((arrivals.interval_s().unwrap() - 4.1).abs() < 1e-9);
+
+        // Without a usable stamp the first poll that saw a frame stands in,
+        // and a period is never taken across the two clock bases.
+        let mut polled = FrameArrivals::default();
+        assert_eq!(polled.observe(7, f64::NAN, 50.0), 50.0);
+        assert_eq!(polled.observe(7, f64::NAN, 50.05), 50.0, "first sight wins");
+        assert_eq!(polled.observe(8, 0.0, 52.0), 52.0);
+        assert!((polled.interval_s().unwrap() - 2.0).abs() < 1e-9);
+        assert_eq!(polled.observe(9, 53.5, 54.0), 53.5);
+        assert!(
+            (polled.interval_s().unwrap() - 2.0).abs() < 1e-9,
+            "a stamp after a poll time measures nothing"
+        );
     }
 
     #[test]
