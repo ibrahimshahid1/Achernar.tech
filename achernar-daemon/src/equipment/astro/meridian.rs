@@ -85,9 +85,13 @@ pub fn minutes_past_meridian(ha_h: f64) -> f64 {
 /// `ha_h` in its normal (counterweight-down) configuration: `East` (looking
 /// west) when the target is west of the meridian, `West` (looking east)
 /// when it is east. INDI mounts derive their destination pier side from
-/// this (§7.1 R6); for other mount types the answer means nothing.
+/// this (§7.1 R6); for other mount types the answer means nothing. A
+/// non-finite hour angle gives `Unknown`, never a guessed side (D5).
 pub fn expected_pier_side(ha_h: f64) -> PierSide {
-    if wrap_hours_pm12(ha_h) >= 0.0 {
+    let ha = wrap_hours_pm12(ha_h);
+    if !ha.is_finite() {
+        PierSide::Unknown
+    } else if ha >= 0.0 {
         PierSide::East
     } else {
         PierSide::West
@@ -95,6 +99,9 @@ pub fn expected_pier_side(ha_h: f64) -> PierSide {
 }
 
 /// Meridian timing for one hour angle.
+///
+/// A non-finite hour angle leaves the three time fields NaN; with a limit
+/// it also counts as past the limit (see [`meridian_timing`]).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MeridianTiming {
     pub ha_h: f64,
@@ -102,23 +109,32 @@ pub struct MeridianTiming {
     /// SI seconds to the next upper transit.
     pub seconds_to_meridian: f64,
     /// SI seconds until the hour angle reaches the limit, `None` without
-    /// one. Zero or more; a target already past the limit wraps to the
-    /// next sidereal day, so check [`Self::past_limit`] first.
+    /// one or when the hour angle or the limit is not finite. Zero or more;
+    /// a target already past the limit wraps to the next sidereal day, so
+    /// check [`Self::past_limit`] first.
     pub seconds_to_limit: Option<f64>,
-    /// The hour angle (in `[-12, 12)`) is beyond the limit.
+    /// The hour angle (in `[-12, 12)`) is beyond the limit, or a limit is
+    /// set and the hour angle or the limit is not finite (fail closed).
     pub past_limit: bool,
 }
 
 /// Meridian timing at `ha_h`, with an optional hour-angle limit (east of
 /// the meridian is negative), e.g. a flip limit in hours past the meridian.
+/// An hour angle or limit that is not finite is unknown: with a limit the
+/// result reads past it with no time to it, never "within the limit".
 pub fn meridian_timing(ha_h: f64, ha_limit_h: Option<f64>) -> MeridianTiming {
     let ha = wrap_hours_pm12(ha_h);
+    let known_limit = ha_limit_h.filter(|limit| ha.is_finite() && limit.is_finite());
     MeridianTiming {
         ha_h: ha,
         minutes_past_meridian: minutes_past_meridian(ha),
         seconds_to_meridian: seconds_until_hour_angle(ha, 0.0),
-        seconds_to_limit: ha_limit_h.map(|limit| seconds_until_hour_angle(ha, limit)),
-        past_limit: ha_limit_h.is_some_and(|limit| ha > limit),
+        seconds_to_limit: known_limit.map(|limit| seconds_until_hour_angle(ha, limit)),
+        past_limit: match (ha_limit_h, known_limit) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(_), Some(limit)) => ha > limit,
+        },
     }
 }
 
@@ -445,6 +461,28 @@ mod tests {
         assert_eq!(expected_pier_side(0.0), PierSide::East);
         assert_eq!(expected_pier_side(-0.01), PierSide::West);
         assert_eq!(expected_pier_side(13.0), PierSide::West);
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(expected_pier_side(bad), PierSide::Unknown);
+        }
+    }
+
+    #[test]
+    fn a_non_finite_hour_angle_or_limit_fails_closed() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let t = meridian_timing(bad, Some(0.25));
+            assert!(t.past_limit, "{bad}");
+            assert_eq!(t.seconds_to_limit, None);
+            assert!(t.ha_h.is_nan() && t.seconds_to_meridian.is_nan());
+            assert!(t.minutes_past_meridian.is_nan());
+            // Without a limit there is nothing to be past.
+            let free = meridian_timing(bad, None);
+            assert!(!free.past_limit && free.seconds_to_limit.is_none());
+            // A finite hour angle against a non-finite limit.
+            let t = meridian_timing(-3.0, Some(bad));
+            assert!(t.past_limit, "limit {bad}");
+            assert_eq!(t.seconds_to_limit, None);
+            assert!((t.seconds_to_meridian - sidereal_hours_to_si_seconds(3.0)).abs() < 1e-9);
+        }
     }
 
     #[test]

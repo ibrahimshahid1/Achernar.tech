@@ -4,9 +4,14 @@
 //! **File format.** One `az_deg,alt_deg` pair per line: azimuth from north
 //! through east in `[0, 360]`, altitude in `[-90, 90]`. Commas, semicolons,
 //! tabs or spaces separate the two numbers, so NINA-style space-separated
-//! files load too. Blank lines, `#` comments and a non-numeric header line
-//! (`az_deg,alt_deg`) are skipped. Points may come in any order; 360 is the
-//! same azimuth as 0.
+//! files load too. Blank lines, `#` comments and a leading UTF-8 byte order
+//! mark are skipped. One header line (`az_deg,alt_deg`) is allowed before
+//! the first point, and only when it contains no digit and no field reads
+//! as a number; any other line that is not two numbers is an error, so a
+//! typo on the first line is never mistaken for a header. Points may come
+//! in any order. 360 is the same azimuth as 0: a closed loop that lists
+//! both (the usual NINA layout) loads when the two altitudes agree, and is
+//! an error ([`HorizonError::NorthMismatch`]) when they differ.
 //!
 //! **Interpolation.** Linear in azimuth between neighbouring points,
 //! wrapping across north. One point gives a flat horizon.
@@ -46,26 +51,63 @@ pub enum HorizonError {
     TooManyPoints,
     #[error("horizon profile lists azimuth {az_deg}° twice")]
     DuplicateAzimuth { az_deg: f64 },
+    /// Azimuths 0 and 360 are the same direction but were given different
+    /// altitudes.
+    #[error(
+        "horizon profile gives azimuth 0° altitude {alt_at_0_deg}° and azimuth 360° \
+         altitude {alt_at_360_deg}°; they are the same direction, so make them equal \
+         or remove one"
+    )]
+    NorthMismatch {
+        alt_at_0_deg: f64,
+        alt_at_360_deg: f64,
+    },
 }
 
 /// A validated horizon profile, sorted by azimuth in `[0, 360)`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// It deserializes through [`HorizonProfile::from_points`], so a stored or
+/// received profile gets the same validation as a loaded file.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct HorizonProfile {
     points: Vec<HorizonPoint>,
 }
 
+impl<'de> Deserialize<'de> for HorizonProfile {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Raw {
+            points: Vec<HorizonPoint>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Self::from_points(raw.points).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Two altitudes listed for azimuths 0 and 360 count as equal within this.
+const NORTH_MATCH_DEG: f64 = 1e-9;
+
 impl HorizonProfile {
-    /// A flat horizon at `alt_deg`.
+    /// A flat horizon at `alt_deg`, clamped to `[-90, 90]`. A non-finite
+    /// altitude gives a 90° wall, so nothing passes a limit check against
+    /// it.
     pub fn flat(alt_deg: f64) -> Self {
+        let alt_deg = if alt_deg.is_finite() {
+            alt_deg.clamp(-90.0, 90.0)
+        } else {
+            90.0
+        };
         Self {
             points: vec![HorizonPoint {
                 az_deg: 0.0,
-                alt_deg: alt_deg.clamp(-90.0, 90.0),
+                alt_deg,
             }],
         }
     }
 
-    /// Validates and sorts the points.
+    /// Validates and sorts the points. A point at azimuth 360 is the same
+    /// as one at 0: when both are listed with equal altitudes they merge,
+    /// and when the altitudes differ the profile is rejected.
     pub fn from_points(points: Vec<HorizonPoint>) -> Result<Self, HorizonError> {
         if points.is_empty() {
             return Err(HorizonError::Empty);
@@ -74,13 +116,22 @@ impl HorizonProfile {
             return Err(HorizonError::TooManyPoints);
         }
         let mut out = Vec::with_capacity(points.len());
+        let mut at_360: Option<f64> = None;
         for (index, p) in points.into_iter().enumerate() {
             validate(p).map_err(|message| HorizonError::Parse {
                 line: index + 1,
                 message,
             })?;
+            if p.az_deg == 360.0 {
+                if at_360.is_some() {
+                    return Err(HorizonError::DuplicateAzimuth { az_deg: 360.0 });
+                }
+                at_360 = Some(p.alt_deg);
+                continue;
+            }
             out.push(HorizonPoint {
-                az_deg: norm_deg(p.az_deg),
+                // `+ 0.0` turns a `-0` azimuth into `0`.
+                az_deg: norm_deg(p.az_deg) + 0.0,
                 alt_deg: p.alt_deg,
             });
         }
@@ -90,13 +141,33 @@ impl HorizonProfile {
                 az_deg: pair[0].az_deg,
             });
         }
+        if let Some(alt_at_360_deg) = at_360 {
+            match out.first() {
+                Some(first) if first.az_deg == 0.0 => {
+                    if (first.alt_deg - alt_at_360_deg).abs() > NORTH_MATCH_DEG {
+                        return Err(HorizonError::NorthMismatch {
+                            alt_at_0_deg: first.alt_deg,
+                            alt_at_360_deg,
+                        });
+                    }
+                }
+                _ => out.insert(
+                    0,
+                    HorizonPoint {
+                        az_deg: 0.0,
+                        alt_deg: alt_at_360_deg,
+                    },
+                ),
+            }
+        }
         Ok(Self { points: out })
     }
 
     /// Parses the file format described in the module docs.
     pub fn parse(text: &str) -> Result<Self, HorizonError> {
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text);
         let mut points = Vec::new();
-        let mut seen_data = false;
+        let mut header_allowed = true;
         for (index, raw) in text.lines().enumerate() {
             let line_no = index + 1;
             let line = raw.split('#').next().unwrap_or("").trim();
@@ -119,11 +190,12 @@ impl HorizonProfile {
                         message,
                     })?;
                     points.push(p);
-                    seen_data = true;
+                    header_allowed = false;
                 }
-                // One header line is allowed before the data.
-                None if !seen_data && points.is_empty() => {
-                    seen_data = true;
+                // One header line is allowed before the data, and only a
+                // line with no number-like field and no digit at all.
+                None if header_allowed && is_header(line, &fields) => {
+                    header_allowed = false;
                 }
                 _ => {
                     return Err(HorizonError::Parse {
@@ -161,6 +233,10 @@ impl HorizonProfile {
     /// (conservative for a limit check).
     pub fn altitude_at(&self, az_deg: f64) -> f64 {
         let pts = &self.points;
+        if pts.is_empty() {
+            // Unreachable through the constructors; a wall if it happens.
+            return 90.0;
+        }
         if pts.len() == 1 || !az_deg.is_finite() {
             return pts.iter().map(|p| p.alt_deg).fold(f64::MIN, f64::max);
         }
@@ -191,6 +267,12 @@ impl HorizonProfile {
     pub fn is_clear(&self, position: AltAz, margin_deg: f64) -> bool {
         self.clearance_deg(position) >= margin_deg
     }
+}
+
+/// A header line: no field reads as a number (`nan` and `inf` included)
+/// and no digit appears anywhere, so `0°,40°` or `0,4O` is never a header.
+fn is_header(line: &str, fields: &[&str]) -> bool {
+    !line.chars().any(|c| c.is_ascii_digit()) && fields.iter().all(|f| f.parse::<f64>().is_err())
 }
 
 fn validate(p: HorizonPoint) -> Result<(), String> {
@@ -306,7 +388,125 @@ az_deg,alt_deg
         ));
         assert_eq!(
             HorizonProfile::parse("0,10\n360,12\n"),
-            Err(HorizonError::DuplicateAzimuth { az_deg: 0.0 })
+            Err(HorizonError::NorthMismatch {
+                alt_at_0_deg: 10.0,
+                alt_at_360_deg: 12.0
+            })
+        );
+        assert_eq!(
+            HorizonProfile::parse("90,10\n90,12\n"),
+            Err(HorizonError::DuplicateAzimuth { az_deg: 90.0 })
+        );
+        assert_eq!(
+            HorizonProfile::parse("360,10\n360,10\n"),
+            Err(HorizonError::DuplicateAzimuth { az_deg: 360.0 })
+        );
+    }
+
+    #[test]
+    fn a_bad_first_line_is_an_error_not_a_header() {
+        // Typos, units and stray characters on the first data line of a
+        // file without a header must not drop the point.
+        for first in ["0,4O", "0°,40°", "0,40°", "O,40", "NaN,NaN", "inf 40", "0"] {
+            let text = format!("{first}\n90,10\n180,10\n270,10\n");
+            assert!(
+                matches!(
+                    HorizonProfile::parse(&text),
+                    Err(HorizonError::Parse { line: 1, .. })
+                ),
+                "{first}: {:?}",
+                HorizonProfile::parse(&text)
+            );
+        }
+        // Only one header line, and only before the data.
+        assert!(matches!(
+            HorizonProfile::parse("az,alt\nazimuth altitude\n0,10\n"),
+            Err(HorizonError::Parse { line: 2, .. })
+        ));
+        assert!(matches!(
+            HorizonProfile::parse("0,10\naz,alt\n"),
+            Err(HorizonError::Parse { line: 2, .. })
+        ));
+        // Accepted header spellings.
+        for header in ["az_deg,alt_deg", "Azimuth Altitude", "az (deg); alt (deg)"] {
+            let text = format!("{header}\n0,40\n180,10\n");
+            let h = HorizonProfile::parse(&text).unwrap();
+            assert_eq!(h.points().len(), 2, "{header}");
+            assert_eq!(h.altitude_at(0.0), 40.0, "{header}");
+        }
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_skipped() {
+        // Windows Notepad and Excel "CSV UTF-8" start the file with U+FEFF.
+        let h = HorizonProfile::parse("\u{feff}0,40\n90,10\n180,10\n270,10\n").unwrap();
+        assert_eq!(h.points().len(), 4);
+        assert_eq!(h.altitude_at(0.0), 40.0);
+        let with_header = HorizonProfile::parse("\u{feff}az_deg,alt_deg\n0,40\n180,10\n").unwrap();
+        assert_eq!(with_header.altitude_at(0.0), 40.0);
+        // A BOM anywhere else is not whitespace and stays an error.
+        assert!(matches!(
+            HorizonProfile::parse("0,40\n\u{feff}90,10\n"),
+            Err(HorizonError::Parse { line: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn a_closed_nina_loop_loads() {
+        // NINA-standard horizon files usually repeat the north point at 360.
+        let h = HorizonProfile::parse("0 20\n90 15\n180 10\n270 15\n360 20\n").unwrap();
+        let azimuths: Vec<f64> = h.points().iter().map(|p| p.az_deg).collect();
+        assert_eq!(azimuths, vec![0.0, 90.0, 180.0, 270.0]);
+        assert_eq!(h.altitude_at(0.0), 20.0);
+        assert_eq!(h.altitude_at(360.0), 20.0);
+        assert!((h.altitude_at(315.0) - 17.5).abs() < 1e-12);
+        // 360 listed first, or with a trailing `.0`, is the same loop.
+        let reordered = HorizonProfile::parse("360 20.0\n180 10\n0 20\n").unwrap();
+        assert_eq!(reordered.points().len(), 2);
+        assert_eq!(reordered.altitude_at(0.0), 20.0);
+    }
+
+    #[test]
+    fn deserializing_validates_like_loading() {
+        let h = HorizonProfile::parse(SAMPLE).unwrap();
+        let json = serde_json::to_string(&h).unwrap();
+        assert_eq!(serde_json::from_str::<HorizonProfile>(&json).unwrap(), h);
+        // Unsorted input comes back sorted, a closing 360 merges.
+        let unsorted: HorizonProfile = serde_json::from_str(
+            r#"{"points":[{"az_deg":180.0,"alt_deg":5.0},{"az_deg":0.0,"alt_deg":10.0},
+                {"az_deg":360.0,"alt_deg":10.0}]}"#,
+        )
+        .unwrap();
+        let azimuths: Vec<f64> = unsorted.points().iter().map(|p| p.az_deg).collect();
+        assert_eq!(azimuths, vec![0.0, 180.0]);
+        for bad in [
+            r#"{"points":[]}"#,
+            r#"{"points":[{"az_deg":10.0,"alt_deg":95.0}]}"#,
+            r#"{"points":[{"az_deg":400.0,"alt_deg":5.0}]}"#,
+            r#"{"points":[{"az_deg":10.0,"alt_deg":5.0},{"az_deg":10.0,"alt_deg":6.0}]}"#,
+            r#"{"points":[{"az_deg":0.0,"alt_deg":5.0},{"az_deg":360.0,"alt_deg":6.0}]}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<HorizonProfile>(bad).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_finite_flat_horizon_is_a_wall() {
+        let h = HorizonProfile::flat(f64::NAN);
+        assert_eq!(h.altitude_at(123.0), 90.0);
+        let zenith_ish = AltAz {
+            alt_deg: 89.0,
+            az_deg: 0.0,
+        };
+        assert!(!h.is_clear(zenith_ish, 0.0));
+        assert_eq!(HorizonProfile::flat(120.0).altitude_at(0.0), 90.0);
+        assert_eq!(
+            HorizonProfile::flat(f64::NEG_INFINITY).altitude_at(0.0),
+            90.0
         );
     }
 

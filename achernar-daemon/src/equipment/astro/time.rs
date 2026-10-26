@@ -288,7 +288,8 @@ pub fn equation_of_equinoxes_rad(ts: &TimeScales) -> f64 {
     let eps_a = frames::mean_obliquity_rad(t);
     // Mean longitude of the Moon's ascending node (linear part).
     let om = ((450_160.398_036 - 6_962_890.543_1 * t) % 1_296_000.0) * ARCSEC_TO_RAD;
-    let complementary_arcsec = 0.000_002_640_96 * om.sin() + 0.000_000_063_52 * (2.0 * om).sin();
+    // Table 5.2e lists these in µas: 2640.96 µas sin Ω + 63.52 µas sin 2Ω.
+    let complementary_arcsec = 0.002_640_96 * om.sin() + 0.000_063_52 * (2.0 * om).sin();
     nutation.dpsi_rad * eps_a.cos() + complementary_arcsec * ARCSEC_TO_RAD
 }
 
@@ -473,8 +474,10 @@ pub(crate) mod tests {
             let at = utc(y, mo, d, h, mi, s);
             // The same IAU 2006 GMST definition: microsecond agreement.
             assert!(dsec(gmst_hours(at), gmst_ref).abs() < 1e-5, "{at}");
-            // GAST: IAU 2000B against 2000A nutation, about 0.1 ms.
-            assert!(dsec(gast_hours(at), gast_ref).abs() < 1e-3, "{at}");
+            // GAST: IAU 2000B against 2000A nutation, a few tens of µs.
+            // The complementary terms alone are worth up to 0.18 ms, so
+            // this bound catches them going missing.
+            assert!(dsec(gast_hours(at), gast_ref).abs() < 1e-4, "{at}");
             // LST for an east-positive longitude (acceptance: < 0.1 s).
             for lon in [-75.1652, 0.0, 149.13, 179.9] {
                 let expected = (gast_ref + lon / 15.0).rem_euclid(24.0);
