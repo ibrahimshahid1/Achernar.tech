@@ -378,7 +378,7 @@ command_registry! {
     "equipment.estop" POST "equipment/estop"
         "Emergency stop: every device's abort within 2 s, including lost ones; \
          `abort_exposure` optional. Never waits for a relay slot."
-        => Ok(crate::api::equipment::estop_value(&state, body(payload)?, true).await),
+        => Ok(crate::api::equipment::estop_value(&state, estop_body(payload), true).await),
 
     "equipment.resume_blocks" GET "equipment/resume-blocks"
         "Active resume blocks that refuse automatic captures and sequencing."
@@ -546,6 +546,18 @@ fn body<T: serde::de::DeserializeOwned>(payload: &Value) -> Result<T, String> {
         payload.clone()
     };
     serde_json::from_value(value).map_err(|error| format!("invalid payload: {error}"))
+}
+
+/// The e-stop's body over the relay. The e-stop is never refused (§2.9): a
+/// missing, null or mistyped `abort_exposure` reads as false, as the direct
+/// route treats a body it cannot read.
+fn estop_body(payload: &Value) -> crate::api::equipment::EstopBody {
+    crate::api::equipment::EstopBody {
+        abort_exposure: payload
+            .get("abort_exposure")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
 }
 
 /// The relay's error string for a route error: `code: message`, so the
@@ -722,6 +734,37 @@ mod tests {
             .collect();
         assert_eq!(sources, vec!["relay".to_string(), "operator".to_string()]);
         assert!(state.equipment.gate().is_idle());
+        crate::api::equipment_tests::cleanup(directory, state).await;
+    }
+
+    /// §2.9: the e-stop is always accepted. A malformed optional field
+    /// never stops it from running over the relay, as on the direct route.
+    #[tokio::test]
+    async fn a_relayed_estop_runs_whatever_its_optional_field_holds() {
+        let (directory, state) = crate::api::equipment_tests::state().await;
+        for payload in [
+            json!({"abort_exposure": "true"}),
+            json!({"abort_exposure": null}),
+            json!({"abort_exposure": 1}),
+            json!("not an object"),
+            Value::Null,
+            json!({}),
+        ] {
+            let stopped = execute(
+                state.clone(),
+                &RelayCommand {
+                    command_id: "relay-estop".into(),
+                    action: "equipment.estop".into(),
+                    payload: payload.clone(),
+                },
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{payload}: {err}"));
+            assert_eq!(stopped["status"], "stopped", "{payload}: {stopped}");
+            assert!(stopped["command_id"].is_string(), "{payload}: {stopped}");
+            assert!(stopped["exposure"].is_null(), "{payload}: {stopped}");
+        }
+        assert!(estop_body(&json!({"abort_exposure": true})).abort_exposure);
         crate::api::equipment_tests::cleanup(directory, state).await;
     }
 

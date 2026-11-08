@@ -201,6 +201,9 @@ pub struct AbortEpochs {
 #[derive(Debug, Default)]
 struct EpochState {
     epochs: BTreeMap<DeviceKind, u64>,
+    /// The audited abort or e-stop that started each kind's current epoch,
+    /// when it was issued through [`AbortEpochs::bump_by`].
+    by: BTreeMap<DeviceKind, CommandId>,
     issued: HashMap<CommandId, Vec<(DeviceKind, u64)>>,
 }
 
@@ -218,9 +221,42 @@ impl AbortEpochs {
     /// the device's cancel is queued.
     pub fn bump(&self, kind: DeviceKind) -> u64 {
         let mut inner = lock(&self.inner);
+        inner.by.remove(&kind);
         let epoch = inner.epochs.entry(kind).or_insert(0);
         *epoch += 1;
         *epoch
+    }
+
+    /// [`Self::bump`] by the audited abort or e-stop `by`, so a compound
+    /// operation it interrupts can report `Aborted { by }`.
+    pub fn bump_by(&self, kind: DeviceKind, by: CommandId) -> u64 {
+        let mut inner = lock(&self.inner);
+        inner.by.insert(kind, by);
+        let epoch = inner.epochs.entry(kind).or_insert(0);
+        *epoch += 1;
+        *epoch
+    }
+
+    /// The abort or e-stop that started `kind`'s current epoch, when known.
+    pub fn bumped_by(&self, kind: DeviceKind) -> Option<CommandId> {
+        lock(&self.inner).by.get(&kind).copied()
+    }
+
+    /// The first of `command_id`'s stamped kinds that was aborted (or
+    /// e-stopped) after its authorisation began, while its permit is alive,
+    /// and the abort that did it when known. A compound operation checks
+    /// this between its steps and while one runs: an abort ends the whole
+    /// operation, not only its current motion (D19).
+    pub fn aborted_after(&self, command_id: CommandId) -> Option<(DeviceKind, Option<CommandId>)> {
+        let inner = lock(&self.inner);
+        inner
+            .issued
+            .get(&command_id)?
+            .iter()
+            .find_map(|(kind, issued)| {
+                let now = inner.epochs.get(kind).copied().unwrap_or(0);
+                (*issued < now).then(|| (*kind, inner.by.get(kind).copied()))
+            })
     }
 
     /// The current epochs of `kinds`, to stamp a permit with.
@@ -1161,7 +1197,7 @@ impl CommandGate {
         // proposed and validated stages.
         let _ = self.authorize(&cmd);
         // Before the cancel is queued, so the worker sees the new epoch.
-        self.aborts.bump(handle.kind());
+        self.aborts.bump_by(handle.kind(), cmd.command_id);
         let ticket = handle.abort();
         self.audit(
             &cmd,
@@ -2201,5 +2237,48 @@ pub(crate) mod tests {
             epochs.issued_epoch(halt.command_id, DeviceKind::Focuser),
             None
         );
+    }
+
+    /// A compound operation learns that a device it owns was aborted after
+    /// it was authorised, and by which audited abort, whatever its current
+    /// step is (D19).
+    #[test]
+    fn a_compound_operation_sees_an_abort_of_any_device_it_owns() {
+        let (gate, _ctx) = gate_with_ctx();
+        let epochs = gate.abort_epochs();
+        let center = GatedCommand::new(
+            GatedOp::Center {
+                target: crate::equipment::types::EqCoord::new(
+                    5.0,
+                    20.0,
+                    crate::equipment::types::EqFrame::J2000,
+                ),
+                tolerance_arcmin: None,
+                max_attempts: None,
+            },
+            operator(false),
+            AutonomyMode::Manual,
+            Priority::Exposure,
+        );
+        let permit = gate.authorize(&center).unwrap();
+        assert_eq!(epochs.aborted_after(center.command_id), None);
+        // An abort of another kind does not concern it.
+        epochs.bump(DeviceKind::Focuser);
+        assert_eq!(epochs.aborted_after(center.command_id), None);
+        let abort = CommandId::new();
+        epochs.bump_by(DeviceKind::Mount, abort);
+        assert_eq!(
+            epochs.aborted_after(center.command_id),
+            Some((DeviceKind::Mount, Some(abort)))
+        );
+        assert_eq!(epochs.bumped_by(DeviceKind::Mount), Some(abort));
+        // A plain bump forgets who aborted.
+        epochs.bump(DeviceKind::Mount);
+        assert_eq!(
+            epochs.aborted_after(center.command_id),
+            Some((DeviceKind::Mount, None))
+        );
+        drop(permit);
+        assert_eq!(epochs.aborted_after(center.command_id), None);
     }
 }

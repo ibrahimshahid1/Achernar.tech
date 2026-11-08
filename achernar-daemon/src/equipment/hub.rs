@@ -2007,6 +2007,8 @@ impl EquipmentHub {
     }
 
     /// A fixed all-sky camera's declared view direction (rig profile).
+    /// Nothing supplies one yet: it belongs to the user-owned COC wiring
+    /// (EQUIPMENT_RUNBOOK.md §10 item 8).
     pub fn set_view_direction(&self, direction: Option<AltAz>) {
         *write(&self.core.view_direction) = direction;
     }

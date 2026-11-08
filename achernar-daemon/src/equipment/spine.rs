@@ -575,6 +575,9 @@ impl SpineContext {
     /// The safety supervisor, created (and its 1 s evaluation started) when
     /// the first monitor connects. With no monitor the state stays `none`.
     pub fn ensure_safety(&self, hub: &Arc<EquipmentHub>) -> Arc<SafetySupervisor> {
+        // The on-unsafe policy aborts the exposure through the hub's camera
+        // hook (`AppState` installs it; §3.10 step 3).
+        self.targets.set_camera(hub.camera());
         let mut slot = lock(&self.safety);
         if let Some(existing) = slot.as_ref() {
             return Arc::clone(existing);

@@ -8,8 +8,10 @@
 //! unknown" rather than computing from a default. Longitude is east-positive,
 //! elevation in metres, as in [`Site`].
 
-// Consumed once sessions are opened by the spine (WP1B-1) and the recorder
-// is given a session id.
+// Deferred: the daemon has no session lifecycle yet (no route opens or
+// closes a session; captures take the client's `session_id`), so nothing
+// opens one and the recorder is given no session id. EQUIPMENT_RUNBOOK.md
+// §10 item 7.
 #![allow(dead_code)]
 
 use chrono::{DateTime, Utc};

@@ -295,6 +295,24 @@ impl ExposureInterval {
             frame_interval_s,
         }
     }
+
+    /// A stream exposure cannot have begun before `settings_applied_unix`:
+    /// the capture accepts only a frame taken under its settings, the
+    /// in-flight one being discarded (`FreshFrameGate`). The window starts
+    /// there when that is later than `arrival - (exposure + frame
+    /// interval)`, so motion, a dither or a settle that ended before the
+    /// capture applied its settings is never put inside the exposure.
+    pub fn not_before(mut self, settings_applied_unix: f64) -> Self {
+        if !settings_applied_unix.is_finite() {
+            return self;
+        }
+        let bound = utc_of(settings_applied_unix);
+        if bound > self.start && bound <= self.end {
+            self.start = bound;
+            self.basis = "settings_applied_to_arrival";
+        }
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1752,6 +1770,18 @@ mod tests {
         // Without a measured interval, the exposure stands in for it.
         let fallback = ExposureInterval::stream(seen, 4.0, None, ClockQuality::HostArrival);
         assert_eq!(fallback.start, utc_of(seen) - chrono::Duration::seconds(8));
+        // The capture applied its settings 5 s before the arrival: the frame
+        // it accepted began after that, not 8.2 s before the arrival.
+        let bounded = measured.clone().not_before(seen - 5.0);
+        assert_eq!(bounded.start, utc_of(seen - 5.0));
+        assert_eq!(bounded.end, measured.end);
+        assert_eq!(bounded.basis, "settings_applied_to_arrival");
+        // A bound earlier than the reach, after the arrival, or not a time
+        // leaves the window as it was.
+        for bound in [seen - 9.0, seen + 1.0, f64::NAN] {
+            let same = measured.clone().not_before(bound);
+            assert_eq!((same.start, same.basis), (measured.start, measured.basis));
+        }
         // A still is the driver's bracket, in order.
         let still = ExposureInterval::still(seen + 30.0, seen, 30.0, ClockQuality::Unknown);
         assert!(still.start < still.end);

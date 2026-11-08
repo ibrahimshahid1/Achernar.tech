@@ -45,11 +45,18 @@ pub fn select_rate(advertised: &[DriveRate], requested: DriveRate) -> DeviceResu
 /// set against each other. Every step is attempted; a failed axis stop is
 /// the command's refusal (e-stop reports it) even though tracking off was
 /// still sent.
+///
+/// A tracking-on that the limit watchdog stops before it is verified fails
+/// with `limit_reached`: the driver's state for that poll was read before
+/// the watchdog's write, so it would otherwise "verify" the on that the
+/// watchdog has just undone.
 pub struct SetTrackingOp {
     shared: Arc<MountShared>,
     meta: CommandMeta,
     on: bool,
     sent_mono_ns: u64,
+    /// The watchdog's tracking-off count when tracking on was written.
+    limit_stops_at_send: u64,
 }
 
 impl SetTrackingOp {
@@ -59,6 +66,7 @@ impl SetTrackingOp {
             meta,
             on,
             sent_mono_ns: 0,
+            limit_stops_at_send: 0,
         }
     }
 
@@ -106,10 +114,16 @@ impl Operation<DynMount> for SetTrackingOp {
         }
         drv.set_tracking(self.on)?;
         self.sent_mono_ns = clock.now_mono_ns();
+        self.limit_stops_at_send = self.shared.limit_stops();
         axes
     }
 
     fn step(&mut self, drv: &mut DynMount, clock: &dyn Clock) -> OpProgress {
+        if self.on && self.shared.limit_stops() > self.limit_stops_at_send {
+            return OpProgress::Done(OpOutcome::Failed(DeviceError::invalid_operation(
+                "limit_reached: the limit watchdog stopped tracking after it was turned on",
+            )));
+        }
         let Ok(state) = drv.state() else {
             return OpProgress::Continue {
                 next_poll: ACTIVE_POLL,

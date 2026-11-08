@@ -18,6 +18,14 @@
 //! unless the source is safety: a safety park must never wait on PHD2, so it
 //! proceeds and the failure is kept as a warning. Tier 1 leaves restarting
 //! guiding to the operator; WP2-8 adds the deterministic restore.
+//!
+//! A guider whose link is lost reports nothing: its last state is history,
+//! not a report, and its worker refuses every command. The same holds for a
+//! connected guider whose last state is stale and whose stop does not get
+//! through. PHD2's state is then unknown, as for a guider that never
+//! reported one: the gate's audited out-of-band abort (`stop_capture` on a
+//! connection of its own, D19) is tried, and the motion proceeds with a
+//! `guider_lost` or `guider_state_unknown` warning instead of being refused.
 
 use std::time::Duration;
 
@@ -28,7 +36,7 @@ use super::gate::{CommandGate, StepOwner};
 use super::handle::GuiderHandle;
 use super::snapshot::GuiderAppState;
 use super::traits::Clock;
-use super::types::{CommandId, CommandSource, DeviceError, DeviceKind, OpOutcome};
+use super::types::{CommandId, CommandSource, DeviceError, DeviceKind, LinkState, OpOutcome};
 
 /// How long the stop waits for `Stopped` (§2.9).
 pub const STOP_GUIDING_TIMEOUT: Duration = Duration::from_secs(10);
@@ -147,7 +155,13 @@ pub async fn stop_guiding_before_motion(
     let Some(guider) = guider.filter(|g| !g.is_retired()) else {
         return Ok(PreMotion::default());
     };
-    let state = guider.snapshot().app_state.value;
+    let reading = guider.snapshot().app_state.clone();
+    let state = reading.value;
+    if guider.health().state == LinkState::Lost {
+        return Ok(
+            stop_unreachable_guider(gate, guider, motion, state, "guider_lost", timeout).await,
+        );
+    }
     match state {
         Some(state) if guider_active(state) => {}
         Some(GuiderAppState::Unknown) | None => {
@@ -189,6 +203,25 @@ pub async fn stop_guiding_before_motion(
             waited_ms,
             warning: None,
         }),
+        // The link was lost while the stop was tried, or the state it acted
+        // on was not a current report: PHD2's state is unknown.
+        Err(failure) if guider.health().state == LinkState::Lost || !reading.is_fresh() => {
+            let warning = if guider.health().state == LinkState::Lost {
+                "guider_lost"
+            } else {
+                "guider_state_unknown"
+            };
+            let mut report =
+                stop_unreachable_guider(gate, guider, motion, state, warning, timeout).await;
+            report.waited_ms = report.waited_ms.saturating_add(waited_ms);
+            report.warning = report.warning.map(|w| {
+                format!(
+                    "{w} (the stop through the worker failed: {})",
+                    failure.reason
+                )
+            });
+            Ok(report)
+        }
         Err(failure) if motion.source == CommandSource::Safety => Ok(PreMotion {
             was_guiding: true,
             guider_state: state,
@@ -200,6 +233,45 @@ pub async fn stop_guiding_before_motion(
         Err(failure) => Err(CoordError {
             reason: failure.reason,
         }),
+    }
+}
+
+/// The guider cannot be reached through its worker and its state is not a
+/// current report: try the gate's audited out-of-band abort (PHD2
+/// `stop_capture` on a connection of its own), waiting up to `timeout` for
+/// it, and let the motion proceed with `warning` and what the abort did.
+async fn stop_unreachable_guider(
+    gate: &CommandGate,
+    guider: &GuiderHandle,
+    motion: &GatedCommand,
+    last_state: Option<GuiderAppState>,
+    warning: &str,
+    timeout: Duration,
+) -> PreMotion {
+    let started = std::time::Instant::now();
+    let abort = gate.abort(guider, motion.source.clone());
+    let command_id = abort.command_id;
+    let path_ran = abort.abort_path_ran;
+    let (sent, detail) = match tokio::time::timeout(timeout, abort.outcome()).await {
+        Ok(Ok(())) if path_ran => (true, "the out-of-band stop was sent".to_string()),
+        Ok(Ok(())) => (false, "the guider has no out-of-band stop".to_string()),
+        Ok(Err(err)) => (false, format!("the out-of-band stop failed: {err}")),
+        Err(_) => (
+            false,
+            format!(
+                "the out-of-band stop had not reported within {:.0} s",
+                timeout.as_secs_f64()
+            ),
+        ),
+    };
+    PreMotion {
+        // Not a current report: the guider may or may not have been guiding.
+        was_guiding: false,
+        guider_state: last_state,
+        stop_sent: sent,
+        stop_command_id: path_ran.then_some(command_id),
+        waited_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        warning: Some(format!("{warning}: {detail}")),
     }
 }
 
@@ -599,5 +671,81 @@ mod tests {
             true
         ))));
         assert!(needs_guider_stop(&GatedOp::Flip));
+    }
+
+    /// A guider whose PHD2 connection was lost while guiding: its worker
+    /// refuses every command and its `Guiding` is history. An operator park
+    /// is not refused: the out-of-band stop is tried and the park proceeds
+    /// with a `guider_lost` warning, whether or not that stop gets through.
+    #[tokio::test]
+    async fn a_lost_guider_does_not_block_motion_and_gets_the_out_of_band_stop() {
+        for path_fails in [false, true] {
+            let (gate, ctx) = gate_with_ctx();
+            let mut snap = guiding(GuiderAppState::Guiding);
+            snap.app_state = snap.app_state.into_stale();
+            let (guider, guider_fake) = fake_guider(snap);
+            guider_fake.set_responder(|_, _| {
+                FakeResponse::reject(DeviceError::disconnected(
+                    "the PHD2 connection was lost; disconnect and reconnect the guider",
+                ))
+            });
+            guider_fake.set_link(LinkState::Lost);
+            if path_fails {
+                guider_fake
+                    .abort_path()
+                    .set_result(Err(DeviceError::transport("connection refused")));
+            }
+            *ctx.guider.lock().unwrap() = Some(guider.clone());
+            let (mount, mount_fake) = fake_mount(MountSnapshot::default());
+            let park = GatedCommand::new(
+                GatedOp::Mount(MountCmd::Park),
+                CommandSource::Operator { overriding: false },
+                AutonomyMode::Manual,
+                Priority::Exposure,
+            );
+            let submitted = gate
+                .submit(&mount, park)
+                .await
+                .unwrap_or_else(|e| panic!("path_fails={path_fails}: {e}"));
+            let report = submitted.pre_motion.unwrap();
+            let warning = report.warning.clone().unwrap();
+            assert!(warning.starts_with("guider_lost"), "{warning}");
+            assert!(!report.was_guiding, "a lost guider's state is not a report");
+            assert_eq!(report.guider_state, Some(GuiderAppState::Guiding));
+            assert_eq!(report.stop_sent, !path_fails, "{report:?}");
+            assert!(report.stop_command_id.is_some(), "the abort was audited");
+            assert_eq!(guider_fake.abort_path().calls(), 1);
+            assert!(
+                guider_fake.commands().is_empty(),
+                "nothing was queued on the lost worker"
+            );
+            assert_eq!(mount_fake.commands(), vec![MountCmd::Park]);
+            assert_eq!(submitted.ticket.wait().await, OpOutcome::Succeeded);
+        }
+    }
+
+    /// A connected guider whose last `Guiding` is stale and whose stop does
+    /// not get through is in an unknown state, not a refusing one; a fresh
+    /// `Guiding` that will not stop still refuses (above).
+    #[tokio::test]
+    async fn a_stale_guiding_state_whose_stop_fails_is_unknown_not_a_refusal() {
+        let (gate, ctx) = gate_with_ctx();
+        let mut snap = guiding(GuiderAppState::Guiding);
+        snap.app_state = snap.app_state.into_stale();
+        let (guider, guider_fake) = fake_guider(snap);
+        guider_fake.set_responder(|_, _| {
+            FakeResponse::reject(DeviceError::transport("PHD2 did not answer"))
+        });
+        *ctx.guider.lock().unwrap() = Some(guider.clone());
+        let (mount, mount_fake) = fake_mount(MountSnapshot::default());
+        let submitted = gate
+            .submit(&mount, slew(CommandSource::Operator { overriding: false }))
+            .await
+            .unwrap();
+        let warning = submitted.pre_motion.unwrap().warning.unwrap();
+        assert!(warning.starts_with("guider_state_unknown"), "{warning}");
+        assert!(warning.contains("refused"), "{warning}");
+        assert_eq!(guider_fake.abort_path().calls(), 1);
+        assert_eq!(mount_fake.commands().len(), 1);
     }
 }

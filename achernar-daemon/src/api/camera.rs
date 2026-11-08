@@ -600,6 +600,7 @@ async fn perform_capture_owned(
             source: source.clone(),
             command_id: Some(authorization.command.command_id),
         },
+        window_start: None,
     };
 
     if let Err(e) = state
@@ -657,6 +658,7 @@ async fn perform_capture_owned(
         .equipment
         .gate()
         .record_outcome(&authorization.command, &outcome);
+    let window_start = link.window_start;
     drop(link);
     drop(authorization);
 
@@ -665,11 +667,16 @@ async fn perform_capture_owned(
             finish_capture_runtime(&state, None);
             // Committed: the automatic plate-solve rules may want this frame.
             // Any solve runs in its own task, after the capture has returned.
+            // The post-slew rule compares the exposure's start, which is the
+            // window's (a stream frame's timestamp is its arrival).
+            let exposure_started_at = window_start
+                .map(|start| start.to_rfc3339())
+                .unwrap_or_else(|| image.metadata.timestamp.clone());
             crate::mount::auto_solve::frame_archived(
                 &state,
                 &image.id,
                 &capture_type,
-                &image.metadata.timestamp,
+                &exposure_started_at,
             );
             Ok(image)
         }
@@ -706,6 +713,10 @@ fn capture_error_class(status: StatusCode) -> ErrorClass {
 struct CaptureLink {
     hooks: equipment::CaptureHooks,
     input: equipment::AssemblyInput,
+    /// The committed frame's window start (H1): the earliest its exposure
+    /// can have begun. A stream frame's `metadata.timestamp` is its
+    /// arrival, after the exposure ended.
+    window_start: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl CaptureLink {
@@ -724,12 +735,13 @@ impl CaptureLink {
     /// rewrite of the window row once it is final (D7) and PHD2's
     /// per-exposure row (H9).
     fn committed(
-        &self,
+        &mut self,
         state: &AppState,
         frame_id: &str,
         interval: &ExposureInterval,
         recorded: &CaptureEquipment,
     ) {
+        self.window_start = Some(interval.start);
         self.hooks.exposure_completed(Some(frame_id), interval);
         let mut input = self.input.clone();
         input.frame_id = frame_id.to_string();
@@ -1437,7 +1449,9 @@ async fn capture_from_stream(
         Some(capture_id),
     );
     // The accepted frame is exposed after the settings were applied: the
-    // `exposing` busy flag is held from here until it arrives.
+    // `exposing` busy flag is held from here until it arrives, and its
+    // window starts no earlier than this.
+    let settings_applied_at = unix_now();
     link.hooks.exposure_started(
         AcquisitionPath::Stream,
         actual_exposure_s,
@@ -1482,14 +1496,16 @@ async fn capture_from_stream(
     link.hooks.exposure_ended();
     mark_capture_processing(state);
 
-    // The equipment window: from `arrival - (exposure + frame interval)` to
-    // the arrival, by the host clock (H1, D7).
+    // The equipment window: from `arrival - (exposure + frame interval)`, or
+    // from when the settings were applied if that is later, to the arrival,
+    // by the host clock (H1, D7).
     let interval = ExposureInterval::stream(
         arrived_at,
         actual_exposure_s,
         arrivals.interval_s(),
         link.hooks.clock_quality(AcquisitionPath::Stream),
-    );
+    )
+    .not_before(settings_applied_at);
     let recorded = link.assemble(state, &interval);
     warnings.extend(recorded.warnings.iter().cloned());
 

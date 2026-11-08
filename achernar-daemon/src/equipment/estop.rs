@@ -323,7 +323,7 @@ pub async fn run_estop(hub: &EquipmentHub, request: EstopRequest) -> EstopReport
     for handle in hub.attached() {
         // Before the cancel is queued: every permit issued so far is now
         // older than the abort, and its worker refuses it (D19).
-        epochs.bump(handle.kind());
+        epochs.bump_by(handle.kind(), cmd.command_id);
         let entry = match &handle {
             AnyHandle::Mount(mount) if !mount.is_retired() => {
                 // `estop_mount` (O11 j): the abort path plus e-stop-rank

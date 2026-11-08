@@ -1621,7 +1621,11 @@ pub(crate) fn frame_freshness(baseline: &FreshnessBaseline, frame: &FrameTiming)
                 ClockQuality::Simulator => ClockQuality::Simulator,
                 _ => ClockQuality::HostArrival,
             };
-            (arrival - chrono_secs(exposure_s + interval_s), arrival, basis)
+            (
+                arrival - chrono_secs(exposure_s + interval_s),
+                arrival,
+                basis,
+            )
         }
     };
     if end <= baseline.settled_at {
@@ -4602,8 +4606,15 @@ mod tests {
         observed.capture_unix_time = at(Utc::now());
         observed.frame_counter += 1;
         let end = unix_time(observed.capture_unix_time).unwrap();
-        match judge_until_decided(&fx.state, &focuser, &baseline, Some(500), &stream, &observed)
-            .await
+        match judge_until_decided(
+            &fx.state,
+            &focuser,
+            &baseline,
+            Some(500),
+            &stream,
+            &observed,
+        )
+        .await
         {
             FrameVerdict::Accept(accepted) => {
                 assert_eq!(accepted.readback_after, Some(500));
@@ -4693,7 +4704,10 @@ mod tests {
         {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(Utc::now() < end, "the test machine is too slow for this window");
+        assert!(
+            Utc::now() < end,
+            "the test machine is too slow for this window"
+        );
         match judge_frame(
             &fx.state,
             &focuser,
@@ -4713,8 +4727,15 @@ mod tests {
             FrameVerdict::Refuse(refusal) => panic!("refused: {refusal}"),
         }
         // The next idle poll after the window's end decides it.
-        match judge_until_decided(&fx.state, &focuser, &baseline, Some(500), &stream, &observed)
-            .await
+        match judge_until_decided(
+            &fx.state,
+            &focuser,
+            &baseline,
+            Some(500),
+            &stream,
+            &observed,
+        )
+        .await
         {
             FrameVerdict::Accept(accepted) => {
                 assert!(accepted.readback_after_at >= end);
@@ -4748,7 +4769,10 @@ mod tests {
         // Already in place (matched like the wheel matches names).
         assert_eq!(af_filter_warning(" l ", &verified("L"), true), None);
         let other = af_filter_warning("L", &verified("Ha"), true).unwrap();
-        assert!(other.contains("not applied") && other.contains("\"Ha\""), "{other}");
+        assert!(
+            other.contains("not applied") && other.contains("\"Ha\""),
+            "{other}"
+        );
         let unknown = af_filter_warning("L", &unverified, true).unwrap();
         assert!(unknown.contains("not verified"), "{unknown}");
         let no_wheel = af_filter_warning("L", &unverified, false).unwrap();
@@ -5031,7 +5055,11 @@ mod tests {
         .unwrap_or_else(|err| panic!("{}: {}", err.code, err.message));
         assert_eq!(response.state, "Converged");
         let best = response.best_position.unwrap();
-        assert_ne!(best % 100, 0, "the fitted optimum {best} must be off the grid");
+        assert_ne!(
+            best % 100,
+            0,
+            "the fitted optimum {best} must be off the grid"
+        );
         assert_eq!(response.verified, Some(false));
         assert!(
             response

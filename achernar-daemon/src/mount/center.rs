@@ -16,12 +16,18 @@
 //!
 //! Every solve writes a `pointing_samples` row with purpose `center` (H12),
 //! through the same path as any other solve. The outcome is
-//! `centered{error_arcmin, attempts}` or `center_failed`. The mount and camera
-//! domains are owned for the whole loop by one gate permit, and every slew
-//! and sync is a child step of it ([`CommandGate::submit_step`]): each
-//! step's own safety checks run, PHD2 is stopped before each slew (D20), and
-//! an abort or e-stop stops the loop's later motion. The busy set shows
-//! `centering` while it runs.
+//! `centered{error_arcmin, attempts}` or `center_failed`, and the loop is one
+//! operation under its own command id (`operation_commanded`,
+//! `operation_started`, `operation_ended{op: center}`), so its overhead is an
+//! `equipment_overheads` row (H18). The mount and camera domains are owned
+//! for the whole loop by one gate permit, and every slew and sync is a child
+//! step of it ([`CommandGate::submit_step`]): each step's own safety checks
+//! run, and PHD2 is stopped before each slew (D20). An abort or e-stop of
+//! the mount or camera, or a preemption, ends the loop at once (D19): it
+//! stops waiting for the frame in hand, drops its permit, sends nothing
+//! more, and ends `Aborted { by }`. A frame already exposing or solving then
+//! finishes in the background and is recorded like any other. The busy set
+//! shows `centering` while it runs.
 //!
 //! [`CommandGate::submit_step`]: crate::equipment::gate::CommandGate::submit_step
 //!
@@ -30,6 +36,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use chrono::Utc;
 use serde::Serialize;
@@ -44,8 +51,9 @@ use crate::equipment::events::{EquipmentEvent, EventKind};
 use crate::equipment::gate::StepOwner;
 use crate::equipment::handle::{MountHandle, Permit};
 use crate::equipment::hub::EquipmentHub;
+use crate::equipment::ops::OpKind;
 use crate::equipment::types::{
-    AutonomyMode, CommandId, CommandSource, DeviceError, DeviceKind, EqCoord, EqFrame,
+    kind_name, AutonomyMode, CommandId, CommandSource, DeviceError, DeviceKind, EqCoord, EqFrame,
     MountSyncMode, OpOutcome, Priority,
 };
 use crate::state::AppState;
@@ -56,6 +64,10 @@ pub const DEFAULT_EXPOSURE_S: f64 = 5.0;
 /// How long a center frame waits for a solve already in flight (an
 /// automatic or manual one) beyond the solver's own timeout.
 const SOLVER_BUSY_MARGIN_S: u64 = 30;
+
+/// How often a running loop looks for an abort while one of its frames is
+/// captured and solved.
+const ABORT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// `[mount.center]`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
@@ -301,6 +313,14 @@ pub enum CenterOutcome {
         attempts: u32,
         reason: String,
     },
+    /// An abort or e-stop of the mount or camera, or a preemption, ended the
+    /// loop (D19); `by` is the command that did it, when known.
+    Aborted {
+        error_arcmin: Option<f64>,
+        attempts: u32,
+        by: Option<CommandId>,
+        reason: String,
+    },
 }
 
 /// The whole run, for logs and tests.
@@ -531,10 +551,10 @@ pub async fn start(
         "exposure": exposure,
         "m4_shadow": m4,
     });
-    let hub = std::sync::Arc::clone(&state.equipment);
-    let imaging = DaemonImaging::for_job(state, &job, exposure);
+    let hub = Arc::clone(&state.equipment);
+    let imaging: Arc<dyn CenterImaging> = Arc::new(DaemonImaging::for_job(state, &job, exposure));
     tokio::spawn(async move {
-        let report = run(&hub, &imaging, job).await;
+        let report = run(&hub, imaging, job).await;
         tracing::info!(
             "Center {} finished: {}",
             report.command_id,
@@ -544,14 +564,77 @@ pub async fn start(
     Ok(body)
 }
 
+/// Why the loop must end now: a device it owns was aborted or e-stopped
+/// after it was authorised, or a higher-ranked command preempted it.
+#[derive(Debug, Clone, PartialEq)]
+struct Interrupted {
+    by: Option<CommandId>,
+    reason: String,
+}
+
+fn interrupted(hub: &EquipmentHub, command_id: CommandId) -> Option<Interrupted> {
+    let gate = hub.gate();
+    if let Some((kind, by)) = gate.abort_epochs().aborted_after(command_id) {
+        return Some(Interrupted {
+            by,
+            reason: format!(
+                "the {} was aborted while the center loop ran",
+                kind_name(kind)
+            ),
+        });
+    }
+    gate.preempted_by(command_id).map(|by| Interrupted {
+        by: Some(by),
+        reason: format!("the center loop was preempted by {by}"),
+    })
+}
+
+/// Why a step of the loop did not succeed.
+#[derive(Debug, Clone, PartialEq)]
+enum Stop {
+    Interrupted(Interrupted),
+    Failed(String),
+}
+
+/// How the loop ends after `stop`. A failure that follows an abort (a slew
+/// the abort cancelled) is the abort's.
+fn ended(
+    hub: &EquipmentHub,
+    job: &CenterJob,
+    stop: Stop,
+    error_arcmin: Option<f64>,
+    attempts: u32,
+) -> CenterOutcome {
+    let interrupt = match stop {
+        Stop::Interrupted(interrupt) => interrupt,
+        Stop::Failed(reason) => match interrupted(hub, job.command.command_id) {
+            Some(interrupt) => interrupt,
+            None => {
+                return CenterOutcome::Failed {
+                    error_arcmin,
+                    attempts,
+                    reason,
+                }
+            }
+        },
+    };
+    CenterOutcome::Aborted {
+        error_arcmin,
+        attempts,
+        by: interrupt.by,
+        reason: interrupt.reason,
+    }
+}
+
 /// One slew or sync step of the loop: a child of the center permit,
-/// awaited to its outcome. The permit is only read while the step is
-/// authorised, so the returned future holds no reference to it.
+/// awaited to its outcome. Nothing is sent once the loop was interrupted.
+/// The permit is only read while the step is authorised, so the returned
+/// future holds no reference to it.
 fn step<'a>(
     hub: &'a EquipmentHub,
     job: &'a CenterJob,
     cmd: MountCmd,
-) -> impl Future<Output = Result<(), String>> + Send + 'a {
+) -> impl Future<Output = Result<(), Stop>> + Send + 'a {
     let step = GatedCommand::new(
         GatedOp::Mount(cmd),
         job.command.source.clone(),
@@ -559,22 +642,81 @@ fn step<'a>(
         job.command.priority,
     );
     let what = format!("{:?}", step.kind());
-    let submit = hub.gate().submit_step(&job.mount, &job.permit, step);
+    let interrupt = interrupted(hub, job.command.command_id);
+    let submit = interrupt
+        .is_none()
+        .then(|| hub.gate().submit_step(&job.mount, &job.permit, step));
     async move {
+        let Some(submit) = submit else {
+            return Err(Stop::Interrupted(interrupt.unwrap_or(Interrupted {
+                by: None,
+                reason: "the center loop was interrupted".into(),
+            })));
+        };
         let submitted = submit
             .await
-            .map_err(|err| format!("{what} refused: {err}"))?;
+            .map_err(|err| Stop::Failed(format!("{what} refused: {err}")))?;
         match submitted.ticket.wait().await {
             OpOutcome::Succeeded => Ok(()),
-            other => Err(format!("{what} ended {}: {other:?}", other.label())),
+            other => Err(Stop::Failed(format!(
+                "{what} ended {}: {other:?}",
+                other.label()
+            ))),
+        }
+    }
+}
+
+/// Capture and solve one frame, watching for an abort. The frame runs in a
+/// task of its own: an abort ends the wait at once, while the capture or
+/// solve already under way finishes in the background (dropping it mid-way
+/// would leave the camera's state behind).
+async fn capture_watching_aborts(
+    hub: &EquipmentHub,
+    imaging: &Arc<dyn CenterImaging>,
+    command_id: CommandId,
+    hint: EqCoord,
+    attempt: u32,
+) -> Result<Result<CenterSolve, CenterImagingError>, Interrupted> {
+    if let Some(interrupt) = interrupted(hub, command_id) {
+        return Err(interrupt);
+    }
+    let imaging = Arc::clone(imaging);
+    let mut frame = tokio::spawn(async move { imaging.capture_and_solve(hint, attempt).await });
+    loop {
+        tokio::select! {
+            joined = &mut frame => {
+                return Ok(joined.unwrap_or_else(|err| {
+                    Err(CenterImagingError::Capture(format!(
+                        "the center frame's task ended: {err}"
+                    )))
+                }));
+            }
+            _ = tokio::time::sleep(ABORT_POLL) => {
+                if let Some(interrupt) = interrupted(hub, command_id) {
+                    return Err(interrupt);
+                }
+            }
         }
     }
 }
 
 /// Run an authorised loop to its end (see the module docs).
-pub async fn run(hub: &EquipmentHub, imaging: &dyn CenterImaging, job: CenterJob) -> CenterReport {
+pub async fn run(
+    hub: &EquipmentHub,
+    imaging: Arc<dyn CenterImaging>,
+    job: CenterJob,
+) -> CenterReport {
     let _busy = hub.busy_flags().claim(BusyFlag::Centering);
     let gate = hub.gate();
+    let command_id = job.command.command_id;
+    let emit = |event: EventKind| {
+        hub.emit(
+            EquipmentEvent::new(event, hub.clock().as_ref())
+                .for_device(DeviceKind::Mount, job.mount.connection_id())
+                .with_command(command_id),
+        );
+    };
+    let started_mono_ns = hub.clock().now_mono_ns();
     gate.record_executed(
         &job.command,
         vec![format!(
@@ -582,22 +724,36 @@ pub async fn run(hub: &EquipmentHub, imaging: &dyn CenterImaging, job: CenterJob
             job.settings.tolerance_arcmin, job.settings.max_attempts
         )],
     );
+    emit(EventKind::OperationCommanded {
+        op: OpKind::Center,
+        source: job.command.source.clone(),
+    });
+    emit(EventKind::OperationStarted { op: OpKind::Center });
     let sync_label = match job.sync_mode {
         MountSyncMode::Mount => "sync",
         MountSyncMode::Offset => "offset",
     };
     let mut attempts: Vec<CenterAttempt> = Vec::new();
     let outcome = 'run: {
-        if let Err(reason) = step(hub, &job, MountCmd::Slew { target: job.target }).await {
-            break 'run CenterOutcome::Failed {
-                error_arcmin: None,
-                attempts: 0,
-                reason,
-            };
+        if let Err(stop) = step(hub, &job, MountCmd::Slew { target: job.target }).await {
+            break 'run ended(hub, &job, stop, None, 0);
         }
         let mut last_error = None;
         for attempt in 1..=job.settings.max_attempts {
-            let solve = imaging.capture_and_solve(job.target, attempt).await;
+            let solve =
+                match capture_watching_aborts(hub, &imaging, command_id, job.target, attempt).await
+                {
+                    Ok(solve) => solve,
+                    Err(interrupt) => {
+                        break 'run ended(
+                            hub,
+                            &job,
+                            Stop::Interrupted(interrupt),
+                            last_error,
+                            attempt - 1,
+                        )
+                    }
+                };
             let mut record = CenterAttempt {
                 attempt,
                 solved_j2000: None,
@@ -618,11 +774,7 @@ pub async fn run(hub: &EquipmentHub, imaging: &dyn CenterImaging, job: CenterJob
                     if retryable && attempt < job.settings.max_attempts {
                         continue;
                     }
-                    break 'run CenterOutcome::Failed {
-                        error_arcmin: last_error,
-                        attempts: attempt,
-                        reason,
-                    };
+                    break 'run ended(hub, &job, Stop::Failed(reason), last_error, attempt);
                 }
             };
             let error = solved
@@ -663,19 +815,11 @@ pub async fn run(hub: &EquipmentHub, imaging: &dyn CenterImaging, job: CenterJob
             }
             record.correction = Some(sync_label);
             attempts.push(record);
-            if let Err(reason) = step(hub, &job, MountCmd::Sync(solved.solved_j2000)).await {
-                break 'run CenterOutcome::Failed {
-                    error_arcmin: Some(error),
-                    attempts: attempt,
-                    reason,
-                };
+            if let Err(stop) = step(hub, &job, MountCmd::Sync(solved.solved_j2000)).await {
+                break 'run ended(hub, &job, stop, Some(error), attempt);
             }
-            if let Err(reason) = step(hub, &job, MountCmd::Slew { target: job.target }).await {
-                break 'run CenterOutcome::Failed {
-                    error_arcmin: Some(error),
-                    attempts: attempt,
-                    reason,
-                };
+            if let Err(stop) = step(hub, &job, MountCmd::Slew { target: job.target }).await {
+                break 'run ended(hub, &job, stop, Some(error), attempt);
             }
         }
         CenterOutcome::Failed {
@@ -684,6 +828,8 @@ pub async fn run(hub: &EquipmentHub, imaging: &dyn CenterImaging, job: CenterJob
             reason: "no attempt solved".into(),
         }
     };
+    // The mount and camera are free again before anything is reported.
+    drop(job.permit);
 
     let event = match &outcome {
         CenterOutcome::Centered {
@@ -702,23 +848,34 @@ pub async fn run(hub: &EquipmentHub, imaging: &dyn CenterImaging, job: CenterJob
             attempts: *attempts,
             reason: reason.clone(),
         },
-    };
-    hub.emit(
-        EquipmentEvent::new(event, hub.clock().as_ref())
-            .for_device(DeviceKind::Mount, job.mount.connection_id())
-            .with_command(job.command.command_id),
-    );
-    gate.record_outcome(
-        &job.command,
-        &match &outcome {
-            CenterOutcome::Centered { .. } => OpOutcome::Succeeded,
-            CenterOutcome::Failed { reason, .. } => {
-                OpOutcome::Failed(DeviceError::invalid_operation(reason.clone()))
-            }
+        CenterOutcome::Aborted {
+            error_arcmin,
+            attempts,
+            reason,
+            ..
+        } => EventKind::CenterFailed {
+            error_arcmin: *error_arcmin,
+            attempts: *attempts,
+            reason: format!("aborted: {reason}"),
         },
-    );
+    };
+    emit(event);
+    let op_outcome = match &outcome {
+        CenterOutcome::Centered { .. } => OpOutcome::Succeeded,
+        CenterOutcome::Failed { reason, .. } => {
+            OpOutcome::Failed(DeviceError::invalid_operation(reason.clone()))
+        }
+        CenterOutcome::Aborted { by, .. } => OpOutcome::Aborted { by: *by },
+    };
+    gate.record_outcome(&job.command, &op_outcome);
+    let duration_ms = hub.clock().now_mono_ns().saturating_sub(started_mono_ns) / 1_000_000;
+    emit(EventKind::OperationEnded {
+        op: OpKind::Center,
+        outcome: op_outcome,
+        duration_ms,
+    });
     CenterReport {
-        command_id: job.command.command_id,
+        command_id,
         target: job.target,
         settings: job.settings,
         outcome,
@@ -789,11 +946,24 @@ mod tests {
         residual: f64,
         syncs_seen: Mutex<usize>,
         converter: Arc<dyn FrameConverter>,
+        /// How long each frame is exposed (the solve follows at once).
+        exposure: Duration,
+        /// Frames begun.
+        frames: Mutex<u32>,
     }
 
     impl ScriptedImaging {
-        fn new(state: &AppState, error: (f64, f64), residual: f64) -> Self {
-            Self {
+        fn new(state: &AppState, error: (f64, f64), residual: f64) -> Arc<Self> {
+            Self::exposing(state, error, residual, Duration::from_millis(250))
+        }
+
+        fn exposing(
+            state: &AppState,
+            error: (f64, f64),
+            residual: f64,
+            exposure: Duration,
+        ) -> Arc<Self> {
+            Arc::new(Self {
                 sim: state.equipment_ctx.sims().mount.unwrap(),
                 site: state
                     .equipment_ctx
@@ -804,7 +974,9 @@ mod tests {
                 residual,
                 syncs_seen: Mutex::new(0),
                 converter: crate::equipment::astro::frame_converter(),
-            }
+                exposure,
+                frames: Mutex::new(0),
+            })
         }
     }
 
@@ -816,8 +988,9 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<CenterSolve, CenterImagingError>> + Send + 'a>>
         {
             Box::pin(async move {
+                *self.frames.lock().unwrap() += 1;
                 let start = Utc::now();
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(self.exposure).await;
                 let end = Utc::now();
                 let syncs = self.sim.calls().iter().filter(|c| *c == "sync").count();
                 let (xi, eta) = {
@@ -890,9 +1063,13 @@ mod tests {
             .collect()
     }
 
-    async fn run_job(state: &AppState, imaging: &ScriptedImaging, target: EqCoord) -> CenterReport {
+    async fn run_job(
+        state: &AppState,
+        imaging: &Arc<ScriptedImaging>,
+        target: EqCoord,
+    ) -> CenterReport {
         let job = authorize(state, target, CenterOverrides::default(), operator()).unwrap();
-        let report = run(&state.equipment, imaging, job).await;
+        let report = run(&state.equipment, imaging.clone(), job).await;
         // The permit was released with the job.
         assert!(state.equipment.gate().is_idle());
         report
@@ -1048,7 +1225,7 @@ mod tests {
         let busy = state.equipment.busy();
         let run = tokio::spawn({
             let state = state.clone();
-            async move { run(&state.equipment, &imaging, job).await }
+            async move { run(&state.equipment, imaging, job).await }
         });
         let mut saw_centering = false;
         for _ in 0..100 {
@@ -1065,6 +1242,208 @@ mod tests {
             CenterOutcome::Centered { attempts: 1, .. }
         ));
         assert!(!state.equipment.busy().borrow().centering);
+        crate::api::equipment_tests::cleanup(directory, state).await;
+    }
+
+    /// The loop's own `operation_*` events, as the recorder would store them,
+    /// read back through the `equipment_overheads` view (H18).
+    async fn center_overhead(
+        state: &AppState,
+        command_id: CommandId,
+    ) -> crate::storage::equipment_events_repo::Overhead {
+        let kinds = [
+            "operation_commanded",
+            "operation_started",
+            "operation_ended",
+            "centered",
+            "center_failed",
+        ]
+        .map(String::from);
+        let events = state.equipment.events_since(0, &kinds, 500);
+        let mine: Vec<_> = events
+            .iter()
+            .filter(|e| e.command_id == Some(command_id))
+            .collect();
+        let names: Vec<&str> = mine.iter().map(|e| e.name()).collect();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.starts_with("operation_"))
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![
+                "operation_commanded",
+                "operation_started",
+                "operation_ended"
+            ],
+            "{names:?}"
+        );
+        for event in &mine {
+            crate::storage::equipment_events_repo::insert(
+                state.local_store.pool(),
+                event,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let rows = crate::storage::equipment_events_repo::overheads(
+            state.local_store.pool(),
+            Some("center"),
+            None,
+            10,
+        )
+        .await
+        .unwrap();
+        let row = rows
+            .into_iter()
+            .find(|row| row.command_id == command_id.to_string())
+            .expect("a center row in equipment_overheads");
+        assert_eq!(row.device_kind.as_deref(), Some("mount"));
+        assert!(row.started_at.is_some() && row.duration_s.is_some());
+        row
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_center_loop_is_one_operation_with_an_overhead_row() {
+        let (directory, state) = state(MountSyncMode::Mount).await;
+        let imaging = ScriptedImaging::new(&state, (420.0, -300.0), 0.05);
+        let target = near(&state, 0.1, 1.0).await;
+        let report = run_job(&state, &imaging, target).await;
+        assert!(
+            matches!(report.outcome, CenterOutcome::Centered { .. }),
+            "{report:#?}"
+        );
+        let row = center_overhead(&state, report.command_id).await;
+        assert_eq!(row.outcome.as_deref(), Some("succeeded"));
+        crate::api::equipment_tests::cleanup(directory, state).await;
+    }
+
+    /// Start a loop whose frames take `exposure`, with a 10' error so that a
+    /// sync would follow the first solve, and wait until its first frame is
+    /// being taken.
+    async fn loop_in_its_first_frame(
+        state: &AppState,
+        exposure: Duration,
+    ) -> (
+        Arc<ScriptedImaging>,
+        CommandId,
+        tokio::task::JoinHandle<CenterReport>,
+    ) {
+        let imaging = ScriptedImaging::exposing(state, (600.0, 0.0), 1.0, exposure);
+        let job = authorize(
+            state,
+            near(state, 0.02, 0.2).await,
+            CenterOverrides::default(),
+            operator(),
+        )
+        .unwrap();
+        let command_id = job.command.command_id;
+        let run = tokio::spawn({
+            let state = state.clone();
+            let imaging = Arc::clone(&imaging);
+            async move { run(&state.equipment, imaging, job).await }
+        });
+        let frames = Arc::clone(&imaging);
+        wait_for(state, "the first center frame", move |_| {
+            *frames.frames.lock().unwrap() >= 1
+        })
+        .await;
+        (imaging, command_id, run)
+    }
+
+    /// After the abort or e-stop `by`: the loop ended at once, while its frame
+    /// was still exposing, as `Aborted { by }`; the mount is free for an
+    /// operator command; and once that frame finishes nothing more is
+    /// captured or synced.
+    async fn assert_ended_by(
+        state: &AppState,
+        imaging: &ScriptedImaging,
+        command_id: CommandId,
+        run: tokio::task::JoinHandle<CenterReport>,
+        by: CommandId,
+    ) {
+        let report = tokio::time::timeout(Duration::from_secs(2), run)
+            .await
+            .expect("the loop ended without waiting for its frame")
+            .unwrap();
+        match &report.outcome {
+            CenterOutcome::Aborted {
+                by: Some(aborted_by),
+                attempts: 0,
+                ..
+            } => assert_eq!(*aborted_by, by),
+            other => panic!("{other:?}"),
+        }
+        assert!(state.equipment.gate().is_idle(), "the permit was dropped");
+        assert!(!state.equipment.busy().borrow().centering);
+        let handle = crate::api::equipment::mount_handle(state).unwrap();
+        // No ownership is left; the mount itself may still be finishing the
+        // e-stop's own tracking-off.
+        let mount = handle.clone();
+        wait_for(state, "the mount's own operation to end", move |_| {
+            mount.snapshot().active_op.is_none()
+        })
+        .await;
+        crate::api::equipment::submit(
+            state,
+            &handle,
+            GatedOp::Mount(MountCmd::SetTracking(false)),
+            operator(),
+            Priority::Exposure,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("an operator command after the abort: {}", err.code));
+        // The frame in hand finishes in the background; nothing follows it.
+        tokio::time::sleep(imaging.exposure + Duration::from_millis(700)).await;
+        assert_eq!(*imaging.frames.lock().unwrap(), 1);
+        assert!(
+            !imaging.sim.calls().iter().any(|c| c == "sync"),
+            "{:?}",
+            imaging.sim.calls()
+        );
+        let failed = state
+            .equipment
+            .events_since(0, &["center_failed".into()], 50);
+        assert_eq!(failed.len(), 1);
+        assert!(
+            matches!(&failed[0].event, EventKind::CenterFailed { reason, .. }
+                if reason.starts_with("aborted")),
+            "{:?}",
+            failed[0].event
+        );
+        let row = center_overhead(state, command_id).await;
+        assert_eq!(row.outcome.as_deref(), Some("aborted"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_mount_abort_during_a_frame_ends_the_loop_and_frees_the_mount() {
+        let (directory, state) = state(MountSyncMode::Mount).await;
+        let (imaging, command_id, run) =
+            loop_in_its_first_frame(&state, Duration::from_secs(3)).await;
+        let handle = crate::api::equipment::mount_handle(&state).unwrap();
+        let abort = state.equipment.gate().abort(&handle, operator());
+        assert_ended_by(&state, &imaging, command_id, run, abort.command_id).await;
+        crate::api::equipment_tests::cleanup(directory, state).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_estop_during_a_frame_ends_the_loop_and_frees_the_mount() {
+        let (directory, state) = state(MountSyncMode::Mount).await;
+        let (imaging, command_id, run) =
+            loop_in_its_first_frame(&state, Duration::from_secs(3)).await;
+        let report = crate::equipment::estop::run_estop(
+            &state.equipment,
+            crate::equipment::estop::EstopRequest {
+                abort_exposure: false,
+                source: operator(),
+            },
+        )
+        .await;
+        // The e-stop turned tracking off; the operator command below turns
+        // it off again, which the mount accepts.
+        assert_ended_by(&state, &imaging, command_id, run, report.command_id).await;
         crate::api::equipment_tests::cleanup(directory, state).await;
     }
 

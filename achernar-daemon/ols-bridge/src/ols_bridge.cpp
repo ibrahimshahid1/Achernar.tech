@@ -181,7 +181,11 @@ public:
 
   void handle_frame(int index) {
     CamFrame frm;
-    frm.unix_timestamp = frames_.at(index).first;
+    // Stamped by the host clock at delivery, as OLS's stream drivers stamp
+    // theirs. The dataset's log.txt time records when the frames were
+    // recorded, in the past: the daemon reads this stamp as the frame's
+    // arrival (exposure windows, A06 freshness, DATE-OBS).
+    frm.unix_timestamp = timestamp();
     frm.width = width_;
     frm.height = height_;
     std::vector<char> buf;

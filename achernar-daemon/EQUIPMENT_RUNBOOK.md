@@ -583,8 +583,9 @@ off for the same reason.
 
 These were found while building and reviewing the interop tests. Each is
 filed as a change note with its owner. Items 1 and 2 were fixed when wave B
-was integrated, and the CI scenario now asserts their fixed behaviour; the
-others are still open and are noted where they matter (§3.2, §4).
+was integrated, and the CI scenario now asserts their fixed behaviour.
+Items 3 to 8 are still open and are noted where they matter (§3.2, §4);
+item 9 records a change to a direct-API response.
 
 1. **Safety resume route (fixed).** `POST equipment/resume-blocks/clear` on a
    `safety_unsafe` or `safety_unknown` block is the operator's manual safety
@@ -617,3 +618,25 @@ others are still open and are noted where they matter (§3.2, §4).
 6. **Guide-camera role check (G-l).** `guider::camera_role_conflict` exists
    and is tested, but nothing calls it when a camera connects, so connecting
    the guide camera as the main camera is not refused.
+7. **No session is opened (deferred).** §4.3 names the site as the first
+   writer of `sessions.location_*`, and the recorder attributes
+   `equipment_events`, `device_connections` and `equipment_overheads` rows
+   to a session once `Recorder::set_session` is called. Nothing opens one
+   yet: the daemon has no session lifecycle (captures take the client's
+   `session_id`, and no route opens or closes a session), so every row's
+   `session_id` is NULL and `night_id` is the only grouping key. Choosing
+   when a session opens and closes is a product decision; the repository
+   (`storage/sessions_repo.rs`: open, set_location, close, with tests) and
+   the recorder's attribution (its `session-a` test) are ready for the one
+   call each that wiring needs.
+8. **COC view direction (deferred, user-owned COC wiring).** A fixed
+   all-sky camera's declared view direction (§7.2.4) reaches
+   `CocContext.view_direction` through `EquipmentHub::set_view_direction`,
+   but no rig profile or configuration key supplies it yet, so it is always
+   `None`. It is consumed only by the COC shadow wiring, which is
+   user-owned (`vision/coc_shadow.rs`); declare it there or in the rig
+   profile when that wiring is done.
+9. **`GET platesolve/status` pending rule.** Wave B renamed
+   `auto_solve.pending.target {ra, dec}` to `hint {ra_h, dec_deg, frame}`.
+   Both keys are now written; `target` is deprecated and will be removed in
+   a later release. Read `hint`.

@@ -112,7 +112,10 @@ pub struct SolveJob {
     generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+/// A rule waiting for a frame. Serialised with `hint` and, for clients of
+/// the earlier `GET platesolve/status`, the same position as the
+/// deprecated `target {ra, dec}` (RA hours, Dec degrees).
+#[derive(Debug, Clone, PartialEq)]
 pub struct PendingRule {
     pub reason: SolveReason,
     pub hint: Option<EqCoord>,
@@ -129,6 +132,26 @@ pub struct PendingRule {
     /// The slew command this rule follows.
     pub command_id: Option<CommandId>,
     pub raised_at: Option<DateTime<Utc>>,
+}
+
+impl Serialize for PendingRule {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let target = self.hint.map(|hint| crate::hardware::mount::EqCoord {
+            ra: hint.ra_h,
+            dec: hint.dec_deg,
+        });
+        let mut rule = serializer.serialize_struct("PendingRule", 8)?;
+        rule.serialize_field("reason", &self.reason)?;
+        rule.serialize_field("hint", &self.hint)?;
+        rule.serialize_field("target", &target)?;
+        rule.serialize_field("awaiting_arrival", &self.awaiting_arrival)?;
+        rule.serialize_field("not_before", &self.not_before)?;
+        rule.serialize_field("cause", &self.cause)?;
+        rule.serialize_field("command_id", &self.command_id)?;
+        rule.serialize_field("raised_at", &self.raised_at)?;
+        rule.end()
+    }
 }
 
 /// A rule that ended without a solve, for the status route.
@@ -810,6 +833,39 @@ mod tests {
             ..bus.mount(41, slew, EventKind::SlewStarted)
         };
         assert_eq!(trigger.observe(&replay), None);
+    }
+
+    /// `GET platesolve/status`: a pending rule carries `hint` and, for the
+    /// clients of the earlier contract, the same position as `target {ra,
+    /// dec}`; no position is null in both.
+    #[test]
+    fn a_pending_rule_keeps_the_earlier_target_key_beside_its_hint() {
+        let mut trigger = PlateSolveTrigger::new(Duration::from_secs(120));
+        let mut bus = Bus::new();
+        trigger.observe(&bus.mount(40, Some(CommandId::new()), commanded(M67)));
+        let status = serde_json::to_value(trigger.status()).unwrap();
+        let pending = &status["pending"];
+        assert_eq!(pending["reason"], json!("post_slew"), "{status}");
+        assert_eq!(pending["hint"]["ra_h"], json!(M67.ra_h), "{status}");
+        assert_eq!(pending["hint"]["dec_deg"], json!(M67.dec_deg), "{status}");
+        assert_eq!(
+            pending["target"],
+            json!({"ra": M67.ra_h, "dec": M67.dec_deg}),
+            "{status}"
+        );
+        assert_eq!(pending["awaiting_arrival"], json!(true), "{status}");
+        for key in ["not_before", "cause", "command_id", "raised_at"] {
+            assert!(pending.get(key).is_some(), "{key}: {status}");
+        }
+        // Startup has no position.
+        let startup = serde_json::to_value(
+            PlateSolveTrigger::new(Duration::from_secs(120))
+                .status()
+                .pending
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(startup["hint"].is_null() && startup["target"].is_null());
     }
 
     #[test]

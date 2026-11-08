@@ -300,29 +300,27 @@ pub(crate) async fn solve_and_record(
         Err(failure) => (None, Some(failure)),
     };
     let pointing = match &solution {
-        Some(solution) => Some(
-            match (frame.exposure_started_at, frame.exposure_completed_at) {
-                (Some(start), Some(end)) => {
-                    record_pointing_sample(
-                        state,
-                        PointingInput {
-                            plate_solve_event_id: event_id.clone(),
-                            frame_id: Some(frame.frame_id.clone()),
-                            exposure_start: start,
-                            exposure_end: end.max(start),
-                            solved_j2000: EqCoord::new(
-                                solution.ra_hours,
-                                solution.dec_deg,
-                                EqFrame::J2000,
-                            ),
-                            purpose: pointing_purpose(trigger),
-                        },
-                    )
-                    .await
-                }
-                _ => PointingOutcome::skipped("exposure_time_unknown"),
-            },
-        ),
+        Some(solution) => Some(match pointing_interval(state, &frame).await {
+            Ok((start, end)) => {
+                record_pointing_sample(
+                    state,
+                    PointingInput {
+                        plate_solve_event_id: event_id.clone(),
+                        frame_id: Some(frame.frame_id.clone()),
+                        exposure_start: start,
+                        exposure_end: end.max(start),
+                        solved_j2000: EqCoord::new(
+                            solution.ra_hours,
+                            solution.dec_deg,
+                            EqFrame::J2000,
+                        ),
+                        purpose: pointing_purpose(trigger),
+                    },
+                )
+                .await
+            }
+            Err(reason) => PointingOutcome::skipped(reason),
+        }),
         None => None,
     };
     Ok(SolveFrameResponse {
@@ -353,6 +351,47 @@ pub(crate) async fn solve_and_record(
 //  Pointing samples (H12)
 // ═══════════════════════════════════════════════════════════════════
 
+/// The exposure a frame's pointing sample is read over: the frame's H1
+/// window (`exposure_device_windows`) when it records both ends, else
+/// `frames.exposure_*` (a still's driver bracket). A stream frame's
+/// `frames.exposure_started_at` is its arrival, after its exposure ended,
+/// so only its window stands for the exposure. `Err` is why no sample can
+/// be written: the window says the mount slewed during the exposure, or no
+/// exposure time is known.
+async fn pointing_interval(
+    state: &AppState,
+    frame: &plate_solve_repo::SolvableFrame,
+) -> Result<(DateTime<Utc>, DateTime<Utc>), &'static str> {
+    let window = match crate::storage::exposure_windows_repo::load(
+        state.local_store.pool(),
+        &frame.frame_id,
+    )
+    .await
+    {
+        Ok(window) => window,
+        Err(error) => {
+            tracing::warn!(
+                "Could not read the exposure window of {}: {error}",
+                frame.frame_id
+            );
+            return Err("exposure_window_unreadable");
+        }
+    };
+    if let Some(window) = window {
+        if window.slewing_any == Some(true) {
+            return Err("mount_slewing_during_exposure");
+        }
+        if let (Some(start), Some(end)) = (window.exposure_started_at, window.exposure_completed_at)
+        {
+            return Ok((start, end));
+        }
+    }
+    match (frame.exposure_started_at, frame.exposure_completed_at) {
+        (Some(start), Some(end)) => Ok((start, end)),
+        _ => Err("exposure_time_unknown"),
+    }
+}
+
 /// `pointing_samples.purpose` for a solve trigger.
 pub fn pointing_purpose(trigger: &str) -> PointingPurpose {
     match trigger {
@@ -367,7 +406,7 @@ pub fn pointing_purpose(trigger: &str) -> PointingPurpose {
 pub struct PointingInput {
     pub plate_solve_event_id: Option<String>,
     pub frame_id: Option<String>,
-    /// The driver's exposure start and end.
+    /// The exposure's start and end: its H1 window when one was recorded.
     pub exposure_start: DateTime<Utc>,
     pub exposure_end: DateTime<Utc>,
     /// The solved centre (ICRS, i.e. J2000).
@@ -1451,6 +1490,87 @@ mod tests {
             assert_eq!(pointing.skipped, None, "{pointing:?}");
             assert_eq!(pointing.sync_generation, Some(1));
 
+            crate::api::equipment_tests::cleanup(directory, state).await;
+        }
+
+        /// A stream frame, stored as the capture path stores one: its
+        /// `frames.exposure_started_at` is its arrival, after the exposure
+        /// ended, and its H1 window is the exposure. The sample is read over
+        /// the window, so its mid-exposure lies inside it; a window that saw
+        /// the mount slew gets no sample.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_stream_frame_is_sampled_over_its_window_and_never_while_slewing() {
+            use crate::equipment::events::ExposureWindowRow;
+            let (directory, state) = crate::api::equipment_tests::state().await;
+            let solver = PlateSolver::with_backend_for_test(
+                AstapSolver::new(
+                    fake_astap(&directory, Some(SOLVED_INI), 0, 0.0),
+                    &PlateSolveConfig::default(),
+                ),
+                directory.join("work"),
+            );
+            let state = state.with_plate_solver(solver);
+            let _connected = crate::api::connect_equipment(
+                State(state.clone()),
+                Json(crate::api::ConnectRequest {
+                    equipment_type: Some("mount".into()),
+                    driver: "sim".into(),
+                    option: None,
+                    index: None,
+                }),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("{}: {}", err.code, err.message));
+            let fits = || crate::fits::encode_linear_analysis(&[1.0; 48], 8, 6, "ADU", "test");
+
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let start = Utc::now();
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            let end = Utc::now();
+            // Delivered a frame interval later, with mount samples after it.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            let arrival = Utc::now();
+            let window = |frame_id: &str, slewing: bool| ExposureWindowRow {
+                frame_id: frame_id.to_string(),
+                exposure_started_at: Some(start),
+                exposure_completed_at: Some(end),
+                slewing_any: Some(slewing),
+                ..ExposureWindowRow::default()
+            };
+            let pool = state.local_store.pool();
+            let frame_id =
+                persist_frame(&state, fits().unwrap(), 1, "light", unix(arrival), 0.05).await;
+            crate::storage::exposure_windows_repo::upsert(pool, &window(&frame_id, false))
+                .await
+                .unwrap();
+            let response = solve_and_record(&state, solve(&frame_id, None), "manual")
+                .await
+                .unwrap();
+            let pointing = response.pointing.unwrap();
+            assert_eq!(pointing.skipped, None, "{pointing:?}");
+            let samples =
+                crate::storage::pointing_samples_repo::for_mount(pool, "sim:mount", None, 10)
+                    .await
+                    .unwrap();
+            let sample = samples
+                .iter()
+                .find(|s| Some(s.id) == pointing.sample_id)
+                .expect("the stored sample");
+            let mid = sample.mid_exposure_utc.unwrap();
+            assert!(start <= mid && mid <= end, "{start} <= {mid} <= {end}");
+
+            let slewed =
+                persist_frame(&state, fits().unwrap(), 1, "light", unix(arrival), 0.05).await;
+            crate::storage::exposure_windows_repo::upsert(pool, &window(&slewed, true))
+                .await
+                .unwrap();
+            let response = solve_and_record(&state, solve(&slewed, None), "manual")
+                .await
+                .unwrap();
+            assert_eq!(
+                response.pointing.unwrap().skipped.as_deref(),
+                Some("mount_slewing_during_exposure")
+            );
             crate::api::equipment_tests::cleanup(directory, state).await;
         }
     }

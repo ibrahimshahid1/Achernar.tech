@@ -1459,4 +1459,58 @@ mod tests {
         // Never an automatic slew from a limit position.
         assert!(!rig.sim.control().slewing());
     }
+
+    /// An operator tracking-on below the limit: the poll that would verify
+    /// it is the one in which the watchdog stops tracking again. The
+    /// operation fails with `limit_reached` and never announces tracking on
+    /// after the limit stop.
+    #[test]
+    fn a_tracking_on_the_watchdog_undoes_is_not_reported_as_on() {
+        use super::super::test_support::operator as meta;
+        let mut rig = limit_rig();
+        rig.tick(Duration::from_secs(1), None);
+        let snap = rig.tick(Duration::from_secs(1), None);
+        assert_eq!(snap.state.tracking.value, Some(false));
+        rig.runtime.take_events();
+        let outcome = rig
+            .run(
+                crate::equipment::commands::MountCmd::SetTracking(true),
+                meta(),
+            )
+            .unwrap();
+        assert!(
+            matches!(&outcome, crate::equipment::types::OpOutcome::Failed(err) if err.message.starts_with("limit_reached")),
+            "{outcome:?}"
+        );
+        let events = rig.runtime.take_events();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.event, EventKind::TrackingChanged { on: Some(true), .. })),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            &e.event,
+            EventKind::TrackingChanged { on: Some(false), reason: Some(r), .. } if r == "limit_reached"
+        )));
+        let snap = rig.tick(Duration::from_secs(1), None);
+        assert_eq!(snap.state.tracking.value, Some(false));
+        // Above the limit a tracking-on verifies as before.
+        let mut rig = rig_with(
+            SimMountProfile::esp32_like(),
+            super::super::MountSettings::default(),
+            Some(site()),
+        );
+        let _ = rig.run(
+            crate::equipment::commands::MountCmd::SetTracking(false),
+            meta(),
+        );
+        let outcome = rig
+            .run(
+                crate::equipment::commands::MountCmd::SetTracking(true),
+                meta(),
+            )
+            .unwrap();
+        assert_eq!(outcome, crate::equipment::types::OpOutcome::Succeeded);
+    }
 }

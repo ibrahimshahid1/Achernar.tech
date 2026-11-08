@@ -330,6 +330,8 @@ struct SharedState {
     jog: JogDemand,
     announced_tracking: Option<bool>,
     announced_park: Option<bool>,
+    /// Tracking-off writes the limit watchdog made (M-k).
+    limit_stops: u64,
 }
 
 /// Per-connection mount state shared by the runtime and its operations. All
@@ -490,6 +492,18 @@ impl MountShared {
 
     pub(crate) fn announced_tracking(&self) -> Option<bool> {
         self.state().announced_tracking
+    }
+
+    /// The limit watchdog wrote tracking off (M-k). A tracking-on operation
+    /// that is still verifying must not read the poll from before this write
+    /// as its success.
+    pub(crate) fn note_limit_stop(&self) {
+        self.state().limit_stops += 1;
+    }
+
+    /// How many tracking-off writes the limit watchdog has made.
+    pub(crate) fn limit_stops(&self) -> u64 {
+        self.state().limit_stops
     }
 
     pub fn set_announced_park(&self, parked: bool) {
@@ -880,7 +894,11 @@ impl MountRuntime {
         if verdict.stop_tracking {
             // Repeated on every poll while tracking still reads on (the
             // watchdog escalates with outcome_unknown); announced once.
-            match drv.set_tracking(false) {
+            let stopped = drv.set_tracking(false);
+            if stopped.is_ok() {
+                self.shared.note_limit_stop();
+            }
+            match stopped {
                 Ok(()) if !self.limit_stop_announced => {
                     self.limit_stop_announced = true;
                     self.shared.emit(

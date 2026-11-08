@@ -32,6 +32,17 @@
 //!   ([`native_alpaca_drivers_conform_against_the_served_simulators`]) holds
 //!   the native Alpaca telescope and focuser drivers to the WP1A-2
 //!   conformance suites, over HTTP to the same simulators.
+//! - The OLS simulator camera (R26, every model's CI data path) on a
+//!   generated dataset whose `log.txt` is a past recording
+//!   ([`the_ols_simulator_camera_is_stamped_by_the_host_clock`]): frames
+//!   carry the host clock at delivery, a capture's window holds the
+//!   connected mount and focuser, and the simulator autofocus gets frames
+//!   past A06. With it, a dither links to the next stream capture (H10,
+//!   [`a_dither_links_to_the_next_stream_capture`]) and, on unix with the
+//!   fake ASTAP, the post-slew rule never solves a stream frame exposed
+//!   during the slew while every pointing sample lies inside its frame's
+//!   window (H11, H12,
+//!   `the_post_slew_rule_never_solves_a_stream_frame_exposed_during_the_slew`).
 //!
 //! It also holds the two gaps the interop work found and wave B closed
 //! (`EQUIPMENT_RUNBOOK.md` §10): the operator's safety resume through
@@ -1438,6 +1449,463 @@ async fn the_tier1_rig_runs_end_to_end_through_the_daemon_routes() {
     daemon.close().await;
     drop(phd2);
     drop(server);
+}
+
+// ---------------------------------------------------------------------------
+// The OLS simulator camera (R26: every model's CI data path)
+// ---------------------------------------------------------------------------
+
+/// A baseline TIFF (uncompressed, little-endian, one strip) of 16-bit
+/// grayscale pixels, the format OLS's simulator reads.
+fn baseline_tiff_mono16(width: u16, height: u16, pixels: &[u16]) -> Vec<u8> {
+    let data: Vec<u8> = pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
+    let data_len = u32::try_from(data.len()).unwrap();
+    let short = |tag: u16, value: u16| -> Vec<u8> {
+        [
+            &tag.to_le_bytes()[..],
+            &3u16.to_le_bytes(),
+            &1u32.to_le_bytes(),
+            &value.to_le_bytes(),
+            &0u16.to_le_bytes(),
+        ]
+        .concat()
+    };
+    let long = |tag: u16, value: u32| -> Vec<u8> {
+        [
+            &tag.to_le_bytes()[..],
+            &4u16.to_le_bytes(),
+            &1u32.to_le_bytes(),
+            &value.to_le_bytes(),
+        ]
+        .concat()
+    };
+    let entries = [
+        short(256, width),
+        short(257, height),
+        short(258, 16),
+        short(259, 1),
+        short(262, 1),
+        long(273, 8),
+        short(277, 1),
+        short(278, height),
+        long(279, data_len),
+        short(284, 1),
+    ];
+    let mut out = b"II".to_vec();
+    out.extend(42u16.to_le_bytes());
+    out.extend((8 + data_len).to_le_bytes());
+    out.extend(data);
+    out.extend(u16::try_from(entries.len()).unwrap().to_le_bytes());
+    for entry in entries {
+        out.extend(entry);
+    }
+    out.extend(0u32.to_le_bytes());
+    out
+}
+
+/// An OLS simulator dataset in `dir`: `log.txt` plus `frames` mono16 star
+/// fields. Like every OLS sim dataset, the log's times are a recording made
+/// in the past (2023-11-14).
+fn write_mono16_sim_dataset(dir: &Path, frames: usize) {
+    const W: u16 = 320;
+    const H: u16 = 240;
+    std::fs::create_dir_all(dir).unwrap();
+    // Deterministic star positions and fluxes (a small LCG).
+    let mut seed = 0x2545_f491_u64;
+    let mut next = move || {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        (seed >> 33) as f64 / f64::from(1u32 << 31)
+    };
+    let stars: Vec<(f64, f64, f64)> = (0..30)
+        .map(|_| {
+            (
+                20.0 + next() * (f64::from(W) - 40.0),
+                20.0 + next() * (f64::from(H) - 40.0),
+                4_000.0 + next() * 16_000.0,
+            )
+        })
+        .collect();
+    let mut log = String::new();
+    for i in 0..frames {
+        let mut pixels = Vec::with_capacity(usize::from(W) * usize::from(H));
+        for y in 0..H {
+            for x in 0..W {
+                let (x, y) = (f64::from(x), f64::from(y));
+                let mut value = 800.0 + 15.0 * (next() - 0.5);
+                for (sx, sy, flux) in &stars {
+                    let d2 = (x - sx).powi(2) + (y - sy).powi(2);
+                    value += flux * (-d2 / (2.0 * 1.6 * 1.6)).exp();
+                }
+                pixels.push(value.clamp(0.0, 65_535.0) as u16);
+            }
+        }
+        std::fs::write(
+            dir.join(format!("frame_{i:08}.tiff")),
+            baseline_tiff_mono16(W, H, &pixels),
+        )
+        .unwrap();
+        log.push_str(&format!("{i},{:.3}\n", 1_700_000_000.0 + 2.0 * i as f64));
+    }
+    std::fs::write(dir.join("log.txt"), log).unwrap();
+}
+
+/// The OLS simulator camera on a recorded dataset (its `log.txt` is from
+/// 2023), through the daemon's routes: frames are stamped by the host clock
+/// at delivery, as OLS's stream drivers stamp theirs; a capture's
+/// equipment window is the exposure's, so it carries the connected mount
+/// and focuser; and the simulator autofocus, the only autofocus D18 allows,
+/// gets frames past the A06 freshness rule.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_ols_simulator_camera_is_stamped_by_the_host_clock() {
+    let daemon = Daemon::start(scenario_configs(40.0, -75.0, 100.0)).await;
+    let dataset = daemon.scratch.path.join("monosim");
+    write_mono16_sim_dataset(&dataset, 6);
+    daemon.connect("mount", "sim", "").await;
+    daemon.connect("focuser", "sim", "").await;
+    daemon
+        .wait_status("a polled sim mount and focuser", |v| {
+            v["mount"]["ra"].is_number() && v["focuser"]["position"].is_number()
+        })
+        .await;
+    let connected = daemon
+        .post_ok(
+            "/connect",
+            json!({
+                "equipment_type": "camera",
+                "driver": "sim",
+                "option": dataset.to_string_lossy(),
+            }),
+        )
+        .await;
+    assert_eq!(connected["status"], "connected", "{connected}");
+    daemon.post_ok("/camera/stream/start", json!({})).await;
+    let vision = crate::vision::vision_loop::spawn(daemon.state.clone(), 5.0);
+
+    // Frames carry the host clock, not the recording's.
+    let deadline = Instant::now() + WAIT;
+    let stamp = loop {
+        let stamp = daemon
+            .state
+            .latest_frame
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|frame| frame.unix_timestamp);
+        if let Some(stamp) = stamp {
+            break stamp;
+        }
+        assert!(Instant::now() < deadline, "the simulator streamed no frame");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let now = unix(Utc::now());
+    assert!(
+        (now - stamp).abs() < 30.0,
+        "frame stamped {stamp}, host clock {now}"
+    );
+
+    // A capture's window is the exposure's: the mount and focuser are in it.
+    let frame = daemon
+        .post_ok("/camera/capture", json!({"exposure": 0.5}))
+        .await;
+    let keywords: Vec<&str> = frame["equipment"]["fits_keywords"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{frame}"))
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    for key in ["RA", "DEC", "PIERSIDE", "FOCPOS"] {
+        assert!(keywords.contains(&key), "{key} missing: {keywords:?}");
+    }
+    let frame_id = frame["id"].as_str().unwrap().to_string();
+    daemon.flush().await;
+    let (started, mount_mid): (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT exposure_started_at, mount_mid_json FROM exposure_device_windows \
+         WHERE frame_id = ?",
+    )
+    .bind(&frame_id)
+    .fetch_one(daemon.state.local_store.pool())
+    .await
+    .unwrap();
+    let started = DateTime::parse_from_rfc3339(started.as_deref().unwrap())
+        .unwrap()
+        .with_timezone(&Utc);
+    assert!(
+        (Utc::now() - started).num_seconds().abs() < 60,
+        "window starts {started}"
+    );
+    assert!(mount_mid.is_some(), "the window holds the mount");
+
+    // The simulator autofocus: a focus frame passes A06 and is archived.
+    let run = {
+        let base = daemon.base.clone();
+        let agent = daemon.agent.clone();
+        tokio::task::spawn_blocking(move || {
+            agent
+                .post(&format!("{base}/api/v1/focus/run"))
+                .content_type("application/json")
+                .send(json!({"sweep_radius_points": 2, "step_size": 40}).to_string())
+                .map(|mut reply| {
+                    let status = reply.status().as_u16();
+                    (
+                        status,
+                        reply.body_mut().read_to_string().unwrap_or_default(),
+                    )
+                })
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(12);
+    while daemon
+        .count("SELECT COUNT(*) FROM frames WHERE capture_type = 'focus'")
+        .await
+        == 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "no focus frame passed A06 within 12 s"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = daemon.post("/focus/abort", json!({})).await;
+    let (status, body) = run.await.unwrap().unwrap();
+    assert!(
+        !body.contains("focus_timeout") && !body.contains("A06 freshness"),
+        "{status} {body}"
+    );
+
+    vision.abort();
+    let _ = daemon.post("/camera/stream/stop", json!({})).await;
+    let _ = daemon
+        .post("/disconnect", json!({"equipment_type": "camera"}))
+        .await;
+    daemon.close().await;
+}
+
+/// H10 with stream captures: a dither settles, then one capture. A stream
+/// frame's window starts no earlier than the capture applied its settings,
+/// so the dither links to that capture's frame (M-2 `next_frame_id`), and
+/// the frame's window holds neither the dither nor its settle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dither_links_to_the_next_stream_capture() {
+    let phd2 = Phd2Mock::start().await;
+    let daemon = Daemon::start(scenario_configs(40.0, -75.0, 100.0)).await;
+    let dataset = daemon.scratch.path.join("monosim");
+    write_mono16_sim_dataset(&dataset, 4);
+    daemon
+        .connect("guider", "phd2", &format!("127.0.0.1:{}", phd2.port()))
+        .await;
+    daemon
+        .post_ok(
+            "/connect",
+            json!({
+                "equipment_type": "camera",
+                "driver": "sim",
+                "option": dataset.to_string_lossy(),
+            }),
+        )
+        .await;
+    daemon.post_ok("/camera/stream/start", json!({})).await;
+    let mark = daemon.mark();
+    daemon.post_ok("/guider/start", json!({})).await;
+    daemon.wait_event("settle_done", mark).await;
+    daemon.wait_idle().await;
+    let mark = daemon.mark();
+    let dither = daemon.post_ok("/guider/dither", json!({})).await;
+    daemon.wait_event("settle_done", mark).await;
+    daemon.wait_idle().await;
+    let first = daemon
+        .post_ok("/camera/capture", json!({"exposure": 1.0}))
+        .await;
+    let second = daemon
+        .post_ok("/camera/capture", json!({"exposure": 1.0}))
+        .await;
+    daemon.flush().await;
+    let pool = daemon.state.local_store.pool();
+    let (next_frame_id,): (Option<String>,) =
+        sqlx::query_as("SELECT next_frame_id FROM dither_events WHERE command_id = ?")
+            .bind(dither["command_id"].as_str().unwrap())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        next_frame_id.as_deref(),
+        first["id"].as_str(),
+        "first {} second {}",
+        first["id"],
+        second["id"]
+    );
+    let (dither_in, settle_in): (Option<i64>, Option<i64>) = sqlx::query_as(
+        "SELECT dither_in_window, settle_in_window FROM exposure_device_windows \
+         WHERE frame_id = ?",
+    )
+    .bind(first["id"].as_str().unwrap())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_ne!(dither_in, Some(1), "the dither preceded the exposure");
+    assert_ne!(settle_in, Some(1), "the settle preceded the exposure");
+    let _ = daemon.post("/camera/stream/stop", json!({})).await;
+    let _ = daemon
+        .post("/disconnect", json!({"equipment_type": "camera"}))
+        .await;
+    daemon.close().await;
+    drop(phd2);
+}
+
+#[cfg(unix)]
+impl Daemon {
+    /// [`Daemon::start`] with a fake ASTAP that always solves, and the
+    /// automatic solve rules armed and attached as `main.rs` attaches them.
+    async fn start_with_auto_solve(configs: EquipmentConfigs) -> Self {
+        use crate::config::PlateSolveConfig;
+        use crate::processing::astap::test_support::{fake_astap, SOLVED_INI};
+        use crate::processing::astap::AstapSolver;
+        use crate::processing::plate_solver::PlateSolver;
+        let mut daemon = Self::start(configs).await;
+        let dir = daemon.scratch.path.clone();
+        let solver = PlateSolver::with_backend_for_test(
+            AstapSolver::new(
+                fake_astap(&dir, Some(SOLVED_INI), 0, 0.0),
+                &PlateSolveConfig::default(),
+            ),
+            dir.join("work"),
+        );
+        daemon.state = daemon
+            .state
+            .clone()
+            .with_plate_solver(solver)
+            .with_auto_solve(&PlateSolveConfig::default());
+        crate::mount::auto_solve::attach(&daemon.state);
+        // The router serves the state it was built with: serve the new one.
+        daemon.server.abort();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        daemon.base = format!("http://{}", listener.local_addr().unwrap());
+        let app = daemon_router(daemon.state.clone());
+        daemon.server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        daemon
+    }
+}
+
+/// H11 and H12 with stream frames across a slew. A stream frame's
+/// timestamp is its arrival, after its exposure; the rules read its H1
+/// window instead. So the post-slew rule never solves a frame whose exposure
+/// began before the slew settled, and every pointing sample's mid-exposure
+/// lies inside its frame's window.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_post_slew_rule_never_solves_a_stream_frame_exposed_during_the_slew() {
+    let daemon = Daemon::start_with_auto_solve(scenario_configs(40.0, -75.0, 100.0)).await;
+    let dataset = daemon.scratch.path.join("monosim");
+    write_mono16_sim_dataset(&dataset, 4);
+    daemon.connect("mount", "sim", "").await;
+    let status = daemon
+        .wait_status("a polled sim mount", |v| v["mount"]["ra"].is_number())
+        .await;
+    if status["mount"]["parked"] == true {
+        let mark = daemon.mark();
+        daemon.post_ok("/mount/unpark", json!({})).await;
+        daemon.wait_event("unparked", mark).await;
+        daemon.wait_idle().await;
+    }
+    daemon
+        .post_ok("/mount/tracking", json!({"enabled": true}))
+        .await;
+    daemon.wait_idle().await;
+    daemon
+        .post_ok(
+            "/connect",
+            json!({
+                "equipment_type": "camera",
+                "driver": "sim",
+                "option": dataset.to_string_lossy(),
+            }),
+        )
+        .await;
+    daemon.post_ok("/camera/stream/start", json!({})).await;
+    // The startup rule takes the first light frame.
+    daemon
+        .post_ok("/camera/capture", json!({"exposure": 1.0}))
+        .await;
+    let (ra, dec) = target_from(&daemon.status().await, -0.4, 45.0);
+    let slew_mark = daemon.mark();
+    let sequence = async {
+        for _ in 0..4 {
+            daemon
+                .post_ok("/camera/capture", json!({"exposure": 2.0}))
+                .await;
+        }
+    };
+    let slew = async {
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        daemon
+            .post_ok(
+                "/mount/slew",
+                json!({"ra": ra, "dec": dec, "frame": "j2000"}),
+            )
+            .await;
+    };
+    tokio::join!(sequence, slew);
+    let settled = daemon.wait_event("slew_settled", slew_mark).await;
+    let settled_at = DateTime::parse_from_rfc3339(settled["at_utc"].as_str().unwrap())
+        .unwrap()
+        .with_timezone(&Utc);
+    let deadline = Instant::now() + WAIT;
+    while daemon
+        .count("SELECT COUNT(*) FROM plate_solve_events WHERE trigger = 'post_slew'")
+        .await
+        == 0
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the post-slew rule solved nothing"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    daemon.flush().await;
+    let pool = daemon.state.local_store.pool();
+    let parse = |text: &str| {
+        DateTime::parse_from_rfc3339(text)
+            .unwrap()
+            .with_timezone(&Utc)
+    };
+    let solved: Vec<(String, String)> = sqlx::query_as(
+        "SELECT e.frame_id, w.exposure_started_at FROM plate_solve_events e \
+         JOIN exposure_device_windows w ON w.frame_id = e.frame_id \
+         WHERE e.trigger = 'post_slew'",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(!solved.is_empty());
+    for (frame_id, started) in &solved {
+        assert!(
+            parse(started) >= settled_at,
+            "post-slew solve of {frame_id}, exposed from {started}, before the settle at \
+             {settled_at}"
+        );
+    }
+    let samples: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT p.frame_id, p.mid_exposure_utc, w.exposure_started_at, \
+         w.exposure_completed_at FROM pointing_samples p \
+         JOIN exposure_device_windows w ON w.frame_id = p.frame_id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(!samples.is_empty(), "the solves wrote pointing samples");
+    for (frame_id, mid, start, end) in &samples {
+        let (mid, start, end) = (parse(mid), parse(start), parse(end));
+        assert!(
+            start <= mid && mid <= end,
+            "{frame_id}: mid {mid} outside {start}..{end}"
+        );
+    }
+    let _ = daemon.post("/camera/stream/stop", json!({})).await;
+    let _ = daemon
+        .post("/disconnect", json!({"equipment_type": "camera"}))
+        .await;
+    daemon.close().await;
 }
 
 /// PHD2's guide steps during the hooked exposure (mount-axis errors RA, Dec

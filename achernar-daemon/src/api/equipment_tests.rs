@@ -1180,6 +1180,53 @@ async fn a_safety_park_the_mount_refuses_reports_park_failed_once() {
     cleanup(directory, state).await;
 }
 
+/// §3.10 step 3: the on-unsafe policy reaches the camera through the hub's
+/// camera hook. The OLS hook cannot interrupt an integrating exposure, so
+/// the abort is attempted, audited and recorded as unsupported, and the
+/// camera is not counted as secured; it is never skipped for want of a hook.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_unsafe_policy_tries_to_abort_an_exposure_through_the_camera_hook() {
+    use crate::equipment::safety::monitor_hub::PolicyTrigger;
+    use crate::equipment::safety::policy::{PolicyAction, PolicyTargetSource, StepStatus};
+    use crate::equipment::snapshot::SafetyLevel;
+    let (directory, state) = state().await;
+    // An OLS camera integrating an exposure, as the capture path leaves it.
+    state
+        .devices
+        .write()
+        .unwrap()
+        .connected(DeviceKind::Camera, "camera-1".into(), None);
+    {
+        let mut runtime = state.camera_runtime.write().unwrap();
+        runtime.connection_id = Some("camera-1".into());
+        runtime.activity = crate::state::CameraActivity::Exposing;
+    }
+    let supervisor = state.equipment_ctx.ensure_safety(&state.equipment);
+    let targets = state.equipment_ctx.targets().targets();
+    assert!(
+        targets.camera.is_some(),
+        "the policy holds the hub's camera hook"
+    );
+    let trigger = PolicyTrigger::ConfirmedUnsafe {
+        connection_id: uuid::Uuid::new_v4(),
+        name: "roof sensor".into(),
+        level: SafetyLevel::Unsafe,
+        detail: Some("rain".into()),
+    };
+    let run = supervisor.policy().run(&trigger, &targets).await;
+    let abort = run
+        .step(PolicyAction::AbortExposure)
+        .expect("an exposure-abort step");
+    assert!(
+        matches!(&abort.status, StepStatus::Failed { error } if error.class
+            == crate::equipment::types::ErrorClass::Unsupported),
+        "{:?}",
+        abort.status
+    );
+    assert!(abort.command_id.is_some(), "the attempt was audited");
+    cleanup(directory, state).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn disconnect_all_refused_by_a_slewing_mount_leaves_every_device_connected() {
     use crate::equipment::sim::mount::SimFaults;
