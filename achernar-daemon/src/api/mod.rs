@@ -405,6 +405,8 @@ pub(crate) async fn disconnect_camera(state: &AppState) -> Result<(), ApiError> 
     *state.streaming.lock().unwrap() = false;
     state.clear_camera_observations();
     *state.camera_runtime.write().unwrap() = crate::state::CameraRuntimeState::default();
+    // No camera, no sensor reading for the hub's H6 fallback.
+    camera::publish_sensor_temperature(state, None);
     state
         .devices
         .write()

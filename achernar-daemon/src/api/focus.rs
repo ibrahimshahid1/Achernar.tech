@@ -178,8 +178,21 @@ async fn start_focus_run_owned(
     let _acquisition = state.acquisition.lock().await;
     state.focus_abort_requested.store(false, Ordering::SeqCst);
 
-    validate_simulation_focus_run(&state).map_err(focus_api_error)?;
-    ensure_streaming(&state).await.map_err(focus_api_error)?;
+    // Both read the OLS camera (blocking FFI under the camera mutex): off
+    // the async threads (D3).
+    let camera_state = state.clone();
+    tokio::task::spawn_blocking(move || {
+        validate_simulation_focus_run(&camera_state)?;
+        ensure_streaming(&camera_state)
+    })
+    .await
+    .map_err(|error| {
+        focus_api_error(
+            HardwareError::Communication(format!("the camera check did not finish: {error}"))
+                .into(),
+        )
+    })?
+    .map_err(focus_api_error)?;
     let camera: Arc<dyn FocusCamera> = Arc::new(OlsFocusCamera {
         state: state.clone(),
     });
@@ -257,7 +270,9 @@ fn response_from_run(run: &FocusRunContext) -> FocusRunResponse {
 
 /// What one autofocus run needs from the camera stream. The daemon's
 /// implementation reads the vision loop's output ([`OlsFocusCamera`]); tests
-/// drive a run with a scripted stream.
+/// drive a run with a scripted stream. `stream` and `sensor_temperature` may
+/// block (the OLS camera is FFI): the run calls them on a blocking thread
+/// ([`stream_info`], [`sensor_temperature`]).
 pub(crate) trait FocusCamera: Send + Sync {
     /// The newest frame the vision loop has observed.
     fn latest(&self) -> Option<ObservedFrame>;
@@ -343,6 +358,28 @@ impl FocusCamera for OlsFocusCamera {
     fn sensor_temperature(&self) -> (Option<f64>, TemperatureState, Option<String>) {
         crate::api::camera::read_temperature(&self.state)
     }
+}
+
+/// The stream's timing and identity, read on a blocking thread: the OLS
+/// camera calls behind it are blocking FFI under the camera mutex, which
+/// must not run on an async thread (D3).
+async fn stream_info(camera: &Arc<dyn FocusCamera>) -> crate::error::Result<StreamInfo> {
+    let camera = Arc::clone(camera);
+    tokio::task::spawn_blocking(move || camera.stream())
+        .await
+        .map_err(|error| {
+            HardwareError::Communication(format!("the camera read did not finish: {error}"))
+        })?
+}
+
+/// The camera-reported sensor temperature, read on a blocking thread (D3).
+async fn sensor_temperature(
+    camera: &Arc<dyn FocusCamera>,
+) -> (Option<f64>, TemperatureState, Option<String>) {
+    let camera = Arc::clone(camera);
+    tokio::task::spawn_blocking(move || camera.sensor_temperature())
+        .await
+        .unwrap_or((None, TemperatureState::Missing, None))
 }
 
 // ---------------------------------------------------------------------------
@@ -829,7 +866,7 @@ async fn run_autofocus_session(
     let focuser = crate::api::equipment::focuser_handle(state)
         .map_err(|_| focus_api_error(FocusError::NoFocuser.into()))?;
     let start_position = current_focuser_position(&focuser).map_err(focus_api_error)?;
-    let stream = camera.stream().map_err(focus_api_error)?;
+    let stream = stream_info(&camera).await.map_err(focus_api_error)?;
     let simulation =
         stream.driver_id.as_deref() == Some("sim") || focuser.identity().driver == DriverId::Sim;
     let mut warnings = Vec::new();
@@ -1854,7 +1891,7 @@ async fn measure_at_position(
     ))
     .await;
     check_no_position_reset(ctx)?;
-    let stream = ctx.camera.stream()?;
+    let stream = stream_info(&ctx.camera).await?;
     let mut settle = settle_point(ctx);
 
     // Keep every frame at this position as its own sample with its own preserved
@@ -1949,7 +1986,7 @@ async fn record_sample(
 ) -> crate::error::Result<(FocusSample, CommittedCapture)> {
     let state = &ctx.state;
     let observation = &accepted.observed.observation;
-    let temperature = ctx.camera.sensor_temperature();
+    let temperature = sensor_temperature(&ctx.camera).await;
     let ambient = state.equipment.ambient_temperature();
     let now_mono_ns = state.equipment.clock().now_mono_ns();
     let sensor_measured = temperature
@@ -2208,7 +2245,7 @@ async fn verify_focus(
         Ok(archive) => archive,
         Err(err) => return failed(format!("no archive slot for the verification frame: {err}")),
     };
-    let stream = match ctx.camera.stream() {
+    let stream = match stream_info(&ctx.camera).await {
         Ok(stream) => stream,
         Err(err) => return failed(err.to_string()),
     };
@@ -2378,8 +2415,11 @@ struct DriftTemperature {
 
 /// H6: the hub's ambient selection (weather, then a focuser probe whose role
 /// is ambient or tube) when it has a fresh reading; otherwise the camera
-/// sensor, flagged `camera_sensor_fallback`.
-fn drift_temperature(state: &AppState) -> DriftTemperature {
+/// sensor, flagged `camera_sensor_fallback`. The hub's own camera-sensor
+/// fallback is fed only when something reads the camera, so it may be old:
+/// the fallback is read live here, on a blocking thread (D3), which also
+/// refreshes the hub's.
+async fn drift_temperature(state: &AppState) -> DriftTemperature {
     let ambient = state.equipment.ambient_temperature();
     let now = state.equipment.clock().now_mono_ns();
     if let Some(reading) = ambient
@@ -2394,7 +2434,8 @@ fn drift_temperature(state: &AppState) -> DriftTemperature {
             age_ms: ambient.age_ms(now),
         };
     }
-    let (celsius, temperature_state, source) = crate::api::camera::read_temperature(state);
+    let (celsius, temperature_state, source) =
+        crate::api::camera::read_temperature_blocking(state).await;
     DriftTemperature {
         camera_sensor_fallback: celsius.is_some(),
         celsius,
@@ -2449,7 +2490,7 @@ pub async fn get_drift_prediction(
     // is reported as missing rather than substituted, because a prediction
     // built on an invented temperature is indistinguishable from one built on
     // a real reading once it has been written down.
-    let reading = drift_temperature(&state);
+    let reading = drift_temperature(&state).await;
     let temperature_state = reading.state;
     let temperature_source = reading.source.clone();
 
@@ -2740,7 +2781,8 @@ fn is_focus_sensor_format(format: OlsStreamType) -> bool {
     matches!(format, OlsStreamType::Mono8 | OlsStreamType::Mono16)
 }
 
-async fn ensure_streaming(state: &AppState) -> crate::error::Result<()> {
+/// Blocking: OLS stream queries and start (call from a blocking thread).
+fn ensure_streaming(state: &AppState) -> crate::error::Result<()> {
     let mut camera = state.camera.lock().unwrap();
     let camera = camera.as_mut().ok_or_else(|| {
         HardwareError::DeviceNotFound("No camera connected for autofocus".to_string())
@@ -5024,7 +5066,7 @@ mod tests {
     async fn the_drift_forecast_prefers_an_ambient_reading_over_the_camera() {
         let fx = fixture(crate::hardware::focuser::SimFocuser::new(0), false).await;
         // No ambient source and no camera: nothing, and not a fallback.
-        let none = drift_temperature(&fx.state);
+        let none = drift_temperature(&fx.state).await;
         assert_eq!(none.celsius, None);
         assert!(!none.camera_sensor_fallback);
         // A weather device with a fresh temperature is the source.
@@ -5035,7 +5077,7 @@ mod tests {
             s.reading.temperature_c =
                 Observed::fresh_at(3.5, Source::Property, fx.state.equipment.clock().as_ref());
         });
-        let ambient = drift_temperature(&fx.state);
+        let ambient = drift_temperature(&fx.state).await;
         assert_eq!(ambient.celsius, Some(3.5));
         assert_eq!(ambient.source.as_deref(), Some("weather"));
         assert!(!ambient.camera_sensor_fallback);

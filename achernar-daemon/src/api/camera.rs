@@ -1684,32 +1684,71 @@ fn temperature_state_name(state: crate::storage::capture_store::TemperatureState
     }
 }
 
+/// A camera temperature reading: the value, how it was obtained, its source.
+pub(crate) type TemperatureRead = (
+    Option<f64>,
+    crate::storage::capture_store::TemperatureState,
+    Option<String>,
+);
+
 /// Read the sensor temperature along with how it was obtained.
 ///
 /// A DSLR exposes no sensor thermometer, so a capture from one records
 /// `missing` rather than a plausible-looking number. Recording an invented
 /// value is worse than recording none: a drift model cannot tell the two apart.
-pub(crate) fn read_temperature(
-    state: &AppState,
-) -> (
-    Option<f64>,
-    crate::storage::capture_store::TemperatureState,
-    Option<String>,
-) {
+///
+/// The reading also feeds the hub's flagged camera-sensor fallback (H6),
+/// which is never an ambient source. This is a blocking OLS call under the
+/// camera mutex: from async code use [`read_temperature_blocking`].
+pub(crate) fn read_temperature(state: &AppState) -> TemperatureRead {
     use crate::storage::capture_store::TemperatureState;
-    let cam_lock = state.camera.lock().unwrap();
-    match cam_lock
-        .as_ref()
-        .and_then(|c| c.get_parameter(OlsCamOptionId::Temperature).ok())
-        .map(|p| p.cur_val)
-    {
-        Some(v) if v.is_finite() => (
+    let celsius = {
+        let cam_lock = state.camera.lock().unwrap();
+        cam_lock
+            .as_ref()
+            .and_then(|c| c.get_parameter(OlsCamOptionId::Temperature).ok())
+            .map(|p| p.cur_val)
+            .filter(|v| v.is_finite())
+    };
+    publish_sensor_temperature(state, celsius);
+    match celsius {
+        Some(v) => (
             Some(v),
             TemperatureState::Measured,
             Some("camera_sensor".to_string()),
         ),
-        _ => (None, TemperatureState::Missing, None),
+        None => (None, TemperatureState::Missing, None),
     }
+}
+
+/// [`read_temperature`] on a blocking thread, for async callers (D3).
+pub(crate) async fn read_temperature_blocking(state: &AppState) -> TemperatureRead {
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || read_temperature(&state))
+        .await
+        .unwrap_or((
+            None,
+            crate::storage::capture_store::TemperatureState::Missing,
+            None,
+        ))
+}
+
+/// Hand a camera sensor reading (already read; nothing here calls the
+/// camera) to the hub's flagged H6 fallback. `None` clears it: a camera
+/// with no thermometer, or none connected.
+pub(crate) fn publish_sensor_temperature(state: &AppState, celsius: Option<f64>) {
+    use crate::equipment::types::{Observed, Source};
+    let hub = &state.equipment;
+    let observed = match celsius.filter(|v| v.is_finite()) {
+        Some(value) => Observed::fresh_at(value, Source::Property, hub.clock().as_ref()),
+        None => Observed::not_set(Source::Property),
+    };
+    let camera = state
+        .camera_runtime
+        .read()
+        .ok()
+        .and_then(|runtime| runtime.camera_name.clone());
+    hub.set_camera_sensor_temperature(observed, camera.filter(|_| celsius.is_some()));
 }
 
 fn disable_auto_exposure(camera: &OlsCamera, options: &[OlsCamOptionId]) -> Result<(), StatusCode> {
@@ -2275,15 +2314,20 @@ fn read_parameters(camera: &OlsCamera) -> Result<Vec<CamParamInfo>, ApiError> {
 }
 
 fn update_runtime_telemetry(state: &AppState, controls: &[CamParamInfo]) {
-    let mut runtime = state.camera_runtime.write().unwrap();
-    runtime.temperature_c = controls
-        .iter()
-        .find(|control| control.name == "temperature")
-        .map(|control| control.current);
-    runtime.cooler_on = controls
-        .iter()
-        .find(|control| control.name == "cooler_on")
-        .map(|control| control.current > 0.5);
+    let temperature = {
+        let mut runtime = state.camera_runtime.write().unwrap();
+        runtime.temperature_c = controls
+            .iter()
+            .find(|control| control.name == "temperature")
+            .map(|control| control.current);
+        runtime.cooler_on = controls
+            .iter()
+            .find(|control| control.name == "cooler_on")
+            .map(|control| control.current > 0.5);
+        runtime.temperature_c
+    };
+    // The reading just made also feeds the hub's flagged H6 fallback.
+    publish_sensor_temperature(state, temperature);
 }
 
 /// GET /camera/parameters — introspect every supported option with its
@@ -3098,6 +3142,36 @@ mod tests {
             None,
         );
         (directory, state)
+    }
+
+    /// H6: what the camera path reads from the sensor becomes the hub's
+    /// camera-sensor fallback, flagged as such; reading no camera clears it.
+    #[tokio::test]
+    async fn a_camera_temperature_reading_feeds_the_hubs_flagged_fallback() {
+        use crate::equipment::snapshot::TemperatureSourceKind;
+        use crate::equipment::traits::EquipmentReader;
+
+        let (directory, state) = equipment_test_state().await;
+        assert!(state.equipment.ambient_temperature().value.is_none());
+        state.camera_runtime.write().unwrap().camera_name = Some("ASI2600MM".into());
+        publish_sensor_temperature(&state, Some(-10.0));
+        let reading = state.equipment.ambient_temperature();
+        assert!(reading.is_fresh());
+        let value = reading.value.unwrap();
+        assert_eq!(value.celsius, -10.0);
+        assert_eq!(value.source, TemperatureSourceKind::CameraSensor);
+        assert!(value.camera_sensor_fallback, "never an ambient source");
+        assert_eq!(value.identity_key.as_deref(), Some("ASI2600MM"));
+        // No camera connected: the (blocking-thread) read finds nothing and
+        // clears the fallback instead of leaving an old value behind.
+        let read = read_temperature_blocking(&state).await;
+        assert_eq!(read.0, None);
+        assert!(state.equipment.ambient_temperature().value.is_none());
+
+        let pool = state.local_store.pool().clone();
+        drop(state);
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[tokio::test]

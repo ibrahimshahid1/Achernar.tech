@@ -791,6 +791,10 @@ struct CameraSensor {
     name: Option<String>,
 }
 
+/// Age past which the camera-sensor fallback (H6) is stale: the camera is
+/// read per capture and per drift query, not polled.
+const CAMERA_SENSOR_MAX_AGE_MS: u64 = 120_000;
+
 /// Shared hub state. The gate holds it as its [`GateContext`].
 pub struct HubCore {
     config: HubConfig,
@@ -1530,7 +1534,19 @@ impl HubCore {
         }
         if let Some(sensor) = read(&self.camera_sensor).clone() {
             let name = sensor.name.clone();
-            candidates.push(sensor.celsius.map(|celsius| TemperatureReading {
+            // The camera path feeds this when it reads the sensor (a capture,
+            // a parameter refresh, the drift fallback); a reading older than
+            // that cadence can promise is stale, never fresh.
+            let celsius = if sensor
+                .celsius
+                .age_ms(self.clock.now_mono_ns())
+                .is_some_and(|age| age > CAMERA_SENSOR_MAX_AGE_MS)
+            {
+                sensor.celsius.into_stale()
+            } else {
+                sensor.celsius
+            };
+            candidates.push(celsius.map(|celsius| TemperatureReading {
                 celsius,
                 source: TemperatureSourceKind::CameraSensor,
                 role: TemperatureRole::Unknown,
@@ -2539,6 +2555,18 @@ mod tests {
         let reading = hub.ambient_temperature().value.unwrap();
         assert_eq!(reading.source, TemperatureSourceKind::CameraSensor);
         assert!(reading.camera_sensor_fallback);
+        assert!(hub.ambient_temperature().is_fresh());
+        // The camera is read per capture, not polled: an old reading is still
+        // the flagged fallback, but stale, never fresh.
+        clock.advance_ms(CAMERA_SENSOR_MAX_AGE_MS + 1);
+        let old = hub.ambient_temperature();
+        assert_eq!(old.state, ObsState::Stale);
+        assert!(old.value.unwrap().camera_sensor_fallback);
+        hub.set_camera_sensor_temperature(
+            Observed::fresh_at(-5.0, Source::Property, clock.as_ref()),
+            Some("R50".into()),
+        );
+        assert!(hub.ambient_temperature().is_fresh());
         // A focuser probe of unknown role is skipped; a tube probe wins.
         let (focuser, focuser_fake) = fake_focuser(FocuserSnapshot::default());
         hub.attach(focuser.clone());
