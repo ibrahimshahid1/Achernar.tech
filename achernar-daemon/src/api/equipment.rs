@@ -950,13 +950,30 @@ pub struct ClearBlockBody {
     pub id: uuid::Uuid,
 }
 
-/// `POST equipment/resume-blocks/clear {id}`: the operator clear, audited;
-/// `safety_*` blocks clear only on a confirmed safe reading (409).
+/// `POST equipment/resume-blocks/clear {id}`: the operator clear, audited.
+/// For a `safety_*` block it is the operator's manual safety resume (§3.10,
+/// Tier 1): every safety block clears together, and only on a confirmed
+/// safe reading or with no monitor (409 otherwise, and while the on-unsafe
+/// policy still runs). The reply's `cleared` lists every block it cleared.
 pub fn clear_resume_block_value(
     state: &AppState,
     body: ClearBlockBody,
     relay: bool,
 ) -> Result<Value, ApiError> {
+    let safety_block = state
+        .equipment
+        .resume()
+        .active()
+        .into_iter()
+        .find(|b| b.id == body.id && !b.kind.operator_clears());
+    if let Some(block) = safety_block {
+        let cleared = state
+            .equipment
+            .gate()
+            .resume_safety(body.id, source(relay, false), |by| safety_resume(state, by))
+            .map_err(|err| submit_error(DeviceKind::Camera, &SubmitError::Gate(err)))?;
+        return Ok(json!({ "status": "cleared", "block": block, "cleared": cleared }));
+    }
     let block = state
         .equipment
         .gate()
@@ -970,6 +987,26 @@ pub fn clear_resume_block_value(
             api
         })?;
     Ok(json!({ "status": "cleared", "block": block }))
+}
+
+/// The manual safety resume: the safety supervisor's own rule when one
+/// runs; without one (no monitor ever connected) the hub's safety clear
+/// under the same rule.
+fn safety_resume(
+    state: &AppState,
+    by: &CommandSource,
+) -> Result<Vec<crate::equipment::snapshot::ResumeBlock>, String> {
+    if let Some(supervisor) = state.equipment_ctx.safety_supervisor() {
+        return supervisor.request_resume(by);
+    }
+    let summary = super::safety::summary(state);
+    if !crate::equipment::safety::safety_block_clear_allowed(
+        &crate::equipment::snapshot::ResumeBlockKind::SafetyUnsafe,
+        &summary,
+    ) {
+        return Err("safety resume blocks clear only on a confirmed safe reading".into());
+    }
+    Ok(state.equipment.clear_safety_blocks(by))
 }
 
 pub async fn clear_resume_block(

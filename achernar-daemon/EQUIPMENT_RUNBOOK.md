@@ -72,9 +72,11 @@ never sets AtPark fails; and every v6 ground-truth table the session feeds
 gets rows (`device_connections`, `equipment_events`, `control_audit_logs`,
 `focuser_moves`, `filter_switch_events`, `guide_steps`, `dither_events`,
 `exposure_device_windows`, `guider_state_log`, `pointing_samples`,
-`environment_log`, `device_profiles`), with the policy's stop guiding, abort
-slew and park audited under the safety source in that order, and the
-exposure window's guide RMS matching a reference computed from PHD2's steps.
+`environment_log`, `device_profiles`, `telemetry_log`), with the policy's
+stop guiding, abort slew and park audited under the safety source in that
+order, the operator's safety resume (S5) refused while unsafe and accepted
+once safe, both audited, and the exposure window's guide RMS matching a
+reference computed from PHD2's steps.
 The camera stays on OLS; for the exposure-window tables the capture path's
 own hooks stand in for a camera, because no CI fixture drives an OLS capture.
 
@@ -93,9 +95,8 @@ Two sibling tests use the same daemon and the same ESP32-like mount over HTTP:
   answering makes it `lost` within `lost_after_s`, and `/mount/abort` still
   runs its path on the lost handle (checks M10 and M11 in simulation).
 
-Two known gaps (§10 items 1 and 2) are asserted as they are today, so the
-fix of each fails the scenario at that step and its message says what to
-require instead.
+The two gaps §10 lists as closed (items 1 and 2) are asserted there in
+their fixed form, so a regression fails the scenario at that step.
 
 `native_alpaca_drivers_conform_against_the_served_simulators` holds the native
 Alpaca telescope and focuser drivers to the WP1A-2 conformance suites over the
@@ -303,7 +304,7 @@ reads it today) and under `focuser` (the layout `profile.rs` documents); see
 | S2 | Safe | §3.10 | Connect the monitor | `state: safe` while the device reads safe |
 | S3 | One bad poll never parks | §2.8, §9.3 | Interrupt the monitor's link briefly | `state` goes `unknown` (automatic actions refused), the policy does not run, nothing parks |
 | S4 | Confirmed unsafe | §3.10, O11 h | Make the monitor read unsafe (its test input, or cover the rain sensor) with the mount slewing and PHD2 guiding | In order: `safety_unsafe` resume block, PHD2 stopped, exposure aborted (if `abort_exposure_on_unsafe`), slew aborted, mount parked (or tracking off per `[safety] on_unsafe`); each action audited under the safety source; the mount physically at park |
-| S5 | Manual resume | §3.10 | Make the monitor safe again; clear the `safety_unsafe` block with `POST $D/equipment/resume-blocks/clear {"id":...}` | Refused (409) while unsafe; allowed once safety reads safe. **Cannot pass yet**: today the route refuses a safety block even when safe (§10 item 1); record S5 as failed until that is fixed |
+| S5 | Manual resume | §3.10 | Make the monitor safe again; clear the `safety_unsafe` block with `POST $D/equipment/resume-blocks/clear {"id":...}` | Refused (409 `refused`) while unsafe and while the on-unsafe policy still runs; once safety reads safe, the reply has `status: cleared` and lists every safety block it cleared under `cleared`, and `GET $D/equipment/resume-blocks` shows none. Both requests have `control_audit_logs` rows (`action = 'clear_resume_block'`) |
 
 ### 3.6 Camera hooks (OLS cameras; H1, H17, H22)
 
@@ -555,21 +556,20 @@ off for the same reason.
 ## 10. Known gaps found by the interop work
 
 These were found while building and reviewing the interop tests. Each is
-filed as a change note with its owner. The CI scenario asserts items 1 and 2
-as they are today, so the fix of each fails the scenario at that step with a
-message saying what to require instead; the others are noted where they
-matter (§3.2, §4).
+filed as a change note with its owner. Items 1 and 2 were fixed when wave B
+was integrated, and the CI scenario now asserts their fixed behaviour; the
+others are still open and are noted where they matter (§3.2, §4).
 
-1. **Safety resume route.** `POST equipment/resume-blocks/clear` refuses every
-   `safety_unsafe` and `safety_unknown` block, even once safety reads safe: it
-   calls the generic block clear, and nothing calls
-   `SafetySupervisor::request_resume`. Until the route reaches it, a safety
-   block lasts until the daemon restarts (blocks are not persisted), and
-   automatic captures stay refused with 423 meanwhile; check S5 cannot pass.
-2. **`telemetry_log` (H19).** Nothing in production records the 1 Hz
-   per-device telemetry series yet, so `telemetry_log` stays empty. TME and
-   AstroM3Edge (v6 Model 9) and replay need it: until it is written, that v6
-   data path has no ground truth from a session.
+1. **Safety resume route (fixed).** `POST equipment/resume-blocks/clear` on a
+   `safety_unsafe` or `safety_unknown` block is the operator's manual safety
+   resume: it goes through `SafetySupervisor::request_resume`, audited by the
+   gate, clears every safety block together once safety reads safe (or no
+   monitor is configured), and answers 409 otherwise. Check S5 can pass.
+2. **`telemetry_log` (H19, fixed).** The hub offers each connected device's
+   latest snapshot to the recorder on every refresh, and the recorder keeps
+   one row per kind per `[equipment] telemetry_log_hz` period (default 1 Hz;
+   0 turns the series off). TME and AstroM3Edge (v6 Model 9) and replay read
+   it.
 3. **Qualification records are not published.** No code reads
    `profile.qualification` records into `DeviceIdentity.qualification`
    (§4 step 5).

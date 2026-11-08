@@ -1014,6 +1014,95 @@ async fn a_refused_or_unreachable_replacement_leaves_the_connected_mount_connect
     drop(server);
 }
 
+/// Runbook S5 (§3.10, Tier 1): the clear of a `safety_*` block is the
+/// operator's manual safety resume. It is refused while safety is not
+/// confirmed safe, and clears every safety block once it is, over the
+/// direct route and the relay alike. (The interop scenario checks its audit
+/// rows.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_operator_resumes_safety_blocks_only_once_safety_reads_safe() {
+    use crate::equipment::resume::BlockRequest;
+    use crate::equipment::snapshot::{ResumeBlockKind, SafetyLevel};
+    let (directory, state) = state().await;
+    // No monitor (safety `none`): a leftover safety block is the operator's.
+    let leftover = state.equipment.raise_block(BlockRequest::new(
+        ResumeBlockKind::SafetyUnknown,
+        "left behind",
+    ));
+    let cleared =
+        eq::clear_resume_block_value(&state, eq::ClearBlockBody { id: leftover.id }, false)
+            .unwrap();
+    assert_eq!(cleared["status"], "cleared", "{cleared}");
+    assert_eq!(cleared["cleared"][0]["id"], json!(leftover.id), "{cleared}");
+    assert_eq!(eq::resume_blocks_value(&state)["blocks"], json!([]));
+
+    connect(&state, "safety_monitor", "sim", "").await;
+    let control = state
+        .equipment_ctx
+        .sims()
+        .safety
+        .expect("the sim's control");
+    control.set_level(SafetyLevel::Unsafe);
+    let value = wait_status(&state, "a safety_unsafe block", |v| {
+        v["resume_blocks"]
+            .as_array()
+            .is_some_and(|b| b.iter().any(|b| b["kind"]["kind"] == "safety_unsafe"))
+    })
+    .await;
+    let block = value["resume_blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["kind"]["kind"] == "safety_unsafe")
+        .unwrap()
+        .clone();
+    let id: uuid::Uuid = serde_json::from_value(block["id"].clone()).unwrap();
+    let err = eq::clear_resume_block_value(&state, eq::ClearBlockBody { id }, false).unwrap_err();
+    assert_eq!(
+        (err.status.as_u16(), err.code),
+        (409, "refused"),
+        "{}",
+        err.message
+    );
+    assert!(err.message.contains("confirmed safe"), "{}", err.message);
+
+    control.set_level(SafetyLevel::Safe);
+    let supervisor = state.equipment_ctx.safety_supervisor().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while super::safety::summary(&state).state != crate::equipment::snapshot::SafetyGate::Safe
+        || supervisor.policy_running()
+    {
+        assert!(Instant::now() < deadline, "safety never read safe again");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Over the relay: the same rule and the same reply.
+    let cleared = eq::clear_resume_block_value(&state, eq::ClearBlockBody { id }, true).unwrap();
+    assert_eq!(cleared["status"], "cleared", "{cleared}");
+    assert_eq!(cleared["block"]["id"], json!(id), "{cleared}");
+    assert!(
+        cleared["cleared"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["id"] == json!(id)),
+        "{cleared}"
+    );
+    assert!(
+        !state
+            .equipment
+            .resume()
+            .active()
+            .iter()
+            .any(|b| !b.kind.operator_clears()),
+        "every safety block cleared"
+    );
+    let events = state
+        .equipment
+        .events_since(0, &["resume_cleared".to_string()], 500);
+    assert!(events.len() >= 2, "{events:?}");
+    cleanup(directory, state).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_safety_park_the_mount_refuses_reports_park_failed_once() {
     use crate::equipment::safety::monitor_hub::PolicyTrigger;

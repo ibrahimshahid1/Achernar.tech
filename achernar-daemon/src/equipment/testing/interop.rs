@@ -5,8 +5,8 @@
 //!
 //! - The scenario
 //!   ([`the_tier1_rig_runs_end_to_end_through_the_daemon_routes`]) is one
-//!   observing session through the daemon's real HTTP routes (the `main.rs`
-//!   route builders, served on `127.0.0.1:0`), against the WP1A-4 kinematic
+//!   observing session through the daemon's real HTTP routes (`main.rs`'s
+//!   `api_router`, served on `127.0.0.1:0`), against the WP1A-4 kinematic
 //!   mount in its ESP32-like profile and the WP1A-5 Platform 6 focuser
 //!   (temperature probe, absolute, firmware-owned backlash), both behind real
 //!   Alpaca HTTP through the `testing/alpaca_server.rs` adapter (O11 l); the
@@ -33,11 +33,11 @@
 //!   the native Alpaca telescope and focuser drivers to the WP1A-2
 //!   conformance suites, over HTTP to the same simulators.
 //!
-//! Two known gaps (`EQUIPMENT_RUNBOOK.md` §10 items 1 and 2, change notes
-//! filed with their owners) are asserted as they are today, so the fix of
-//! each fails the scenario at that step and says what to require instead:
-//! the resume-blocks route cannot clear a safety block, and nothing writes
-//! `telemetry_log` (H19).
+//! It also holds the two gaps the interop work found and wave B closed
+//! (`EQUIPMENT_RUNBOOK.md` §10): the operator's safety resume through
+//! `equipment/resume-blocks/clear` once safety reads safe, audited (runbook
+//! S5), and the 1 Hz `telemetry_log` series of the mount and the focuser
+//! (H19).
 //!
 //! **Local only** (`#[ignore]`, named `interop_*`; run with
 //! `cargo test --locked -- --ignored interop`). Each starts its external
@@ -126,31 +126,11 @@ use crate::storage::{
 /// scenario holds on a slow Windows CI runner.
 const WAIT: Duration = Duration::from_secs(30);
 
-/// The daemon's `/api/v1` router, built from the same handlers and the same
-/// `main.rs` route builders the binary serves. The COC routes are left out
-/// (they belong to the user's COC work and take no equipment).
+/// The daemon's `/api/v1` router: `main.rs`'s own [`crate::api_router`], the
+/// exact routes the binary serves.
 fn daemon_router(state: AppState) -> axum::Router {
-    use crate::api;
-    use axum::routing::{get, post};
-    let api_v1 = axum::Router::new()
-        .route("/status", get(api::get_status))
-        .route("/drivers", get(api::get_driver_capabilities))
-        .route("/commands", get(api::get_commands))
-        .route("/discover", post(api::discover_devices))
-        .route("/connect", post(api::connect_equipment))
-        .route("/disconnect", post(api::disconnect_equipment))
-        .nest("/camera", crate::camera_routes())
-        .nest("/mount", crate::mount_routes())
-        .nest("/focuser", crate::focuser_routes())
-        .nest("/filter-wheel", crate::filter_wheel_routes())
-        .nest("/guider", crate::guider_routes())
-        .route("/weather", get(api::weather::status))
-        .route("/safety", get(api::safety::status))
-        .nest("/equipment", crate::equipment_routes())
-        .nest("/focus", crate::focus_routes())
-        .nest("/platesolve", crate::platesolve_routes());
     axum::Router::new()
-        .nest("/api/v1", api_v1)
+        .nest("/api/v1", crate::api_router())
         .with_state(state)
 }
 
@@ -1042,28 +1022,25 @@ async fn the_tier1_rig_runs_end_to_end_through_the_daemon_routes() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     // The operator's manual resume (Tier 1, runbook S5) once safety reads
-    // safe. Known gap (runbook §10 item 1, change note filed with WP1B-1):
-    // the route calls the generic clear, which refuses every safety block,
-    // and nothing in production calls `SafetySupervisor::request_resume`.
-    // The refusal is asserted as it is today, so the route's fix fails this
-    // step; then delete the supervisor fallback and require a 2xx here.
-    let (code, reply) = daemon
-        .post(
+    // safe and the policy has finished: the same route clears every safety
+    // block through the safety supervisor, audited by the gate.
+    while supervisor.policy_running() {
+        assert!(Instant::now() < deadline, "the policy never finished");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let cleared = daemon
+        .post_ok(
             "/equipment/resume-blocks/clear",
             json!({"id": unsafe_block}),
         )
         .await;
-    assert_eq!(
-        (code, reply["error"]["code"].as_str()),
-        (409, Some("refused")),
-        "resume-blocks/clear answered a safety block while safe with {code} {reply}: \
-         if the route now resumes, remove the request_resume fallback below and \
-         assert a 2xx (runbook S5)"
+    assert_eq!(cleared["status"], "cleared", "{cleared}");
+    assert!(
+        cleared["cleared"]
+            .as_array()
+            .is_some_and(|b| b.iter().any(|b| b["id"] == unsafe_block.as_str())),
+        "{cleared}"
     );
-    let cleared = supervisor
-        .request_resume(&CommandSource::Operator { overriding: false })
-        .expect("the operator resumes once safety reads safe");
-    assert!(!cleared.is_empty());
     let blocks = daemon.get("/equipment/resume-blocks").await;
     assert!(
         !blocks["blocks"]
@@ -1316,6 +1293,22 @@ async fn the_tier1_rig_runs_end_to_end_through_the_daemon_routes() {
             );
         }
     }
+    // Runbook S5: the operator's safety resume is audited, the refusal while
+    // unsafe and the clear once safe.
+    let resume_rows: Vec<(Option<String>, bool)> = sqlx::query_as(
+        "SELECT stage, accepted FROM control_audit_logs \
+         WHERE actor = 'operator' AND action = 'clear_resume_block' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert!(
+        resume_rows.iter().any(|(_, accepted)| !accepted)
+            && resume_rows
+                .iter()
+                .any(|(stage, accepted)| *accepted && stage.as_deref() == Some("outcome")),
+        "{resume_rows:?}"
+    );
     // F-a: the move with its read-back.
     assert!(
         daemon
@@ -1418,17 +1411,20 @@ async fn the_tier1_rig_runs_end_to_end_through_the_daemon_routes() {
             .await
             >= 1
     );
-    // Known gap (runbook §10 item 2, change note filed): nothing in
-    // production records the 1 Hz `telemetry_log` series (H19), which the
-    // v6 TME/AstroM3Edge data path (Model 9) reads. Asserted empty as it is
-    // today, so the writer's arrival fails here; then require rows for the
-    // mount and the focuser instead.
-    assert_eq!(
-        rows("telemetry_log").await,
-        0,
-        "telemetry_log has rows now: replace this with an assertion that the mount \
-         and the focuser have rows (H19)"
-    );
+    // H19: the downsampled per-device series the v6 TME/AstroM3Edge data
+    // path (Model 9) and replay read, from the hub's published snapshots.
+    for source in ["mount", "focuser"] {
+        assert!(
+            daemon
+                .count(&format!(
+                    "SELECT COUNT(*) FROM telemetry_log WHERE source = '{source}' \
+                     AND event_type = 'snapshot' AND json_valid(payload)"
+                ))
+                .await
+                >= 1,
+            "no {source} rows in telemetry_log (H19)"
+        );
+    }
     assert_eq!(
         daemon
             .count(&format!(

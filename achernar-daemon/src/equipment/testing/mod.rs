@@ -9,7 +9,14 @@
 //! - `IdentityConverter` and `NullRecorder` live in `traits`, because an
 //!   inert hub uses them outside tests too.
 //!
-//! The other files are placeholders owned by later packages (§2.2).
+//! The other modules belong to later packages (§2.2):
+//!
+//! - [`alpaca_server`]: an in-process Alpaca HTTP server with scripted
+//!   devices, and the adapter that serves the simulator drivers (O11 l).
+//! - [`conformance`]: the generic per-trait conformance suites.
+//! - [`phd2_mock`]: a scripted PHD2 event server.
+//! - [`interop`]: the Tier 1 interop and acceptance tests, CI-runnable and
+//!   local-only (§5.7, O9).
 
 pub mod fake_handles;
 pub mod fake_transport;

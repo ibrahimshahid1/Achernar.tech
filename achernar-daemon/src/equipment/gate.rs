@@ -1242,6 +1242,35 @@ impl CommandGate {
             )),
         }
     }
+
+    /// The operator's manual safety resume (§3.10, Tier 1) asked for through
+    /// the clear of a `safety_*` block `id`, audited with the same stages as
+    /// [`CommandGate::clear_resume_block`]. `resume` is the safety layer's
+    /// own clear (`SafetySupervisor::request_resume`): it clears every
+    /// safety block, and only on a confirmed safe reading or with no monitor,
+    /// so its refusal reason becomes a 409 here.
+    pub fn resume_safety(
+        &self,
+        id: Uuid,
+        source: CommandSource,
+        resume: impl FnOnce(&CommandSource) -> Result<Vec<ResumeBlock>, String>,
+    ) -> Result<Vec<ResumeBlock>, GateError> {
+        let cmd = GatedCommand::new(
+            GatedOp::ClearResumeBlock { id },
+            source.clone(),
+            AutonomyMode::Manual,
+            Priority::Exposure,
+        );
+        self.audit(&cmd, AuditStage::Proposed, true, None, Vec::new(), None);
+        match resume(&source) {
+            Ok(cleared) => {
+                self.audit(&cmd, AuditStage::Validated, true, None, Vec::new(), None);
+                self.record_outcome(&cmd, &OpOutcome::Succeeded);
+                Ok(cleared)
+            }
+            Err(reason) => Err(self.reject(&cmd, GateError::Refused { reason })),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

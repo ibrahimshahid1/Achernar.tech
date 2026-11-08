@@ -479,6 +479,19 @@ impl AnyHandle {
         (published > 0).then(|| now_mono_ns.saturating_sub(published) / 1_000_000)
     }
 
+    /// The latest snapshot as an H19 `telemetry_log` sample, at its own
+    /// publication time; `None` before the first publication. The recorder
+    /// keeps one sample per kind per `telemetry_log_hz` period.
+    fn telemetry_sample(&self) -> Option<super::events::TelemetrySample> {
+        dispatch!(self, h => {
+            let snapshot = h.snapshot();
+            if snapshot.at_mono_ns() == 0 {
+                return None;
+            }
+            super::recorder::telemetry_sample(h.kind(), snapshot.at_utc(), &*snapshot)
+        })
+    }
+
     fn push_into(&self, rings: &Rings) {
         match self {
             AnyHandle::Mount(h) => push_latest(&rings.mount, h),
@@ -1045,6 +1058,10 @@ impl HubCore {
             if handle.is_retired() {
                 self.detach(handle.kind(), handle.connection_id());
                 continue;
+            }
+            // H19: the downsampled per-device series (TME/AstroM3Edge, replay).
+            if let Some(sample) = handle.telemetry_sample() {
+                self.recorder.record(GroundTruthRecord::Telemetry(sample));
             }
             // A lost mount or guider blocks automatic resumption even when no
             // `device_lost` event reached the bus (once per connection).
@@ -3165,5 +3182,38 @@ mod tests {
             "retired handles are detached"
         );
         assert!(!registry.read().unwrap().0[&DeviceKind::Focuser].connected);
+    }
+
+    /// H19: each refresh offers every attached device's latest published
+    /// snapshot to the recorder as a `telemetry_log` sample, stamped with
+    /// the snapshot's own publication time (the recorder downsamples); a
+    /// device that never published offers nothing.
+    #[test]
+    fn refresh_offers_each_published_snapshot_as_telemetry() {
+        let (hub, clock, sink) = hub_with_clock();
+        let telemetry = || -> Vec<crate::equipment::events::TelemetrySample> {
+            sink.records()
+                .into_iter()
+                .filter_map(|record| match record {
+                    GroundTruthRecord::Telemetry(sample) => Some(sample),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (mount, mount_fake) = fake_mount(MountSnapshot::default());
+        let (focuser, _focuser_fake) = fake_focuser(FocuserSnapshot::default());
+        hub.attach(mount);
+        hub.attach(focuser);
+        hub.refresh();
+        assert!(telemetry().is_empty(), "nothing was published yet");
+        clock.advance_ms(500);
+        let snapshot = mount_sample(&clock, 5.5, 20.0, false);
+        mount_fake.publish((*snapshot).clone());
+        hub.refresh();
+        let samples = telemetry();
+        assert_eq!(samples.len(), 1, "{samples:?}");
+        assert_eq!(samples[0].source, DeviceKind::Mount);
+        assert_eq!(samples[0].at, snapshot.at_utc());
+        assert_eq!(samples[0].payload["state"]["ra_h"]["value"], 5.5);
     }
 }

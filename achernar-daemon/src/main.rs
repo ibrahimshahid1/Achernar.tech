@@ -198,32 +198,9 @@ async fn main() -> anyhow::Result<()> {
     vision::vision_loop::spawn(app_state.clone(), 1.0);
     vision::coc_shadow::spawn(app_state.clone());
 
-    // Build API routes
-    let api_v1 = Router::new()
-        .route("/status", get(api::get_status))
-        .route("/drivers", get(api::get_driver_capabilities))
-        .route("/commands", get(api::get_commands))
-        .route("/discover", post(api::discover_devices))
-        .route("/connect", post(api::connect_equipment))
-        .route("/disconnect", post(api::disconnect_equipment))
-        .route("/coc/status", get(api::coc::status))
-        .route("/coc/configure", post(api::coc::configure))
-        .route("/coc/save-sample", post(api::coc::save))
-        .route("/coc/freeze-sample", post(api::coc::freeze))
-        .nest("/camera", camera_routes())
-        .nest("/mount", mount_routes())
-        .nest("/focuser", focuser_routes())
-        .nest("/filter-wheel", filter_wheel_routes())
-        .nest("/guider", guider_routes())
-        .route("/weather", get(api::weather::status))
-        .route("/safety", get(api::safety::status))
-        .nest("/equipment", equipment_routes())
-        .nest("/focus", focus_routes())
-        .nest("/platesolve", platesolve_routes());
-
     let app = Router::new()
         .route("/health", get(health_check))
-        .nest("/api/v1", api_v1)
+        .nest("/api/v1", api_router())
         .route("/ws/telemetry", get(telemetry_ws_handler))
         .layer(CorsLayer::permissive())
         .with_state(app_state.clone());
@@ -259,6 +236,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// The `/api/v1` routes. The interop tests serve this same router
+/// (`equipment/testing/interop.rs`), so they exercise the binary's routes.
+fn api_router() -> Router<AppState> {
+    Router::new()
+        .route("/status", get(api::get_status))
+        .route("/drivers", get(api::get_driver_capabilities))
+        .route("/commands", get(api::get_commands))
+        .route("/discover", post(api::discover_devices))
+        .route("/connect", post(api::connect_equipment))
+        .route("/disconnect", post(api::disconnect_equipment))
+        .route("/coc/status", get(api::coc::status))
+        .route("/coc/configure", post(api::coc::configure))
+        .route("/coc/save-sample", post(api::coc::save))
+        .route("/coc/freeze-sample", post(api::coc::freeze))
+        .nest("/camera", camera_routes())
+        .nest("/mount", mount_routes())
+        .nest("/focuser", focuser_routes())
+        .nest("/filter-wheel", filter_wheel_routes())
+        .nest("/guider", guider_routes())
+        .route("/weather", get(api::weather::status))
+        .route("/safety", get(api::safety::status))
+        .nest("/equipment", equipment_routes())
+        .nest("/focus", focus_routes())
+        .nest("/platesolve", platesolve_routes())
 }
 
 /// SIGINT/SIGTERM, or a Windows console close (Ctrl+C).
