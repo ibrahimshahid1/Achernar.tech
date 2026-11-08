@@ -190,6 +190,9 @@ async fn main() -> anyhow::Result<()> {
         Ok(None) => {}
         Err(e) => tracing::warn!("Could not read the equipment journal's last seq: {e}"),
     }
+    // The plate-solve trigger follows the equipment bus from boot (M-3),
+    // from the continued sequence numbers. A disabled trigger starts nothing.
+    mount::auto_solve::attach(&app_state);
     hardware::health::spawn(app_state.clone());
     cloud_client::spawn_if_configured(app_state.clone());
     vision::vision_loop::spawn(app_state.clone(), 1.0);
