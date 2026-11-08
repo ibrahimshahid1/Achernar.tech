@@ -417,6 +417,65 @@ mod tests {
         crate::api::equipment_tests::cleanup(directory, state).await;
     }
 
+    /// D19: the guider's stop is its abort, so over the relay it runs while
+    /// all 16 command slots are busy, through the guider's abort path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn guider_stop_over_the_relay_succeeds_while_all_16_slots_are_busy() {
+        use crate::equipment::snapshot::GuiderSnapshot;
+        use crate::equipment::testing::fake_handles::fake_guider;
+
+        let (directory, state) = crate::api::equipment_tests::state().await;
+        let (guider, guider_fake) = fake_guider(GuiderSnapshot::default());
+        state.equipment.attach(guider);
+
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+        let (results, mut received) = tokio::sync::mpsc::channel(32);
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Arc::new(std::sync::Mutex::new(wait));
+        for _ in 0..16 {
+            let wait = std::sync::Arc::clone(&wait);
+            spawn_bounded_command(&slots, results.clone(), async move {
+                let _ = wait
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(std::time::Duration::from_secs(10));
+                None
+            })
+            .unwrap();
+        }
+        assert_eq!(slots.available_permits(), 0);
+        let start = json!({
+            "type": "COMMAND",
+            "command_id": "guider-start",
+            "action": "guider.start",
+            "payload": {},
+        })
+        .to_string();
+        assert!(!is_priority_command(&start), "an ordinary command waits");
+        assert!(spawn_bounded_command(&slots, results.clone(), async { None }).is_err());
+        let text = json!({
+            "type": "COMMAND",
+            "command_id": "guider-stop-1",
+            "action": "guider.stop",
+            "payload": {},
+        })
+        .to_string();
+        assert!(is_priority_command(&text));
+        let command_state = state.clone();
+        spawn_priority_command(results.clone(), async move {
+            handle_gateway_text(command_state, &text).await
+        });
+        let result = tokio::time::timeout(Duration::from_secs(3), received.recv())
+            .await
+            .expect("the guider stop answered within its budget")
+            .unwrap();
+        assert_eq!(result["command_id"], "guider-stop-1");
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(guider_fake.abort_path().calls(), 1);
+        drop(release);
+        crate::api::equipment_tests::cleanup(directory, state).await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn disconnected_gateway_keeps_global_capacity_and_accepted_work() {
         let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));

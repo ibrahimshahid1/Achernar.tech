@@ -555,9 +555,11 @@ fn relay(result: Result<Value, crate::api::api_error::ApiError>) -> Result<Value
 }
 
 /// True for actions that must never wait for a relay command slot: aborts,
-/// halts and the e-stop (D19).
+/// halts, the guider's stop (its abort, D19) and the e-stop.
 pub fn bypasses_slots(action: &str) -> bool {
-    action == "equipment.estop" || action.ends_with(".abort") || action.ends_with(".halt")
+    matches!(action, "equipment.estop" | "guider.stop")
+        || action.ends_with(".abort")
+        || action.ends_with(".halt")
 }
 
 /// The published spec of `action`, if any.
@@ -646,6 +648,7 @@ mod tests {
             "mount.abort",
             "focuser.abort",
             "filter_wheel.abort",
+            "guider.stop",
             "equipment.estop",
         ] {
             let spec = spec(name).unwrap_or_else(|| panic!("{name} is not registered"));
@@ -653,6 +656,7 @@ mod tests {
             assert!(bypasses_slots(name), "{name} must bypass the relay slots");
         }
         assert!(!bypasses_slots("mount.slew"));
+        assert!(!bypasses_slots("guider.start"));
         let json = serde_json::to_value(spec("mount.move_axis").unwrap()).unwrap();
         assert_eq!(json["relay_allowed"], false);
     }
