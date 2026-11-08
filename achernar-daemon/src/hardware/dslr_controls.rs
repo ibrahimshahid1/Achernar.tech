@@ -216,7 +216,8 @@ mod tests {
         let l = labels(&["bulb", "30", "15", "8"]);
         let r = nearest_shutter(&l, 300.0).unwrap();
         assert_eq!(r.value, 30.0);
-        assert!((stops_from(300.0, r.value) + 3.3219).abs() < 1e-3);
+        // 300 s -> 30 s is log2(10) stops short.
+        assert!((stops_from(300.0, r.value) + std::f64::consts::LOG2_10).abs() < 1e-3);
     }
 
     #[test]
