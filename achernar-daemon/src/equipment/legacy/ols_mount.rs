@@ -157,6 +157,27 @@ impl OlsFlavour {
             OlsFlavour::Indi => crate::hardware::mount::MountDriver::Indi,
         }
     }
+
+    /// The option handed to the OLS wrapper. The public INDI option is
+    /// `host:port#device=<INDI device name>` (§2.12); OLS `indi:remote`
+    /// takes only `host[:port]` and picks the telescope itself, so the
+    /// interim adapter drops the fragment (the native INDI client of Tier 2
+    /// uses it). The Alpaca option is OLS's own format, `#device=N` included.
+    pub fn backend_option(self, option: &str) -> String {
+        let option = match self {
+            OlsFlavour::Alpaca => option,
+            OlsFlavour::Indi => option.split('#').next().unwrap_or_default().trim(),
+        };
+        self.hardware_driver().ols_option(option)
+    }
+}
+
+/// The `#device=` fragment of an option, if one names a device.
+fn device_fragment(option: &str) -> Option<&str> {
+    option
+        .split_once("#device=")
+        .map(|(_, device)| device.trim())
+        .filter(|device| !device.is_empty())
 }
 
 /// `host`, `port` from `http(s)://host:port...` or `host[:port]`.
@@ -360,7 +381,15 @@ impl<B: OlsMountBackend> Device for OlsMountAdapter<B> {
 
     fn connect(&mut self, _timeout: Duration) -> DeviceResult<ConnectReport> {
         let started = self.clock.now_mono_ns();
-        let option = self.flavour.hardware_driver().ols_option(&self.option);
+        if self.flavour == OlsFlavour::Indi {
+            if let Some(device) = device_fragment(&self.option) {
+                tracing::warn!(
+                    "the OLS INDI mount adapter cannot select INDI device {device:?}; OLS uses \
+                     the first telescope on the server (the native INDI client will honour it)"
+                );
+            }
+        }
+        let option = self.flavour.backend_option(&self.option);
         write(&self.backend)
             .connect(&option)
             .map_err(DeviceError::transport)?;
@@ -730,6 +759,38 @@ mod tests {
             ols_identity(OlsFlavour::Indi, "").identity_key,
             "indi:localhost:7624/telescope"
         );
+    }
+
+    /// §2.12's INDI option `host:port#device=<name>`: OLS `indi:remote`
+    /// takes only `host[:port]` (without a port it would take the whole
+    /// string as the host name), so the interim adapter drops the fragment;
+    /// the identity keeps its host and port. The Alpaca option keeps its
+    /// `#device=N`, which OLS reads itself.
+    #[test]
+    fn the_indi_device_fragment_never_reaches_ols() {
+        for (option, ols) in [
+            ("pi.local:7625#device=EQMod Mount", "pi.local:7625"),
+            ("pi.local#device=EQMod Mount", "pi.local"),
+            ("pi.local:7625", "pi.local:7625"),
+            ("#device=EQMod Mount", "localhost:7624"),
+            ("", "localhost:7624"),
+        ] {
+            assert_eq!(OlsFlavour::Indi.backend_option(option), ols, "{option:?}");
+            let (fake, _clock, mut drv) = adapter(OlsFlavour::Indi, option);
+            drv.connect(Duration::from_secs(1)).unwrap();
+            assert_eq!(fake.state().option, ols, "{option:?}");
+        }
+        assert_eq!(
+            ols_identity(OlsFlavour::Indi, "pi.local:7625#device=EQMod Mount").identity_key,
+            "indi:pi.local:7625/telescope"
+        );
+        assert_eq!(
+            OlsFlavour::Alpaca.backend_option("http://h:11111#device=1"),
+            "http://h:11111#device=1"
+        );
+        assert_eq!(device_fragment("h:1#device= EQMod "), Some("EQMod"));
+        assert_eq!(device_fragment("h:1#device="), None);
+        assert_eq!(device_fragment("h:1"), None);
     }
 
     #[test]
