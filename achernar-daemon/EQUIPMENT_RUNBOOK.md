@@ -72,9 +72,30 @@ never sets AtPark fails; and every v6 ground-truth table the session feeds
 gets rows (`device_connections`, `equipment_events`, `control_audit_logs`,
 `focuser_moves`, `filter_switch_events`, `guide_steps`, `dither_events`,
 `exposure_device_windows`, `guider_state_log`, `pointing_samples`,
-`environment_log`, `device_profiles`). The camera stays on OLS; for the
-exposure-window tables the capture path's own hooks stand in for a camera,
-because no CI fixture drives an OLS capture.
+`environment_log`, `device_profiles`), with the policy's stop guiding, abort
+slew and park audited under the safety source in that order, and the
+exposure window's guide RMS matching a reference computed from PHD2's steps.
+The camera stays on OLS; for the exposure-window tables the capture path's
+own hooks stand in for a camera, because no CI fixture drives an OLS capture.
+
+Two sibling tests use the same daemon and the same ESP32-like mount over HTTP:
+
+- `manual_motion_reaches_the_alpaca_mount_through_the_daemon_routes`: a jog
+  through `mount/move-axis` on a mount that reports CanSlew false (O10: jog is
+  gated on CanMoveAxis), stopped by its dead-man (`jog_deadman_lapsed`), kept
+  moving by renewals, stopped at once by rate 0; a tertiary-axis jog refused
+  with 501 and nothing sent; a sync (`sync_applied` with a new generation,
+  read back); a pulse seen as `is_pulse_guiding` true, then false; a jog
+  refused with 422 while parked.
+- `a_stalled_alpaca_mount_degrades_and_a_silent_one_is_lost`: one 4 s stall
+  of the DeviceState poll makes the mount `degraded`, never `lost`;
+  `/mount/abort` stops a GoTo while it is degraded; a server that stops
+  answering makes it `lost` within `lost_after_s`, and `/mount/abort` still
+  runs its path on the lost handle (checks M10 and M11 in simulation).
+
+Two known gaps (§10 items 1 and 2) are asserted as they are today, so the
+fix of each fails the scenario at that step and its message says what to
+require instead.
 
 `native_alpaca_drivers_conform_against_the_served_simulators` holds the native
 Alpaca telescope and focuser drivers to the WP1A-2 conformance suites over the
@@ -82,18 +103,28 @@ same HTTP adapter.
 
 ### 1.2 Local interop (`#[ignore]`, run on demand)
 
-From `achernar-daemon/` in the main checkout (the firmware folder is
-local-only, so a worktree needs the absolute path):
+From `achernar-daemon/`. The firmware folder is local-only and lives in the
+main checkout, so the recipe finds the main checkout through git; it works
+from a worktree too:
 
 ```sh
-ACHERNAR_MOUNT_SIM=$PWD/../mount_cad_esp_32_firmware/achernar-mount-esp32/host_sim/build/achernar-mount-sim \
+ROOT=$(git rev-parse --path-format=absolute --git-common-dir)/..
+ACHERNAR_MOUNT_SIM=$ROOT/mount_cad_esp_32_firmware/achernar-mount-esp32/host_sim/build/achernar-mount-sim \
 ACHERNAR_OMNISIM=$HOME/.local/opt/ascom-omnisim/omnisim \
-cargo test --locked -- --ignored interop
+cargo test --locked -- --ignored interop --nocapture
 ```
 
-Each test starts its process on free ports, kills it on every exit path
-(including a failed assertion), and passes with a message when its variable
-is not set.
+Each test starts its process on free ports and kills it on every exit path
+(including a failed assertion). A test skips, and passes, only when its
+variable is **unset**; it prints `ACHERNAR_MOUNT_SIM is not set; skipping
+this local-only interop test` (visible with `--nocapture`). A variable that
+is set but does not name an existing file fails the test with the path, so a
+mistyped path cannot pass. A pass with a variable unset proves nothing about
+that fixture: for the O2 gate (deleting the OLS mount and focuser) and for a
+rig session, run with both variables set and check the output for the
+host-sim and OmniSim lines (`host sim: ...`, `OmniSim on port ...`). An
+OmniSim log is removed after a pass and kept, with its path printed, after a
+failure.
 
 - **ESP32 host simulator** (`ACHERNAR_MOUNT_SIM`, macOS and Linux). The
   firmware's portable core in real time. Build it with
@@ -104,16 +135,21 @@ is not set.
   (`achernar-mount-sim 0.1.0 alpaca=127.0.0.1:PORT ...`). With the Dec axis
   present the native Alpaca mount runs end to end through the daemon
   (connect, status fields, J2000 GoTo and settle, abort mid-GoTo, tracking,
-  a pulse, park and unpark, e-stop, disconnect) and passes the telescope
-  conformance suite. With the Dec axis absent, a GoTo outside the firmware's
-  1° Dec window is refused with `409 mount_invalid_operation` and the
-  firmware's message, and the mount stays still.
+  a pulse, a jog stopped by its dead-man and one stopped by rate 0, a sync,
+  park and unpark with a jog refused while parked, e-stop, disconnect) and
+  passes the telescope conformance suite. With the Dec axis absent, a GoTo
+  outside the firmware's 1° Dec window is refused with
+  `409 mount_invalid_operation` and the firmware's message, a Dec jog is
+  refused with `501 mount_unsupported` (the firmware reports
+  CanMoveAxis(1) false), and the mount stays still.
 - **ASCOM OmniSim** (`ACHERNAR_OMNISIM`, owner decision O9). The launcher
   must honour `OMNISIM_PORT`. Every native Alpaca driver (Telescope,
   Focuser, FilterWheel, ObservingConditions, SafetyMonitor) passes its
   conformance suite against its OmniSim device; the daemon connects all five
-  through `/connect` and drives each one (GoTo, abort, pulse, park, focuser
-  move, filter change, weather and safety reads, e-stop). Rotator,
+  through `/connect` and drives each one (GoTo, abort, pulse, jog, sync,
+  park, focuser move, filter change, weather and safety reads, and an e-stop
+  of a running GoTo that reaches the mount, focuser and filter wheel and
+  stops the mount). Rotator,
   CoverCalibrator, Switch and Dome have no native driver until Tier 2
   (WP2-5): the client connects to and reads each one, and the daemon refuses
   them with 501. OmniSim runs are serialised, because every instance also
@@ -184,7 +220,7 @@ its row holds. Record the measured values (latencies, errors, positions) with
 the result. "Event X" means `GET $D/equipment/events?since_seq=<mark>&kinds=X`
 shows it after a mark taken just before the check.
 
-### 3.1 Mount (R1-R11, §3.2 M-a to M-k)
+### 3.1 Mount (R1-R11, §3.2 M-a to M-k and M-n)
 
 | # | Check | Proves | Run | Pass |
 |---|---|---|---|---|
@@ -195,11 +231,14 @@ shows it after a mark taken just before the check.
 | M5 | Abort mid-GoTo | D4, D19, O10 (never gated) | Start a long GoTo, then `POST $D/mount/abort` | `abort_path_ran: true`; `slewing` false within 2 s (record the latency); event `slew_ended` with outcome `aborted`; the scope physically stopped |
 | M6 | Tracking | M-e | `POST $D/mount/tracking {"enabled":false}`, then `true` | Status follows each write; event `tracking_changed`; with tracking on, two solves 10 min apart agree within the mount's tracking error |
 | M7 | Park and unpark, verified | M-f | `POST $D/mount/park`, then `POST $D/mount/unpark` | Event `parked` only after AtPark reads true; the scope is at its physical park marks; `unparked` after AtPark reads false. A mount without CanPark answers 501 |
-| M8 | Pulse guide | M-i, D20 | `POST $D/mount/pulse-guide {"direction":"east","duration_ms":300}`; repeat while PHD2 guides | Event `pulse_guide`; `is_pulse_guiding` true while it runs (when the mount reports it); refused with 422 while PHD2 is guiding or calibrating |
+| M8 | Pulse guide | M-i, D20 | `POST $D/mount/pulse-guide {"direction":"east","duration_ms":300}` (and 1000 ms, to watch it in `GET $D/status`); repeat while PHD2 guides | Event `pulse_guide`; `mount.is_pulse_guiding` true while it runs and false after (when the mount reports IsPulseGuiding); the scope moved by about duration × guide rate; refused with 422 while PHD2 is guiding or calibrating |
 | M9 | Limits | M-k, H13 | Temporarily raise `[mount.safety] min_altitude` above a target's altitude, restart, request that slew | 422 `safety_rejected` (event `safety_rejected`), no motion. Restore the value |
 | M10 | Degraded, not lost | §2.8 | Interrupt the network for less than `lost_after_s` (default 10 s) | `device_health.mount.state` goes `degraded`, then `ready`; never `lost`; nothing parks |
 | M11 | Lost, abort still runs | §2.8, D19 | Power the mount controller off | `lost` within `lost_after_s`; `POST $D/mount/abort` still answers (`abort_path_ran`), and only a retired handle answers 412 |
 | M12 | Disconnect never parks | §2.6, D16 | `POST $D/disconnect {"equipment_type":"mount"}` while idle; then while slewing | Idle: disconnected, scope untouched. Slewing: 409 unless `"force": true`, which aborts first |
+| M13 | Sync | M-g | With tracking on, take a frame, plate-solve it, then `POST $D/mount/sync {"ra":<h>,"dec":<deg>,"frame":"j2000"}` with the solved position | `[mount] sync_mode = "mount"` (default): event `sync_applied` with `before`, `after` and a `generation` one higher than the last sync's; `mount.ra_j2000`/`dec_j2000` read back within 5″ of the synced position; a solve of the next frame agrees within the mount's pointing accuracy (record the error). `sync_mode = "offset"`: `sync_applied` with `after: null` and the generation unchanged; the mount itself is not synced. Refused while parked |
+| M14 | Jog and its dead-man | M-h, O10 point 3 (jog gated on CanMoveAxis, never on CanSlew), D19 | `POST $D/mount/move-axis {"axis":0,"rate_deg_s":<r>}` with `r` inside the mount's AxisRates; do not repeat it. Then start a jog again, repeat the request within `renew_within_ms` for a few seconds, and send `{"axis":0,"rate_deg_s":0}`. Then park and request a jog. Then a jog on an axis the mount does not move (axis 1 on a Dec-less mount) | The first reply has `status: moving` and `renew_within_ms` = `[mount] jog_deadman_ms` (default 1000); the axis moves; without renewal it stops within `jog_deadman_ms` plus one poll, with events `move_axis` (rate r) then `move_axis` (rate 0) and `operation_ended` failed with `jog_deadman_lapsed`. Renewed, it keeps moving; rate 0 stops it at once (`status: stopped`, `abort_path_ran: true`). Parked: 422 `safety_rejected`, no motion. An axis without CanMoveAxis: 501 `mount_unsupported`, nothing sent. A mount reporting CanSlew false still jogs |
+| M15 | Center | M-n, H12, D20 | With a camera and the plate solver (ASTAP) configured, `POST $D/mount/center {"ra":<h>,"dec":<deg>,"frame":"j2000"}` (optional `tolerance_arcmin`, `max_attempts`, `exposure_s`, `gain`, `binning` override `[mount.center]`) | Accepted with a `command_id`; the busy set shows `centering`; PHD2 stopped before each slew; event `centered` with `error_arcmin` within the tolerance and the attempts used (or `center_failed` with its reason after `max_attempts`); one `pointing_samples` row with purpose `center` per solve. An abort or e-stop stops the loop's later motion |
 
 ### 3.2 Focuser (R12-R16, §3.3 F-a to F-i; A23 bench items)
 
@@ -225,7 +264,7 @@ reads it today) and under `focuser` (the layout `profile.rs` documents); see
 
 | # | Check | Proves | Run | Pass |
 |---|---|---|---|---|
-| F1 | Connect and capabilities | §2.6, F-g | `POST $D/connect {"equipment_type":"focuser","driver":"alpaca","option":"..."}`; `GET $D/focuser` | `absolute`, `max_range`, `max_increment`, `step_size_um` (a driver claim) as the device declares; `backlash_owner` and `temperature_source` from the profile; no move was sent |
+| F1 | Connect and capabilities | §2.6, F-g | `POST $D/connect {"equipment_type":"focuser","driver":"alpaca","option":"..."}`; `GET $D/focuser` (the descriptor) and `GET $D/status` (its `focuser` block) | Descriptor: `capabilities.absolute`, `capabilities.max_step`, `capabilities.max_increment` and `capabilities.step_size_um` (a driver claim) as the device declares; `backlash_owner`, `backlash_model` and `temperature_role` from the profile. Status block: the same facts as `absolute`, `max_range`, `max_increment`, `step_size_um`, `backlash_owner` and `temperature_source`. No move was sent |
 | F2 | Absolute move with read-back | F-a, A23 | `POST $D/focuser/moveto {"position":N}` | Status `position == N` once `active_op` is null; one `focuser_moves` row with `raw_start`, `raw_end == N`, `outcome = succeeded`; events `focuser_move_commanded`, `focuser_move_started`, `focuser_move_stopped`, `focuser_settled` |
 | F3 | Backlash ownership | F-e | The move of F2, and a reversal | Firmware-owned: exactly one device move per request (no overshoot), `backlash_model.model = none`. Achernar-owned: the overshoot or absolute sequence of the profile, with logical and raw positions recorded |
 | F4 | Repeatability (A23) | A23 | 10 approaches to one position from each side; read the position and focus a star (HFR) each time | Read-back equals the target every time; the HFR spread is within the seeing; record the spread in steps |
@@ -264,7 +303,7 @@ reads it today) and under `focuser` (the layout `profile.rs` documents); see
 | S2 | Safe | §3.10 | Connect the monitor | `state: safe` while the device reads safe |
 | S3 | One bad poll never parks | §2.8, §9.3 | Interrupt the monitor's link briefly | `state` goes `unknown` (automatic actions refused), the policy does not run, nothing parks |
 | S4 | Confirmed unsafe | §3.10, O11 h | Make the monitor read unsafe (its test input, or cover the rain sensor) with the mount slewing and PHD2 guiding | In order: `safety_unsafe` resume block, PHD2 stopped, exposure aborted (if `abort_exposure_on_unsafe`), slew aborted, mount parked (or tracking off per `[safety] on_unsafe`); each action audited under the safety source; the mount physically at park |
-| S5 | Manual resume | §3.10 | Make the monitor safe again; clear the `safety_unsafe` block | Refused while unsafe; allowed once safety reads safe. See §10 item 1 for today's route |
+| S5 | Manual resume | §3.10 | Make the monitor safe again; clear the `safety_unsafe` block with `POST $D/equipment/resume-blocks/clear {"id":...}` | Refused (409) while unsafe; allowed once safety reads safe. **Cannot pass yet**: today the route refuses a safety block even when safe (§10 item 1); record S5 as failed until that is fixed |
 
 ### 3.6 Camera hooks (OLS cameras; H1, H17, H22)
 
@@ -370,7 +409,7 @@ planned ESP32 focuser.
 | CanSlew false, CanSlewAsync true | Correct for Alpaca (O10): GoTo uses the async slew only | M4 |
 | CanPark true, CanSetPark false, CanFindHome false | Park is the power-on reference (HA 0 h, Dec +90°); home answers 501 | M7 |
 | Guide rate 0.5× sidereal | Read from the mount; `[mount] guide_rate = 0.5` is only a fallback | M8 |
-| Dec motor absent (`CFG_DEC_INSTALLED 0`) | GoTos more than 1° from the synced Dec, MoveAxis on axis 1 and N/S pulses are refused by the firmware: expect `409 mount_invalid_operation` with the firmware's message, and no motion | M4, M8 |
+| Dec motor absent (`CFG_DEC_INSTALLED 0`) | GoTos more than 1° from the synced Dec and N/S pulses are refused by the firmware: expect `409 mount_invalid_operation` with the firmware's message, and no motion. The firmware reports CanMoveAxis(1) false, so a Dec jog is refused by Achernar with `501 mount_unsupported` before anything is sent; RA jogs work although CanSlew is false (O10) | M4, M8, M14 |
 | Firmware limits HA ±5.5 h, Dec −10°…+90° | Enforced in firmware as well; Achernar's own limits (M9) refuse first | M9 |
 | One connection per ClientID; motion stops only when the last client leaves | Achernar and PHD2 can share the mount; disconnecting Achernar never stops PHD2's guiding (D16) | M12, G1 |
 | Clock from SNTP (needs internet) or a client | Without internet, set `[mount] time_sync = true` (UTC written once at connect when off by ≥ 10 s) or set the clock from another client; check M3 | M3 |
@@ -385,11 +424,12 @@ planned ESP32 focuser.
    polar, `can_flip` false, `pier_side` east, `parked` true.
 3. Unpark (M7 part 2). With the Dec motor absent: point the tube in Dec by
    hand, capture with the R50 (`POST $D/camera/capture`), plate-solve,
-   `POST $D/mount/sync {"ra":..,"dec":..,"frame":"j2000"}`, then run M4 with a
-   target within 1° of that Dec, and confirm the firmware's refusal for a
-   target outside it.
-4. M5 abort, M6 tracking, M8 pulses (E/W only without Dec), M9 limits, M10 and
-   M11 by switching the mount's Wi-Fi off and on, M12.
+   `POST $D/mount/sync {"ra":..,"dec":..,"frame":"j2000"}` (M13), then run M4
+   with a target within 1° of that Dec, and confirm the firmware's refusal
+   for a target outside it.
+4. M5 abort, M6 tracking, M8 pulses (E/W only without Dec), M14 jog (axis 0;
+   axis 1 refused without Dec), M15 center once the camera and solver work,
+   M9 limits, M10 and M11 by switching the mount's Wi-Fi off and on, M12.
 5. PHD2 checks G1-G5 with the SV105 (G6: never connect the SV105 as the main
    camera).
 6. Camera checks C1-C4 with the R50 through OLS `gphoto2`: windows with
@@ -500,7 +540,7 @@ Lifting the gate is a separate, reviewed code change after the evidence
 exists, never a configuration flag. The evidence this runbook produces for it:
 
 - **A23** (the real focuser and mount protocols): F1-F9 on the real focuser,
-  F4's repeatability sweep (approach and reversal), and M1-M12 on the mount;
+  F4's repeatability sweep (approach and reversal), and M1-M15 on the mount;
 - then the **A06/A13** focus timing trace (exposure identity after settle,
   unknown settings and pauses) with the real camera, and the **A15** real
   stellar sweep (annuli and blends), each as defined in
@@ -514,27 +554,36 @@ off for the same reason.
 
 ## 10. Known gaps found by the interop work
 
-These were found while building the interop tests. Each is filed as a change
-note with its owner; the tests tolerate them and say so in their output.
+These were found while building and reviewing the interop tests. Each is
+filed as a change note with its owner. The CI scenario asserts items 1 and 2
+as they are today, so the fix of each fails the scenario at that step with a
+message saying what to require instead; the others are noted where they
+matter (§3.2, §4).
 
 1. **Safety resume route.** `POST equipment/resume-blocks/clear` refuses every
    `safety_unsafe` and `safety_unknown` block, even once safety reads safe: it
    calls the generic block clear, and nothing calls
    `SafetySupervisor::request_resume`. Until the route reaches it, a safety
    block lasts until the daemon restarts (blocks are not persisted), and
-   automatic captures stay refused with 423 meanwhile.
+   automatic captures stay refused with 423 meanwhile; check S5 cannot pass.
 2. **`telemetry_log` (H19).** Nothing in production records the 1 Hz
    per-device telemetry series yet, so `telemetry_log` stays empty. TME and
-   AstroM3Edge (v6 Model 9) and replay need it.
+   AstroM3Edge (v6 Model 9) and replay need it: until it is written, that v6
+   data path has no ground truth from a session.
 3. **Qualification records are not published.** No code reads
    `profile.qualification` records into `DeviceIdentity.qualification`
    (§4 step 5).
 4. **Focuser profile layout.** The focuser session reads `backlash_owner`,
    `temperature_role`, `travel`, `settle_ms` and `relative_position` at the
    top level of the profile, while `profile.rs` documents a `focuser`
-   section and the recorder's lost-position safeguard writes
+   section and the recorder's lost-position safeguard (§2.15) writes
    `focuser.relative_position`, which the session never reads. Declare
-   focuser values in both places (§3.2) until the two agree.
+   focuser values in both places (§3.2) until the two agree. For a
+   **relative** focuser the safeguard therefore does not work: after a
+   dropped position update and a reconnect, a stale top-level origin can be
+   restored. Until this is fixed, do not count F9 as passed for a relative
+   focuser, and re-establish its origin by hand after a reconnect
+   (`POST $D/focuser/set-position`).
 5. **Unknown Action on Alpaca drivers.** The drivers pass a device's error for
    an unknown `Action` through as is; OmniSim's telescope answers 0x40B, so
    the conformance rule `unknown_action_is_unsupported` cannot hold for it.

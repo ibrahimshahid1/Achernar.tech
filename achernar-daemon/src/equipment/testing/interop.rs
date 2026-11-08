@@ -17,34 +17,57 @@
 //!   policy in order, abort and e-stop reaching the hardware, resume blocks
 //!   refusing an automatic capture, park verification (success and
 //!   failure), and that every v6 ground-truth table the session feeds gets
-//!   rows (`telemetry_log` is reported, not required: nothing writes the H19
-//!   series yet).
+//!   rows.
+//! - Manual motion
+//!   ([`manual_motion_reaches_the_alpaca_mount_through_the_daemon_routes`]):
+//!   a jog through MoveAxis on a mount reporting CanSlew false (O10), its
+//!   dead-man, its renewal and its rate-0 stop, an unsupported axis, a sync,
+//!   a pulse seen through IsPulseGuiding, and a jog refused while parked.
+//! - Link health
+//!   ([`a_stalled_alpaca_mount_degrades_and_a_silent_one_is_lost`]): one 4 s
+//!   stall degrades the mount without losing it, `/mount/abort` stops a GoTo
+//!   while it is degraded, and a stopped server loses it within
+//!   `lost_after_s` with the abort path still running (§5.7 item 2).
 //! - The conformance run
 //!   ([`native_alpaca_drivers_conform_against_the_served_simulators`]) holds
 //!   the native Alpaca telescope and focuser drivers to the WP1A-2
 //!   conformance suites, over HTTP to the same simulators.
 //!
+//! Two known gaps (`EQUIPMENT_RUNBOOK.md` §10 items 1 and 2, change notes
+//! filed with their owners) are asserted as they are today, so the fix of
+//! each fails the scenario at that step and says what to require instead:
+//! the resume-blocks route cannot clear a safety block, and nothing writes
+//! `telemetry_log` (H19).
+//!
 //! **Local only** (`#[ignore]`, named `interop_*`; run with
 //! `cargo test --locked -- --ignored interop`). Each starts its external
 //! process on free ports and kills it on every exit path, including a
-//! failed assertion ([`ChildGuard`]). Without its environment variable a
-//! test prints why and passes, so `--ignored` never needs the fixtures.
+//! failed assertion ([`ChildGuard`]). A test skips (it prints why, and
+//! passes) only when its environment variable is **unset**; a variable that
+//! is set but does not name an existing file fails the test
+//! ([`fixture`]), so a wrong path can never pass without starting anything.
+//! A pass with a variable unset proves nothing about that fixture: run with
+//! `--nocapture` to see the skip lines.
 //!
 //! - `ACHERNAR_MOUNT_SIM=<FW/host_sim/build/achernar-mount-sim>` (unix): the
 //!   ESP32 firmware's host simulator, started with
 //!   `--alpaca-port 0 --discovery-port 0 --lx200-port 0` plus `--lat`,
 //!   `--lon`, `--elev` and `--unique-id`; the port comes from its banner.
 //!   The native Alpaca mount runs end to end through the daemon (DEC
-//!   present), the DEC-absent firmware refuses an out-of-window GoTo
-//!   cleanly, and the telescope conformance suite passes against it.
+//!   present, including a jog and a sync), the DEC-absent firmware refuses
+//!   an out-of-window GoTo and a Dec jog cleanly, and the telescope
+//!   conformance suite passes against it.
 //! - `ACHERNAR_OMNISIM=<launcher honouring OMNISIM_PORT>` (O9): ASCOM
 //!   OmniSim on a free port. Every native Alpaca driver (Telescope,
 //!   Focuser, FilterWheel, ObservingConditions, SafetyMonitor) passes its
 //!   conformance suite against its OmniSim device, the daemon drives each of
-//!   them through its routes, and Rotator, CoverCalibrator, Switch and Dome,
-//!   which have no native driver until Tier 2 (WP2-5), get a client-level
-//!   connect and read while the daemon refuses them with 501. OmniSim runs
-//!   are serialised: every instance also binds the discovery port UDP 32227.
+//!   them through its routes (the mount including a jog, a sync and an
+//!   e-stop of a running GoTo), and Rotator, CoverCalibrator, Switch and
+//!   Dome, which have no native driver until Tier 2 (WP2-5), get a
+//!   client-level connect and read while the daemon refuses them with 501.
+//!   OmniSim runs are serialised: every instance also binds the discovery
+//!   port UDP 32227. Its log is removed after a pass and kept (and named)
+//!   after a failure.
 //!
 //! Nothing here records `qualified` (D21): simulator success is not rig
 //! acceptance. `achernar-daemon/EQUIPMENT_RUNBOOK.md` is the procedure that
@@ -79,7 +102,7 @@ use crate::equipment::sim::focuser::{SimFocuser, SimFocuserConfig};
 use crate::equipment::sim::mount::{SimFaults, SimMount, SimMountProfile};
 use crate::equipment::snapshot::SafetyLevel;
 use crate::equipment::spine::WorkerTuning;
-use crate::equipment::testing::alpaca_server::{ScriptedDevice, TestAlpacaServer};
+use crate::equipment::testing::alpaca_server::{ScriptedDevice, ServerReply, TestAlpacaServer};
 use crate::equipment::testing::conformance::{
     assert_conforms, disconnect_suite, filter_wheel_suite, focuser_suite, mount_suite,
     safety_suite, weather_suite, Violation,
@@ -147,21 +170,55 @@ fn scenario_configs(lat_deg: f64, lon_deg: f64, elev_m: f64) -> EquipmentConfigs
     configs
 }
 
+/// A fresh directory under the OS temporary directory, removed when this
+/// guard drops: after a pass, and while a failed assertion unwinds. With
+/// `keep_on_failure` a failing test keeps it and names it on stderr (a
+/// process log worth reading).
+struct ScratchDir {
+    path: PathBuf,
+    keep_on_failure: bool,
+}
+
+impl ScratchDir {
+    fn new(prefix: &str, keep_on_failure: bool) -> Self {
+        let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&path)
+            .unwrap_or_else(|err| panic!("create {}: {err}", path.display()));
+        Self {
+            path,
+            keep_on_failure,
+        }
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        if self.keep_on_failure && std::thread::panicking() {
+            eprintln!("kept {} for the failed test", self.path.display());
+            return;
+        }
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// One daemon: `AppState` with a live hub, recorder and profile store over a
 /// fresh database (`with_equipment`, as `main.rs` builds it), its router on a
 /// loopback port, and a blocking HTTP client run off the async workers.
 struct Daemon {
-    directory: PathBuf,
     state: AppState,
     base: String,
     agent: ureq::Agent,
     server: tokio::task::JoinHandle<()>,
+    /// The database and its files. Declared last, so it is removed after
+    /// the state that holds the database has dropped, whether or not the
+    /// test reached [`Daemon::close`].
+    scratch: ScratchDir,
 }
 
 impl Daemon {
     async fn start(configs: EquipmentConfigs) -> Self {
-        let directory = std::env::temp_dir().join(format!("achernar-interop-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&directory).unwrap();
+        let scratch = ScratchDir::new("achernar-interop", false);
+        let directory = scratch.path.clone();
         let store = LocalStore::open(directory.join("state.db").to_str().unwrap())
             .await
             .unwrap();
@@ -204,11 +261,11 @@ impl Daemon {
             .build()
             .new_agent();
         Self {
-            directory,
             state,
             base,
             agent,
             server,
+            scratch,
         }
     }
 
@@ -318,6 +375,27 @@ impl Daemon {
         }
     }
 
+    /// The first `operation_ended` of operation `op` after `after`.
+    async fn wait_op_ended(&self, op: &str, after: u64) -> Value {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            let ended = self
+                .events_after(after, "operation_ended")
+                .await
+                .into_iter()
+                .find(|e| e["payload"]["op"] == op);
+            if let Some(event) = ended {
+                return event;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no operation_ended for {op} after seq {after}; journal: {:?}",
+                names(&self.events_after(after, "").await)
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Wait until no command holds a domain (the last operation resolved);
     /// an operator command on a held domain gets 409.
     async fn wait_idle(&self) {
@@ -397,7 +475,8 @@ impl Daemon {
         let pool = self.state.local_store.pool().clone();
         drop(self.state);
         pool.close().await;
-        std::fs::remove_dir_all(&self.directory).ok();
+        // The database is closed: dropping the guard removes its directory.
+        drop(self.scratch);
     }
 }
 
@@ -445,7 +524,8 @@ fn target_from(status: &Value, ha_h: f64, dec_deg: f64) -> (f64, f64) {
 }
 
 // ---------------------------------------------------------------------------
-// CI: the Tier 1 rig scenario (§5.7 items 2-8)
+// CI: the Tier 1 rig scenario (§5.7 items 2-8; item 2's stall, loss, abort
+// while degraded and pulse read-back are in the sibling tests further down)
 // ---------------------------------------------------------------------------
 
 const MOUNT_UID: &str = "interop-esp32-like-mount";
@@ -933,6 +1013,7 @@ async fn the_tier1_rig_runs_end_to_end_through_the_daemon_routes() {
         .post("/camera/capture", automatic_capture.clone())
         .await;
     assert_eq!(code, 423, "{refused}");
+    assert_eq!(refused["error"]["code"], "resume_block_active", "{refused}");
     let blocks = daemon.get("/equipment/resume-blocks").await;
     let block_id = |kind: &str| -> String {
         blocks["blocks"]
@@ -960,23 +1041,29 @@ async fn the_tier1_rig_runs_end_to_end_through_the_daemon_routes() {
         assert!(Instant::now() < deadline, "safety never read safe again");
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    // The operator's manual resume (Tier 1) once safety reads safe. The
-    // clear route refuses every safety block today (it calls the generic
-    // clear, not `SafetySupervisor::request_resume`; change note filed), so
-    // the supervisor's resume stands in until the route reaches it.
+    // The operator's manual resume (Tier 1, runbook S5) once safety reads
+    // safe. Known gap (runbook §10 item 1, change note filed with WP1B-1):
+    // the route calls the generic clear, which refuses every safety block,
+    // and nothing in production calls `SafetySupervisor::request_resume`.
+    // The refusal is asserted as it is today, so the route's fix fails this
+    // step; then delete the supervisor fallback and require a 2xx here.
     let (code, reply) = daemon
         .post(
             "/equipment/resume-blocks/clear",
             json!({"id": unsafe_block}),
         )
         .await;
-    if !(200..300).contains(&code) {
-        eprintln!("resume-blocks/clear refused a safety block while safe: {code} {reply}");
-        let cleared = supervisor
-            .request_resume(&CommandSource::Operator { overriding: false })
-            .expect("the operator resumes once safety reads safe");
-        assert!(!cleared.is_empty());
-    }
+    assert_eq!(
+        (code, reply["error"]["code"].as_str()),
+        (409, Some("refused")),
+        "resume-blocks/clear answered a safety block while safe with {code} {reply}: \
+         if the route now resumes, remove the request_resume fallback below and \
+         assert a 2xx (runbook S5)"
+    );
+    let cleared = supervisor
+        .request_resume(&CommandSource::Operator { overriding: false })
+        .expect("the operator resumes once safety reads safe");
+    assert!(!cleared.is_empty());
     let blocks = daemon.get("/equipment/resume-blocks").await;
     assert!(
         !blocks["blocks"]
@@ -1086,6 +1173,7 @@ async fn the_tier1_rig_runs_end_to_end_through_the_daemon_routes() {
     // clears it.
     let (code, refused) = daemon.post("/camera/capture", automatic_capture).await;
     assert_eq!(code, 423, "{refused}");
+    assert_eq!(refused["error"]["code"], "resume_block_active", "{refused}");
     let blocks = daemon.get("/equipment/resume-blocks").await;
     let estop_block = blocks["blocks"]
         .as_array()
@@ -1197,8 +1285,37 @@ async fn the_tier1_rig_runs_end_to_end_through_the_daemon_routes() {
             .await,
         0
     );
-    // H21: every gated command audited, the policy under the safety source.
+    // H21: every gated command audited. §5.7 item 6: the policy's stop
+    // guiding, abort slew and park are audited under the safety source, in
+    // that order, each proposed, validated, executed and with its outcome.
     assert!(rows("control_audit_logs").await >= 10);
+    let pool = daemon.state.local_store.pool();
+    let safety_rows: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT action, stage FROM control_audit_logs WHERE actor = 'safety' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    let first = |action: &str| {
+        safety_rows
+            .iter()
+            .position(|(a, _)| a == action)
+            .unwrap_or_else(|| panic!("no {action} under the safety source: {safety_rows:?}"))
+    };
+    assert!(
+        first("guider_stop") < first("abort_slew") && first("abort_slew") < first("park"),
+        "§5.7 item 6 order: {safety_rows:?}"
+    );
+    for action in ["guider_stop", "abort_slew", "park"] {
+        for stage in ["proposed", "validated", "executed", "outcome"] {
+            assert!(
+                safety_rows
+                    .iter()
+                    .any(|(a, s)| a == action && s.as_deref() == Some(stage)),
+                "{action} has no {stage} row under the safety source: {safety_rows:?}"
+            );
+        }
+    }
     // F-a: the move with its read-back.
     assert!(
         daemon
@@ -1235,6 +1352,47 @@ async fn the_tier1_rig_runs_end_to_end_through_the_daemon_routes() {
         1,
         "the window carries the mount, wheel, focuser and guide state"
     );
+    // G-i, H9: the window's guide statistics are those of PHD2's steps
+    // inside it, against a two-pass reference (population standard
+    // deviation per mount axis; arcsec through the mock's pixel scale).
+    let guide_window = {
+        use sqlx::Row;
+        let row = sqlx::query(
+            "SELECT guide_rms_ra_px, guide_rms_dec_px, guide_rms_total_arcsec, \
+             guide_peak_ra_px, guide_steps_n FROM exposure_device_windows WHERE frame_id = ?",
+        )
+        .bind(&frame_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let column = |name: &str| row.get::<Option<f64>, _>(name);
+        (
+            column("guide_rms_ra_px"),
+            column("guide_rms_dec_px"),
+            column("guide_rms_total_arcsec"),
+            column("guide_peak_ra_px"),
+            row.get::<Option<i64>, _>("guide_steps_n"),
+        )
+    };
+    let (rms_ra, rms_dec, rms_total, peak_ra, steps_n) = guide_window;
+    let ra_steps: Vec<f64> = EXPOSURE_GUIDE_STEPS.iter().map(|s| s.0).collect();
+    let dec_steps: Vec<f64> = EXPOSURE_GUIDE_STEPS.iter().map(|s| s.1).collect();
+    let (ra_std, dec_std) = (population_std(&ra_steps), population_std(&dec_steps));
+    assert_eq!(steps_n, Some(EXPOSURE_GUIDE_STEPS.len() as i64));
+    for (column, got, want) in [
+        ("guide_rms_ra_px", rms_ra, ra_std),
+        ("guide_rms_dec_px", rms_dec, dec_std),
+        (
+            "guide_rms_total_arcsec",
+            rms_total,
+            MOCK_PIXEL_SCALE * ra_std.hypot(dec_std),
+        ),
+        ("guide_peak_ra_px", peak_ra, 0.4),
+    ] {
+        let got = got.unwrap_or_else(|| panic!("{column} is null"));
+        assert!((got - want).abs() < 1e-9, "{column}: {got} vs {want}");
+    }
+    assert!(ra_std > 0.1 && dec_std > 0.1, "the steps vary");
     assert!(
         daemon
             .count(&format!(
@@ -1253,19 +1411,24 @@ async fn the_tier1_rig_runs_end_to_end_through_the_daemon_routes() {
         1
     );
     // Weather and the focuser probe (§3.9, F-f) and the identity profiles
-    // (last used, D17). The 1 Hz `telemetry_log` series (H19) has no
-    // production writer yet (change note filed), so it is reported, not
-    // required.
+    // (last used, D17).
     assert!(
         daemon
             .count("SELECT COUNT(*) FROM environment_log WHERE source = 'probe'")
             .await
             >= 1
     );
-    let telemetry = rows("telemetry_log").await;
-    if telemetry == 0 {
-        eprintln!("telemetry_log has no rows: nothing records the H19 series yet");
-    }
+    // Known gap (runbook §10 item 2, change note filed): nothing in
+    // production records the 1 Hz `telemetry_log` series (H19), which the
+    // v6 TME/AstroM3Edge data path (Model 9) reads. Asserted empty as it is
+    // today, so the writer's arrival fails here; then require rows for the
+    // mount and the focuser instead.
+    assert_eq!(
+        rows("telemetry_log").await,
+        0,
+        "telemetry_log has rows now: replace this with an assertion that the mount \
+         and the focuser have rows (H19)"
+    );
     assert_eq!(
         daemon
             .count(&format!(
@@ -1279,6 +1442,22 @@ async fn the_tier1_rig_runs_end_to_end_through_the_daemon_routes() {
     daemon.close().await;
     drop(phd2);
     drop(server);
+}
+
+/// PHD2's guide steps during the hooked exposure (mount-axis errors RA, Dec
+/// in guide pixels): varied, so the window's RMS about the mean is not zero
+/// and a stub could not match the reference.
+const EXPOSURE_GUIDE_STEPS: [(f64, f64); 4] =
+    [(0.25, 0.1), (-0.15, 0.3), (0.4, -0.2), (-0.05, 0.05)];
+
+/// The PHD2 mock's pixel scale, arcsec per guide pixel (`Phd2Mock::start`).
+const MOCK_PIXEL_SCALE: f64 = 1.5;
+
+/// Population standard deviation, two-pass (the G-i definition).
+fn population_std(values: &[f64]) -> f64 {
+    let n = values.len() as f64;
+    let mean = values.iter().sum::<f64>() / n;
+    (values.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n).sqrt()
 }
 
 /// One 2 s exposure while the mount tracks and PHD2 guides, through the
@@ -1304,8 +1483,8 @@ async fn exposure_with_ground_truth(
     let mut hooks = CaptureHooks::new(Arc::clone(&hub), &runtime, &capture_id, &frame_id);
     let started = Utc::now();
     hooks.exposure_started(AcquisitionPath::Still, 2.0, None);
-    for frame in 20..24 {
-        phd2.send_event(Phd2Mock::guide_step(frame, 0.2, 0.1));
+    for (frame, (ra_raw, dec_raw)) in (20..).zip(EXPOSURE_GUIDE_STEPS) {
+        phd2.send_event(Phd2Mock::guide_step(frame, ra_raw, dec_raw));
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
     hooks.exposure_ended();
@@ -1357,6 +1536,398 @@ async fn exposure_with_ground_truth(
     let error = outcome.error_arcmin.expect("a pointing error");
     assert!(error < 3.0, "pointing error {error:.2}'");
     frame_id
+}
+
+// ---------------------------------------------------------------------------
+// CI: manual motion and link health of the ESP32-like mount over HTTP
+// ---------------------------------------------------------------------------
+
+/// The ESP32-like simulator mount, unparked and tracking, served over Alpaca
+/// HTTP, and a daemon connected to it.
+async fn esp32_like_mount_on_a_daemon() -> (
+    crate::equipment::sim::mount::SimMountControl,
+    TestAlpacaServer,
+    Daemon,
+) {
+    let mut profile = SimMountProfile::esp32_like();
+    profile.slew_rate_deg_s = 30.0;
+    let sim = SimMount::new(profile, SystemClock::shared());
+    let control = sim.control();
+    let server =
+        TestAlpacaServer::start(vec![ScriptedDevice::sim_mount(0, sim).unique_id(MOUNT_UID)]);
+    let daemon = Daemon::start(scenario_configs(40.0, -75.0, 100.0)).await;
+    daemon
+        .connect(
+            "mount",
+            "alpaca",
+            &format!("{}#device=0", server.base_url()),
+        )
+        .await;
+    daemon
+        .wait_status("a polled, tracking Alpaca mount", |v| {
+            v["device_health"]["mount"]["state"] == "ready"
+                && v["mount"]["lst_h"].is_number()
+                && v["mount"]["tracking"] == true
+        })
+        .await;
+    (control, server, daemon)
+}
+
+/// Poll `cond` every 10 ms for up to `within`.
+async fn eventually(within: Duration, cond: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    while !cond() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    true
+}
+
+/// §3.2 M-g, M-h and M-i through the daemon's routes, against the
+/// ESP32-like profile behind Alpaca HTTP. That profile reports CanSlew
+/// false and CanMoveAxis true on axes 0 and 1, so a jog that works here is
+/// gated on CanMoveAxis, never on CanSlew (O10 point 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn manual_motion_reaches_the_alpaca_mount_through_the_daemon_routes() {
+    let (control, server, daemon) = esp32_like_mount_on_a_daemon().await;
+    let deadman = Duration::from_millis(daemon.state.equipment_ctx.configs.mount.jog_deadman_ms);
+    // Every MoveAxis the mount received, as (axis, rate deg/s).
+    let moveaxis_puts = || -> Vec<(i64, f64)> {
+        server
+            .requests()
+            .into_iter()
+            .filter(|r| r.member == "moveaxis")
+            .map(|r| {
+                let find = |key| {
+                    crate::equipment::alpaca::form::find(&r.params, key, true)
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .unwrap_or(f64::NAN)
+                };
+                (find("Axis") as i64, find("Rate"))
+            })
+            .collect()
+    };
+
+    // ---- M-h: a jog without renewal stops at its dead-man ----
+    let (ha_before, _) = mechanical(&control);
+    let mark = daemon.mark();
+    let sent = Instant::now();
+    let accepted = daemon
+        .post_ok("/mount/move-axis", json!({"axis": 0, "rate_deg_s": 2.0}))
+        .await;
+    assert_eq!(accepted["status"], "moving", "{accepted}");
+    assert_eq!(accepted["was_jogging"], false, "{accepted}");
+    assert_eq!(
+        accepted["renew_within_ms"],
+        json!(deadman.as_millis() as u64),
+        "{accepted}"
+    );
+    assert!(
+        eventually(WAIT, || control.axis_rates()[0] == 2.0).await,
+        "MoveAxis(0, 2) never reached the mount"
+    );
+    let ended = daemon.wait_op_ended("move_axis", mark).await;
+    let lapsed_after = sent.elapsed();
+    assert_eq!(ended["payload"]["outcome"]["status"], "failed", "{ended}");
+    assert_eq!(
+        ended["payload"]["outcome"]["detail"]["class"], "timeout",
+        "{ended}"
+    );
+    assert!(
+        ended["payload"]["outcome"]["detail"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("jog_deadman_lapsed")),
+        "{ended}"
+    );
+    assert!(
+        lapsed_after >= deadman,
+        "the dead-man lapsed after {lapsed_after:?}, before {deadman:?}"
+    );
+    assert_eq!(
+        control.axis_rates()[0],
+        0.0,
+        "the dead-man stopped the axis"
+    );
+    let (ha_after, _) = mechanical(&control);
+    let moved_deg = ((ha_after - ha_before + 12.0).rem_euclid(24.0) - 12.0).abs() * 15.0;
+    assert!(
+        moved_deg > 0.5,
+        "the jog moved the axis by {moved_deg:.3} deg"
+    );
+    let jog_events: Vec<Value> = daemon
+        .events_after(mark, "move_axis")
+        .await
+        .into_iter()
+        .map(|e| e["payload"].clone())
+        .collect();
+    assert_eq!(
+        jog_events,
+        vec![
+            json!({"axis": 0, "rate_deg_s": 2.0}),
+            json!({"axis": 0, "rate_deg_s": 0.0}),
+        ]
+    );
+    let puts = moveaxis_puts();
+    assert_eq!(puts.first(), Some(&(0, 2.0)), "{puts:?}");
+    assert!(puts.iter().skip(1).any(|p| *p == (0, 0.0)), "{puts:?}");
+    daemon.wait_idle().await;
+
+    // ---- M-h: renewed in time it keeps moving; rate 0 stops it at once ----
+    let mark = daemon.mark();
+    daemon
+        .post_ok("/mount/move-axis", json!({"axis": 0, "rate_deg_s": -2.0}))
+        .await;
+    // Renewed every third of the dead-man period, for longer than one.
+    let renewals = 4;
+    let jogging_since = Instant::now();
+    for _ in 0..renewals {
+        tokio::time::sleep(deadman / 3).await;
+        let renewed = daemon
+            .post_ok("/mount/move-axis", json!({"axis": 0, "rate_deg_s": -2.0}))
+            .await;
+        assert_eq!(renewed["was_jogging"], true, "{renewed}");
+    }
+    assert!(jogging_since.elapsed() > deadman);
+    assert_eq!(
+        control.axis_rates()[0],
+        -2.0,
+        "a renewed jog still moves after {:?}",
+        jogging_since.elapsed()
+    );
+    let stop = Instant::now();
+    let stopped = daemon
+        .post_ok("/mount/move-axis", json!({"axis": 0, "rate_deg_s": 0.0}))
+        .await;
+    assert_eq!(stopped["status"], "stopped", "{stopped}");
+    assert_eq!(stopped["abort_path_ran"], true, "{stopped}");
+    assert!(
+        eventually(deadman / 2, || control.axis_rates()[0] == 0.0).await,
+        "rate 0 did not stop the axis within half the dead-man period"
+    );
+    eprintln!("jog: rate 0 stopped the axis in {:?}", stop.elapsed());
+    daemon.wait_op_ended("move_axis", mark).await;
+    daemon.wait_idle().await;
+
+    // ---- O10: no CanMoveAxis(2), no tertiary jog; nothing is sent ----
+    let puts_before = moveaxis_puts().len();
+    let (code, refused) = daemon
+        .post("/mount/move-axis", json!({"axis": 2, "rate_deg_s": 1.0}))
+        .await;
+    assert_eq!(code, 501, "{refused}");
+    assert_eq!(refused["error"]["code"], "mount_unsupported", "{refused}");
+    assert_eq!(
+        moveaxis_puts().len(),
+        puts_before,
+        "no MoveAxis(2) was sent"
+    );
+    daemon.wait_idle().await;
+
+    // ---- M-g: a sync (sync_mode = mount) is applied and read back ----
+    let status = daemon.status().await;
+    let ra = (status["mount"]["ra_j2000"].as_f64().unwrap() + 0.02).rem_euclid(24.0);
+    let dec = status["mount"]["dec_j2000"].as_f64().unwrap() + 0.2;
+    let mark = daemon.mark();
+    daemon
+        .post_ok(
+            "/mount/sync",
+            json!({"ra": ra, "dec": dec, "frame": "j2000"}),
+        )
+        .await;
+    let applied = daemon.wait_event("sync_applied", mark).await;
+    assert!(
+        applied["payload"]["generation"]
+            .as_u64()
+            .is_some_and(|g| g >= 1),
+        "{applied}"
+    );
+    assert!(applied["payload"]["after"].is_object(), "{applied}");
+    daemon.wait_idle().await;
+    assert!(
+        server
+            .requests()
+            .iter()
+            .any(|r| r.member == "synctocoordinates"),
+        "SyncToCoordinates reached the mount"
+    );
+    let value = daemon
+        .wait_status("the synced position", |v| {
+            v["mount"]["ra_j2000"]
+                .as_f64()
+                .zip(v["mount"]["dec_j2000"].as_f64())
+                .is_some_and(|(r, d)| separation_arcmin(r, d, ra, dec) < 0.1)
+        })
+        .await;
+    assert_eq!(value["mount"]["tracking"], true);
+
+    // ---- M-i: a pulse is seen through IsPulseGuiding, then ends ----
+    let mark = daemon.mark();
+    daemon
+        .post_ok(
+            "/mount/pulse-guide",
+            json!({"direction": "west", "duration_ms": 1000}),
+        )
+        .await;
+    daemon
+        .wait_status("is_pulse_guiding true", |v| {
+            v["mount"]["is_pulse_guiding"] == true
+        })
+        .await;
+    daemon
+        .wait_status("is_pulse_guiding false", |v| {
+            v["mount"]["is_pulse_guiding"] == false
+        })
+        .await;
+    daemon.wait_event("pulse_guide", mark).await;
+    daemon.wait_idle().await;
+    assert!(control.calls().iter().any(|c| c == "pulse_guide:West:1000"));
+
+    // ---- M-h: refused while parked; nothing moves ----
+    let mark = daemon.mark();
+    daemon.post_ok("/mount/park", json!({})).await;
+    daemon.wait_event("parked", mark).await;
+    daemon.wait_idle().await;
+    let puts_before = moveaxis_puts().len();
+    let (code, body) = daemon
+        .post("/mount/move-axis", json!({"axis": 0, "rate_deg_s": 1.0}))
+        .await;
+    // The gate's mount-limits check refuses motion of a parked mount.
+    assert_eq!(code, 422, "{body}");
+    assert_eq!(body["error"]["code"], "safety_rejected", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("mount_parked")),
+        "{body}"
+    );
+    daemon.wait_idle().await;
+    assert_eq!(control.axis_rates(), [0.0; 3]);
+    assert_eq!(
+        moveaxis_puts().len(),
+        puts_before,
+        "a MoveAxis reached a parked mount"
+    );
+
+    daemon.close().await;
+    drop(server);
+}
+
+/// §5.7 item 2's link criteria for the ESP32-like profile over HTTP: one
+/// 4 s stall degrades the mount without losing it, `/mount/abort` stops a
+/// GoTo while it is degraded, and a server that stops answering loses the
+/// mount within `lost_after_s` while `/mount/abort` still runs its path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stalled_alpaca_mount_degrades_and_a_silent_one_is_lost() {
+    let (control, mut server, daemon) = esp32_like_mount_on_a_daemon().await;
+    let mount_state = |v: &Value| {
+        v["device_health"]["mount"]["state"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    // A GoTo that never arrives keeps the mount slewing.
+    control.update_faults(|f| f.slew_hangs = true);
+    let (ra, dec) = target_from(&daemon.status().await, -1.0, 30.0);
+    daemon
+        .post_ok(
+            "/mount/slew",
+            json!({"ra": ra, "dec": dec, "frame": "j2000"}),
+        )
+        .await;
+    daemon
+        .wait_status("slewing", |v| v["mount"]["slewing"] == true)
+        .await;
+
+    // One 4 s stall: the next DeviceState poll answers after 4 s, with the
+    // state as it was when the stall was set up.
+    let base = server.base_url();
+    let device_state = tokio::task::spawn_blocking(move || {
+        raw_client(&base, "telescope").get("devicestate", &[], TimeoutClass::Ordinary)
+    })
+    .await
+    .unwrap()
+    .expect("DeviceState");
+    let stall = Duration::from_secs(4);
+    server.queue_reply(
+        "telescope",
+        0,
+        crate::equipment::alpaca::errors::Verb::Get,
+        "devicestate",
+        ServerReply::Delay(stall, Box::new(ServerReply::Value(device_state))),
+    );
+    let stalled_at = Instant::now();
+    let mut states: Vec<String> = Vec::new();
+    let mut abort_latency = None;
+    let deadline = stalled_at + WAIT;
+    loop {
+        let state = mount_state(&daemon.status().await);
+        if states.last() != Some(&state) {
+            states.push(state.clone());
+        }
+        if state == "degraded" && abort_latency.is_none() {
+            // Abort while degraded: the out-of-band path, not the stalled
+            // poll, reaches the mount (D19).
+            let started = Instant::now();
+            let aborted = daemon.post_ok("/mount/abort", json!({})).await;
+            assert_eq!(aborted["abort_path_ran"], true, "{aborted}");
+            assert!(
+                eventually(Duration::from_secs(2), || !control.slewing()).await,
+                "the mount still slews 2 s after an abort while degraded"
+            );
+            abort_latency = Some(started.elapsed());
+        }
+        if abort_latency.is_some() && state == "ready" && stalled_at.elapsed() > stall {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the stall never resolved: {states:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(states.iter().any(|s| s == "degraded"), "{states:?}");
+    assert!(
+        !states.iter().any(|s| s == "lost"),
+        "one 4 s stall lost the mount: {states:?}"
+    );
+    eprintln!(
+        "stall: states {states:?}, abort while degraded stopped the mount in {:?}",
+        abort_latency.unwrap()
+    );
+    control.update_faults(|f| f.slew_hangs = false);
+    daemon.wait_idle().await;
+
+    // The server stops answering: lost within lost_after_s.
+    let lost_after = HealthPolicy::default().lost_after;
+    server.stop();
+    let stopped_at = Instant::now();
+    let mut states: Vec<String> = Vec::new();
+    loop {
+        let state = mount_state(&daemon.status().await);
+        if states.last() != Some(&state) {
+            states.push(state.clone());
+        }
+        if state == "lost" {
+            break;
+        }
+        assert!(
+            stopped_at.elapsed() < lost_after,
+            "not lost {lost_after:?} after the server stopped: {states:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    eprintln!(
+        "silent server: states {states:?}, lost after {:?}",
+        stopped_at.elapsed()
+    );
+    // A lost (not retired) handle still runs its abort path.
+    let aborted = daemon.post_ok("/mount/abort", json!({})).await;
+    assert_eq!(aborted["abort_path_ran"], true, "{aborted}");
+
+    daemon.close().await;
+    drop(server);
 }
 
 // ---------------------------------------------------------------------------
@@ -1453,20 +2024,24 @@ fn native_alpaca_drivers_conform_against_the_served_simulators() {
 // Local-only fixtures: external processes
 // ---------------------------------------------------------------------------
 
-/// The value of a fixture variable naming an existing file, or `None` with
-/// the reason printed (the test then passes without running).
+/// The file a local-only test runs against. `None` (the test skips, saying
+/// why on stderr) only when `var` is unset (O9: skip otherwise). A variable
+/// that is set but does not name an existing file fails the test, so a
+/// mistyped or worktree-relative path never passes without starting
+/// anything.
 fn fixture(var: &str) -> Option<PathBuf> {
-    match std::env::var_os(var).map(PathBuf::from) {
-        Some(path) if path.is_file() => Some(path),
-        Some(path) => {
-            eprintln!("{var}={} is not a file; skipping", path.display());
-            None
-        }
-        None => {
-            eprintln!("{var} is not set; skipping this local-only interop test");
-            None
-        }
-    }
+    let Some(value) = std::env::var_os(var) else {
+        eprintln!("{var} is not set; skipping this local-only interop test");
+        return None;
+    };
+    let path = PathBuf::from(value);
+    assert!(
+        path.is_file(),
+        "{var}={} does not name an existing file; fix the path (absolute is safest) \
+         or unset {var} to skip this test",
+        path.display()
+    );
+    Some(path)
 }
 
 /// A free loopback TCP port (released for the child to bind).
@@ -1540,6 +2115,117 @@ fn raw_client(base: &str, device_type: &str) -> AlpacaClient {
         ClientConfig::new(ClientId::new(4322).unwrap()),
     )
     .unwrap()
+}
+
+/// §3.2 M-h and M-g against an external Alpaca mount, through the daemon:
+/// a jog on axis 0 that stops at its dead-man, a jog stopped at once by
+/// rate 0, then a sync near the current position (`sync_mode = mount`).
+/// The mount must be unparked and tracking.
+async fn jog_and_sync_through_the_daemon(daemon: &Daemon, label: &str) {
+    let deadman = Duration::from_millis(daemon.state.equipment_ctx.configs.mount.jog_deadman_ms);
+    let ha_deg = |v: &Value| v["mount"]["ha_h"].as_f64().map(|h| h * 15.0);
+
+    // No renewal: the dead-man stops the axis (MoveAxis rate 0).
+    let before = daemon.status().await;
+    let mark = daemon.mark();
+    let sent = Instant::now();
+    let accepted = daemon
+        .post_ok("/mount/move-axis", json!({"axis": 0, "rate_deg_s": 1.0}))
+        .await;
+    assert_eq!(accepted["status"], "moving", "{label}: {accepted}");
+    let ended = daemon.wait_op_ended("move_axis", mark).await;
+    let lapsed_after = sent.elapsed();
+    assert!(
+        ended["payload"]["outcome"]["detail"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("jog_deadman_lapsed")),
+        "{label}: {ended}"
+    );
+    assert!(
+        lapsed_after >= deadman,
+        "{label}: lapsed after {lapsed_after:?}"
+    );
+    let rates: Vec<f64> = daemon
+        .events_after(mark, "move_axis")
+        .await
+        .iter()
+        .filter_map(|e| e["payload"]["rate_deg_s"].as_f64())
+        .collect();
+    assert_eq!(rates.first(), Some(&1.0), "{label}: {rates:?}");
+    assert!(rates[1..].contains(&0.0), "{label}: {rates:?}");
+    daemon.wait_idle().await;
+    let after = daemon
+        .wait_status("stopped after the dead-man", |v| {
+            v["mount"]["slewing"] == false
+        })
+        .await;
+    let moved = ha_deg(&after)
+        .zip(ha_deg(&before))
+        .map(|(a, b)| ((a - b + 180.0).rem_euclid(360.0) - 180.0).abs())
+        .expect("the hour angle");
+    eprintln!(
+        "{label}: the jog moved axis 0 by {moved:.3} deg; the dead-man lapsed after {lapsed_after:?}"
+    );
+    assert!(
+        moved > 0.05,
+        "{label}: the jog moved axis 0 by {moved:.4} deg"
+    );
+
+    // Rate 0 stops a jog at once, through the abort path (D19).
+    let mark = daemon.mark();
+    daemon
+        .post_ok("/mount/move-axis", json!({"axis": 0, "rate_deg_s": -1.0}))
+        .await;
+    tokio::time::sleep(deadman / 4).await;
+    let stopped = daemon
+        .post_ok("/mount/move-axis", json!({"axis": 0, "rate_deg_s": 0.0}))
+        .await;
+    assert_eq!(stopped["status"], "stopped", "{label}: {stopped}");
+    assert_eq!(stopped["abort_path_ran"], true, "{label}: {stopped}");
+    let ended = daemon.wait_op_ended("move_axis", mark).await;
+    assert!(
+        !ended["payload"]["outcome"]["detail"]["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("jog_deadman_lapsed")),
+        "{label}: rate 0, not the dead-man, ends the jog: {ended}"
+    );
+    daemon.wait_idle().await;
+    daemon
+        .wait_status("stopped by rate 0", |v| v["mount"]["slewing"] == false)
+        .await;
+
+    // A sync near the current position, applied and read back.
+    let status = daemon.status().await;
+    let ra = (status["mount"]["ra_j2000"].as_f64().unwrap() + 0.01).rem_euclid(24.0);
+    let dec = status["mount"]["dec_j2000"].as_f64().unwrap() - 0.1;
+    let mark = daemon.mark();
+    daemon
+        .post_ok(
+            "/mount/sync",
+            json!({"ra": ra, "dec": dec, "frame": "j2000"}),
+        )
+        .await;
+    let applied = daemon.wait_event("sync_applied", mark).await;
+    eprintln!("{label}: sync_applied {}", applied["payload"]);
+    assert!(
+        applied["payload"]["generation"]
+            .as_u64()
+            .is_some_and(|g| g >= 1),
+        "{label}: {applied}"
+    );
+    assert!(
+        applied["payload"]["after"].is_object(),
+        "{label}: {applied}"
+    );
+    daemon.wait_idle().await;
+    daemon
+        .wait_status("the synced position", |v| {
+            v["mount"]["ra_j2000"]
+                .as_f64()
+                .zip(v["mount"]["dec_j2000"].as_f64())
+                .is_some_and(|(r, d)| separation_arcmin(r, d, ra, dec) < 0.5)
+        })
+        .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1752,12 +2438,21 @@ async fn interop_esp32_host_sim_runs_the_native_alpaca_mount_end_to_end() {
     daemon.wait_event("pulse_guide", mark).await;
     daemon.wait_idle().await;
 
-    // Park, verified through AtPark (M-f), and unpark.
+    // A jog (M-h, O10: the firmware reports CanSlew false) and a sync (M-g).
+    jog_and_sync_through_the_daemon(&daemon, "host sim").await;
+
+    // Park, verified through AtPark (M-f); a jog is refused while parked;
+    // unpark.
     let mark = daemon.mark();
     daemon.post_ok("/mount/park", json!({})).await;
     daemon.wait_event("parked", mark).await;
     daemon.wait_idle().await;
     assert_eq!(daemon.status().await["mount"]["parked"], true);
+    let (code, body) = daemon
+        .post("/mount/move-axis", json!({"axis": 0, "rate_deg_s": 1.0}))
+        .await;
+    assert_eq!(code, 422, "a jog while parked: {body}");
+    assert_eq!(body["error"]["code"], "safety_rejected", "{body}");
     let mark = daemon.mark();
     daemon.post_ok("/mount/unpark", json!({})).await;
     daemon.wait_event("unparked", mark).await;
@@ -1852,6 +2547,16 @@ async fn interop_esp32_host_sim_without_dec_refuses_an_out_of_window_goto_cleanl
         assert!(body["error"]["code"].is_string(), "{body}");
     }
     daemon.wait_idle().await;
+    // A Dec jog is refused before anything is sent: the firmware reports
+    // CanMoveAxis(1) false without its Dec motor (O10: jog is gated on
+    // CanMoveAxis).
+    let (code, body) = daemon
+        .post("/mount/move-axis", json!({"axis": 1, "rate_deg_s": 1.0}))
+        .await;
+    eprintln!("host sim (no Dec): a Dec jog answered {code} {body}");
+    assert_eq!(code, 501, "{body}");
+    assert_eq!(body["error"]["code"], "mount_unsupported", "{body}");
+    daemon.wait_idle().await;
     let value = daemon.status().await;
     assert_eq!(value["mount"]["slewing"], false);
     let moved = (value["mount"]["dec"].as_f64().unwrap() - dec_now).abs();
@@ -1869,16 +2574,21 @@ async fn interop_esp32_host_sim_without_dec_refuses_an_out_of_window_goto_cleanl
 static OMNISIM_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// OmniSim bound to `127.0.0.1:{OMNISIM_PORT}` on a free port, with its
-/// output in a log under the temporary directory (named on stderr).
+/// output in a log in a directory of its own under the temporary directory
+/// (named on stderr): removed after a pass, kept after a failure.
 struct OmniSim {
     base: String,
     _child: ChildGuard,
+    /// After the child, which is killed and reaped first, so the log is
+    /// closed before its directory is removed.
+    _log: ScratchDir,
 }
 
 impl OmniSim {
     fn start(launcher: &Path) -> Self {
         let port = free_port();
-        let log = std::env::temp_dir().join(format!("achernar-interop-omnisim-{port}.log"));
+        let log_dir = ScratchDir::new("achernar-interop-omnisim", true);
+        let log = log_dir.path.join(format!("omnisim-{port}.log"));
         eprintln!("OmniSim on port {port}, log {}", log.display());
         let out = std::fs::File::create(&log).unwrap();
         let err = out.try_clone().unwrap();
@@ -1898,6 +2608,7 @@ impl OmniSim {
         Self {
             base,
             _child: child,
+            _log: log_dir,
         }
     }
 }
@@ -2163,6 +2874,7 @@ async fn interop_omnisim_daemon_drives_every_tier1_alpaca_device() {
         .await;
     daemon.wait_event("pulse_guide", mark).await;
     daemon.wait_idle().await;
+    jog_and_sync_through_the_daemon(&daemon, "OmniSim").await;
     let mark = daemon.mark();
     daemon.post_ok("/mount/park", json!({})).await;
     daemon.wait_event("parked", mark).await;
@@ -2214,11 +2926,44 @@ async fn interop_omnisim_daemon_drives_every_tier1_alpaca_device() {
     assert!(weather["fields"].is_object(), "{weather}");
     assert_eq!(daemon.get("/safety").await["state"], "safe");
 
-    // E-stop reaches every motion device; the operator clears the block.
+    // E-stop during a GoTo reaches every motion device and stops the
+    // mount; the operator clears the block.
+    let (ra_far, dec_far) = target_from(&daemon.status().await, -3.0, 10.0);
+    daemon
+        .post_ok(
+            "/mount/slew",
+            json!({"ra": ra_far, "dec": dec_far, "frame": "j2000"}),
+        )
+        .await;
+    daemon
+        .wait_status("slewing", |v| v["mount"]["slewing"] == true)
+        .await;
     let report = daemon.post_ok("/equipment/estop", json!({})).await;
     assert!(report["elapsed_ms"].as_u64().unwrap() < 2000, "{report}");
+    for kind in ["mount", "focuser", "filter_wheel"] {
+        let result = report["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["kind"] == kind)
+            .unwrap_or_else(|| panic!("the e-stop did not reach the {kind}: {report}"));
+        assert_eq!(result["ok"], true, "{kind}: {report}");
+    }
+    daemon
+        .wait_status("the mount stopped by the e-stop", |v| {
+            v["mount"]["slewing"] == false && v["mount"]["tracking"] == false
+        })
+        .await;
+    daemon.wait_idle().await;
     let blocks = daemon.get("/equipment/resume-blocks").await;
-    let id = blocks["blocks"][0]["id"].as_str().unwrap().to_string();
+    let id = blocks["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["kind"]["kind"] == "estop")
+        .and_then(|b| b["id"].as_str())
+        .unwrap_or_else(|| panic!("no estop block: {blocks}"))
+        .to_string();
     daemon
         .post_ok("/equipment/resume-blocks/clear", json!({"id": id}))
         .await;
