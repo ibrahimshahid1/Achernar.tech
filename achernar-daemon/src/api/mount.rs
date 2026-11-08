@@ -104,6 +104,31 @@ pub struct CenterRequest {
     pub dec: f64,
     #[serde(default)]
     pub frame: Option<String>,
+    /// Overrides of `[mount.center]` for this run; a non-positive or
+    /// non-finite value is ignored.
+    #[serde(default)]
+    pub tolerance_arcmin: Option<f64>,
+    #[serde(default)]
+    pub max_attempts: Option<u32>,
+    /// The exposure, gain and binning of each center frame.
+    #[serde(default)]
+    pub exposure_s: Option<f64>,
+    #[serde(default)]
+    pub gain: Option<u32>,
+    #[serde(default)]
+    pub binning: Option<u32>,
+}
+
+impl CenterRequest {
+    fn overrides(&self) -> crate::mount::center::CenterOverrides {
+        crate::mount::center::CenterOverrides {
+            tolerance_arcmin: self.tolerance_arcmin,
+            max_attempts: self.max_attempts,
+            exposure_s: self.exposure_s,
+            gain: self.gain,
+            binning: self.binning,
+        }
+    }
 }
 
 /// Gate, send and audit one mount command.
@@ -517,25 +542,31 @@ pub async fn site_sync(
     site_sync_value(&state, req, false).await.map(Json)
 }
 
-/// `POST mount/center`: the center loop (M-n) is WP1B-4's
-/// `D/mount/center.rs`; until it lands the route answers 501 after
-/// validating the request.
-pub async fn center_value(state: &AppState, req: CenterRequest) -> Result<Value, ApiError> {
-    parse_frame(req.frame.as_deref())?;
-    eq::mount_handle(state)?;
-    let _ = (req.ra, req.dec);
-    Err(ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "mount_center_unavailable",
-        "the center loop (slew, solve, sync or offset, re-slew) arrives with WP1B-4",
-    ))
+/// `POST mount/center` (M-n): authorise the center loop (`D/mount/center.rs`)
+/// for the mount and camera domains, start it, and return on accept with
+/// `{status: "centering", command_id, ...}`. Completion arrives as the
+/// `centered` or `center_failed` event.
+pub async fn center_value(
+    state: &AppState,
+    req: CenterRequest,
+    relay: bool,
+) -> Result<Value, ApiError> {
+    tracing::info!("Center requested: RA={}, Dec={}", req.ra, req.dec);
+    let frame = parse_frame(req.frame.as_deref())?;
+    crate::mount::center::start(
+        state,
+        EqCoord::new(req.ra, req.dec, frame),
+        req.overrides(),
+        source(relay, false),
+    )
+    .await
 }
 
 pub async fn center(
     State(state): State<AppState>,
     Json(req): Json<CenterRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    center_value(&state, req).await.map(Json)
+    center_value(&state, req, false).await.map(Json)
 }
 
 // -- descriptor -----------------------------------------------------------------

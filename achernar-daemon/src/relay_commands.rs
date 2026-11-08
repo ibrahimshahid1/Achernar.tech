@@ -268,8 +268,9 @@ command_registry! {
         => relay(crate::api::mount::home_value(&state, true).await),
 
     "mount.center" POST "mount/center"
-        "Center a target by slew, solve and sync or offset (the loop arrives with WP1B-4)."
-        => relay(crate::api::mount::center_value(&state, body(payload)?).await),
+        "Center a target by slew, solve and sync or offset, then re-slew, until within \
+         tolerance. Requires `ra` and `dec`; optional `frame`."
+        => relay(crate::api::mount::center_value(&state, body(payload)?, true).await),
 
     "mount.move_axis" POST "mount/move-axis" direct_only
         "Jog one axis at `rate_deg_s`; renew within jog_deadman_ms. Direct API only: a \

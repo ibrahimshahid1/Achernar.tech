@@ -24,11 +24,9 @@
 //! `centering` while it runs.
 //!
 //! [`CommandGate::submit_step`]: crate::equipment::gate::CommandGate::submit_step
-
-// `start` is the body of `POST mount/center` (`api/mount.rs::center_value`,
-// spine-owned): wired by the WP1B-4 change note for that file. Until it is
-// applied only tests call the loop.
-#![allow(dead_code)]
+//!
+//! [`start`] is the body of `POST mount/center` and of the relay's
+//! `mount.center` (`api/mount.rs::center_value`).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -1084,6 +1082,77 @@ mod tests {
             CenterOutcome::Centered { attempts: 1, .. }
         ));
         assert!(!state.equipment.busy().borrow().centering);
+        crate::api::equipment_tests::cleanup(directory, state).await;
+    }
+
+    async fn wait_for(state: &AppState, what: &str, done: impl Fn(&AppState) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        while !done(state) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// `POST mount/center` and the relay's `mount.center` start the loop
+    /// and answer on accept with its settings. This fixture has no plate
+    /// solver, so each loop slews, fails its first frame and releases the
+    /// mount and camera.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn post_mount_center_starts_the_loop_and_answers_on_accept() {
+        use crate::api::mount::{center_value, CenterRequest};
+        let (directory, state) = state(MountSyncMode::Mount).await;
+        let target = near(&state, 0.02, 0.2).await;
+        let request = |extra: Value| -> CenterRequest {
+            let mut body = json!({"ra": target.ra_h, "dec": target.dec_deg, "frame": "j2000"});
+            body.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value(body).unwrap()
+        };
+        let body = center_value(
+            &state,
+            request(json!({"tolerance_arcmin": 2.5, "max_attempts": 2, "exposure_s": 3.0})),
+            false,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{}: {}", err.code, err.message));
+        assert_eq!(body["status"], json!("centering"), "{body}");
+        assert!(body["command_id"].is_string(), "{body}");
+        assert_eq!(body["tolerance_arcmin"], json!(2.5));
+        assert_eq!(body["max_attempts"], json!(2));
+        assert_eq!(body["exposure"]["exposure_s"], json!(3.0));
+        assert_eq!(body["exposure"]["source"], json!("request"));
+        wait_for(&state, "the first loop to end", |s| {
+            center_events(s) == vec!["center_failed".to_string()] && s.equipment.gate().is_idle()
+        })
+        .await;
+
+        let relayed = crate::relay_commands::execute(
+            state.clone(),
+            &crate::relay_commands::RelayCommand {
+                command_id: "relay-center".into(),
+                action: "mount.center".into(),
+                payload: json!({"ra": target.ra_h, "dec": target.dec_deg, "frame": "j2000"}),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(relayed["status"], json!("centering"), "{relayed}");
+        wait_for(&state, "the relayed loop to end", |s| {
+            center_events(s).len() == 2 && s.equipment.gate().is_idle()
+        })
+        .await;
+
+        // A frame the daemon does not know is refused before anything is
+        // authorised.
+        let bad = center_value(&state, request(json!({"frame": "b1950"})), false)
+            .await
+            .unwrap_err();
+        assert_eq!(bad.status, axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(bad.code, "invalid_frame");
         crate::api::equipment_tests::cleanup(directory, state).await;
     }
 
