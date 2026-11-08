@@ -512,6 +512,58 @@ async fn the_sim_focuser_moves_through_the_gate_within_its_travel_bounds() {
     cleanup(directory, state).await;
 }
 
+/// A focuser move resolves inside the worker after the last poll was
+/// published while it still settled. The snapshot republished on resolve
+/// shows it settled and at its committed position at once, instead of
+/// reporting it moving (to hub quiescence and the busy set) until the next
+/// idle poll, seconds later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resolved_focuser_move_is_published_settled_without_waiting_for_an_idle_poll() {
+    use crate::equipment::ring::DeviceSnapshot as _;
+    let (directory, mut state) = state().await;
+    let mut configs = AchernarConfig::default().equipment_configs();
+    configs.focus_safety.settle_ms = 150;
+    let ctx = SpineContext::new(&state.equipment, configs, None, None);
+    ctx.set_tuning(WorkerTuning {
+        cadence: Some(Cadence {
+            idle: Duration::from_secs(20),
+            active: Duration::from_millis(20),
+        }),
+        policy: Some(HealthPolicy::default()),
+        sim_mount_profile: None,
+    });
+    state.equipment_ctx = Arc::new(ctx);
+    connect(&state, "focuser", "sim", "12345").await;
+    let handle = eq::focuser_handle(&state).unwrap();
+    super::focuser::move_absolute_value(
+        &state,
+        super::focuser::MoveToRequest {
+            position: 12_400,
+            overriding: false,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut saw_settling = false;
+    let resolved = loop {
+        let snapshot = handle.snapshot();
+        saw_settling |= snapshot.settling;
+        if snapshot.active_op.is_none() && snapshot.logical_position != Some(12_345) {
+            break snapshot;
+        }
+        assert!(Instant::now() < deadline, "the move never resolved");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    };
+    assert!(saw_settling, "the move settled before it resolved");
+    // The next idle poll is 20 s away: this is the republished snapshot.
+    assert!(!resolved.settling, "{resolved:?}");
+    assert!(!resolved.in_motion());
+    assert_eq!(resolved.logical_position, Some(12_400));
+    cleanup(directory, state).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_sim_filter_wheel_changes_through_the_handshake() {
     let (directory, state) = state().await;

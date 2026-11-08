@@ -1126,6 +1126,11 @@ impl FocuserSession {
         self.inner.lock().logical
     }
 
+    /// True while a move settles (F-a), cleared when the move resolves.
+    pub fn settling(&self) -> bool {
+        self.inner.lock().settling
+    }
+
     pub fn backlash_state(&self) -> BacklashState {
         self.inner.lock().backlash
     }

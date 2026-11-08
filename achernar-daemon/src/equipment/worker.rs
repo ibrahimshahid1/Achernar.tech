@@ -404,6 +404,15 @@ pub trait WorkerKind: Send + 'static {
         Vec::new()
     }
 
+    /// The snapshot republished when an operation resolves, built from the
+    /// last poll's. The operation's own bookkeeping may have changed since
+    /// that poll (a focuser's settle ended, its logical position was
+    /// committed), and the next idle poll can be seconds away. `None`
+    /// republishes the last poll's snapshot unchanged.
+    fn resolved_snapshot(&mut self, _last: &Self::Snap) -> Option<Self::Snap> {
+        None
+    }
+
     /// After the single reconnect (§2.6): a relative focuser's origin becomes
     /// `unknown_after_reconnect`, a wheel's verified slot is re-read.
     fn after_reconnect(&mut self, _drv: &mut Self::Driver) {}
@@ -1363,7 +1372,21 @@ impl<K: WorkerKind> Worker<K> {
         self.shared.resolve_done(&outcome);
         // Releases the domains (on every path, including panics).
         drop(active);
-        self.republish();
+        self.republish_resolved();
+    }
+
+    /// Re-publish after an operation resolved, with whatever the kind says
+    /// changed since the last poll (a focuser is no longer settling).
+    fn republish_resolved(&mut self) {
+        let Some(last) = self.last.clone() else {
+            return;
+        };
+        let kind = &mut self.kind;
+        let resolved = catch_unwind(AssertUnwindSafe(|| kind.resolved_snapshot(&last)))
+            .ok()
+            .flatten();
+        let snap = self.publish(resolved.unwrap_or_else(|| (*last).clone()));
+        self.last = Some(snap);
     }
 
     fn after_poll(&mut self, snap: Option<&Arc<K::Snap>>) {

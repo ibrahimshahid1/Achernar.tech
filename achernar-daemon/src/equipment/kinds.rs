@@ -310,6 +310,18 @@ impl WorkerKind for FocuserKind {
         Some(stale)
     }
 
+    /// A move resolves inside the worker, after the last poll's snapshot
+    /// was built while it still settled: republish the session's settled
+    /// state and committed position, so hub quiescence does not report the
+    /// focuser moving until the next idle poll.
+    fn resolved_snapshot(&mut self, last: &FocuserSnapshot) -> Option<FocuserSnapshot> {
+        let mut snapshot = last.clone();
+        snapshot.settling = self.session.settling();
+        snapshot.logical_position = self.session.logical_position();
+        snapshot.position_source = self.session.position_source();
+        Some(snapshot)
+    }
+
     fn after_reconnect(&mut self, _drv: &mut Self::Driver) {
         self.session.on_reconnect();
     }
