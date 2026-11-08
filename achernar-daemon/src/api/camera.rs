@@ -399,6 +399,49 @@ pub async fn capture(
     perform_capture(state, params).await.map(Json)
 }
 
+/// Who a capture runs for, as the command gate sees it (H21).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CaptureOrigin {
+    /// The gate's source: the operator on the direct API, the relay, or the
+    /// automatic source the request names.
+    pub source: crate::equipment::types::CommandSource,
+    /// The compound operation this capture is one step of (a center loop's
+    /// frame). Its permit already holds the camera domain, so the capture is
+    /// authorised as a child step of it (O11 b) instead of claiming the
+    /// camera again, which the gate would refuse with 409.
+    pub parent: Option<crate::equipment::gate::StepOwner>,
+}
+
+impl CaptureOrigin {
+    /// The direct API: the request's own source.
+    pub fn direct(params: &CaptureParams) -> Self {
+        Self {
+            source: params.source.command_source_over(false),
+            parent: None,
+        }
+    }
+
+    /// The cloud relay: an operator request is audited as the relay; a
+    /// trigger or policy keeps its own source.
+    pub fn relay(params: &CaptureParams) -> Self {
+        Self {
+            source: params.source.command_source_over(true),
+            parent: None,
+        }
+    }
+
+    /// One step of `parent`, issued by `source` (the parent's own source).
+    pub fn step_of(
+        parent: crate::equipment::gate::StepOwner,
+        source: crate::equipment::types::CommandSource,
+    ) -> Self {
+        Self {
+            source,
+            parent: Some(parent),
+        }
+    }
+}
+
 /// The capture implementation, shared by the HTTP handler above and the cloud
 /// relay in `relay_commands.rs`.
 ///
@@ -408,11 +451,22 @@ pub(crate) async fn perform_capture(
     state: AppState,
     params: CaptureParams,
 ) -> Result<ImageData, ApiError> {
+    let origin = CaptureOrigin::direct(&params);
+    perform_capture_as(state, params, origin).await
+}
+
+/// [`perform_capture`] for an explicit origin: the relay's source, or a step
+/// of a compound operation that holds the camera (the center loop).
+pub(crate) async fn perform_capture_as(
+    state: AppState,
+    params: CaptureParams,
+    origin: CaptureOrigin,
+) -> Result<ImageData, ApiError> {
     // Detach the hardware transaction from the HTTP request lifetime. If a
     // browser tab closes mid-exposure, Tokio keeps this task (and its ownership
     // gate) alive until the camera and local archive commit finish.
     let cleanup_state = state.clone();
-    tokio::spawn(async move { perform_capture_owned(state, params).await })
+    tokio::spawn(async move { perform_capture_owned(state, params, origin).await })
         .await
         .map_err(|error| {
             let message = format!("Capture task failed: {error}. Camera outcome is uncertain; reconnect or restart the daemon before another exposure");
@@ -428,6 +482,7 @@ pub(crate) async fn perform_capture(
 async fn perform_capture_owned(
     state: AppState,
     params: CaptureParams,
+    origin: CaptureOrigin,
 ) -> Result<ImageData, ApiError> {
     // Serialise everything that commands the camera. Held across the whole
     // exposure — which can be minutes — so a second request cannot change the
@@ -469,16 +524,20 @@ async fn perform_capture_owned(
         "retention_acknowledgement": params.retention_acknowledgement,
         "retention": RetentionDecision::for_request(params.retention_policy, true),
         "source": params.source,
+        "command_source": origin.source.label(),
+        "parent_command_id": origin.parent.as_ref().map(|parent| parent.command_id),
     });
 
     // The command gate (H21, H22): an automatic source is refused while a
     // resume block is active (423) or the safety state is not confirmed safe
     // (422). Decided before the camera is marked exposing; the refusal is
-    // audited by the gate and recorded as a failed attempt here.
-    let source = params.source.command_source();
+    // audited by the gate and recorded as a failed attempt here. A step of a
+    // compound operation is a child of its permit (O11 b).
+    let source = origin.source.clone();
     let authorization = match equipment::authorize_capture(
         &state.equipment,
         &source,
+        origin.parent.as_ref(),
         &capture_type,
         serde_json::json!({"capture_id": capture_id, "request": requested_json}),
     ) {

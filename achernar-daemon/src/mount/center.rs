@@ -43,6 +43,7 @@ use crate::config::MountCenterConfig;
 use crate::equipment::busy::BusyFlag;
 use crate::equipment::commands::{GatedCommand, GatedOp, MountCmd};
 use crate::equipment::events::{EquipmentEvent, EventKind};
+use crate::equipment::gate::StepOwner;
 use crate::equipment::handle::{MountHandle, Permit};
 use crate::equipment::hub::EquipmentHub;
 use crate::equipment::types::{
@@ -166,9 +167,28 @@ pub trait CenterImaging: Send + Sync {
 
 /// The daemon's camera and ASTAP: a `center` capture through the capture
 /// path, then a hinted solve recorded with trigger `center`.
+///
+/// The center permit owns the camera for the whole loop, so each frame is
+/// a child step of it (O11 b): `owner` is that permit and `source` the
+/// loop's own source (the operator or the relay). A plain capture would
+/// claim the camera again and be refused with 409.
 pub struct DaemonImaging {
     pub state: AppState,
     pub exposure: CenterExposure,
+    pub owner: StepOwner,
+    pub source: CommandSource,
+}
+
+impl DaemonImaging {
+    /// The imaging of `job`: its frames are steps of its permit.
+    pub fn for_job(state: &AppState, job: &CenterJob, exposure: CenterExposure) -> Self {
+        Self {
+            state: state.clone(),
+            exposure,
+            owner: StepOwner::of(&job.permit),
+            source: job.command.source.clone(),
+        }
+    }
 }
 
 impl CenterImaging for DaemonImaging {
@@ -200,7 +220,9 @@ impl CenterImaging for DaemonImaging {
                 retention_acknowledgement: None,
                 source: Default::default(),
             };
-            let image = crate::api::camera::perform_capture(self.state.clone(), params)
+            let origin =
+                crate::api::camera::CaptureOrigin::step_of(self.owner.clone(), self.source.clone());
+            let image = crate::api::camera::perform_capture_as(self.state.clone(), params, origin)
                 .await
                 .map_err(|e| CenterImagingError::Capture(format!("{}: {}", e.code, e.message)))?;
             let request = SolveFrameRequest {
@@ -529,10 +551,7 @@ pub async fn start(
         "m4_shadow": m4,
     });
     let hub = std::sync::Arc::clone(&state.equipment);
-    let imaging = DaemonImaging {
-        state: state.clone(),
-        exposure,
-    };
+    let imaging = DaemonImaging::for_job(state, &job, exposure);
     tokio::spawn(async move {
         let report = run(&hub, &imaging, job).await;
         tracing::info!(
@@ -1065,6 +1084,107 @@ mod tests {
             CenterOutcome::Centered { attempts: 1, .. }
         ));
         assert!(!state.equipment.busy().borrow().centering);
+        crate::api::equipment_tests::cleanup(directory, state).await;
+    }
+
+    fn center_frame() -> crate::api::camera::CaptureParams {
+        serde_json::from_value(json!({"exposure": 1.0, "capture_type": "center"})).unwrap()
+    }
+
+    /// The center permit owns the camera, so its own frame is a child step
+    /// of it and passes the gate (no camera is connected here, so it stops
+    /// at the camera lookup with 412, never 409), while a plain operator
+    /// capture during the loop is still refused with 409.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_center_frame_is_a_step_of_the_center_permit_and_an_operator_capture_is_refused() {
+        use crate::api::camera::{perform_capture, perform_capture_as, CaptureOrigin};
+        use crate::equipment::commands::Domain;
+        let (directory, state) = state(MountSyncMode::Mount).await;
+        let job = authorize(
+            &state,
+            near(&state, 0.02, 0.2).await,
+            CenterOverrides::default(),
+            CommandSource::Relay { overriding: false },
+        )
+        .unwrap();
+        let origin = CaptureOrigin::step_of(StepOwner::of(&job.permit), job.command.source.clone());
+        let step = perform_capture_as(state.clone(), center_frame(), origin)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            step.status,
+            axum::http::StatusCode::PRECONDITION_FAILED,
+            "{}: {}",
+            step.code,
+            step.message
+        );
+        assert_eq!(step.code, "camera_not_ready");
+        let plain = perform_capture(state.clone(), center_frame())
+            .await
+            .unwrap_err();
+        assert_eq!(plain.status, axum::http::StatusCode::CONFLICT);
+        assert_eq!(plain.code, "ownership_conflict", "{}", plain.message);
+        // The step held nothing of its own: the loop still owns the camera.
+        assert_eq!(
+            state
+                .equipment
+                .gate()
+                .holder(Domain::Device(DeviceKind::Camera))
+                .map(|claim| claim.command_id),
+            Some(job.command.command_id)
+        );
+        // The step was recorded under the loop's (relay) source.
+        let sources: Vec<(String,)> =
+            sqlx::query_as("SELECT requested_json FROM capture_attempts ORDER BY rowid")
+                .fetch_all(state.local_store.pool())
+                .await
+                .unwrap();
+        let first: Value = serde_json::from_str(&sources[0].0).unwrap();
+        assert_eq!(first["command_source"], json!("relay"));
+        assert_eq!(
+            first["parent_command_id"],
+            json!(job.command.command_id),
+            "{first}"
+        );
+        drop(job);
+        assert!(state.equipment.gate().is_idle());
+        crate::api::equipment_tests::cleanup(directory, state).await;
+    }
+
+    /// The daemon's own imaging path takes its frame under the center
+    /// permit: with a solver available it reaches the camera (none here),
+    /// not an ownership conflict.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_daemon_imaging_captures_under_the_center_permit() {
+        use crate::config::PlateSolveConfig;
+        use crate::processing::astap::test_support::{fake_astap, SOLVED_INI};
+        use crate::processing::astap::AstapSolver;
+        use crate::processing::plate_solver::PlateSolver;
+        let (directory, state) = state(MountSyncMode::Mount).await;
+        let solver = PlateSolver::with_backend_for_test(
+            AstapSolver::new(
+                fake_astap(&directory, Some(SOLVED_INI), 0, 0.0),
+                &PlateSolveConfig::default(),
+            ),
+            directory.join("work"),
+        );
+        let state = state.with_plate_solver(solver);
+        let target = near(&state, 0.02, 0.2).await;
+        let job = authorize(&state, target, CenterOverrides::default(), operator()).unwrap();
+        let imaging = DaemonImaging::for_job(
+            &state,
+            &job,
+            exposure(&state, &CenterOverrides::default()).await,
+        );
+        let failure = imaging.capture_and_solve(target, 1).await.unwrap_err();
+        match &failure {
+            CenterImagingError::Capture(detail) => {
+                assert!(detail.starts_with("camera_not_ready"), "{detail}");
+            }
+            other => panic!("{other:?}"),
+        }
+        drop(job);
         crate::api::equipment_tests::cleanup(directory, state).await;
     }
 

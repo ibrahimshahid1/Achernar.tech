@@ -53,6 +53,7 @@ use crate::equipment::astro;
 use crate::equipment::busy::{BusyFlag, BusyGuard};
 use crate::equipment::commands::{GateError, GatedCommand, GatedOp};
 use crate::equipment::events::{EquipmentEvent, EventKind, ExposureWindowRow, GroundTruthRecord};
+use crate::equipment::gate::StepOwner;
 use crate::equipment::guider::service::GuiderWindows;
 use crate::equipment::handle::Permit;
 use crate::equipment::hub::{max_read_age, motion_kinds, EquipmentHub};
@@ -130,8 +131,13 @@ pub enum CaptureSource {
 }
 
 impl CaptureSource {
-    pub(crate) fn command_source(&self) -> CommandSource {
+    /// The gate's source for this capture when it arrives over the relay
+    /// (`relay`) or the direct API: an operator request is audited as the
+    /// transport it came through; a trigger or policy keeps its own
+    /// (automatic) source, so a resume block still refuses it.
+    pub(crate) fn command_source_over(&self, relay: bool) -> CommandSource {
         match self {
+            CaptureSource::Operator if relay => CommandSource::Relay { overriding: false },
             CaptureSource::Operator => CommandSource::Operator { overriding: false },
             CaptureSource::Trigger { rule } => CommandSource::Trigger { rule: rule.clone() },
             CaptureSource::Policy { model, version } => CommandSource::Policy {
@@ -147,7 +153,8 @@ impl CaptureSource {
 /// the resume blocks active when it was authorised.
 pub(crate) struct CaptureAuthorization {
     pub command: GatedCommand,
-    /// Held, never read: the camera domain is released when it drops.
+    /// Held, never read: the camera domain is released when it drops. A
+    /// step's permit holds nothing; its parent's holds the domain.
     _permit: Permit,
     pub blocks: Vec<ResumeBlock>,
 }
@@ -155,9 +162,17 @@ pub(crate) struct CaptureAuthorization {
 /// Authorise a capture through the command gate. Automatic sources are
 /// refused while a resume block is active (423) or while the safety state
 /// is not confirmed safe (422); every stage is audited.
+///
+/// With `parent`, the capture is one step of a compound operation that
+/// already owns the camera domain (a center loop's frame): it is authorised
+/// as a child of that operation (O11 b), so its own checks run but it does
+/// not contend with the parent for the camera. Without one it claims the
+/// camera domain itself, so an operator capture while a center loop holds
+/// the camera is refused with 409.
 pub(crate) fn authorize_capture(
     hub: &EquipmentHub,
     source: &CommandSource,
+    parent: Option<&StepOwner>,
     capture_type: &str,
     params: Value,
 ) -> Result<CaptureAuthorization, GateError> {
@@ -175,7 +190,10 @@ pub(crate) fn authorize_capture(
         Priority::Exposure,
     )
     .with_params(params);
-    let permit = hub.gate().authorize(&command)?;
+    let permit = match parent {
+        Some(parent) => hub.gate().child_permit_of(parent, &command)?,
+        None => hub.gate().authorize(&command)?,
+    };
     let blocks = hub.resume().active();
     Ok(CaptureAuthorization {
         command,
@@ -2295,6 +2313,76 @@ mod tests {
         assert!(card(&equipment.cards, "SITELAT").is_some());
     }
 
+    /// A capture that is a step of a compound operation holding the camera
+    /// (a center loop's frame) is a child of that operation's permit: it
+    /// passes while the parent holds the camera, claims nothing itself, and
+    /// is audited under its own source. A plain capture is refused 409.
+    #[test]
+    fn a_step_capture_runs_under_its_parents_camera_claim() {
+        use crate::equipment::commands::Domain;
+        let (hub, _clock, sink) = hub();
+        let relay = CommandSource::Relay { overriding: false };
+        let center = GatedCommand::new(
+            GatedOp::Center {
+                target: EqCoord::new(5.5, -5.0, EqFrame::J2000),
+                tolerance_arcmin: None,
+                max_attempts: None,
+            },
+            relay.clone(),
+            AutonomyMode::Manual,
+            Priority::Exposure,
+        );
+        let parent = hub.gate().authorize(&center).unwrap();
+        let owner = StepOwner::of(&parent);
+        let step = authorize_capture(&hub, &relay, Some(&owner), "center", json!({})).unwrap();
+        assert_eq!(step.command.source, relay);
+        assert_eq!(
+            hub.gate()
+                .holder(Domain::Device(DeviceKind::Camera))
+                .map(|claim| claim.command_id),
+            Some(center.command_id),
+            "the parent keeps the camera; the step claims nothing"
+        );
+        let operator = CaptureSource::Operator.command_source_over(false);
+        let plain = authorize_capture(&hub, &operator, None, "light", json!({})).err();
+        assert_eq!(plain.as_ref().map(GateError::http_status), Some(409));
+        assert_eq!(plain.map(|e| e.code()), Some("ownership_conflict"));
+        drop(step);
+        // Once the parent lets go of the camera, its steps are refused.
+        drop(parent);
+        assert!(hub.gate().is_idle());
+        let orphan = authorize_capture(&hub, &relay, Some(&owner), "center", json!({})).err();
+        assert_eq!(orphan.map(|e| e.code()), Some("ownership_conflict"));
+        let audited_as_step = sink.records().into_iter().any(|r| match r {
+            GroundTruthRecord::Audit(audit) => audit
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason == format!("step of {}", center.command_id)),
+            _ => false,
+        });
+        assert!(audited_as_step, "the step's proposal names its parent");
+    }
+
+    #[test]
+    fn a_relayed_operator_capture_is_audited_as_the_relay_and_automatic_ones_stay_automatic() {
+        assert_eq!(
+            CaptureSource::Operator.command_source_over(true),
+            CommandSource::Relay { overriding: false }
+        );
+        assert_eq!(
+            CaptureSource::Operator.command_source_over(false),
+            CommandSource::Operator { overriding: false }
+        );
+        let trigger = CaptureSource::Trigger {
+            rule: "sequence".into(),
+        };
+        assert!(trigger.command_source_over(true).is_automatic());
+        assert_eq!(
+            trigger.command_source_over(true),
+            trigger.command_source_over(false)
+        );
+    }
+
     #[test]
     fn automatic_captures_are_refused_while_a_resume_block_is_active() {
         let (hub, _clock, sink) = hub();
@@ -2305,13 +2393,13 @@ mod tests {
         let trigger = CaptureSource::Trigger {
             rule: "sequence".into(),
         }
-        .command_source();
-        let refused = authorize_capture(&hub, &trigger, "light", json!({})).err();
+        .command_source_over(false);
+        let refused = authorize_capture(&hub, &trigger, None, "light", json!({})).err();
         assert_eq!(refused.as_ref().map(GateError::http_status), Some(423));
         assert_eq!(refused.map(|e| e.code()), Some("resume_block_active"));
         // The operator's capture runs, and knows which blocks were active.
-        let operator = CaptureSource::Operator.command_source();
-        let authorized = authorize_capture(&hub, &operator, "light", json!({})).unwrap();
+        let operator = CaptureSource::Operator.command_source_over(false);
+        let authorized = authorize_capture(&hub, &operator, None, "light", json!({})).unwrap();
         assert_eq!(authorized.blocks.len(), 1);
         assert_eq!(authorized.blocks[0].id, block.id);
         assert!(hub

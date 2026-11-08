@@ -439,11 +439,15 @@ async fn camera_set_parameter(state: AppState, payload: &Value) -> Result<Value,
 /// `let _ =`, and then recorded the *requested* exposure in the FITS header —
 /// so a remote capture could disagree with the photograph it claimed to
 /// describe. One implementation means one place to be correct.
+///
+/// The gate audits it as the relay (H21): an operator request arrives as
+/// `CommandSource::Relay`; a trigger or policy keeps its own source.
 async fn camera_capture(state: AppState, payload: &Value) -> Result<Value, String> {
     let params: crate::api::camera::CaptureParams =
         serde_json::from_value(payload.clone()).map_err(|e| e.to_string())?;
 
-    let image = crate::api::camera::perform_capture(state, params)
+    let origin = crate::api::camera::CaptureOrigin::relay(&params);
+    let image = crate::api::camera::perform_capture_as(state, params, origin)
         .await
         .map_err(|error| error.message)?;
 
@@ -671,6 +675,48 @@ mod tests {
                 "{err}"
             );
         }
+        crate::api::equipment_tests::cleanup(directory, state).await;
+    }
+
+    /// H21: a relayed capture reaches the gate as the relay, not as the
+    /// direct operator; the attempt row records which.
+    #[tokio::test]
+    async fn a_relayed_capture_is_gated_as_the_relay() {
+        let (directory, state) = crate::api::equipment_tests::state().await;
+        let relayed = execute(
+            state.clone(),
+            &RelayCommand {
+                command_id: "relay-capture".into(),
+                action: "camera.capture".into(),
+                payload: json!({"exposure": 1.0}),
+            },
+        )
+        .await
+        .unwrap_err();
+        // Past the gate, refused at the camera lookup (no camera here).
+        assert!(relayed.contains("No camera connected"), "{relayed}");
+        let direct: crate::api::camera::CaptureParams =
+            serde_json::from_value(json!({"exposure": 1.0})).unwrap();
+        crate::api::camera::perform_capture(state.clone(), direct)
+            .await
+            .unwrap_err();
+        let sources: Vec<(String,)> =
+            sqlx::query_as("SELECT requested_json FROM capture_attempts ORDER BY rowid")
+                .fetch_all(state.local_store.pool())
+                .await
+                .unwrap();
+        let sources: Vec<String> = sources
+            .iter()
+            .map(|(json,)| {
+                let value: Value = serde_json::from_str(json).unwrap();
+                value["command_source"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(sources, vec!["relay".to_string(), "operator".to_string()]);
+        assert!(state.equipment.gate().is_idle());
         crate::api::equipment_tests::cleanup(directory, state).await;
     }
 
