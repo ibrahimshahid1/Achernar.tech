@@ -1053,7 +1053,8 @@ async fn run_capture(
     warnings.extend(recorded.warnings.iter().cloned());
 
     // ─── 3. Sensor temperature, with its provenance ───
-    let (temperature, temperature_state, temperature_source) = read_temperature(state);
+    let (temperature, temperature_state, temperature_source) =
+        read_temperature_blocking(state).await;
 
     // ─── 4. Assemble the bundle ───
     let mut assets: Vec<crate::storage::capture_store::PendingAsset> = Vec::new();
@@ -1492,7 +1493,8 @@ async fn capture_from_stream(
     let recorded = link.assemble(state, &interval);
     warnings.extend(recorded.warnings.iter().cloned());
 
-    let (temperature, temperature_state, temperature_source) = read_temperature(state);
+    let (temperature, temperature_state, temperature_source) =
+        read_temperature_blocking(state).await;
 
     let meta = crate::fits::FitsMeta {
         exposure_s: actual_exposure_s,
