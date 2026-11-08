@@ -77,6 +77,101 @@ pub struct FitsMeta {
     pub calibration: Option<SensorCalibration>,
 }
 
+/// A header card supplied by the caller rather than derived from
+/// [`FitsMeta`]: the equipment keywords of a capture (equipment spec H1:
+/// `OBJCTRA`, `RA`, `PIERSIDE`, `FOCPOS`, `FILTER`, `SITELAT`, ...).
+///
+/// A card is written only when its value is known. The caller omits a card
+/// whose value is missing; a non-finite float is dropped here as a last line
+/// of defence, so a header never carries `NAN` or a placeholder 0.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FitsCard {
+    pub key: String,
+    pub value: FitsValue,
+    pub comment: String,
+}
+
+/// The value of a [`FitsCard`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum FitsValue {
+    Str(String),
+    Float(f64),
+    Int(i64),
+}
+
+impl FitsCard {
+    pub fn string(key: &str, value: impl Into<String>, comment: &str) -> Self {
+        Self::new(key, FitsValue::Str(value.into()), comment)
+    }
+
+    pub fn float(key: &str, value: f64, comment: &str) -> Self {
+        Self::new(key, FitsValue::Float(value), comment)
+    }
+
+    pub fn int(key: &str, value: i64, comment: &str) -> Self {
+        Self::new(key, FitsValue::Int(value), comment)
+    }
+
+    fn new(key: &str, value: FitsValue, comment: &str) -> Self {
+        Self {
+            key: key.to_string(),
+            value,
+            comment: comment.to_string(),
+        }
+    }
+
+    /// A FITS keyword: 1-8 characters of `A-Z`, `0-9`, `-` and `_`.
+    fn valid_key(&self) -> bool {
+        !self.key.is_empty()
+            && self.key.len() <= 8
+            && self
+                .key
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    }
+
+    /// The 80-column card, or `None` when the card cannot be written
+    /// truthfully (an invalid keyword, a non-finite number).
+    fn render(&self) -> Option<String> {
+        if !self.valid_key() {
+            return None;
+        }
+        Some(match &self.value {
+            FitsValue::Str(value) => card_string(&self.key, value, &self.comment),
+            FitsValue::Float(value) if value.is_finite() => {
+                card_float(&self.key, *value, &self.comment)
+            }
+            FitsValue::Float(_) => return None,
+            FitsValue::Int(value) => card_int(&self.key, *value, &self.comment),
+        })
+    }
+}
+
+/// Right ascension in hours as `HH MM SS.ss` (the `OBJCTRA` convention).
+/// Rounding carries, so 23h59m59.999s is written `00 00 00.00`, never
+/// `23 59 60.00`.
+pub fn sexagesimal_ra(ra_h: f64) -> Option<String> {
+    if !ra_h.is_finite() {
+        return None;
+    }
+    let centiseconds = (ra_h.rem_euclid(24.0) * 360_000.0).round() as i64 % 8_640_000;
+    let (h, rest) = (centiseconds / 360_000, centiseconds % 360_000);
+    let (m, cs) = (rest / 6_000, rest % 6_000);
+    Some(format!("{h:02} {m:02} {:02}.{:02}", cs / 100, cs % 100))
+}
+
+/// Declination in degrees as `+DD MM SS.s` (the `OBJCTDEC` convention).
+pub fn sexagesimal_dec(dec_deg: f64) -> Option<String> {
+    if !dec_deg.is_finite() || dec_deg.abs() > 90.0 {
+        return None;
+    }
+    let sign = if dec_deg < 0.0 { '-' } else { '+' };
+    let deciseconds = (dec_deg.abs() * 36_000.0).round() as i64;
+    let (d, rest) = (deciseconds / 36_000, deciseconds % 36_000);
+    let (m, ds) = (rest / 600, rest % 600);
+    Some(format!("{sign}{d:02} {m:02} {:02}.{}", ds / 10, ds % 10))
+}
+
 /// Directory captures are written to. `./frames`, overridable via
 /// `ACHERNAR_FRAMES_DIR`.
 pub fn frames_dir() -> String {
@@ -91,9 +186,18 @@ pub fn frames_dir() -> String {
 /// function that writes its own file behind the store's back produces exactly
 /// the orphan the staging protocol exists to prevent.
 pub fn encode_capture(frame: &FrameData, meta: &FitsMeta) -> Result<Vec<u8>> {
+    encode_capture_with(frame, meta, &[])
+}
+
+/// [`encode_capture`] with caller-supplied header cards (equipment H1).
+pub fn encode_capture_with(
+    frame: &FrameData,
+    meta: &FitsMeta,
+    extra: &[FitsCard],
+) -> Result<Vec<u8>> {
     let (bitpix, naxes, data) = frame_to_pixels(frame)?;
     let bayer = bayer_pattern(frame.bayer);
-    let header = build_header(bitpix, &naxes, meta, bayer);
+    let header = build_header(bitpix, &naxes, meta, bayer, extra);
 
     let mut out = Vec::with_capacity(header.len() + data.len());
     out.extend_from_slice(&header);
@@ -224,7 +328,7 @@ mod analysis_encoding_tests {
             source_file: None,
             calibration: None,
         };
-        let derived = fits_from_source(jpeg.get_ref(), "jpg", &meta)
+        let derived = fits_from_source(jpeg.get_ref(), "jpg", &meta, &[])
             .unwrap()
             .unwrap();
         assert!(!derived.bytes.is_empty());
@@ -327,12 +431,29 @@ mod analysis_encoding_tests {
 /// The samples are written as FITS `BITPIX = 16` (signed big-endian) with
 /// `BZERO = 32768`, which is the standard, exactly reversible encoding of
 /// unsigned 16-bit data. No values are altered.
+///
+/// Writes no equipment keywords: the capture path derives its FITS through
+/// [`fits_from_source`], which carries them. This plain form is kept for the
+/// plate-solve fixtures and tests.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn encode_bayer_u16(
     pixels: &[u8],
     width: u32,
     height: u32,
     meta: &FitsMeta,
     bayer: Option<&str>,
+) -> Result<Vec<u8>> {
+    encode_bayer_u16_with(pixels, width, height, meta, bayer, &[])
+}
+
+/// [`encode_bayer_u16`] with caller-supplied header cards.
+fn encode_bayer_u16_with(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    meta: &FitsMeta,
+    bayer: Option<&str>,
+    extra: &[FitsCard],
 ) -> Result<Vec<u8>> {
     let expected = (width as usize)
         .checked_mul(height as usize)
@@ -347,7 +468,7 @@ pub fn encode_bayer_u16(
     }
 
     let naxes = vec![width as i64, height as i64];
-    let header = build_header(16, &naxes, meta, bayer);
+    let header = build_header(16, &naxes, meta, bayer, extra);
 
     let mut out = Vec::with_capacity(header.len() + expected + BLOCK);
     out.extend_from_slice(&header);
@@ -398,10 +519,14 @@ pub struct DerivedFits {
 /// untouched sensor ADU plus the calibration constants needed to interpret
 /// them. A build without LibRaw returns `Ok(None)` here rather than an error,
 /// so the exposure is still archived and can be converted later.
+///
+/// `extra` holds the caller's header cards (equipment H1); they are in the
+/// header before any analysis asset hashes the FITS.
 pub fn fits_from_source(
     bytes: &[u8],
     extension: &str,
     meta: &FitsMeta,
+    extra: &[FitsCard],
 ) -> Result<Option<DerivedFits>> {
     match extension.to_ascii_lowercase().as_str() {
         // Every container LibRaw handles that a body in this rig might write.
@@ -438,7 +563,14 @@ pub fn fits_from_source(
             let bayer = bayer_pattern(info.bayer);
             // `pixels()` borrows the C++ buffer; nothing is copied on the way
             // into the encoder.
-            let out = encode_bayer_u16(image.pixels(), info.width, info.height, &meta, bayer)?;
+            let out = encode_bayer_u16_with(
+                image.pixels(),
+                info.width,
+                info.height,
+                &meta,
+                bayer,
+                extra,
+            )?;
             let analysis = raw_analysis_assets(&info, image.pixels(), &out);
             let (analysis_assets, analysis_pending_reason) = match analysis {
                 Ok(assets) => (assets, None),
@@ -461,7 +593,7 @@ pub fn fits_from_source(
             let (w, h) = (img.width() as usize, img.height() as usize);
             let data = interleaved_rgb_to_planar(img.as_raw(), w, h);
             let naxes = vec![w as i64, h as i64, 3];
-            let header = build_header(8, &naxes, meta, None);
+            let header = build_header(8, &naxes, meta, None, extra);
             let mut out = Vec::with_capacity(header.len() + data.len());
             out.extend_from_slice(&header);
             out.extend_from_slice(&data);
@@ -682,7 +814,13 @@ fn bayer_pattern(b: OlsBayerType) -> Option<&'static str> {
     }
 }
 
-fn build_header(bitpix: i32, naxes: &[i64], meta: &FitsMeta, bayer: Option<&str>) -> Vec<u8> {
+fn build_header(
+    bitpix: i32,
+    naxes: &[i64],
+    meta: &FitsMeta,
+    bayer: Option<&str>,
+    extra: &[FitsCard],
+) -> Vec<u8> {
     let mut cards: Vec<String> = Vec::new();
     cards.push(card_logical("SIMPLE", true, "conforms to FITS standard"));
     cards.push(card_int("BITPIX", bitpix as i64, "bits per pixel"));
@@ -876,6 +1014,24 @@ fn build_header(bitpix: i32, naxes: &[i64], meta: &FitsMeta, bayer: Option<&str>
                 cal.bayer_y_offset as i64,
                 "Bayer pattern Y offset",
             ));
+        }
+    }
+    // Caller cards come after the acquisition cards and never replace one:
+    // a keyword the header already carries (or a repeated caller keyword)
+    // is skipped, so a header can never hold two values for one keyword.
+    let mut written: std::collections::BTreeSet<String> = cards
+        .iter()
+        .map(|card| card.get(..8).unwrap_or(card).trim_end().to_string())
+        .collect();
+    written.insert("CREATOR".into());
+    written.insert("END".into());
+    for card in extra {
+        if written.contains(&card.key) {
+            continue;
+        }
+        if let Some(rendered) = card.render() {
+            written.insert(card.key.clone());
+            cards.push(rendered);
         }
     }
     cards.push(card_string("CREATOR", "Achernar daemon", ""));
@@ -1114,13 +1270,156 @@ fn card_float(key: &str, v: f64, c: &str) -> String {
     card_kv(key, format!("{:.6}", v), c)
 }
 
+/// Longest string value that fits one card: 80 columns, minus the 10-column
+/// keyword and value indicator, minus the two quotes.
+const MAX_STRING_VALUE: usize = 68;
+
 fn card_string(key: &str, v: &str, c: &str) -> String {
     // String values are single-quoted and left-justified (min 8 chars inside).
-    let quoted = format!("'{:<8}'", v);
+    // A quote inside the value is written as two quotes; a value too long for
+    // one card is cut on a character boundary so the closing quote is never
+    // lost to the 80-column truncation (which would corrupt the header).
+    let mut escaped = String::new();
+    for ch in v
+        .chars()
+        .filter(|ch| ch.is_ascii() && !ch.is_ascii_control())
+    {
+        let width = if ch == '\'' { 2 } else { 1 };
+        if escaped.len() + width > MAX_STRING_VALUE {
+            break;
+        }
+        if ch == '\'' {
+            escaped.push('\'');
+        }
+        escaped.push(ch);
+    }
+    let quoted = format!("'{:<8}'", escaped);
     let mut card = format!("{:<8}= {:<20}", key, quoted);
-    if !c.is_empty() {
+    if !c.is_empty() && card.len() + 3 < 80 {
         card.push_str(" / ");
         card.push_str(c);
     }
     card
+}
+
+#[cfg(test)]
+mod card_tests {
+    use super::*;
+
+    fn meta() -> FitsMeta {
+        FitsMeta {
+            exposure_s: 30.0,
+            gain: 120,
+            temperature_c: f64::NAN,
+            binning: 1,
+            instrument: "fixture".into(),
+            date_obs: "2026-10-26T04:00:00Z".into(),
+            iso: None,
+            shutter_label: None,
+            source_file: None,
+            calibration: None,
+        }
+    }
+
+    /// Every `KEY = value` card of a primary header, in order.
+    fn header_cards(bytes: &[u8]) -> Vec<(String, Option<String>)> {
+        let mut out = Vec::new();
+        for card in bytes.as_chunks::<80>().0 {
+            let key = std::str::from_utf8(&card[..8])
+                .unwrap()
+                .trim_end()
+                .to_string();
+            if key == "END" {
+                break;
+            }
+            out.push((key, card_value(card)));
+        }
+        out
+    }
+
+    fn value(cards: &[(String, Option<String>)], key: &str) -> Option<String> {
+        cards
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn caller_cards_are_written_before_end_and_never_duplicate_a_keyword() {
+        let extra = vec![
+            FitsCard::string("OBJCTRA", "05 35 17.30", "[hms J2000] telescope RA"),
+            FitsCard::float("RA", 83.822083, "[deg J2000] telescope RA"),
+            FitsCard::int("FOCPOS", 12_345, "[step] focuser position"),
+            // Already written from FitsMeta: the caller cannot replace it.
+            FitsCard::float("EXPTIME", 999.0, "must not appear twice"),
+            // A repeated caller keyword keeps the first value.
+            FitsCard::int("FOCPOS", 1, "duplicate"),
+            // Never written: a non-finite value and an invalid keyword.
+            FitsCard::float("AIRMASS", f64::NAN, "unknown"),
+            FitsCard::float("toolongkey", 1.0, "invalid"),
+        ];
+        let bytes = encode_bayer_u16_with(&[0u8; 4 * 2 * 2], 4, 2, &meta(), None, &extra).unwrap();
+        let cards = header_cards(&bytes);
+        let keys: Vec<&str> = cards.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys.iter().filter(|k| **k == "EXPTIME").count(), 1);
+        assert_eq!(value(&cards, "EXPTIME").as_deref(), Some("30.000000"));
+        assert_eq!(keys.iter().filter(|k| **k == "FOCPOS").count(), 1);
+        assert_eq!(value(&cards, "FOCPOS").as_deref(), Some("12345"));
+        assert_eq!(value(&cards, "OBJCTRA").as_deref(), Some("05 35 17.30"));
+        assert_eq!(value(&cards, "RA").as_deref(), Some("83.822083"));
+        assert!(!keys.contains(&"AIRMASS"), "a missing value is omitted");
+        assert!(!keys.iter().any(|k| k.eq_ignore_ascii_case("toolongk")));
+        // CREATOR stays the last card before END, and the header still parses.
+        assert_eq!(keys.last(), Some(&"CREATOR"));
+        let geometry = image_geometry(&bytes).unwrap();
+        assert_eq!((geometry.width, geometry.height), (4, 2));
+        assert_eq!(bytes.len() % BLOCK, 0);
+    }
+
+    #[test]
+    fn string_cards_escape_quotes_and_keep_the_closing_quote() {
+        let card = card_string("FILTER", "O'III", "filter");
+        let mut bytes = card.into_bytes();
+        bytes.resize(80, b' ');
+        assert_eq!(card_value(&bytes).as_deref(), Some("O'III"));
+
+        let long = "x".repeat(120);
+        let card = card_string("INSTRUME", &long, "a comment that cannot fit");
+        assert!(card.len() <= 80, "{}", card.len());
+        let mut bytes = card.into_bytes();
+        bytes.resize(80, b' ');
+        assert_eq!(
+            card_value(&bytes).map(|v| v.len()),
+            Some(MAX_STRING_VALUE),
+            "truncated inside the quotes, never past them"
+        );
+        // Non-ASCII and control characters never reach a FITS header.
+        let card = card_string("FILTER", "H\u{3b1}\u{7}", "");
+        let mut bytes = card.into_bytes();
+        bytes.resize(80, b' ');
+        assert_eq!(card_value(&bytes).as_deref(), Some("H"));
+    }
+
+    #[test]
+    fn sexagesimal_formatting_rounds_with_carry() {
+        assert_eq!(sexagesimal_ra(5.588_139).as_deref(), Some("05 35 17.30"));
+        assert_eq!(sexagesimal_ra(23.999_999_9).as_deref(), Some("00 00 00.00"));
+        assert_eq!(sexagesimal_ra(-1.0).as_deref(), Some("23 00 00.00"));
+        assert_eq!(sexagesimal_ra(f64::NAN), None);
+        assert_eq!(sexagesimal_dec(-5.390_278).as_deref(), Some("-05 23 25.0"));
+        assert_eq!(
+            sexagesimal_dec(41.999_999_9).as_deref(),
+            Some("+42 00 00.0")
+        );
+        assert_eq!(sexagesimal_dec(91.0), None);
+    }
+
+    #[test]
+    fn the_plain_encoders_write_no_equipment_keywords() {
+        let bytes = encode_bayer_u16(&[0u8; 2 * 2 * 2], 2, 2, &meta(), None).unwrap();
+        let cards = header_cards(&bytes);
+        for key in ["RA", "DEC", "OBJCTRA", "FOCPOS", "FILTER", "SITELAT"] {
+            assert!(value(&cards, key).is_none(), "{key}");
+        }
+    }
 }

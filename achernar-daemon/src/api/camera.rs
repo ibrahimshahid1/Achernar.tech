@@ -1,9 +1,11 @@
 use axum::{extract::Query, extract::State, http::StatusCode, Json};
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use crate::api::api_error::ApiError;
+use crate::equipment::types::{DeviceError, ErrorClass, OpOutcome};
 use crate::hardware::camera::{CamParam, FrameData, OlsCamera, StreamFormat};
 use crate::hardware::ols_ffi::{OlsCamOptionId, OlsCamOptionType, OlsStreamType};
 use crate::state::{AppState, CameraActivity};
@@ -11,6 +13,11 @@ use crate::storage::capture_archive::ArchiveReservation;
 use crate::storage::capture_retention::{
     validate_retention_policy, RetentionAcknowledgement, RetentionDecision, RetentionPolicy,
 };
+
+/// Capture integration with the equipment layer (H1, H16, H17, H22, D7).
+pub(crate) mod equipment;
+
+use equipment::{AcquisitionPath, CaptureEquipment, ExposureInterval};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CaptureParams {
@@ -33,6 +40,12 @@ pub struct CaptureParams {
     pub retention_policy: RetentionPolicy,
     #[serde(default)]
     pub retention_acknowledgement: Option<RetentionAcknowledgement>,
+    /// Who asked for the capture (H22): the operator by default. A
+    /// sequencer, trigger or policy names itself
+    /// (`{"kind": "trigger", "rule": "..."}`) so that an active resume block
+    /// refuses it with HTTP 423.
+    #[serde(default)]
+    pub source: equipment::CaptureSource,
 }
 
 /// One artifact of a committed capture.
@@ -76,6 +89,13 @@ pub struct ImageData {
     pub path: Option<String>,
     pub retention: RetentionDecision,
     pub metadata: ImageMetadata,
+    /// What the equipment layer recorded for this frame: the filter and
+    /// whether a wheel verified it, the focuser position, the window's clock
+    /// quality and finalisation, and the FITS keywords written. The full
+    /// record is the frame's `acquisition_json.equipment` and its
+    /// `exposure_device_windows` row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equipment: Option<serde_json::Value>,
 }
 
 /// Canonical asset for the legacy `path` field: the native RAW if there is
@@ -154,6 +174,49 @@ impl FreshFrameGate {
                 }
             },
         }
+    }
+}
+
+/// When each stream frame arrived, by the host clock: the accepted frame's
+/// arrival, and the stream's frame period once two consecutive counters
+/// were seen. Together they bound a stream exposure's window, because OLS
+/// stamps a stream frame on delivery (`FrameData::unix_timestamp`, the
+/// `host_arrival` clock), not at exposure start. The daemon's poll time
+/// stands in only for a frame without a usable stamp.
+#[derive(Debug, Default)]
+struct FrameArrivals {
+    /// The last counter seen, its arrival, and whether that is OLS's stamp.
+    last: Option<(i32, f64, bool)>,
+    interval_s: Option<f64>,
+}
+
+impl FrameArrivals {
+    /// Note `counter`, stamped `stamp` by OLS and polled at `polled_at`;
+    /// returns its arrival: the stamp, or the first poll that saw it when
+    /// the stamp is not a usable time.
+    fn observe(&mut self, counter: i32, stamp: f64, polled_at: f64) -> f64 {
+        match self.last {
+            Some((seen, at, _)) if seen == counter => at,
+            previous => {
+                let stamped = stamp.is_finite() && stamp > 0.0;
+                let at = if stamped { stamp } else { polled_at };
+                // A period only from two arrivals on the same clock basis.
+                if let Some((seen, before, before_stamped)) = previous {
+                    if i64::from(counter) - i64::from(seen) == 1
+                        && before_stamped == stamped
+                        && at > before
+                    {
+                        self.interval_s = Some(at - before);
+                    }
+                }
+                self.last = Some((counter, at, stamped));
+                at
+            }
+        }
+    }
+
+    fn interval_s(&self) -> Option<f64> {
+        self.interval_s
     }
 }
 
@@ -240,7 +303,7 @@ pub(crate) async fn start_stream_control(
     }
 
     let frame_store = state.latest_frame.clone();
-    let (index, format) = {
+    let (index, format, generation) = {
         let mut cam_lock = state.camera.lock().unwrap();
         let camera = cam_lock.as_mut().ok_or_else(ApiError::no_camera)?;
         let formats = camera
@@ -275,11 +338,11 @@ pub(crate) async fn start_stream_control(
             runtime.last_error = Some(message.clone());
             return Err(ApiError::hardware(message));
         }
-        (index, format)
+        (index, format, generation)
     };
 
     *state.streaming.lock().unwrap() = true;
-    {
+    let connection_id = {
         let mut runtime = state.camera_runtime.write().unwrap();
         runtime.activity = CameraActivity::Streaming;
         runtime.streaming = true;
@@ -288,7 +351,10 @@ pub(crate) async fn start_stream_control(
         runtime.exposure_started_at = None;
         runtime.exposure_duration_s = None;
         runtime.last_error = None;
-    }
+        runtime.connection_id.clone()
+    };
+    // A new stream generation: frame baselines from the old one are void (H2).
+    equipment::emit_stream_restarted(&state.equipment, connection_id.as_deref(), generation);
 
     Ok(serde_json::json!({
         "status": "streaming",
@@ -389,21 +455,6 @@ async fn perform_capture_owned(
         .clone()
         .unwrap_or_else(|| "light".to_string());
 
-    {
-        let mut runtime = state.camera_runtime.write().unwrap();
-        runtime.activity = CameraActivity::Exposing;
-        runtime.operation_id = Some(capture_id.clone());
-        runtime.exposure_started_at = Some(chrono::Utc::now());
-        runtime.exposure_duration_s = Some(params.exposure);
-        runtime.last_error = None;
-    }
-
-    tracing::info!(
-        "Capture {capture_id}: {}s, gain {:?}, type {capture_type}",
-        params.exposure,
-        params.gain
-    );
-
     // Record the attempt before touching hardware, so a failure leaves a trace
     // instead of being indistinguishable from "nobody asked".
     let requested_json = serde_json::json!({
@@ -417,7 +468,81 @@ async fn perform_capture_owned(
         "retention_policy": params.retention_policy,
         "retention_acknowledgement": params.retention_acknowledgement,
         "retention": RetentionDecision::for_request(params.retention_policy, true),
+        "source": params.source,
     });
+
+    // The command gate (H21, H22): an automatic source is refused while a
+    // resume block is active (423) or the safety state is not confirmed safe
+    // (422). Decided before the camera is marked exposing; the refusal is
+    // audited by the gate and recorded as a failed attempt here.
+    let source = params.source.command_source();
+    let authorization = match equipment::authorize_capture(
+        &state.equipment,
+        &source,
+        &capture_type,
+        serde_json::json!({"capture_id": capture_id, "request": requested_json}),
+    ) {
+        Ok(authorization) => authorization,
+        Err(refusal) => {
+            let error = ApiError::new(
+                StatusCode::from_u16(refusal.http_status()).unwrap_or(StatusCode::CONFLICT),
+                refusal.code(),
+                format!("Capture refused: {refusal}"),
+            );
+            tracing::warn!("Capture {capture_id} refused by the command gate: {refusal}");
+            if state
+                .capture_store
+                .begin_attempt(
+                    state.local_store.pool(),
+                    &capture_id,
+                    params.session_id.as_deref(),
+                    &state.rig_id,
+                    &requested_json,
+                )
+                .await
+                .is_ok()
+            {
+                state
+                    .capture_store
+                    .fail_attempt(state.local_store.pool(), &capture_id, &error.message)
+                    .await;
+            }
+            return Err(error);
+        }
+    };
+
+    let runtime_now = {
+        let mut runtime = state.camera_runtime.write().unwrap();
+        runtime.activity = CameraActivity::Exposing;
+        runtime.operation_id = Some(capture_id.clone());
+        runtime.exposure_started_at = Some(chrono::Utc::now());
+        runtime.exposure_duration_s = Some(params.exposure);
+        runtime.last_error = None;
+        runtime.clone()
+    };
+
+    tracing::info!(
+        "Capture {capture_id}: {}s, gain {:?}, type {capture_type}",
+        params.exposure,
+        params.gain
+    );
+
+    let mut link = CaptureLink {
+        hooks: equipment::CaptureHooks::new(
+            std::sync::Arc::clone(&state.equipment),
+            &runtime_now,
+            &capture_id,
+            &frame_id,
+        ),
+        input: equipment::AssemblyInput {
+            frame_id: frame_id.clone(),
+            client_filter: params.filter.clone(),
+            blocks_at_start: authorization.blocks.clone(),
+            source: source.clone(),
+            command_id: Some(authorization.command.command_id),
+        },
+    };
+
     if let Err(e) = state
         .capture_store
         .begin_attempt(
@@ -431,14 +556,52 @@ async fn perform_capture_owned(
     {
         tracing::error!("Could not record capture attempt: {e}");
         finish_capture_runtime(&state, Some(e.to_string()));
+        let error = DeviceError::new(ErrorClass::Driver, e.to_string());
+        state
+            .equipment
+            .gate()
+            .record_outcome(&authorization.command, &OpOutcome::Failed(error));
         return Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             "capture_attempt_store_failed",
             format!("Could not record capture attempt: {e}"),
         ));
     }
+    state
+        .equipment
+        .gate()
+        .record_executed(&authorization.command, Vec::new());
 
-    match run_capture(&state, &capture_id, &frame_id, &capture_type, &params).await {
+    let result = run_capture(
+        &state,
+        &capture_id,
+        &frame_id,
+        &capture_type,
+        &params,
+        &mut link,
+    )
+    .await;
+    // The outcome stage of the audit (H21). A failure that left the camera
+    // in an uncertain state is an unknown outcome, not a clean failure.
+    let outcome = match &result {
+        Ok(_) => OpOutcome::Succeeded,
+        Err(err) => {
+            let error = DeviceError::new(capture_error_class(err.status), err.detail.clone());
+            if state.camera_runtime.read().unwrap().activity == CameraActivity::Error {
+                OpOutcome::Unknown(error)
+            } else {
+                OpOutcome::Failed(error)
+            }
+        }
+    };
+    state
+        .equipment
+        .gate()
+        .record_outcome(&authorization.command, &outcome);
+    drop(link);
+    drop(authorization);
+
+    match result {
         Ok(image) => {
             finish_capture_runtime(&state, None);
             // Committed: the automatic plate-solve rules may want this frame.
@@ -465,6 +628,81 @@ async fn perform_capture_owned(
             ))
         }
     }
+}
+
+/// The failure class of a capture error, for the gate's outcome audit.
+fn capture_error_class(status: StatusCode) -> ErrorClass {
+    match status {
+        StatusCode::PRECONDITION_FAILED => ErrorClass::NotConnected,
+        StatusCode::UNPROCESSABLE_ENTITY | StatusCode::BAD_REQUEST => ErrorClass::InvalidValue,
+        StatusCode::CONFLICT => ErrorClass::InvalidOperation,
+        StatusCode::GATEWAY_TIMEOUT => ErrorClass::Timeout,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => ErrorClass::Unsupported,
+        _ => ErrorClass::Driver,
+    }
+}
+
+/// One capture's link to the equipment layer: the exposure hooks and what
+/// the window assembly needs to know about the request.
+struct CaptureLink {
+    hooks: equipment::CaptureHooks,
+    input: equipment::AssemblyInput,
+}
+
+impl CaptureLink {
+    /// The frame's equipment record from the window of `interval` (rings and
+    /// journal only; no device is called, D7).
+    fn assemble(&self, state: &AppState, interval: &ExposureInterval) -> CaptureEquipment {
+        equipment::assemble(
+            self.hooks.hub(),
+            state.equipment_ctx.guider_windows().as_ref(),
+            interval,
+            &self.input,
+        )
+    }
+
+    /// After the commit: `exposure_completed{frame_id}` (H17), then the
+    /// rewrite of the window row once it is final (D7) and PHD2's
+    /// per-exposure row (H9).
+    fn committed(
+        &self,
+        state: &AppState,
+        frame_id: &str,
+        interval: &ExposureInterval,
+        recorded: &CaptureEquipment,
+    ) {
+        self.hooks.exposure_completed(Some(frame_id), interval);
+        let mut input = self.input.clone();
+        input.frame_id = frame_id.to_string();
+        equipment::spawn_finaliser(
+            state,
+            equipment::FinalisePlan {
+                input,
+                interval: interval.clone(),
+                finalised_at_commit: recorded.row.finalised,
+            },
+        );
+    }
+}
+
+/// The exposure-relevant settings a control write changed, under the keys
+/// `exposure_settings_changed` uses. `None` for controls that do not change
+/// the recorded signal (cooler, fan, viewfinder, capture target, ...).
+fn exposure_setting(id: OlsCamOptionId, value: f64) -> Option<(String, serde_json::Value)> {
+    use OlsCamOptionId::*;
+    let (key, value) = match id {
+        Exp => ("exposure_s".to_string(), value / 1000.0),
+        Gain => ("gain".to_string(), value),
+        BlackLevel => ("offset".to_string(), value),
+        Iso => ("iso_choice".to_string(), value),
+        Shutter => ("shutter_choice".to_string(), value),
+        AutoExp | AutoWb | Wb | WbR | WbB | Gamma | Brightness | Contrast | AverageBin
+        | ConvGainHcg | ConvGainHdr | LowNoise | HighFullwell | Zoom => {
+            (option_name(id).to_string(), value)
+        }
+        _ => return None,
+    };
+    value.is_finite().then(|| (key, serde_json::json!(value)))
 }
 
 fn capture_error_code(status: StatusCode) -> &'static str {
@@ -567,6 +805,7 @@ async fn run_capture(
     frame_id: &str,
     capture_type: &str,
     params: &CaptureParams,
+    link: &mut CaptureLink,
 ) -> Result<ImageData, CaptureError> {
     let mut warnings: Vec<String> = Vec::new();
 
@@ -613,6 +852,7 @@ async fn run_capture(
             params,
             warnings,
             archive,
+            link,
         )
         .await;
     }
@@ -650,34 +890,40 @@ async fn run_capture(
     let camera_arc = state.camera.clone();
     let exposure = params.exposure;
     let sensitivity = params.gain.map(|g| g as f64);
-    let native = tokio::task::spawn_blocking(move || {
+    // The `exposing` busy flag and `exposure_started` cover the trigger
+    // through the return of the still (exposure and download).
+    link.hooks
+        .exposure_started(AcquisitionPath::Still, params.exposure, None);
+    let still = tokio::task::spawn_blocking(move || {
         let cam_lock = camera_arc.lock().unwrap();
         let camera = cam_lock
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Camera disconnected before the exposure started"))?;
         camera.capture_still(exposure, sensitivity)
     })
-    .await
-    .map_err(|e| {
-        CaptureError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            mark_capture_outcome_uncertain(
-                &mut state.camera_runtime.write().unwrap(),
-                capture_id,
-                format!("capture task panicked: {e}"),
-            ),
-        )
-    })?
-    .map_err(|e| {
-        CaptureError::new(
-            StatusCode::BAD_GATEWAY,
-            mark_capture_outcome_uncertain(
-                &mut state.camera_runtime.write().unwrap(),
-                capture_id,
-                e,
-            ),
-        )
-    })?;
+    .await;
+    link.hooks.exposure_ended();
+    let native = still
+        .map_err(|e| {
+            CaptureError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                mark_capture_outcome_uncertain(
+                    &mut state.camera_runtime.write().unwrap(),
+                    capture_id,
+                    format!("capture task panicked: {e}"),
+                ),
+            )
+        })?
+        .map_err(|e| {
+            CaptureError::new(
+                StatusCode::BAD_GATEWAY,
+                mark_capture_outcome_uncertain(
+                    &mut state.camera_runtime.write().unwrap(),
+                    capture_id,
+                    e,
+                ),
+            )
+        })?;
 
     let (capture, handle) = native;
     mark_capture_processing(state);
@@ -707,6 +953,45 @@ async fn run_capture(
     if capture.applied_sensitivity <= 0.0 && params.gain.is_some() {
         warnings.push("Camera reported no numeric ISO; gain was not applied".to_string());
     }
+
+    // The settings the body applied (exposure_settings_changed on a change).
+    let runtime_now = state.camera_runtime.read().unwrap().clone();
+    let applied = BTreeMap::from([
+        (
+            "exposure_s".to_string(),
+            serde_json::json!(capture.applied_exposure_s),
+        ),
+        (
+            "iso".to_string(),
+            serde_json::json!(
+                (capture.applied_sensitivity > 0.0).then_some(capture.applied_sensitivity)
+            ),
+        ),
+        (
+            "shutter".to_string(),
+            serde_json::json!(
+                (!capture.shutter_label.is_empty()).then(|| capture.shutter_label.clone())
+            ),
+        ),
+    ]);
+    equipment::settings_applied(
+        link.hooks.hub(),
+        &runtime_now,
+        applied,
+        "capture",
+        Some(capture_id),
+    );
+
+    // The equipment window of the trigger bracket (H1, D7): FITS keywords,
+    // the verified filter and the focuser position come from it.
+    let interval = ExposureInterval::still(
+        capture.started_at,
+        capture.completed_at,
+        capture.applied_exposure_s,
+        link.hooks.clock_quality(AcquisitionPath::Still),
+    );
+    let recorded = link.assemble(state, &interval);
+    warnings.extend(recorded.warnings.iter().cloned());
 
     // ─── 3. Sensor temperature, with its provenance ───
     let (temperature, temperature_state, temperature_source) = read_temperature(state);
@@ -772,6 +1057,7 @@ async fn run_capture(
                 // the body's black and saturation levels.
                 calibration: None,
             },
+            &recorded.cards,
         ) {
             Ok(Some(fits)) => {
                 width = fits.width;
@@ -873,8 +1159,8 @@ async fn run_capture(
         shutter_label: (!capture.shutter_label.is_empty()).then(|| capture.shutter_label.clone()),
         offset_val: applied_offset.map(|value| value.round() as i64),
         binning: 1,
-        filter_name: params.filter.clone(),
-        focuser_position: read_focuser_position(state),
+        filter_name: recorded.filter_name.clone(),
+        focuser_position: recorded.focuser_position,
         temperature,
         temperature_source,
         temperature_state,
@@ -889,6 +1175,7 @@ async fn run_capture(
             "quality": if capture.bundle_complete { serde_json::json!({"training_label_eligible": false, "acquisition_domain": "unqualified_sensor_analysis"}) } else {
                 serde_json::json!({"training_label_eligible": false, "acquisition_domain": "incomplete_native_capture"})
             },
+            "equipment": recorded.block,
         }),
         assets,
     };
@@ -899,6 +1186,7 @@ async fn run_capture(
             format!("persist capture: {e}"),
         )
     })?;
+    link.committed(state, &committed.frame_id, &interval, &recorded);
 
     // Release bridge buffers without deleting camera files. A local commit
     // does not authorize reclamation or establish a retained second copy.
@@ -954,6 +1242,7 @@ async fn run_capture(
             completed_at: unix_to_rfc3339(capture.completed_at),
             warnings,
         },
+        equipment: Some(recorded.summary()),
     })
 }
 
@@ -965,6 +1254,7 @@ async fn run_capture(
 /// frame in the same stream generation. It fails rather than substituting a
 /// stale frame.
 /// A capture that cannot prove which exposure it returned is not a capture.
+#[allow(clippy::too_many_arguments)]
 async fn capture_from_stream(
     state: &AppState,
     capture_id: &str,
@@ -973,6 +1263,7 @@ async fn capture_from_stream(
     params: &CaptureParams,
     mut warnings: Vec<String>,
     archive: ArchiveReservation,
+    link: &mut CaptureLink,
 ) -> Result<ImageData, CaptureError> {
     if !*state.streaming.lock().unwrap() {
         return Err(CaptureError::new(
@@ -1000,7 +1291,7 @@ async fn capture_from_stream(
         .as_ref()
         .map(|f| f.frame_counter);
 
-    let (applied_exposure, applied_gain, applied_offset, camera_name, actual_binning) = {
+    let (applied_exposure, applied_gain, applied_offset, camera_name, actual_binning, controls) = {
         let cam_lock = state.camera.lock().unwrap();
         let camera = cam_lock.as_ref().ok_or_else(|| {
             CaptureError::new(StatusCode::PRECONDITION_FAILED, "No camera connected")
@@ -1050,28 +1341,69 @@ async fn capture_from_stream(
                 }
             }
         }
+        // Which of the applied values are readbacks of a real control (a
+        // camera without one reports a placeholder that is not a setting).
+        let controls = (
+            options.contains(&OlsCamOptionId::Exp) || options.contains(&OlsCamOptionId::Shutter),
+            options.contains(&OlsCamOptionId::Gain) || options.contains(&OlsCamOptionId::Iso),
+        );
         (
             exposure,
             gain,
             offset,
             camera.name().unwrap_or_else(|_| "Unknown".to_string()),
             actual_binning,
+            controls,
         )
     };
 
     let actual_exposure_s = applied_exposure.value;
+    // The settings now on the stream (exposure_settings_changed on a change).
+    let mut applied = BTreeMap::from([("binning".to_string(), serde_json::json!(actual_binning))]);
+    if controls.0 {
+        applied.insert("exposure_s".into(), serde_json::json!(actual_exposure_s));
+    }
+    if controls.1 {
+        applied.insert("gain".into(), serde_json::json!(applied_gain.value));
+    }
+    if let Some(offset) = applied_offset {
+        applied.insert("offset".into(), serde_json::json!(offset));
+    }
+    equipment::settings_applied(
+        link.hooks.hub(),
+        &runtime,
+        applied,
+        "capture",
+        Some(capture_id),
+    );
+    // The accepted frame is exposed after the settings were applied: the
+    // `exposing` busy flag is held from here until it arrives.
+    link.hooks.exposure_started(
+        AcquisitionPath::Stream,
+        actual_exposure_s,
+        Some(stream_generation),
+    );
 
     // Two exposures plus slack: the in-flight exposure must finish and be
     // discarded before a frame taken under the new settings can arrive.
     let timeout = Duration::from_secs_f64((actual_exposure_s * 3.0 + 20.0).clamp(20.0, 900.0));
     let deadline = Instant::now() + timeout;
     let mut fresh_gate = FreshFrameGate::new(baseline);
-    let frame = loop {
+    // When each frame of this generation arrived (OLS's host-clock stamp):
+    // the accepted frame's arrival, and the stream's frame period when two
+    // consecutive frames were seen, bound its exposure window (H3 rule for
+    // `host_arrival`). The same stamp is the frame's DATE-OBS.
+    let mut arrivals = FrameArrivals::default();
+    let (frame, arrived_at) = loop {
         {
             let guard = state.latest_frame.lock().unwrap();
             if let Some(f) = guard.as_ref() {
-                if f.stream_generation == stream_generation && fresh_gate.accepts(f.frame_counter) {
-                    break f.clone();
+                if f.stream_generation == stream_generation {
+                    let arrived_at =
+                        arrivals.observe(f.frame_counter, f.unix_timestamp, unix_now());
+                    if fresh_gate.accepts(f.frame_counter) {
+                        break (f.clone(), arrived_at);
+                    }
                 }
             }
         }
@@ -1087,7 +1419,19 @@ async fn capture_from_stream(
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     let completed_at = unix_now();
+    link.hooks.exposure_ended();
     mark_capture_processing(state);
+
+    // The equipment window: from `arrival - (exposure + frame interval)` to
+    // the arrival, by the host clock (H1, D7).
+    let interval = ExposureInterval::stream(
+        arrived_at,
+        actual_exposure_s,
+        arrivals.interval_s(),
+        link.hooks.clock_quality(AcquisitionPath::Stream),
+    );
+    let recorded = link.assemble(state, &interval);
+    warnings.extend(recorded.warnings.iter().cloned());
 
     let (temperature, temperature_state, temperature_source) = read_temperature(state);
 
@@ -1106,12 +1450,13 @@ async fn capture_from_stream(
         // guess written into a file that reads like a measurement.
         calibration: None,
     };
-    let fits_bytes = crate::fits::encode_capture(&frame, &meta).map_err(|e| {
-        CaptureError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("encode FITS: {e}"),
-        )
-    })?;
+    let fits_bytes =
+        crate::fits::encode_capture_with(&frame, &meta, &recorded.cards).map_err(|e| {
+            CaptureError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("encode FITS: {e}"),
+            )
+        })?;
 
     let bit_depth = stream_frame_bit_depth(frame.format).ok_or_else(|| {
         CaptureError::new(
@@ -1182,8 +1527,8 @@ async fn capture_from_stream(
         shutter_label: applied_exposure.label.clone(),
         offset_val: applied_offset.map(|value| value.round() as i64),
         binning: actual_binning as i64,
-        filter_name: params.filter.clone(),
-        focuser_position: read_focuser_position(state),
+        filter_name: recorded.filter_name.clone(),
+        focuser_position: recorded.focuser_position,
         temperature,
         temperature_source,
         temperature_state,
@@ -1200,6 +1545,7 @@ async fn capture_from_stream(
             "retention": RetentionDecision::retaining(frame.source.is_some()),
             "analysis": analysis_state,
             "quality": {"training_label_eligible": false, "acquisition_domain": "unqualified_sensor_analysis"},
+            "equipment": recorded.block,
         }),
         assets,
     };
@@ -1210,6 +1556,7 @@ async fn capture_from_stream(
             format!("persist capture: {e}"),
         )
     })?;
+    link.committed(state, &committed.frame_id, &interval, &recorded);
 
     // Build the asset list once; `legacy_path` needs it before ImageData is
     // constructed, and `committed.assets` is consumed by the conversion.
@@ -1250,6 +1597,7 @@ async fn capture_from_stream(
             completed_at: unix_to_rfc3339(completed_at),
             warnings,
         },
+        equipment: Some(recorded.summary()),
     })
 }
 
@@ -1303,14 +1651,6 @@ pub(crate) fn read_temperature(
         ),
         _ => (None, TemperatureState::Missing, None),
     }
-}
-
-/// The focuser's logical position from its latest snapshot; never a driver
-/// call, and no slot guard is held beyond the clone.
-fn read_focuser_position(state: &AppState) -> Option<i64> {
-    let handle = crate::api::equipment::focuser_handle(state).ok()?;
-    let position = handle.snapshot().logical_position;
-    position.map(i64::from)
 }
 
 fn disable_auto_exposure(camera: &OlsCamera, options: &[OlsCamOptionId]) -> Result<(), StatusCode> {
@@ -2029,6 +2369,17 @@ fn apply_parameter(state: &AppState, req: &SetParamRequest) -> Result<serde_json
     } else if id == OlsCamOptionId::CoolerOn {
         state.camera_runtime.write().unwrap().cooler_on = Some(current > 0.5);
     }
+    // A control that changes the recorded signal voids frame baselines (H2).
+    if let Some((key, value)) = exposure_setting(id, current) {
+        let runtime = state.camera_runtime.read().unwrap().clone();
+        equipment::settings_applied(
+            &state.equipment,
+            &runtime,
+            BTreeMap::from([(key, value)]),
+            "parameter",
+            None,
+        );
+    }
 
     Ok(serde_json::json!({
         "status": "ok",
@@ -2604,6 +2955,145 @@ mod tests {
 
         let mut exactly_two = FreshFrameGate::new(Some(i32::MAX - 2));
         assert!(exactly_two.accepts(i32::MAX));
+    }
+
+    #[test]
+    fn frame_arrivals_measure_the_period_of_consecutive_frames_only() {
+        let mut arrivals = FrameArrivals::default();
+        // OLS's arrival stamp is the arrival, not the (later) poll.
+        assert_eq!(arrivals.observe(41, 99.8, 100.0), 99.8);
+        assert_eq!(
+            arrivals.observe(41, 99.8, 100.05),
+            99.8,
+            "one frame, one time"
+        );
+        assert_eq!(arrivals.interval_s(), None);
+        assert_eq!(arrivals.observe(42, 103.9, 104.1), 103.9);
+        assert!((arrivals.interval_s().unwrap() - 4.1).abs() < 1e-9);
+        // A counter the poll skipped measures nothing new.
+        assert_eq!(arrivals.observe(44, 112.1, 112.5), 112.1);
+        assert!((arrivals.interval_s().unwrap() - 4.1).abs() < 1e-9);
+
+        // Without a usable stamp the first poll that saw a frame stands in,
+        // and a period is never taken across the two clock bases.
+        let mut polled = FrameArrivals::default();
+        assert_eq!(polled.observe(7, f64::NAN, 50.0), 50.0);
+        assert_eq!(polled.observe(7, f64::NAN, 50.05), 50.0, "first sight wins");
+        assert_eq!(polled.observe(8, 0.0, 52.0), 52.0);
+        assert!((polled.interval_s().unwrap() - 2.0).abs() < 1e-9);
+        assert_eq!(polled.observe(9, 53.5, 54.0), 53.5);
+        assert!(
+            (polled.interval_s().unwrap() - 2.0).abs() < 1e-9,
+            "a stamp after a poll time measures nothing"
+        );
+    }
+
+    #[test]
+    fn only_controls_that_change_the_signal_are_exposure_settings() {
+        use OlsCamOptionId::*;
+        assert_eq!(
+            exposure_setting(Exp, 2500.0),
+            Some(("exposure_s".to_string(), serde_json::json!(2.5)))
+        );
+        assert_eq!(exposure_setting(Gain, 120.0).unwrap().0, "gain");
+        assert_eq!(exposure_setting(BlackLevel, 10.0).unwrap().0, "offset");
+        assert_eq!(exposure_setting(Gamma, 1.2).unwrap().0, "gamma");
+        for id in [
+            CoolerTarget,
+            CoolerOn,
+            FanOn,
+            Temperature,
+            Viewfinder,
+            CaptureTarget,
+            KeepImages,
+            LiveStretch,
+        ] {
+            assert!(exposure_setting(id, 1.0).is_none(), "{id:?}");
+        }
+        assert!(exposure_setting(Gain, f64::NAN).is_none());
+    }
+
+    async fn equipment_test_state() -> (std::path::PathBuf, AppState) {
+        let directory =
+            std::env::temp_dir().join(format!("achernar-capture-gate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database = directory.join("achernar.db");
+        let local_store = crate::storage::local_store::LocalStore::open(database.to_str().unwrap())
+            .await
+            .unwrap();
+        let mut focus = crate::config::FocusConfig::default();
+        focus.models.quality_model_path = Some(
+            directory
+                .join("absent-model.onnx")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        let state = AppState::new(
+            focus,
+            crate::config::CameraConfig::default(),
+            local_store,
+            crate::storage::frames_repo::FrameStore::new(directory.join("preview")),
+            crate::storage::capture_store::CaptureStore::new(directory.join("captures")),
+            "capture-gate-rig".to_string(),
+            directory.join("data"),
+            None,
+        );
+        (directory, state)
+    }
+
+    #[tokio::test]
+    async fn an_automatic_capture_is_refused_with_423_while_a_resume_block_is_active() {
+        use crate::equipment::resume::BlockRequest;
+        use crate::equipment::snapshot::ResumeBlockKind;
+        use crate::equipment::traits::EquipmentReader;
+
+        let (directory, state) = equipment_test_state().await;
+        state
+            .equipment
+            .raise_block(BlockRequest::new(ResumeBlockKind::Estop, "operator e-stop"));
+        let automatic: CaptureParams = serde_json::from_value(serde_json::json!({
+            "exposure": 1.0,
+            "source": {"kind": "trigger", "rule": "sequence"},
+        }))
+        .unwrap();
+        let error = perform_capture(state.clone(), automatic).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::LOCKED);
+        assert_eq!(error.code, "resume_block_active");
+        // Refused before the camera was marked exposing, and recorded as a
+        // failed attempt with its source.
+        {
+            let runtime = state.camera_runtime.read().unwrap();
+            assert_eq!(runtime.activity, CameraActivity::Disconnected);
+            assert!(runtime.operation_id.is_none());
+        }
+        let attempts: Vec<(String, String)> =
+            sqlx::query_as("SELECT status, requested_json FROM capture_attempts")
+                .fetch_all(state.local_store.pool())
+                .await
+                .unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].0, "failed");
+        let requested: serde_json::Value = serde_json::from_str(&attempts[0].1).unwrap();
+        assert_eq!(requested["source"]["kind"], "trigger");
+
+        // The operator's capture passes the gate and reaches the camera
+        // lookup (no camera here: 412), then releases everything it held.
+        let operator: CaptureParams =
+            serde_json::from_value(serde_json::json!({"exposure": 1.0})).unwrap();
+        let error = perform_capture(state.clone(), operator).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::PRECONDITION_FAILED);
+        assert!(state.equipment.gate().is_idle(), "camera domain released");
+        assert!(!state.equipment.busy().borrow().exposing);
+        let (frames,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM frames")
+            .fetch_one(state.local_store.pool())
+            .await
+            .unwrap();
+        assert_eq!(frames, 0);
+
+        let pool = state.local_store.pool().clone();
+        drop(state);
+        pool.close().await;
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
