@@ -7,9 +7,11 @@ from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
 from django.core.cache import cache
 import json
+import math
 import os
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from .models import ConnectedEquipment
@@ -53,6 +55,45 @@ def get_daemon(path, timeout=5):
     with urllib.request.urlopen(f'{daemon_api_base()}/{path.lstrip("/")}', timeout=timeout) as response:
         body = response.read().decode('utf-8')
         return json.loads(body) if body else {}
+
+
+def _query_value(value):
+    """One query-string value the way the frontend's `queryString` writes it."""
+    if isinstance(value, bool):
+        return 'true' if value else 'false'
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and math.isfinite(value):
+        return str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+    return None
+
+
+def query_string(payload):
+    """A GET command's arguments, as the query string of its direct route.
+
+    The relay hands the payload to the same handler as a body, so the direct
+    route has to carry it too, or `equipment.events?since_seq=` would replay
+    the journal from the start on every poll. This mirrors
+    achernar-frontend's `queryString`: only scalar values travel, lists are
+    joined with commas (the daemon's `kinds` format), and null is dropped.
+    """
+    params = []
+    for key, value in (payload or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            parts = [
+                _query_value(part) for part in value
+                if isinstance(part, (str, int, float)) and not isinstance(part, bool)
+            ]
+            parts = [part for part in parts if part is not None]
+            if parts:
+                params.append((key, ','.join(parts)))
+            continue
+        text = _query_value(value)
+        if text is not None:
+            params.append((key, text))
+    return urllib.parse.urlencode(params)
 
 
 # The daemon publishes its own command registry at GET /api/v1/commands,
@@ -410,7 +451,8 @@ class ConnectedEquipmentViewSet(viewsets.ModelViewSet):
 
         try:
             if method == 'GET':
-                body = get_daemon(path)
+                query = query_string(payload)
+                body = get_daemon(f'{path}?{query}' if query else path)
             elif action_name in _QUERY_PARAM_COMMANDS:
                 # The daemon takes this argument as a query parameter, not a body.
                 key = _QUERY_PARAM_COMMANDS[action_name]

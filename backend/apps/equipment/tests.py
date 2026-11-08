@@ -236,6 +236,35 @@ class CommandErrorTests(APITestCase):
         post.assert_not_called()
         self.assertEqual(get.call_args.args[0], 'focuser/position')
 
+    def test_get_commands_carry_their_payload_as_the_query_string(self):
+        """equipment.events must not replay the journal from seq 0 on every poll."""
+        registry = registry_payload() + [
+            {'name': 'equipment.events', 'method': 'GET', 'path': 'equipment/events',
+             'description': 'Equipment event journal tail after since_seq.'},
+        ]
+        with mock.patch.object(views, 'get_daemon', side_effect=[registry, {'events': []}]) as get:
+            response = self.client.post(
+                '/api/equipment/command/',
+                {'action': 'equipment.events',
+                 'payload': {'since_seq': 42, 'limit': 100.0, 'kinds': ['slew_settled', 'parked'],
+                             'missing': None, 'live': True}},
+                format='json',
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            get.call_args.args[0],
+            'equipment/events?since_seq=42&limit=100&kinds=slew_settled%2Cparked&live=true',
+        )
+
+    def test_query_string_drops_what_cannot_travel(self):
+        self.assertEqual(views.query_string({}), '')
+        self.assertEqual(views.query_string(None), '')
+        self.assertEqual(
+            views.query_string({'a': float('nan'), 'b': [], 'c': {'nested': 1}, 'd': 'x y'}),
+            'd=x+y',
+        )
+
     def test_query_parameter_commands_keep_their_quirk(self):
         with mock.patch.object(views, 'get_daemon', return_value=registry_payload()), \
              mock.patch.object(views, 'post_daemon', return_value={}) as post:

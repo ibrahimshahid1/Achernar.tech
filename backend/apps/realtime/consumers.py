@@ -16,7 +16,7 @@ from channels.db import database_sync_to_async
 from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
-from .state import HARDWARE_FIELDS, connected_hardware, snapshot_payload
+from .state import HARDWARE_FIELDS, connected_hardware, snapshot_payload, status_blocks
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ def clear_snapshot(snapshot):
     snapshot.guiding_state = {}
     snapshot.ai_metrics = {}
     snapshot.device_health = {}
+    snapshot.status_blocks = {}
     snapshot.save()
 
 
@@ -310,6 +311,7 @@ class DaemonConsumer(AsyncWebsocketConsumer):
                 snapshot.guiding_state = payload.get('guiding') or {}
                 snapshot.ai_metrics = payload.get('ai') or {}
                 snapshot.device_health = payload.get('device_health') or {}
+                snapshot.status_blocks = status_blocks(payload)
                 snapshot.save()
                 cache.delete(f'telemetry:{self.daemon_id}')
                 if (

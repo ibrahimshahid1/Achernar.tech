@@ -11,7 +11,7 @@ from apps.equipment.views import snapshot_to_status
 from apps.realtime.consumers import DaemonConsumer, TelemetryConsumer, frame_preview_key
 from apps.realtime.models import DaemonConnection, TelemetrySnapshot
 from apps.realtime.relay import get_daemon_telemetry, is_daemon_healthy
-from apps.realtime.state import HARDWARE_FIELDS, snapshot_payload
+from apps.realtime.state import HARDWARE_FIELDS, STATUS_BLOCKS, snapshot_payload
 
 
 def make_daemon(**overrides):
@@ -59,6 +59,12 @@ class SnapshotFreshnessTests(TestCase):
         self.assertTrue(payload['connected'])
         self.assertTrue(payload['daemon_connected'])
         self.assertFalse(payload['telemetry_stale'])
+
+    def test_a_snapshot_without_status_blocks_reports_them_null(self):
+        payload = snapshot_payload(self.daemon, self.snapshot)
+        for name in STATUS_BLOCKS:
+            self.assertIsNone(payload[name], name)
+        self.assertIsNone(snapshot_payload(self.daemon)['safety'])
 
     def test_dead_tunnel_masks_even_a_recent_hardware_snapshot(self):
         self.daemon.is_connected = False
@@ -130,6 +136,37 @@ class RelayLifecycleTests(TransactionTestCase):
         self.assertEqual(payload['device_health'], health)
         self.assertIsNone(cache.get(frame_preview_key(self.daemon.id)))
         self.assertIsNone(cache.get(f'telemetry:{self.daemon.id}'))
+
+    def test_weather_safety_busy_and_resume_blocks_reach_new_clients(self):
+        blocks = {
+            'weather': {'connected': True, 'name': 'sim weather', 'temperature': 4.5},
+            'safety_monitor': {'connected': False, 'name': 'old monitor'},
+            'safety': {'state': 'safe', 'changed_at': '2026-11-07T20:00:00Z'},
+            'busy': {'exposing': True, 'slewing': False},
+            'resume_blocks': [{'id': 'b1', 'kind': {'kind': 'estop'}}],
+        }
+        payload = async_to_sync(self.consumer.store_telemetry_snapshot)(blocks)
+        self.assertEqual(payload['weather']['temperature'], 4.5)
+        self.assertIsNone(payload['safety_monitor'], 'a disconnected monitor is not live')
+        self.assertEqual(payload['safety'], blocks['safety'])
+        self.assertEqual(payload['busy'], blocks['busy'])
+        self.assertEqual(payload['resume_blocks'], blocks['resume_blocks'])
+        # A newly connected browser gets the same blocks from the saved twin.
+        consumer = TelemetryConsumer()
+        consumer.daemon_id = str(self.daemon.id)
+        event = async_to_sync(consumer.get_latest_telemetry)()
+        self.assertEqual(event['payload']['safety']['state'], 'safe')
+        self.assertEqual(event['payload']['resume_blocks'], blocks['resume_blocks'])
+        # Stale telemetry says nothing about them: null, not an empty list.
+        TelemetrySnapshot.objects.filter(daemon=self.daemon).update(
+            updated_at=timezone.now() - timedelta(minutes=2),
+        )
+        stale = async_to_sync(consumer.get_latest_telemetry)()['payload']
+        for name in STATUS_BLOCKS:
+            self.assertIsNone(stale[name], name)
+        # A gateway close clears them with the devices.
+        async_to_sync(self.consumer.disconnect)(1006)
+        self.assertEqual(TelemetrySnapshot.objects.get(daemon=self.daemon).status_blocks, {})
 
     def test_full_snapshot_removes_devices_missing_from_new_payload(self):
         payload = async_to_sync(self.consumer.store_telemetry_snapshot)({

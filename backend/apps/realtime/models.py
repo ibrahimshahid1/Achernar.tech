@@ -126,6 +126,9 @@ class TelemetrySnapshot(models.Model):
     device_health = models.JSONField(default=dict, blank=True)
     guiding_state = models.JSONField(default=dict, blank=True)
     ai_metrics = models.JSONField(default=dict, blank=True)
+    # The other TELEMETRY_UPDATE blocks (weather, safety_monitor, safety,
+    # busy, resume_blocks), keyed by block name; see state.STATUS_BLOCKS.
+    status_blocks = models.JSONField(default=dict, blank=True)
     
     updated_at = models.DateTimeField(auto_now=True)
     
