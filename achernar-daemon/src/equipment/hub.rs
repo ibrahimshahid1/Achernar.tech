@@ -647,6 +647,28 @@ pub fn derive_safety_summary(
 // Window helpers
 // ---------------------------------------------------------------------------
 
+/// A window's `moved` flag from one ring (D7): motion at the start sample
+/// (a move already running when the exposure began) or at any sample inside
+/// the exposure, or a change of `value` between the start sample and the
+/// last sample at or before the end. A change that only the first sample
+/// after the end shows may have begun after the exposure ended; the window's
+/// end state (`WindowSamples::end`, `end_stale`) carries that, not `moved`.
+fn ring_moved<S: DeviceSnapshot, V: PartialEq>(
+    ring: &Ring<S>,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+    value: impl Fn(&S) -> Option<V>,
+) -> bool {
+    let inside = ring.range(start, end);
+    let first = ring.at_or_before(start).or_else(|| inside.first().cloned());
+    let moving = first.iter().chain(inside.iter()).any(|s| s.in_motion());
+    let changed = match (&first, ring.at_or_before(end)) {
+        (Some(first), Some(last)) => value(first) != value(&last),
+        _ => false,
+    };
+    moving || changed
+}
+
 /// Device kinds whose motion an event signals (quiescence and `moved`).
 pub fn motion_kinds(event: &EquipmentEvent) -> &'static [DeviceKind] {
     use DeviceKind::*;
@@ -1050,6 +1072,20 @@ impl HubCore {
 
     // -- windows and quiescence ----------------------------------------------------
 
+    /// One kind's quiescence over `[start, end]`: unknown with no data, a
+    /// lost device, no sample covering the start, or a stale start; moved on
+    /// a motion event inside the window or motion at the start sample or
+    /// inside it; otherwise quiet since it last settled.
+    ///
+    /// With no sample at or after the end yet, a device that published
+    /// within `2 x idle` of now still counts as quiet. That verdict is
+    /// provisional, inside D7's grace: the latest sample is at most `2 x
+    /// idle` before now, so the window is not yet due to be marked stale,
+    /// and once the grace has passed without a post-end sample the device
+    /// is unknown (`<kind>_no_sample_after_end`), never quiet. A consumer
+    /// that needs the end confirmed waits for a post-end sample itself
+    /// (autofocus's read-back check) or for `window().finalised` (the
+    /// capture finaliser).
     fn kind_quiet<S: DeviceSnapshot>(
         &self,
         ring: &Ring<S>,
@@ -1367,64 +1403,25 @@ impl HubCore {
         };
         window.guide = self.guide_stats(start, end, &events);
         window.motion = self.motion_intervals(start, end);
-        let moved = |kind: DeviceKind, ring_moving: bool| {
-            ring_moving || events.iter().any(|e| signals_motion_of(e, kind))
+        let moved = |kind: DeviceKind, ring_moved: bool| {
+            ring_moved || events.iter().any(|e| signals_motion_of(e, kind))
         };
-        let any_motion = |samples: Vec<bool>| samples.into_iter().any(|m| m);
         window.moved = MovedFlags {
             focuser: moved(
                 DeviceKind::Focuser,
-                any_motion(
-                    r.focuser
-                        .range(start, end)
-                        .iter()
-                        .map(|s| s.in_motion())
-                        .collect(),
-                ) || window
-                    .focuser
-                    .start
-                    .as_ref()
-                    .and_then(|s| s.logical_position)
-                    != window.focuser.end.as_ref().and_then(|s| s.logical_position),
+                ring_moved(&r.focuser, start, end, |s| s.logical_position),
             ),
             wheel: moved(
                 DeviceKind::FilterWheel,
-                any_motion(
-                    r.filter_wheel
-                        .range(start, end)
-                        .iter()
-                        .map(|s| s.in_motion())
-                        .collect(),
-                ) || window
-                    .filter_wheel
-                    .start
-                    .as_ref()
-                    .and_then(|s| s.position.known().copied())
-                    != window
-                        .filter_wheel
-                        .end
-                        .as_ref()
-                        .and_then(|s| s.position.known().copied()),
+                ring_moved(&r.filter_wheel, start, end, |s| s.position.known().copied()),
             ),
             mount: moved(
                 DeviceKind::Mount,
-                any_motion(
-                    r.mount
-                        .range(start, end)
-                        .iter()
-                        .map(|s| s.in_motion())
-                        .collect(),
-                ),
+                ring_moved(&r.mount, start, end, |_| None::<()>),
             ),
             rotator: moved(
                 DeviceKind::Rotator,
-                any_motion(
-                    r.rotator
-                        .range(start, end)
-                        .iter()
-                        .map(|s| s.in_motion())
-                        .collect(),
-                ),
+                ring_moved(&r.rotator, start, end, |_| None::<()>),
             ),
         };
         window.resume_block_active = self.resume.active_during(start, end);
@@ -1438,25 +1435,51 @@ impl HubCore {
         .filter(|kind| attached.contains(kind))
         .collect();
         window.quiescence = self.quiescent(&motion_kinds, start, end);
-        window.clock_quality = self.exposure_clock_quality(start);
+        window.clock_quality = self.exposure_clock_quality(start, end);
         window.events = events.iter().map(|e| (**e).clone()).collect();
         window.finalised = finalised;
         window.stale_kinds = stale_kinds;
         window
     }
 
-    /// The clock quality the camera hook reported for the exposure that
-    /// started at `start` (`exposure_started`), else unknown.
-    fn exposure_clock_quality(&self, start: DateTime<Utc>) -> ClockQuality {
+    /// The clock quality of the exposure that `[start, end]` describes
+    /// (§2.14), from the camera's own records:
+    ///
+    /// 1. a capture's `exposure_completed` for exactly this interval: the
+    ///    capture path emits it after the commit with the interval its
+    ///    window was assembled from, which need not start at the trigger (a
+    ///    still's driver bracket follows the trigger, a stream frame's
+    ///    conservative start can precede it);
+    /// 2. else an `exposure_started` triggered exactly at `start`;
+    /// 3. else unknown. A window that only overlaps an exposure (a preview
+    ///    frame, a sub-span) is not matched to it.
+    ///
+    /// A committed frame's authoritative value is its
+    /// `exposure_device_windows` row (and `acquisition_json.equipment`),
+    /// which the capture path writes from its own interval; models read
+    /// that rather than re-deriving it here.
+    fn exposure_clock_quality(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> ClockQuality {
         let slack = chrono::Duration::seconds(120);
-        self.bus
-            .events_between(start - slack, start + slack)
-            .iter()
-            .find_map(|event| match &event.event {
-                EventKind::ExposureStarted { exposure } if exposure.started_at == Some(start) => {
-                    Some(exposure.clock_quality)
-                }
-                _ => None,
+        let events = self.bus.events_between(start - slack, end + slack);
+        let completed = events.iter().find_map(|event| match &event.event {
+            EventKind::ExposureCompleted {
+                exposure,
+                completed_at,
+            } if exposure.started_at == Some(start) && *completed_at == end => {
+                Some(exposure.clock_quality)
+            }
+            _ => None,
+        });
+        completed
+            .or_else(|| {
+                events.iter().find_map(|event| match &event.event {
+                    EventKind::ExposureStarted { exposure }
+                        if exposure.started_at == Some(start) =>
+                    {
+                        Some(exposure.clock_quality)
+                    }
+                    _ => None,
+                })
             })
             .unwrap_or_default()
     }
@@ -2899,6 +2922,167 @@ mod tests {
             clock.as_ref(),
         );
         assert_eq!(motion_kinds(&flip), &[DeviceKind::Mount]);
+    }
+
+    fn wheel_sample(
+        clock: &ManualClock,
+        slot: Option<u32>,
+        moving: bool,
+    ) -> Arc<FilterWheelSnapshot> {
+        let (utc, mono) = at(clock);
+        let mut snap = FilterWheelSnapshot {
+            position: match slot {
+                Some(slot) => Observed::fresh(slot, Source::Property, utc, mono),
+                None => Observed::not_set(Source::Property),
+            },
+            moving,
+            ..FilterWheelSnapshot::default()
+        };
+        snap.set_published(utc, mono);
+        Arc::new(snap)
+    }
+
+    /// `moved` compares the start sample with the last sample at or before
+    /// the end, and counts motion at the start sample (a move already
+    /// running). A change that only the first sample after the end shows
+    /// may have begun after the exposure: it is the D7 end state's business,
+    /// not `moved`'s.
+    #[test]
+    fn moved_counts_a_running_move_and_not_a_change_after_the_end() {
+        let (hub, clock, _sink) = hub_with_clock();
+        let rings = hub.rings();
+        let t0 = clock.now_utc();
+        let ms = chrono::Duration::milliseconds;
+        // Still at 1000 / slot 2 before a 0.5 s exposure; the next samples,
+        // after the exposure end, show a move.
+        clock.advance_ms(1_000);
+        rings.focuser.push(focuser_sample(&clock, 1000, false));
+        rings
+            .filter_wheel
+            .push(wheel_sample(&clock, Some(2), false));
+        clock.advance_ms(2_000);
+        rings.focuser.push(focuser_sample(&clock, 1100, false));
+        rings
+            .filter_wheel
+            .push(wheel_sample(&clock, Some(3), false));
+        let window = hub.window(t0 + ms(1_500), t0 + ms(2_000));
+        assert!(!window.moved.focuser, "{:?}", window.moved);
+        assert!(!window.moved.wheel, "{:?}", window.moved);
+        // The end state still shows where they went.
+        assert_eq!(
+            window.focuser.end.as_ref().and_then(|s| s.logical_position),
+            Some(1100)
+        );
+        // A change inside the exposure is a move.
+        let across = hub.window(t0 + ms(1_500), t0 + ms(3_000));
+        assert!(
+            across.moved.focuser && across.moved.wheel,
+            "{:?}",
+            across.moved
+        );
+
+        // A move already running at the start sample is a move, even when
+        // the next sample comes after the end at the same position.
+        let (hub, clock, _sink) = hub_with_clock();
+        let rings = hub.rings();
+        let t0 = clock.now_utc();
+        clock.advance_ms(1_000);
+        rings.focuser.push(focuser_sample(&clock, 1000, true));
+        rings.filter_wheel.push(wheel_sample(&clock, None, true));
+        rings.mount.push(mount_sample(&clock, 1.0, 1.0, true));
+        clock.advance_ms(2_000);
+        rings.focuser.push(focuser_sample(&clock, 1000, false));
+        rings
+            .filter_wheel
+            .push(wheel_sample(&clock, Some(2), false));
+        rings.mount.push(mount_sample(&clock, 1.0, 1.0, false));
+        let window = hub.window(t0 + ms(1_500), t0 + ms(2_000));
+        assert!(window.moved.focuser, "{:?}", window.moved);
+        assert!(window.moved.wheel, "{:?}", window.moved);
+        assert!(window.moved.mount, "{:?}", window.moved);
+    }
+
+    /// The capture path's window need not start at its trigger; its
+    /// `exposure_completed` names the exact interval, so `window()` of that
+    /// interval reports the capture's clock quality. A window that merely
+    /// overlaps it is not matched.
+    #[test]
+    fn exposure_clock_quality_follows_the_captures_own_interval() {
+        let (hub, clock, _sink) = hub_with_clock();
+        let ms = chrono::Duration::milliseconds;
+        let trigger = clock.now_utc();
+        let exposure = |started_at| ExposureRef {
+            started_at: Some(started_at),
+            duration_s: Some(2.0),
+            capture_id: Some("capture-1".into()),
+            clock_quality: ClockQuality::HostArrival,
+            ..ExposureRef::default()
+        };
+        hub.emit(EquipmentEvent::new(
+            EventKind::ExposureStarted {
+                exposure: exposure(trigger),
+            },
+            clock.as_ref(),
+        ));
+        // A stream frame's conservative window starts before the trigger.
+        let (start, end) = (trigger - ms(1_500), trigger + ms(2_500));
+        clock.advance_ms(4_000);
+        assert_eq!(hub.window(start, end).clock_quality, ClockQuality::Unknown);
+        hub.emit(EquipmentEvent::new(
+            EventKind::ExposureCompleted {
+                exposure: exposure(start),
+                completed_at: end,
+            },
+            clock.as_ref(),
+        ));
+        assert_eq!(
+            hub.window(start, end).clock_quality,
+            ClockQuality::HostArrival
+        );
+        assert_eq!(
+            hub.window(start + ms(100), end).clock_quality,
+            ClockQuality::Unknown
+        );
+    }
+
+    /// Without a sample after the end, a device that published within
+    /// `2 x idle` of now is provisionally quiet (D7's grace); once the grace
+    /// has passed it is unknown, never quiet.
+    #[test]
+    fn a_window_without_a_post_end_sample_is_quiet_only_inside_the_grace() {
+        let (hub, clock, _sink) = hub_with_clock();
+        let rings = hub.rings();
+        let t0 = clock.now_utc();
+        let ms = chrono::Duration::milliseconds;
+        clock.advance_ms(1_000);
+        rings.mount.push(mount_sample(&clock, 1.0, 1.0, false));
+        rings
+            .filter_wheel
+            .push(wheel_sample(&clock, Some(1), false));
+        let (start, end) = (t0 + ms(1_200), t0 + ms(1_700));
+        clock.advance_ms(800);
+        for kind in [DeviceKind::Mount, DeviceKind::FilterWheel] {
+            assert!(
+                hub.quiescent(&[kind], start, end).is_quiescent(),
+                "{kind:?} inside the grace"
+            );
+        }
+        assert!(!hub.window(start, end).finalised, "provisional");
+        // The mount's idle cadence is 1 s and the wheel's 2 s: past twice
+        // that after the exposure end, with still no sample after it, both
+        // are unknown and their end states stale.
+        clock.advance_ms(4_200);
+        for kind in [DeviceKind::Mount, DeviceKind::FilterWheel] {
+            assert!(
+                matches!(
+                    hub.quiescent(&[kind], start, end),
+                    Quiescence::Unknown { reason } if reason.ends_with("_no_sample_after_end")
+                ),
+                "{kind:?} after the grace"
+            );
+        }
+        let late = hub.window(start, end);
+        assert!(late.mount.end_stale && late.filter_wheel.end_stale);
     }
 
     #[test]

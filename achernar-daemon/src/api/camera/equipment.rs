@@ -2081,10 +2081,16 @@ mod tests {
         };
         let done = try_finalise(&hub, None, &plan).expect("a sample after the end exists");
         assert!(done.row.finalised);
-        assert!(
-            hub.window(interval.start, interval.end).moved.wheel,
-            "the hub's window sees the change too"
-        );
+        // The hub agrees: its `moved` covers the exposure only (start sample
+        // to the last sample at or before the end), and its D7 end state is
+        // the moving post-end sample.
+        let window = hub.window(interval.start, interval.end);
+        assert!(!window.moved.wheel, "the change shows only after the end");
+        assert!(window
+            .filter_wheel
+            .end
+            .as_ref()
+            .is_some_and(|end| end.moving));
         assert_eq!(done.row.filter_verified, Some(false));
         assert_eq!(done.row.filter_slot, None);
         assert_eq!(done.filter_name.as_deref(), Some("Ha"), "the client label");
