@@ -2083,6 +2083,7 @@ async fn record_sample(
         );
     }
 
+    let (equipment, finalise) = focus_frame_equipment(ctx, accepted, stream);
     let committed = persist_observed_frame(
         state,
         ctx.camera.as_ref(),
@@ -2094,8 +2095,14 @@ async fn record_sample(
         stream,
         temperature.clone(),
         extra,
+        Some(equipment),
     )
     .await?;
+    // D7: rewrite the frame's window row once every device has reported
+    // after the exposure (and write PHD2's per-exposure row, H9).
+    let mut plan = finalise;
+    plan.input.frame_id = committed.frame_id.clone();
+    crate::api::camera::equipment::spawn_finaliser(state, plan);
     let sample = sample_from_observation(position, observation, &committed, temperature.0)?;
 
     let age_ms = temperature
@@ -2854,6 +2861,7 @@ async fn persist_observed_frame(
     stream: &StreamInfo,
     temperature: (Option<f64>, TemperatureState, Option<String>),
     extra_quality: serde_json::Map<String, Value>,
+    equipment: Option<FocusFrameEquipment>,
 ) -> crate::error::Result<CommittedCapture> {
     if observed.frame.stream_generation != camera.generation() {
         return Err(FocusError::RunFailed(
@@ -2876,6 +2884,7 @@ async fn persist_observed_frame(
             temperature_state,
             temperature_source,
             extra_quality,
+            equipment,
         },
     )?;
     let capture_id = pending.capture_id.clone();
@@ -2920,6 +2929,74 @@ struct SimulationFocusMetadata {
     /// Keys merged into `quality_json`: the A06 evidence, the H6 ambient
     /// reading and the FOP vector (H7).
     extra_quality: serde_json::Map<String, Value>,
+    /// The frame's equipment record from the hub's window (H1, D7); `None`
+    /// keeps the bare record (unit tests of the bundle itself).
+    equipment: Option<FocusFrameEquipment>,
+}
+
+/// A focus frame's equipment record: the capture path's assembly (H1, D7)
+/// over the A06 interval the frame was accepted on. Nothing here calls a
+/// device; it reads the hub's rings and journal.
+struct FocusFrameEquipment {
+    frame_id: String,
+    /// `acquisition_json.equipment`; its `window` is the frame's
+    /// `exposure_device_windows` row.
+    block: Value,
+    cards: Vec<crate::fits::FitsCard>,
+    filter_name: Option<String>,
+    /// The window's reliable, unmoved position, else the A06 read-back
+    /// (taken after the exposure and equal to the one before it).
+    focuser_position: Option<i64>,
+}
+
+/// Assemble a focus frame's equipment record (FQE and FOP ground truth),
+/// and the finaliser's plan for its window row.
+fn focus_frame_equipment(
+    ctx: &RunContext,
+    accepted: &AcceptedFrame,
+    stream: &StreamInfo,
+) -> (
+    FocusFrameEquipment,
+    crate::api::camera::equipment::FinalisePlan,
+) {
+    use crate::api::camera::equipment::{assemble, AssemblyInput, ExposureInterval, FinalisePlan};
+    let state = &ctx.state;
+    let interval = ExposureInterval {
+        start: accepted.window_start,
+        end: accepted.window_end,
+        clock_quality: accepted.timing_basis,
+        basis: "a06_accepted_window",
+        exposure_s: stream.exposure_s,
+        frame_interval_s: Some(stream.frame_interval_s).filter(|s| s.is_finite() && *s > 0.0),
+    };
+    let input = AssemblyInput {
+        frame_id: Uuid::new_v4().to_string(),
+        client_filter: ctx.filter.name.clone(),
+        blocks_at_start: state.equipment.resume().active(),
+        source: ctx.op.command.source.clone(),
+        command_id: Some(ctx.op.command_id()),
+    };
+    let recorded = assemble(
+        &state.equipment,
+        state.equipment_ctx.guider_windows().as_ref(),
+        &interval,
+        &input,
+    );
+    let equipment = FocusFrameEquipment {
+        frame_id: input.frame_id.clone(),
+        block: recorded.block,
+        cards: recorded.cards,
+        filter_name: recorded.filter_name,
+        focuser_position: recorded
+            .focuser_position
+            .or(accepted.readback_after.map(i64::from)),
+    };
+    let plan = FinalisePlan {
+        input,
+        interval,
+        finalised_at_commit: recorded.row.finalised,
+    };
+    (equipment, plan)
 }
 
 /// The permitted analysis domain is deliberately small while A03 is pending:
@@ -3007,9 +3084,15 @@ fn simulation_focus_bundle(
         source_file: None,
         calibration: None,
     };
-    let fits_bytes = crate::fits::encode_capture(frame, &fits_meta).map_err(|error| {
-        crate::error::StorageError::Database(format!("encode autofocus sensor FITS: {error}"))
-    })?;
+    let cards = meta
+        .equipment
+        .as_ref()
+        .map(|equipment| equipment.cards.as_slice())
+        .unwrap_or_default();
+    let fits_bytes =
+        crate::fits::encode_capture_with(frame, &fits_meta, cards).map_err(|error| {
+            crate::error::StorageError::Database(format!("encode autofocus sensor FITS: {error}"))
+        })?;
     let analysis_bytes = encode_simulation_luma(&luma)?;
     let descriptor = frame.analysis_sensor_descriptor()?;
     let linear = crate::processing::debayer::analyze(&crate::processing::debayer::SensorFrame {
@@ -3030,9 +3113,40 @@ fn simulation_focus_bundle(
     .map_err(|error| {
         FocusError::RunFailed(format!("Simulation analysis archive failed: {error}"))
     })?;
+    let (frame_id, filter_name, focuser_position, equipment_block) = match meta.equipment {
+        Some(equipment) => (
+            equipment.frame_id,
+            equipment.filter_name,
+            equipment.focuser_position,
+            Some(equipment.block),
+        ),
+        None => (
+            uuid::Uuid::new_v4().to_string(),
+            meta.filter_name,
+            Some(meta.position as i64),
+            None,
+        ),
+    };
+    let mut acquisition = serde_json::json!({
+        "acquisition_domain": "simulation",
+        "training_label_eligible": false,
+        "analysis_version": crate::processing::debayer::PROCESSING_VERSION,
+        "analysis_descriptor": "analysis/analysis.json",
+        "stream_generation": frame.stream_generation,
+        "frame_counter": frame.frame_counter,
+        "stream_format": format!("{:?}", frame.format),
+        "timing_state": "simulator_delivery_timestamp_only",
+        "exposure_state": "simulator_cadence_readback_without_settings_write",
+        "gain_state": "unavailable",
+        "retention": crate::storage::capture_retention::RetentionDecision::retaining(false),
+        "quality": quality,
+    });
+    if let Some(block) = equipment_block {
+        acquisition["equipment"] = block;
+    }
     Ok(PendingCapture {
         capture_id: uuid::Uuid::new_v4().to_string(),
-        frame_id: uuid::Uuid::new_v4().to_string(),
+        frame_id,
         session_id: None,
         rig_id: meta.rig_id,
         camera_name: meta.camera_name,
@@ -3049,25 +3163,12 @@ fn simulation_focus_bundle(
         shutter_label: None,
         offset_val: None,
         binning: 1,
-        filter_name: meta.filter_name,
-        focuser_position: Some(meta.position as i64),
+        filter_name,
+        focuser_position,
         temperature: meta.temperature,
         temperature_source: meta.temperature_source,
         temperature_state: meta.temperature_state,
-        acquisition: serde_json::json!({
-            "acquisition_domain": "simulation",
-            "training_label_eligible": false,
-            "analysis_version": crate::processing::debayer::PROCESSING_VERSION,
-            "analysis_descriptor": "analysis/analysis.json",
-            "stream_generation": frame.stream_generation,
-            "frame_counter": frame.frame_counter,
-            "stream_format": format!("{:?}", frame.format),
-            "timing_state": "simulator_delivery_timestamp_only",
-            "exposure_state": "simulator_cadence_readback_without_settings_write",
-            "gain_state": "unavailable",
-            "retention": crate::storage::capture_retention::RetentionDecision::retaining(false),
-            "quality": quality,
-        }),
+        acquisition,
         assets: {
             let mut assets = vec![
                 PendingAsset::new(
@@ -3516,6 +3617,7 @@ mod tests {
             temperature_state: TemperatureState::Missing,
             temperature_source: None,
             extra_quality: serde_json::Map::new(),
+            equipment: None,
         }
     }
 
@@ -4745,6 +4847,48 @@ mod tests {
             )
             .unwrap();
             assert!(started >= settled, "{started} before {settled}");
+        }
+
+        // H1/D7: every focus frame carries the hub's window of the A06
+        // interval it was accepted on: the equipment block, a window row
+        // assembled from the rings (not the bare "not assembled" row) and
+        // the window's focuser position, the same one FITS FOCPOS carries.
+        for row in &rows {
+            let frame_id: String = row.get("frame_id");
+            let position: i64 = row.get("position");
+            let (acquisition, focuser_position): (String, Option<i64>) = sqlx::query_as(
+                "SELECT acquisition_json, focuser_position FROM frames WHERE id = ?",
+            )
+            .bind(&frame_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let acquisition: Value = serde_json::from_str(&acquisition).unwrap();
+            let block = &acquisition["equipment"];
+            assert_eq!(
+                block["schema"],
+                crate::api::camera::equipment::EQUIPMENT_SCHEMA,
+                "{acquisition}"
+            );
+            assert_eq!(block["window"]["clock_quality"], "simulator");
+            assert_eq!(focuser_position, Some(position));
+            let (reason, start, pos_start): (Option<String>, Option<String>, Option<i64>) =
+                sqlx::query_as(
+                    "SELECT quiescence_reason, exposure_started_at, focuser_pos_start \
+                     FROM exposure_device_windows WHERE frame_id = ?",
+                )
+                .bind(&frame_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            assert_ne!(reason.as_deref(), Some("equipment_window_not_assembled"));
+            assert_eq!(pos_start, Some(position));
+            let start = crate::storage::columns::parse_time(&start.unwrap()).unwrap();
+            let a06_start = crate::storage::columns::parse_time(
+                &row.get::<Option<String>, _>("exposure_started_at").unwrap(),
+            )
+            .unwrap();
+            assert_eq!(start, a06_start, "the window is the A06 interval");
         }
 
         // H7: every sample frame carries its FOP vector and A06 evidence.

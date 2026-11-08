@@ -178,18 +178,14 @@ pub fn frames_dir() -> String {
     std::env::var("ACHERNAR_FRAMES_DIR").unwrap_or_else(|_| "frames".to_string())
 }
 
-/// Encode `frame` as a complete FITS file in memory.
+/// Encode `frame` as a complete FITS file in memory, with caller-supplied
+/// header cards (equipment H1; none for a bare capture).
 ///
 /// Returns bytes rather than writing them, because a capture is committed by
 /// [`crate::storage::capture_store`], which stages every asset into one
 /// directory, hashes it, and renames the bundle into place atomically. A
 /// function that writes its own file behind the store's back produces exactly
 /// the orphan the staging protocol exists to prevent.
-pub fn encode_capture(frame: &FrameData, meta: &FitsMeta) -> Result<Vec<u8>> {
-    encode_capture_with(frame, meta, &[])
-}
-
-/// [`encode_capture`] with caller-supplied header cards (equipment H1).
 pub fn encode_capture_with(
     frame: &FrameData,
     meta: &FitsMeta,
@@ -704,12 +700,12 @@ fn raw_analysis_assets(
 ///
 /// Retained for callers outside the capture path (autofocus preservation and
 /// the sim/bench harnesses). New capture code should go through
-/// `encode_capture` + the capture store so the file is catalogued.
+/// `encode_capture_with` + the capture store so the file is catalogued.
 pub fn write_capture(frame: &FrameData, meta: &FitsMeta, id: &str) -> Result<String> {
     let dir = frames_dir();
     fs::create_dir_all(&dir)?;
     let path = PathBuf::from(&dir).join(format!("{id}.fits"));
-    let bytes = encode_capture(frame, meta)?;
+    let bytes = encode_capture_with(frame, meta, &[])?;
     let mut file = fs::File::create(&path)?;
     file.write_all(&bytes)?;
     Ok(path.to_string_lossy().into_owned())
