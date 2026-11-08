@@ -198,6 +198,7 @@ impl CenterImaging for DaemonImaging {
                 capture_type: Some("center".into()),
                 retention_policy: Default::default(),
                 retention_acknowledgement: None,
+                source: Default::default(),
             };
             let image = crate::api::camera::perform_capture(self.state.clone(), params)
                 .await
