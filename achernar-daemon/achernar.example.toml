@@ -218,6 +218,9 @@ limit_hysteresis_deg = 0.5
 [mount.center]                      # slew, solve, correct, re-slew
 tolerance_arcmin = 1.0
 max_attempts = 3
+exposure_s = 5.0                    # each center frame; a request may override it
+# gain = 100                        # unset: the camera's own gain
+# binning = 2                       # unset: the camera's own binning
 
 [mount.flip]                        # Tier 2; inert unless the mount can flip
 enabled = false

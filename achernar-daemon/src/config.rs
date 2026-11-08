@@ -928,6 +928,16 @@ pub struct MountCenterConfig {
     pub tolerance_arcmin: f64,
     #[serde(default = "default_center_max_attempts")]
     pub max_attempts: u32,
+    /// The plate-solve exposure of each center frame (M-n step 2), seconds.
+    /// A request may override it; it never comes from the newest solved
+    /// frame.
+    #[serde(default = "default_center_exposure_s")]
+    pub exposure_s: f64,
+    /// Gain and binning of each center frame; unset keeps the camera's own.
+    #[serde(default)]
+    pub gain: Option<u32>,
+    #[serde(default)]
+    pub binning: Option<u32>,
 }
 
 impl Default for MountCenterConfig {
@@ -935,6 +945,9 @@ impl Default for MountCenterConfig {
         Self {
             tolerance_arcmin: default_center_tolerance_arcmin(),
             max_attempts: default_center_max_attempts(),
+            exposure_s: default_center_exposure_s(),
+            gain: None,
+            binning: None,
         }
     }
 }
@@ -1228,6 +1241,14 @@ impl AchernarConfig {
                 self.equipment.alpaca_client_id
             ));
         }
+        let center_exposure = self.mount.center.exposure_s;
+        if !center_exposure.is_finite() || center_exposure <= 0.0 {
+            warnings.push(format!(
+                "[mount.center] exposure_s {center_exposure} is not a positive number of \
+                 seconds; center frames use {} s",
+                default_center_exposure_s()
+            ));
+        }
         if self
             .guider
             .algo_param_min
@@ -1301,6 +1322,9 @@ fn default_center_tolerance_arcmin() -> f64 {
 }
 fn default_center_max_attempts() -> u32 {
     3
+}
+fn default_center_exposure_s() -> f64 {
+    5.0
 }
 fn default_flip_minutes_after() -> f64 {
     5.0
@@ -1625,6 +1649,33 @@ mod example_config_tests {
         assert_eq!(set.filter_wheel.max_switches_per_hour, 12);
         assert_eq!(set.site.dut1_s, -0.2);
         assert_eq!(set.equipment_configs().site.dut1_s, -0.2);
+    }
+
+    /// `[mount.center]` exposure settings default to 5 s at the camera's
+    /// own gain and binning, parse when given, and a nonsensical exposure
+    /// is reported.
+    #[test]
+    fn the_center_exposure_keys_default_and_parse() {
+        use super::*;
+        let empty: AchernarConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.mount.center.exposure_s, 5.0);
+        assert_eq!(empty.mount.center.gain, None);
+        assert_eq!(empty.mount.center.binning, None);
+        let set: AchernarConfig =
+            toml::from_str("[mount.center]\nexposure_s = 8.0\ngain = 120\nbinning = 2\n").unwrap();
+        assert_eq!(set.mount.center.exposure_s, 8.0);
+        assert_eq!(set.mount.center.gain, Some(120));
+        assert_eq!(set.mount.center.binning, Some(2));
+        assert_eq!(set.mount.center.tolerance_arcmin, 1.0);
+        assert!(set
+            .equipment_warnings()
+            .iter()
+            .all(|w| !w.contains("[mount.center]")));
+        let bad: AchernarConfig = toml::from_str("[mount.center]\nexposure_s = 0\n").unwrap();
+        assert!(bad
+            .equipment_warnings()
+            .iter()
+            .any(|w| w.contains("[mount.center] exposure_s")));
     }
 
     /// The example documents the equipment defaults, so a copied example

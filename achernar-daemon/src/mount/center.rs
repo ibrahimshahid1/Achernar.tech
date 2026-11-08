@@ -50,7 +50,7 @@ use crate::equipment::types::{
 };
 use crate::state::AppState;
 
-/// Exposure used when neither the request nor an earlier solved frame says.
+/// Exposure used when `[mount.center] exposure_s` is not a positive number.
 pub const DEFAULT_EXPOSURE_S: f64 = 5.0;
 
 /// How long a center frame waits for a solve already in flight (an
@@ -93,7 +93,7 @@ pub struct CenterExposure {
     pub exposure_s: f64,
     pub gain: Option<u32>,
     pub binning: Option<u32>,
-    /// `request`, `last_solved_frame` or `default`.
+    /// `request` or `config`.
     pub source: &'static str,
 }
 
@@ -414,43 +414,26 @@ pub fn authorize(
     })
 }
 
-/// The exposure of each center frame: the request's, else the settings of
-/// the newest frame that solved, else [`DEFAULT_EXPOSURE_S`].
-pub async fn exposure(state: &AppState, overrides: &CenterOverrides) -> CenterExposure {
-    if let Some(exposure_s) = overrides.exposure_s.filter(|s| s.is_finite() && *s > 0.0) {
-        return CenterExposure {
-            exposure_s,
-            gain: overrides.gain,
-            binning: overrides.binning,
-            source: "request",
-        };
-    }
-    let solved =
-        crate::storage::plate_solve_repo::latest_successful_solve(state.local_store.pool())
-            .await
-            .ok()
-            .flatten()
-            .and_then(|solve| solve.exposure);
-    match solved {
-        Some(solved) => CenterExposure {
-            exposure_s: solved.exposure_s,
-            gain: overrides.gain.or_else(|| {
-                solved
-                    .gain
-                    .filter(|g| g.is_finite() && *g >= 0.0)
-                    .map(|g| g.round() as u32)
-            }),
-            binning: overrides
-                .binning
-                .or_else(|| solved.binning.and_then(|b| u32::try_from(b).ok())),
-            source: "last_solved_frame",
-        },
-        None => CenterExposure {
-            exposure_s: DEFAULT_EXPOSURE_S,
-            gain: overrides.gain,
-            binning: overrides.binning,
-            source: "default",
-        },
+/// The exposure of each center frame, M-n step 2's "plate-solve exposure
+/// settings": the request's, else `[mount.center]`'s, never an earlier
+/// frame's. A request's gain or binning overrides the configured one even
+/// when the request sets no exposure; unset keeps the camera's own.
+pub fn exposure(config: &MountCenterConfig, overrides: &CenterOverrides) -> CenterExposure {
+    let valid = |s: &f64| s.is_finite() && *s > 0.0;
+    let (exposure_s, source) = match overrides.exposure_s.filter(valid) {
+        Some(exposure_s) => (exposure_s, "request"),
+        None => (
+            Some(config.exposure_s)
+                .filter(valid)
+                .unwrap_or(DEFAULT_EXPOSURE_S),
+            "config",
+        ),
+    };
+    CenterExposure {
+        exposure_s,
+        gain: overrides.gain.or(config.gain),
+        binning: overrides.binning.or(config.binning),
+        source,
     }
 }
 
@@ -537,7 +520,7 @@ pub async fn start(
     source: CommandSource,
 ) -> Result<Value, ApiError> {
     let job = authorize(state, target, overrides, source)?;
-    let exposure = exposure(state, &overrides).await;
+    let exposure = exposure(&state.equipment_ctx.configs.mount.center, &overrides);
     let m4 = m4_shadow(state, &job.mount, job.target).await;
     let body = json!({
         "status": "centering",
@@ -1244,7 +1227,10 @@ mod tests {
         let imaging = DaemonImaging::for_job(
             &state,
             &job,
-            exposure(&state, &CenterOverrides::default()).await,
+            exposure(
+                &state.equipment_ctx.configs.mount.center,
+                &CenterOverrides::default(),
+            ),
         );
         let failure = imaging.capture_and_solve(target, 1).await.unwrap_err();
         match &failure {
@@ -1296,6 +1282,54 @@ mod tests {
         ));
         assert!(!unavailable.retryable());
         assert!(CenterImagingError::NoSolution("clouds".into()).retryable());
+    }
+
+    /// M-n step 2: the request's exposure, else `[mount.center]`'s; gain
+    /// and binning from the request, else the configuration, else the
+    /// camera's own. Nothing comes from an earlier frame.
+    #[test]
+    fn a_center_frame_uses_the_request_then_the_configured_exposure() {
+        let config = MountCenterConfig {
+            exposure_s: 8.0,
+            gain: Some(120),
+            binning: Some(2),
+            ..MountCenterConfig::default()
+        };
+        let configured = exposure(&config, &CenterOverrides::default());
+        assert_eq!(
+            configured,
+            CenterExposure {
+                exposure_s: 8.0,
+                gain: Some(120),
+                binning: Some(2),
+                source: "config",
+            }
+        );
+        let requested = exposure(
+            &config,
+            &CenterOverrides {
+                exposure_s: Some(2.0),
+                gain: Some(50),
+                ..CenterOverrides::default()
+            },
+        );
+        assert_eq!(requested.exposure_s, 2.0);
+        assert_eq!(requested.gain, Some(50));
+        assert_eq!(requested.binning, Some(2));
+        assert_eq!(requested.source, "request");
+        let nonsense = exposure(
+            &MountCenterConfig {
+                exposure_s: f64::NAN,
+                ..MountCenterConfig::default()
+            },
+            &CenterOverrides {
+                exposure_s: Some(-1.0),
+                ..CenterOverrides::default()
+            },
+        );
+        assert_eq!(nonsense.exposure_s, DEFAULT_EXPOSURE_S);
+        assert_eq!(nonsense.source, "config");
+        assert_eq!(nonsense.gain, None);
     }
 
     #[test]
