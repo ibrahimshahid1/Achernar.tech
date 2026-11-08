@@ -148,9 +148,37 @@ impl FocusAgent {
         &self.history
     }
 
-    /// Start a new autofocus run.
+    /// Start a new autofocus run with a fresh run id.
+    #[cfg(test)]
     pub async fn run_autofocus<F, Fut>(
         &mut self,
+        config: &crate::config::FocusConfig,
+        rig_id: String,
+        filter_name: Option<String>,
+        start_position: i32,
+        measure_at: F,
+    ) -> crate::error::Result<FocusRunContext>
+    where
+        F: FnMut(i32) -> Fut,
+        Fut: Future<Output = crate::error::Result<Vec<FocusSample>>>,
+    {
+        self.run_autofocus_with_id(
+            uuid::Uuid::new_v4(),
+            config,
+            rig_id,
+            filter_name,
+            start_position,
+            measure_at,
+        )
+        .await
+    }
+
+    /// Start a new autofocus run under `run_id`, the id the caller already
+    /// published for it (the autofocus operation's `autofocus_started`, its
+    /// gate op and every later record share the `focus_runs` id).
+    pub async fn run_autofocus_with_id<F, Fut>(
+        &mut self,
+        run_id: uuid::Uuid,
         config: &crate::config::FocusConfig,
         rig_id: String,
         filter_name: Option<String>,
@@ -177,7 +205,7 @@ impl FocusAgent {
         }
 
         let mut run = FocusRunContext {
-            run_id: uuid::Uuid::new_v4(),
+            run_id,
             rig_id,
             filter_name,
             temperature: None,

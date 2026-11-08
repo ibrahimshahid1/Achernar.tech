@@ -357,6 +357,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// domains, and the devices it steps.
 struct AutofocusOp {
     command: GatedCommand,
+    /// The `focus_runs` id, minted before the run is authorised so that
+    /// `GatedOp::Autofocus`, `autofocus_started`, `autofocus_verified` and
+    /// `autofocus_failed` all carry it.
+    run_id: Uuid,
     /// Released (dropped) by [`AutofocusOp::finish`], or on drop.
     permit: Mutex<Option<Permit>>,
     focuser: FocuserHandle,
@@ -391,7 +395,10 @@ impl AutofocusOp {
             .trim()
             .is_empty()
             && crate::api::equipment::wheel_slot(state).is_some_and(|w| !w.is_retired());
-        let op = GatedOp::Autofocus { run_id: None };
+        let run_id = Uuid::new_v4();
+        let op = GatedOp::Autofocus {
+            run_id: Some(run_id.to_string()),
+        };
         let mut domains = op.default_domains(af_filter);
         if guider.is_some() {
             domains.push(Domain::Device(DeviceKind::Guider));
@@ -411,6 +418,7 @@ impl AutofocusOp {
         let clock = state.equipment.clock();
         Ok(Self {
             command,
+            run_id,
             permit: Mutex::new(Some(permit)),
             focuser,
             guider,
@@ -452,13 +460,12 @@ impl AutofocusOp {
                 op: OpKind::Autofocus,
             },
         );
-        // The focus run's own id is minted by the agent once the sweep
-        // begins; the operation's command id is what this event, the
-        // verification and the overhead records share.
+        // The run's `focus_runs` id: the agent runs under it, and the
+        // verification and failure events carry it too.
         self.emit(
             state,
             EventKind::AutofocusStarted {
-                run_id: self.command.command_id.to_string(),
+                run_id: self.run_id.to_string(),
             },
         );
     }
@@ -872,7 +879,7 @@ async fn run_autofocus_session(
             ctx.op.emit(
                 state,
                 EventKind::AutofocusFailed {
-                    run_id: ctx.op.command_id().to_string(),
+                    run_id: ctx.op.run_id.to_string(),
                     reason: reason.clone(),
                 },
             );
@@ -888,7 +895,7 @@ async fn run_autofocus_session(
             ctx.op.emit(
                 state,
                 EventKind::AutofocusFailed {
-                    run_id: ctx.op.command_id().to_string(),
+                    run_id: ctx.op.run_id.to_string(),
                     reason: reason.clone(),
                 },
             );
@@ -993,7 +1000,8 @@ async fn sweep_and_verify(
     let mut agent = state.focus_agent.lock().await;
     let measure_ctx = Arc::clone(ctx);
     let run_result = agent
-        .run_autofocus(
+        .run_autofocus_with_id(
+            ctx.op.run_id,
             &ctx.config,
             ctx.rig_id.clone(),
             ctx.filter.name.clone(),
@@ -1017,7 +1025,7 @@ async fn sweep_and_verify(
                     persist_run_logged(ctx, &failed_run).await;
                     failed_run.run_id.to_string()
                 }
-                None => ctx.op.command_id().to_string(),
+                None => ctx.op.run_id.to_string(),
             };
             ctx.op.emit(
                 state,
@@ -4771,6 +4779,28 @@ mod tests {
             .expect("autofocus_verified");
         assert_eq!(verified.0, response.run_id);
         assert_eq!(verified.1.as_deref(), Some(verification_frame.as_str()));
+        // autofocus_started names the same focus_runs id as the verification
+        // and the stored run, and both share the operation's command id.
+        let started = events
+            .iter()
+            .find(|e| matches!(&e.event, EventKind::AutofocusStarted { .. }))
+            .expect("autofocus_started");
+        match &started.event {
+            EventKind::AutofocusStarted { run_id } => assert_eq!(run_id, &response.run_id),
+            _ => unreachable!(),
+        }
+        let verified_event = events
+            .iter()
+            .find(|e| matches!(&e.event, EventKind::AutofocusVerified { .. }))
+            .unwrap();
+        assert!(started.command_id.is_some());
+        assert_eq!(started.command_id, verified_event.command_id);
+        let (stored_runs,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM focus_runs WHERE id = ?")
+            .bind(&response.run_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        assert_eq!(stored_runs, 1);
         assert!(events.iter().any(|e| matches!(
             &e.event,
             EventKind::OperationEnded {
