@@ -296,20 +296,26 @@ impl ExposureInterval {
         }
     }
 
-    /// A stream exposure cannot have begun before `settings_applied_unix`:
-    /// the capture accepts only a frame taken under its settings, the
-    /// in-flight one being discarded (`FreshFrameGate`). The window starts
-    /// there when that is later than `arrival - (exposure + frame
-    /// interval)`, so motion, a dither or a settle that ended before the
-    /// capture applied its settings is never put inside the exposure.
-    pub fn not_before(mut self, settings_applied_unix: f64) -> Self {
-        if !settings_applied_unix.is_finite() {
+    /// A stream exposure cannot have begun before `capture_began_unix`, the
+    /// moment the capture read its baseline frame counter, before it wrote
+    /// any setting. `FreshFrameGate` rejects the first frame delivered after
+    /// that read and accepts a later one, whose exposure began once the
+    /// rejected frame's ended. (A camera that overlaps readout with the next
+    /// exposure starts it up to one readout earlier than that delivery; the
+    /// bound assumes that latency is short.) The time is the read, not the
+    /// end of the writes, because the rejected frame can be delivered while
+    /// the writes run. The window starts there when that is later than
+    /// `arrival - (exposure + frame interval)`, so motion, a dither or a
+    /// settle that ended before the capture began is never put inside the
+    /// exposure.
+    pub fn not_before(mut self, capture_began_unix: f64) -> Self {
+        if !capture_began_unix.is_finite() {
             return self;
         }
-        let bound = utc_of(settings_applied_unix);
+        let bound = utc_of(capture_began_unix);
         if bound > self.start && bound <= self.end {
             self.start = bound;
-            self.basis = "settings_applied_to_arrival";
+            self.basis = "capture_began_to_arrival";
         }
         self
     }
@@ -1770,12 +1776,12 @@ mod tests {
         // Without a measured interval, the exposure stands in for it.
         let fallback = ExposureInterval::stream(seen, 4.0, None, ClockQuality::HostArrival);
         assert_eq!(fallback.start, utc_of(seen) - chrono::Duration::seconds(8));
-        // The capture applied its settings 5 s before the arrival: the frame
-        // it accepted began after that, not 8.2 s before the arrival.
+        // The capture began 5 s before the arrival: the frame it accepted
+        // began after that, not 8.2 s before the arrival.
         let bounded = measured.clone().not_before(seen - 5.0);
         assert_eq!(bounded.start, utc_of(seen - 5.0));
         assert_eq!(bounded.end, measured.end);
-        assert_eq!(bounded.basis, "settings_applied_to_arrival");
+        assert_eq!(bounded.basis, "capture_began_to_arrival");
         // A bound earlier than the reach, after the arrival, or not a time
         // leaves the window as it was.
         for bound in [seen - 9.0, seen + 1.0, f64::NAN] {

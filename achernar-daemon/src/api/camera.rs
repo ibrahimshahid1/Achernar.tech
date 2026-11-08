@@ -1355,7 +1355,12 @@ async fn capture_from_stream(
 
     // Baseline before settings are applied. The gate below rejects both this
     // counter and the first counter after it, covering an exposure already in
-    // flight while the hardware accepted the writes.
+    // flight while the hardware accepted the writes. The frame it accepts
+    // began after the first rejected one ended, so after this read: the
+    // exposure window starts no earlier than `capture_began_at` (H1). The
+    // time is taken here, not after the writes, because that first frame
+    // can arrive while they run.
+    let capture_began_at = unix_now();
     let baseline = state
         .latest_frame
         .lock()
@@ -1449,9 +1454,7 @@ async fn capture_from_stream(
         Some(capture_id),
     );
     // The accepted frame is exposed after the settings were applied: the
-    // `exposing` busy flag is held from here until it arrives, and its
-    // window starts no earlier than this.
-    let settings_applied_at = unix_now();
+    // `exposing` busy flag is held from here until it arrives.
     link.hooks.exposure_started(
         AcquisitionPath::Stream,
         actual_exposure_s,
@@ -1497,15 +1500,15 @@ async fn capture_from_stream(
     mark_capture_processing(state);
 
     // The equipment window: from `arrival - (exposure + frame interval)`, or
-    // from when the settings were applied if that is later, to the arrival,
-    // by the host clock (H1, D7).
+    // from when this capture began if that is later, to the arrival, by the
+    // host clock (H1, D7).
     let interval = ExposureInterval::stream(
         arrived_at,
         actual_exposure_s,
         arrivals.interval_s(),
         link.hooks.clock_quality(AcquisitionPath::Stream),
     )
-    .not_before(settings_applied_at);
+    .not_before(capture_began_at);
     let recorded = link.assemble(state, &interval);
     warnings.extend(recorded.warnings.iter().cloned());
 
