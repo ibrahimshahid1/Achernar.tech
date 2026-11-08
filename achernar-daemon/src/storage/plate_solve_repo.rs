@@ -9,8 +9,9 @@
 //!   perception bus (v6 §8.1): `last_solve_at` and `pointing_error_arcmin`
 //!   come from `plate_solve_events`, never from a value carried forward
 //!   between observations, and the solved WCS (with the pier side and
-//!   rotator angle at that solve) is what lets TED attribute a trail to a sky
-//!   axis (H15).
+//!   rotator angle at that solve, and the mount and mid-exposure of its
+//!   pointing sample, which tie it to a mount connection) is what lets TED
+//!   attribute a trail to a sky axis (H15).
 //! - [`set_pointing_error`] fills `plate_solve_events.pointing_error_arcmin`
 //!   for the first time, from the H12 pointing sample of that solve.
 
@@ -248,6 +249,11 @@ pub struct LatestSolve {
     /// The mount's pier side at that exposure (its pointing sample); `None`
     /// when no sample exists or the side was unknown.
     pub pier_side: Option<PierSide>,
+    /// The mount of that exposure's pointing sample.
+    pub mount_identity_key: Option<String>,
+    /// That pointing sample's mid-exposure, which places the solve in a
+    /// mount connection's segment (`pointing_model::connection_segment_start`).
+    pub sample_mid_exposure_utc: Option<DateTime<Utc>>,
     /// The rotator angle at that exposure (its device window), when one was
     /// recorded.
     pub rotator_angle_deg: Option<f64>,
@@ -268,6 +274,12 @@ pub async fn latest_successful_solve(
                f.requested_gain, f.binning,
                (SELECT p.pier_side FROM pointing_samples p
                  WHERE p.plate_solve_event_id = e.id ORDER BY p.rowid DESC LIMIT 1) AS pier_side,
+               (SELECT p.mount_identity_key FROM pointing_samples p
+                 WHERE p.plate_solve_event_id = e.id ORDER BY p.rowid DESC LIMIT 1)
+                 AS mount_identity_key,
+               (SELECT p.mid_exposure_utc FROM pointing_samples p
+                 WHERE p.plate_solve_event_id = e.id ORDER BY p.rowid DESC LIMIT 1)
+                 AS sample_mid_exposure_utc,
                (SELECT w.rotator_angle_deg FROM exposure_device_windows w
                  WHERE w.frame_id = e.frame_id) AS rotator_angle_deg
         FROM plate_solve_events e
@@ -301,6 +313,8 @@ pub async fn latest_successful_solve(
             camera_name: row.get("camera_name"),
             pier_side: columns::from_name::<PierSide>(text("pier_side").as_deref())
                 .filter(|side| *side != PierSide::Unknown),
+            mount_identity_key: text("mount_identity_key"),
+            sample_mid_exposure_utc: columns::parse_opt_time(text("sample_mid_exposure_utc")),
             rotator_angle_deg: row.get("rotator_angle_deg"),
             exposure: exposure_s.map(|exposure_s| SolvedExposure {
                 exposure_s,
@@ -528,8 +542,8 @@ mod tests {
         sqlx::query(
             "INSERT INTO pointing_samples (id, plate_solve_event_id, frame_id, \
              mount_identity_key, mount_frame, solved_ra_j2000_h, solved_dec_j2000_deg, \
-             pier_side, purpose) VALUES ('s1', ?, 'f1', 'sim:mount', 'jnow_apparent', 5.58, \
-             -5.4, 'west', 'manual')",
+             pier_side, purpose, mid_exposure_utc) VALUES ('s1', ?, 'f1', 'sim:mount', \
+             'jnow_apparent', 5.58, -5.4, 'west', 'manual', '2026-10-26T04:01:00Z')",
         )
         .bind(&first)
         .execute(&pool)
@@ -543,6 +557,15 @@ mod tests {
         assert_eq!(latest.wcs, Some(wcs));
         assert_eq!(latest.camera_name.as_deref(), Some("SV105"));
         assert_eq!(latest.pier_side, Some(PierSide::West));
+        assert_eq!(latest.mount_identity_key.as_deref(), Some("sim:mount"));
+        assert_eq!(
+            latest.sample_mid_exposure_utc,
+            Some(
+                DateTime::parse_from_rfc3339("2026-10-26T04:01:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc)
+            )
+        );
         assert_eq!(latest.rotator_angle_deg, None);
         assert!(latest.solved_at.is_some());
         assert_eq!(

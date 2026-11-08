@@ -11,7 +11,10 @@
 //!   angle, focuser motion and wind. These come from the hub's device window
 //!   (`EquipmentReader::window`), never from a read after the frame.
 //! - **The RB-E untracked label** (15.041·cos δ ″/s) only with a verified
-//!   `tracking = false` across the window and a known declination.
+//!   `tracking = false` across the whole window: tracking read off in every
+//!   motion interval, and the intervals covering the exposure from start to
+//!   end. An exposure that tracked for part of its length gets no label.
+//!   The declination must be known too.
 //!
 //! Missing values stay missing. There is no learned TED model yet; the
 //! classical measurement is the evidence, and the runner refuses to dress a
@@ -56,7 +59,8 @@ pub struct TedEvidence {
     pub rotator_angle_deg: Option<f64>,
     pub focuser_moved: Option<bool>,
     pub wind_speed_ms: Option<f64>,
-    /// RB-E: the untracked drift rate, only with a verified tracking=false.
+    /// RB-E: the untracked drift rate, only with tracking verified off over
+    /// the whole window (not merely off at some point).
     pub untracked_rate_arcsec_s: Option<f64>,
 }
 
@@ -123,6 +127,10 @@ impl TedRunner {
         if evidence.tracking.is_none() && window.motion.iter().any(|m| m.tracking == Some(false)) {
             evidence.tracking = Some(false);
         }
+        // RB-E needs more than "off at some point": off in every interval,
+        // and intervals that cover the exposure.
+        let tracking_off_throughout = motion_covers_window(window)
+            && all_known(|m| m.tracking).is_some_and(|v| v.iter().all(|on| !on));
         evidence.slewing_any = all_known(|m| m.slewing)
             .map(|v| v.iter().any(|on| *on))
             .or_else(|| {
@@ -173,13 +181,29 @@ impl TedRunner {
             .weather
             .as_ref()
             .and_then(|w| w.wind_speed_ms.known().copied());
-        if evidence.tracking == Some(false) {
+        if tracking_off_throughout {
             evidence.untracked_rate_arcsec_s = evidence
                 .dec_deg
                 .map(|dec| SIDEREAL_RATE_ARCSEC_S * dec.to_radians().cos());
         }
         evidence
     }
+}
+
+/// The window's motion intervals run without a gap from its start to its
+/// end. The hub starts them at the last mount sample before the exposure;
+/// with none, the first interval begins inside the window and the start of
+/// the exposure is unobserved.
+fn motion_covers_window(window: &DeviceWindow) -> bool {
+    let (Some(first), Some(last)) = (window.motion.first(), window.motion.last()) else {
+        return false;
+    };
+    first.from <= window.start
+        && last.to >= window.end
+        && window
+            .motion
+            .windows(2)
+            .all(|pair| pair[1].from <= pair[0].to)
 }
 
 fn elongation_ratio(severity: f32) -> f64 {
@@ -284,13 +308,32 @@ mod tests {
 
     #[test]
     fn the_untracked_label_needs_tracking_verified_off() {
-        let off =
-            TedRunner::new(None).evidence(&trailed(), Some(&window([Some(false), Some(true)])));
+        let runner = TedRunner::new(None);
+        let off = runner.evidence(&trailed(), Some(&window([Some(false), Some(false)])));
         assert_eq!(off.tracking, Some(false));
         let rate = off.untracked_rate_arcsec_s.unwrap();
         assert!((rate - SIDEREAL_RATE_ARCSEC_S * 0.5).abs() < 1e-6);
 
-        let unknown = TedRunner::new(None).evidence(&trailed(), Some(&window([None, Some(true)])));
+        // Off for the first half only: tracking was off at some point, but
+        // the exposure did not drift at the full sidereal rate.
+        let half = runner.evidence(&trailed(), Some(&window([Some(false), Some(true)])));
+        assert_eq!(half.tracking, Some(false));
+        assert_eq!(half.untracked_rate_arcsec_s, None);
+
+        // Off where known, unknown elsewhere: not verified.
+        let partly = runner.evidence(&trailed(), Some(&window([Some(false), None])));
+        assert_eq!(partly.tracking, Some(false));
+        assert_eq!(partly.untracked_rate_arcsec_s, None);
+
+        // Off throughout the samples, but no sample covers the start of the
+        // exposure.
+        let mut late = window([Some(false), Some(false)]);
+        late.motion[0].from = t(2);
+        let late = runner.evidence(&trailed(), Some(&late));
+        assert_eq!(late.tracking, Some(false));
+        assert_eq!(late.untracked_rate_arcsec_s, None);
+
+        let unknown = runner.evidence(&trailed(), Some(&window([None, Some(true)])));
         assert_eq!(unknown.tracking, None);
         assert_eq!(unknown.untracked_rate_arcsec_s, None);
 

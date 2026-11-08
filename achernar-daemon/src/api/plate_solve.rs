@@ -19,10 +19,14 @@
 //! residual (mount minus truth, RA scaled by cos δ), pier side, hour angle,
 //! LST, Alt/Az, sync generation and sync mode. The residual also fills
 //! `plate_solve_events.pointing_error_arcmin`, and the pointing model of
-//! that mount, generation and pier side is refitted. No sample is written
-//! when the window has no mount data, the mount slewed or was synced during
-//! the exposure, or its native frame is unknown (M-a); the response says
-//! why.
+//! that mount, connection, generation and pier side is refitted. No sample
+//! is written when the window has no mount data, its mount samples do not
+//! bracket the exposure (a frame older than the ring's retention, or exposed
+//! during a gap: the nearest reading would be one taken long after it), the
+//! samples come from another connection, the mount slewed or was synced
+//! during the exposure, or its native frame is unknown (M-a); the response
+//! says why. A solve made right after the frame waits briefly for the
+//! mount's first post-exposure sample.
 
 use axum::{extract::State, http::StatusCode, Json};
 use chrono::{DateTime, Utc};
@@ -48,7 +52,7 @@ use crate::storage::plate_solve_repo::{self, LatestSolve, PlateSolveRecord};
 /// this times pixel size in microns over focal length in millimetres.
 const ARCSEC_PER_UM_PER_MM: f64 = 206.264_806;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct SolveFrameRequest {
     pub frame_id: String,
     /// Where to start looking. Omit for a blind, all-sky solve.
@@ -63,7 +67,7 @@ pub struct SolveFrameRequest {
     pub ignore_rig_optics: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct HintRequest {
     pub ra_hours: f64,
     pub dec_deg: f64,
@@ -435,6 +439,46 @@ fn window_mid_snapshot(window: &DeviceWindow) -> Option<&MountSnapshot> {
         .or(window.mount.end.as_ref())
 }
 
+/// How far a mount sample may lie from the instant it stands for: the
+/// hub's read age for the mount (12 idle cadences).
+fn mount_sample_reach() -> chrono::Duration {
+    chrono::Duration::from_std(crate::equipment::hub::max_read_age(
+        crate::equipment::types::DeviceKind::Mount,
+    ))
+    .unwrap_or(chrono::Duration::MAX)
+}
+
+/// The ring's mount samples describe the exposure itself: one within `reach`
+/// of its start, one within `reach` of its end, the sample used for the
+/// middle inside the exposure (give or take `reach`), and enough samples
+/// inside it that no gap between them can be much longer than `reach`. The
+/// hub picks its start, middle and end samples without a distance bound, so
+/// a frame solved after the ring's retention, or exposed while the ring had
+/// a gap, would otherwise be paired with a reading taken long after it.
+fn mount_samples_cover(window: &DeviceWindow, reach: chrono::Duration) -> bool {
+    let near = |sample: &Option<MountSnapshot>, at: DateTime<Utc>, slack: chrono::Duration| {
+        sample
+            .as_ref()
+            .is_some_and(|s| (s.published_at - at).abs() <= slack)
+    };
+    let half = (window.end - window.start) / 2;
+    let mid = window.start + half;
+    let enough_inside = match (
+        (window.end - window.start).num_milliseconds(),
+        reach.num_milliseconds(),
+    ) {
+        (duration, reach) if reach > 0 => {
+            let needed = (duration / reach).saturating_sub(1).max(0);
+            i64::from(window.mount.samples_n) >= needed
+        }
+        _ => false,
+    };
+    near(&window.mount.start, window.start, reach)
+        && near(&window.mount.end, window.end, reach)
+        && near(&window.mount.mid, mid, half + reach)
+        && enough_inside
+}
+
 /// Build the H12 sample for one solve from the exposure's device window.
 /// `Err` is the reason no sample can be written.
 pub fn pointing_sample_from_window(
@@ -444,8 +488,17 @@ pub fn pointing_sample_from_window(
     input: &PointingInput,
 ) -> Result<PointingSampleRecord, &'static str> {
     let snapshot = window_mid_snapshot(window).ok_or("no_mount_samples_in_window")?;
-    if snapshot.connection_id != ctx.mount_connection_id {
+    // Every sample must come from the connection whose generation and
+    // settings the sample is filed under.
+    if [&window.mount.start, &window.mount.mid, &window.mount.end]
+        .iter()
+        .filter_map(|s| s.as_ref())
+        .any(|s| s.connection_id != ctx.mount_connection_id)
+    {
         return Err("mount_reconnected_since_exposure");
+    }
+    if !mount_samples_cover(window, mount_sample_reach()) {
+        return Err("mount_samples_do_not_cover_exposure");
     }
     if window.motion.iter().any(|m| m.slewing == Some(true))
         || [&window.mount.start, &window.mount.mid, &window.mount.end]
@@ -467,11 +520,12 @@ pub fn pointing_sample_from_window(
     if frame == EqFrame::Unknown {
         return Err("mount_frame_unknown");
     }
+    // Interpolated between the ring samples either side of mid-exposure;
+    // never a single reading from elsewhere in (or outside) the window.
     let native = window
         .mount_mid
         .map(|c| EqCoord { frame, ..c })
-        .or_else(|| crate::equipment::mount::position(&snapshot.state, frame))
-        .ok_or("mount_position_unknown")?;
+        .ok_or("mount_position_unknown_at_mid_exposure")?;
     let mid = input.exposure_start + (input.exposure_end - input.exposure_start) / 2;
     let mount_j2000 = if frame == EqFrame::J2000 {
         native
@@ -543,11 +597,38 @@ pub fn pointing_sample_from_window(
 }
 
 /// The connected mount's handle: the hub's slot, else the state slot.
-fn mount_handle(state: &AppState) -> Option<MountHandle> {
+pub(crate) fn mount_handle(state: &AppState) -> Option<MountHandle> {
     state
         .equipment
         .handle::<MountHandle>()
         .or_else(|| super::equipment::mount_slot(state))
+}
+
+/// Longest wait for the mount's first sample after the exposure end, so
+/// mid-exposure is bracketed for a solve made right after the frame. Above
+/// the hub's D7 grace (two idle cadences) with room for a slow poll.
+const POST_END_SAMPLE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The exposure's device window, once the mount ring holds a sample from
+/// after the exposure end (or [`POST_END_SAMPLE_WAIT`] has passed). An old
+/// frame's window is returned at once.
+async fn exposure_window(
+    state: &AppState,
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> DeviceWindow {
+    let deadline = tokio::time::Instant::now() + POST_END_SAMPLE_WAIT;
+    loop {
+        let window = state.equipment.window(start, end);
+        let post_end = match &window.mount.end {
+            Some(sample) => sample.published_at >= end,
+            None => true,
+        };
+        if post_end || tokio::time::Instant::now() >= deadline {
+            return window;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// H12 for one solve: build the sample from the hub's device window, write
@@ -559,9 +640,7 @@ pub async fn record_pointing_sample(state: &AppState, input: PointingInput) -> P
         return PointingOutcome::skipped("no_mount_connected");
     };
     let identity = handle.identity();
-    let window = state
-        .equipment
-        .window(input.exposure_start, input.exposure_end);
+    let window = exposure_window(state, input.exposure_start, input.exposure_end).await;
     let configs = &state.equipment_ctx.configs;
     let site = state
         .equipment_ctx
@@ -609,10 +688,18 @@ pub async fn record_pointing_sample(state: &AppState, input: PointingInput) -> P
             tracing::warn!("Could not fill pointing_error_arcmin for {event_id}: {error}");
         }
     }
+    // M-4 segments by connection as well as generation: the generation
+    // counter restarts with every connection.
+    let mid = record
+        .mid_exposure_utc
+        .unwrap_or(input.exposure_start + (input.exposure_end - input.exposure_start) / 2);
+    let segment_start =
+        crate::mount::pointing_model::note_connection_sample(ctx.mount_connection_id, mid);
     let model_snapshot_id = match crate::mount::pointing_model::refit_snapshot(
         pool,
         Some(&state.rig_id),
         &record,
+        segment_start,
     )
     .await
     {
@@ -1175,6 +1262,72 @@ mod tests {
                 check(window(connection, [4, 4]), &context(uuid::Uuid::new_v4())),
                 "mount_reconnected_since_exposure"
             );
+            // Only the end sample came from the connection now in use.
+            let mut straddles = window(connection, [4, 4]);
+            straddles.mount.start.as_mut().unwrap().connection_id = uuid::Uuid::new_v4();
+            assert_eq!(check(straddles, &ctx), "mount_reconnected_since_exposure");
+            let mut stale = window(connection, [4, 4]);
+            stale.mount_mid = None;
+            assert_eq!(check(stale, &ctx), "mount_position_unknown_at_mid_exposure");
+        }
+
+        /// A frame solved long after it was exposed: the ring no longer
+        /// holds the exposure, and its oldest sample is on another target.
+        #[test]
+        fn a_mount_reading_from_long_after_the_exposure_is_never_a_sample() {
+            let connection = uuid::Uuid::new_v4();
+            let ctx = context(connection);
+            let check = |window: DeviceWindow| {
+                pointing_sample_from_window(&window, &ctx, &IdentityConverter, &input())
+                    .unwrap_err()
+            };
+            let forty_minutes = 40 * 60 * 1000;
+            let later = snapshot(connection, forty_minutes, 4);
+            let after_retention = DeviceWindow {
+                start: at(0),
+                end: at(4000),
+                mount: WindowSamples {
+                    start: None,
+                    mid: Some(later.clone()),
+                    end: Some(later.clone()),
+                    end_stale: false,
+                    samples_n: 0,
+                },
+                mount_mid: None,
+                ..DeviceWindow::default()
+            };
+            assert_eq!(
+                check(after_retention),
+                "mount_samples_do_not_cover_exposure"
+            );
+
+            // Bracketed only by readings far either side (a gap in the ring),
+            // even with an interpolated position.
+            let mut gap = window(connection, [4, 4]);
+            gap.mount.start = Some(snapshot(connection, -60_000, 4));
+            gap.mount.mid = Some(snapshot(connection, -60_000, 4));
+            assert_eq!(check(gap), "mount_samples_do_not_cover_exposure");
+            let mut late_end = window(connection, [4, 4]);
+            late_end.mount.end = Some(snapshot(connection, forty_minutes, 4));
+            assert_eq!(check(late_end), "mount_samples_do_not_cover_exposure");
+
+            // A five-minute exposure with three samples has gaps far longer
+            // than the mount's read age.
+            let mut sparse = window(connection, [4, 4]);
+            sparse.end = at(300_000);
+            sparse.mount.mid = Some(snapshot(connection, 150_000, 4));
+            sparse.mount.end = Some(snapshot(connection, 300_000, 4));
+            assert_eq!(check(sparse), "mount_samples_do_not_cover_exposure");
+            let mut dense = window(connection, [4, 4]);
+            dense.end = at(300_000);
+            dense.mount.mid = Some(snapshot(connection, 150_000, 4));
+            dense.mount.end = Some(snapshot(connection, 300_000, 4));
+            dense.mount.samples_n = 290;
+            let input = PointingInput {
+                exposure_end: at(300_000),
+                ..input()
+            };
+            assert!(pointing_sample_from_window(&dense, &ctx, &IdentityConverter, &input).is_ok());
         }
 
         #[test]

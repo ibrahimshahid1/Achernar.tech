@@ -54,6 +54,10 @@ use crate::state::AppState;
 /// Exposure used when neither the request nor an earlier solved frame says.
 pub const DEFAULT_EXPOSURE_S: f64 = 5.0;
 
+/// How long a center frame waits for a solve already in flight (an
+/// automatic or manual one) beyond the solver's own timeout.
+const SOLVER_BUSY_MARGIN_S: u64 = 30;
+
 /// `[mount.center]`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct CenterSettings {
@@ -117,17 +121,37 @@ pub struct CenterSolve {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "detail", rename_all = "snake_case")]
 pub enum CenterImagingError {
+    /// The capture failed, or its frame or file cannot be solved.
     Capture(String),
     /// The solver ran and found nothing (cloud, defocus): another attempt
     /// may succeed.
     NoSolution(String),
+    /// Another solve held the solver for longer than this frame waited:
+    /// another attempt may find it free.
+    SolverBusy(String),
     /// The solver could not be asked; no further attempt can succeed.
     SolverUnavailable(String),
 }
 
 impl CenterImagingError {
     fn retryable(&self) -> bool {
-        matches!(self, CenterImagingError::NoSolution(_))
+        matches!(
+            self,
+            CenterImagingError::NoSolution(_) | CenterImagingError::SolverBusy(_)
+        )
+    }
+
+    /// A refused `solve_and_record`, by what refused it.
+    fn from_solve_error(error: &ApiError) -> Self {
+        let detail = format!("{}: {}", error.code, error.message);
+        match error.code {
+            "plate_solver_busy" => CenterImagingError::SolverBusy(detail),
+            "frame_not_found"
+            | "no_solvable_asset"
+            | "asset_unreadable"
+            | "asset_checksum_mismatch" => CenterImagingError::Capture(detail),
+            _ => CenterImagingError::SolverUnavailable(detail),
+        }
     }
 }
 
@@ -189,11 +213,28 @@ impl CenterImaging for DaemonImaging {
                 ignore_rig_optics: false,
             };
             let trigger = crate::mount::plate_solve_trigger::SolveReason::Center.as_str();
-            let response = solve_and_record(&self.state, request, trigger)
-                .await
-                .map_err(|e| {
-                    CenterImagingError::SolverUnavailable(format!("{}: {}", e.code, e.message))
-                })?;
+            // One solve runs at a time: an automatic or manual solve begun
+            // just before Center holds the solver for up to its timeout.
+            let busy_wait = std::time::Duration::from_secs(
+                self.state
+                    .plate_solver
+                    .status()
+                    .timeout_s
+                    .saturating_add(SOLVER_BUSY_MARGIN_S),
+            );
+            let deadline = tokio::time::Instant::now() + busy_wait;
+            let response = loop {
+                match solve_and_record(&self.state, request.clone(), trigger).await {
+                    Ok(response) => break response,
+                    Err(error)
+                        if error.code == "plate_solver_busy"
+                            && tokio::time::Instant::now() < deadline =>
+                    {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    }
+                    Err(error) => return Err(CenterImagingError::from_solve_error(&error)),
+                }
+            };
             match response.solution {
                 Some(solution) => Ok(CenterSolve {
                     solved_j2000: EqCoord::new(solution.ra_hours, solution.dec_deg, EqFrame::J2000),
@@ -392,13 +433,13 @@ pub async fn exposure(state: &AppState, overrides: &CenterOverrides) -> CenterEx
     }
 }
 
-/// M-4 in shadow: what the pointing model of this mount, sync generation
-/// and pier side would correct for `target`. Reported beside the first
-/// solve's measured error so the model can be evaluated; never applied (see
-/// `pointing_model`'s module docs).
+/// M-4 in shadow: what the pointing model of this mount, connection, sync
+/// generation and pier side would correct for `target`. Reported beside
+/// the first solve's measured error so the model can be evaluated; never
+/// applied (see `pointing_model`'s module docs).
 pub async fn m4_shadow(state: &AppState, mount: &MountHandle, target: EqCoord) -> Value {
     use crate::equipment::types::PierSide;
-    use crate::mount::pointing_model::{ModelKey, PointingModel};
+    use crate::mount::pointing_model::{connection_segment_start, ModelKey, PointingModel};
     let snapshot = mount.snapshot();
     let pier_side = snapshot
         .state
@@ -406,12 +447,25 @@ pub async fn m4_shadow(state: &AppState, mount: &MountHandle, target: EqCoord) -
         .known()
         .copied()
         .unwrap_or(PierSide::Unknown);
+    let native_frame = snapshot.capabilities.native_frame;
+    if native_frame == EqFrame::Unknown {
+        return json!({"applied": false, "refused": {"reason": "mount_frame_unknown"}});
+    }
+    // The generation counter restarts with every connection: only this
+    // connection's samples describe the mount's model now.
+    let Some(segment_start) = connection_segment_start(mount.connection_id()) else {
+        return json!({
+            "applied": false,
+            "refused": {"reason": "no_samples_on_this_connection"},
+        });
+    };
     let key = ModelKey {
         mount_identity_key: mount.identity().identity_key.clone(),
         sync_generation: snapshot.sync_generation,
         pier_side,
-        mount_frame: snapshot.capabilities.native_frame,
+        mount_frame: native_frame,
         jnow_flavour: state.equipment_ctx.configs.mount.jnow_flavour,
+        segment_start,
     };
     let records = match crate::storage::pointing_samples_repo::for_mount(
         state.local_store.pool(),
@@ -428,7 +482,24 @@ pub async fn m4_shadow(state: &AppState, mount: &MountHandle, target: EqCoord) -
     let Some(lst) = snapshot.state.sidereal_time_h.known().copied() else {
         return json!({"applied": false, "refused": {"reason": "lst_unknown"}});
     };
-    let ha_h = (lst - target.ra_h + 12.0).rem_euclid(24.0) - 12.0;
+    // The samples' hour angle is LST minus the mount's native RA (H12), so
+    // the target's is taken in the native frame too.
+    let native = if native_frame == EqFrame::J2000 {
+        target
+    } else {
+        let site = state
+            .equipment_ctx
+            .mount_shared()
+            .and_then(|shared| shared.geometry_site())
+            .or_else(|| state.equipment.site());
+        crate::equipment::astro::frame_converter().convert(
+            target,
+            native_frame,
+            Utc::now(),
+            site.as_ref(),
+        )
+    };
+    let ha_h = (lst - native.ra_h + 12.0).rem_euclid(24.0) - 12.0;
     match model.correct(target, ha_h, pier_side) {
         Ok(correction) => json!({"applied": false, "correction": correction}),
         Err(refused) => json!({"applied": false, "refused": refused}),
@@ -886,9 +957,27 @@ mod tests {
             "{:?}",
             offsets[0]
         );
-        // M-4 in shadow: two samples of this generation are too few to
-        // predict from, and nothing is ever applied.
+        // A sample of the same mount and generation number from an earlier
+        // connection (whose counter also started at 0) is another model's.
+        let pool = state.local_store.pool();
         let handle = crate::api::equipment::mount_handle(&state).unwrap();
+        let stored = crate::storage::pointing_samples_repo::for_mount(
+            pool,
+            &handle.identity().identity_key,
+            Some(0),
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(stored.len(), 2);
+        let mut earlier = stored[0].clone();
+        earlier.id = uuid::Uuid::new_v4();
+        earlier.mid_exposure_utc = Some(Utc::now() - chrono::Duration::hours(2));
+        crate::storage::pointing_samples_repo::upsert(pool, &earlier)
+            .await
+            .unwrap();
+        // M-4 in shadow: two samples of this connection and generation are
+        // too few to predict from, and nothing is ever applied.
         let shadow = m4_shadow(&state, &handle, target).await;
         assert_eq!(shadow["applied"], json!(false));
         assert_eq!(
@@ -896,6 +985,7 @@ mod tests {
             json!("too_few_samples"),
             "{shadow}"
         );
+        assert_eq!(shadow["refused"]["have"], json!(2), "{shadow}");
         crate::api::equipment_tests::cleanup(directory, state).await;
     }
 
@@ -994,6 +1084,28 @@ mod tests {
         let bad = target_j2000(&state, &handle, EqCoord::new(1.0, 95.0, EqFrame::J2000));
         assert_eq!(bad.unwrap_err().status, axum::http::StatusCode::BAD_REQUEST);
         crate::api::equipment_tests::cleanup(directory, state).await;
+    }
+
+    #[test]
+    fn a_busy_solver_is_retried_and_only_an_unavailable_one_is_final() {
+        let error =
+            |status, code| CenterImagingError::from_solve_error(&ApiError::new(status, code, "x"));
+        use axum::http::StatusCode;
+        let busy = error(StatusCode::CONFLICT, "plate_solver_busy");
+        assert!(matches!(busy, CenterImagingError::SolverBusy(_)));
+        assert!(busy.retryable());
+        for code in ["frame_not_found", "no_solvable_asset", "asset_unreadable"] {
+            let failure = error(StatusCode::UNPROCESSABLE_ENTITY, code);
+            assert!(matches!(failure, CenterImagingError::Capture(_)), "{code}");
+            assert!(!failure.retryable());
+        }
+        let unavailable = error(StatusCode::SERVICE_UNAVAILABLE, "plate_solver_unavailable");
+        assert!(matches!(
+            unavailable,
+            CenterImagingError::SolverUnavailable(_)
+        ));
+        assert!(!unavailable.retryable());
+        assert!(CenterImagingError::NoSolution("clouds".into()).retryable());
     }
 
     #[test]

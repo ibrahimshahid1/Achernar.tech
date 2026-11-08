@@ -8,22 +8,41 @@
 //! A trail is attributed to a **sky** axis (RA or Dec) only when a plate
 //! solve's WCS says how this pixel grid sits on the sky: the CD matrix
 //! carries the rotation and the parity. The attribution is withheld, with
-//! the reason, unless the solve is of the same camera, its pixel grid has
-//! the same orientation, and the pier side and rotator angle are known and
-//! unchanged since that solve. Before this, any trail along the sensor's x
-//! axis was labelled "RA", whatever the camera's rotation.
+//! the reason, unless all of these hold:
+//!
+//! - the solve is of the same camera and its pixel grid has the same
+//!   orientation;
+//! - it was taken under the mount connection now in use, and less than
+//!   [`MAX_SOLVE_AGE`] ago (a camera turned by hand between sessions is not
+//!   otherwise seen);
+//! - on a mount that is not equatorial (Alt/Az, or an alignment mode that is
+//!   unknown) the field rotates with time and with every repointing: the
+//!   solve is less than [`FIELD_ROTATION_BUDGET`] old and the mount has not
+//!   slewed, jogged, flipped, parked or homed since;
+//! - the pier side and rotator angle are known and unchanged since that
+//!   solve.
+//!
+//! Before this, any trail along the sensor's x axis was labelled "RA",
+//! whatever the camera's rotation.
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::background::BackgroundStats;
 use super::quality::LumaFrame;
-use crate::equipment::types::PierSide;
+use crate::equipment::types::{AlignmentMode, PierSide};
 
 /// Sky-axis attribution tolerance: a trail within this of an axis is
 /// labelled with it.
 const AXIS_TOLERANCE_DEG: f32 = 25.0;
 /// A rotator that moved more than this since the solve invalidates its WCS.
 const ROTATOR_TOLERANCE_DEG: f64 = 0.5;
+/// The oldest solve whose orientation is trusted at all: about one night.
+pub const MAX_SOLVE_AGE: chrono::Duration = chrono::Duration::hours(12);
+/// The oldest solve trusted on a mount that is not equatorial. Field
+/// rotation is about 15°/h·cos(lat)·cos(az)/cos(alt): a degree or two in
+/// five minutes away from the zenith, well inside the axis tolerance.
+pub const FIELD_ROTATION_BUDGET: chrono::Duration = chrono::Duration::minutes(5);
 
 /// The sensor axis a trail lies along.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,6 +131,8 @@ pub struct SolveOrientation<'a> {
     pub camera: Option<&'a str>,
     pub pier_side: Option<PierSide>,
     pub rotator_angle_deg: Option<f64>,
+    /// When the solved frame was exposed (else recorded).
+    pub exposed_at: Option<DateTime<Utc>>,
 }
 
 /// The frame being measured, and the conditions now.
@@ -122,6 +143,16 @@ pub struct FrameGeometry<'a> {
     pub height: usize,
     pub pier_side: Option<PierSide>,
     pub rotator_angle_deg: Option<f64>,
+    /// When this frame was seen.
+    pub at: Option<DateTime<Utc>>,
+    /// The mount's alignment mode; `None` when unknown.
+    pub alignment_mode: Option<AlignmentMode>,
+    /// The solve was taken under the mount connection now in use; `None`
+    /// when that cannot be told.
+    pub solve_on_this_connection: Option<bool>,
+    /// The mount slewed, jogged, flipped, parked or homed after the solved
+    /// exposure; `None` when not known.
+    pub mount_repointed_since_solve: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -176,6 +207,32 @@ fn orientation_problem(solve: &SolveOrientation, frame: &FrameGeometry) -> Optio
     if let Some([w, h]) = solve.naxis {
         if (w >= h) != (frame.width >= frame.height) {
             return Some("pixel_grid_differs_from_solve");
+        }
+    }
+    match frame.solve_on_this_connection {
+        Some(true) => {}
+        Some(false) => return Some("solve_from_another_mount_connection"),
+        None => return Some("solve_connection_unknown"),
+    }
+    let age = match (solve.exposed_at, frame.at) {
+        (Some(solved), Some(now)) => (now - solved).abs(),
+        _ => return Some("solve_time_unknown"),
+    };
+    if age > MAX_SOLVE_AGE {
+        return Some("solve_older_than_session");
+    }
+    let equatorial = matches!(
+        frame.alignment_mode,
+        Some(AlignmentMode::Polar | AlignmentMode::GermanPolar)
+    );
+    if !equatorial {
+        if age > FIELD_ROTATION_BUDGET {
+            return Some("field_rotation_since_solve");
+        }
+        match frame.mount_repointed_since_solve {
+            Some(false) => {}
+            Some(true) => return Some("mount_repointed_since_solve"),
+            None => return Some("mount_motion_since_solve_unknown"),
         }
     }
     match (solve.pier_side, frame.pier_side) {
@@ -450,6 +507,11 @@ mod tests {
         estimate_trailing(&frame, &background)
     }
 
+    fn at(minutes: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(1_792_029_600, 0).unwrap() + chrono::Duration::minutes(minutes)
+    }
+
+    /// A frame on a German equatorial mount, an hour after the solve.
     fn frame(pier: Option<PierSide>) -> FrameGeometry<'static> {
         FrameGeometry {
             camera: Some("SV105"),
@@ -457,6 +519,10 @@ mod tests {
             height: 64,
             pier_side: pier,
             rotator_angle_deg: None,
+            at: Some(at(60)),
+            alignment_mode: Some(AlignmentMode::GermanPolar),
+            solve_on_this_connection: Some(true),
+            mount_repointed_since_solve: Some(true),
         }
     }
 
@@ -469,6 +535,7 @@ mod tests {
             camera: Some("SV105"),
             pier_side: Some(PierSide::East),
             rotator_angle_deg: None,
+            exposed_at: Some(at(0)),
         }
     }
 
@@ -542,6 +609,83 @@ mod tests {
             trailing.withheld.as_deref(),
             Some("pixel_grid_differs_from_solve")
         );
+    }
+
+    /// The WCS of an earlier target, hour, connection or session.
+    #[test]
+    fn a_solve_from_another_time_or_connection_is_not_this_frames_orientation() {
+        let good = solve([[-3.0e-4, 0.0], [0.0, 3.0e-4]]);
+        let east = frame(Some(PierSide::East));
+        let check = |solve: &SolveOrientation, frame: FrameGeometry| {
+            attribute(measured(), Some(solve), &frame).withheld
+        };
+        // An equatorial mount: an hour and a slew later the WCS still holds.
+        assert_eq!(check(&good, east), None);
+
+        let reconnected = FrameGeometry {
+            solve_on_this_connection: Some(false),
+            ..east
+        };
+        assert_eq!(
+            check(&good, reconnected).as_deref(),
+            Some("solve_from_another_mount_connection")
+        );
+        let unknown_connection = FrameGeometry {
+            solve_on_this_connection: None,
+            ..east
+        };
+        assert_eq!(
+            check(&good, unknown_connection).as_deref(),
+            Some("solve_connection_unknown")
+        );
+        let last_night = FrameGeometry {
+            at: Some(at(13 * 60)),
+            ..east
+        };
+        assert_eq!(
+            check(&good, last_night).as_deref(),
+            Some("solve_older_than_session")
+        );
+        let untimed = SolveOrientation {
+            exposed_at: None,
+            ..good
+        };
+        assert_eq!(check(&untimed, east).as_deref(), Some("solve_time_unknown"));
+
+        // Alt/Az (or unknown): the field rotates with time and every slew.
+        for mode in [Some(AlignmentMode::AltAz), None] {
+            let altaz = FrameGeometry {
+                alignment_mode: mode,
+                ..east
+            };
+            assert_eq!(
+                check(&good, altaz).as_deref(),
+                Some("field_rotation_since_solve"),
+                "{mode:?}"
+            );
+            let recent = FrameGeometry {
+                at: Some(at(2)),
+                ..altaz
+            };
+            assert_eq!(
+                check(&good, recent).as_deref(),
+                Some("mount_repointed_since_solve"),
+                "{mode:?}"
+            );
+            let unknown_motion = FrameGeometry {
+                mount_repointed_since_solve: None,
+                ..recent
+            };
+            assert_eq!(
+                check(&good, unknown_motion).as_deref(),
+                Some("mount_motion_since_solve_unknown")
+            );
+            let still = FrameGeometry {
+                mount_repointed_since_solve: Some(false),
+                ..recent
+            };
+            assert_eq!(check(&good, still), None, "{mode:?}");
+        }
     }
 
     #[test]

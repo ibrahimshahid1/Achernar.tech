@@ -26,6 +26,12 @@
 //! closed roof, a lens cap — leaves it pending, and `retry_after` keeps a long
 //! cloudy spell from turning every frame into a minutes-long blind solve.
 //!
+//! A PostSlew hint is the slew's J2000 target, else its native-frame target.
+//! An Alt/Az slew gives none: its RA/Dec is informative only (RA 0 h, Dec 0°
+//! when the site or LST is unknown), so the solve falls back to the mount's
+//! own report after the settle, or runs blind. A failed hinted solve drops
+//! the hint, so a wrong one is never retried.
+//!
 //! Every decision about an eligible light frame while a rule is pending is an
 //! H23 `policy_decisions` record ([`decision_record`]): the rule, the M-3
 //! readings with their ages, the safe arms (`solve`, `skip`) and the chosen
@@ -95,8 +101,9 @@ pub struct SolveJob {
     pub reason: SolveReason,
     pub frame_id: String,
     /// Where to look: the slew target (J2000 when it was commanded so, else
-    /// the native target). `None` for the other rules: the caller hints with
-    /// the mount's reported position if it has one, otherwise solves blind.
+    /// the native target). `None` for an Alt/Az slew, after a failed hinted
+    /// attempt, and for the other rules: the caller hints with the mount's
+    /// reported position if it has one, otherwise solves blind.
     pub hint: Option<EqCoord>,
     /// What raised the rule, e.g. `star_lost`.
     pub cause: Option<String>,
@@ -341,12 +348,15 @@ impl PlateSolveTrigger {
             EventKind::SlewCommanded {
                 target,
                 native_target,
-                ..
+                altaz,
             } => {
-                let hint = if target.frame == EqFrame::J2000 {
+                let hint = if altaz.is_some() {
+                    // Informative only, and (0 h, 0°) without a site or LST.
+                    None
+                } else if target.frame == EqFrame::J2000 {
                     Some(*target)
                 } else {
-                    native_target.or(Some(*target))
+                    native_target.or_else(|| (target.frame != EqFrame::Unknown).then_some(*target))
                 };
                 self.set(PendingRule {
                     reason: SolveReason::PostSlew,
@@ -524,6 +534,12 @@ impl PlateSolveTrigger {
             self.last_solved_temperature_c = temperature_c.or(self.last_solved_temperature_c);
             if job.generation == self.generation {
                 self.pending = None;
+            }
+        } else if job.hint.is_some() && job.generation == self.generation {
+            // The hint may be what failed: the next attempt uses the mount's
+            // report or solves blind.
+            if let Some(rule) = self.pending.as_mut() {
+                rule.hint = None;
             }
         }
     }
@@ -794,6 +810,53 @@ mod tests {
             ..bus.mount(41, slew, EventKind::SlewStarted)
         };
         assert_eq!(trigger.observe(&replay), None);
+    }
+
+    #[test]
+    fn an_alt_az_slew_gives_no_hint_and_a_failed_hint_is_dropped() {
+        let mut trigger = PlateSolveTrigger::new(Duration::from_secs(120));
+        let mut bus = Bus::new();
+        let slew = Some(CommandId::new());
+        // Site or LST unknown: the event's RA/Dec is the default (0 h, 0°).
+        let altaz = EventKind::SlewCommanded {
+            target: EqCoord::default(),
+            native_target: None,
+            altaz: Some(crate::equipment::types::AltAz {
+                alt_deg: 45.0,
+                az_deg: 200.0,
+            }),
+        };
+        trigger.observe(&bus.mount(10, slew, altaz));
+        assert_eq!(trigger.status().pending.unwrap().hint, None);
+        trigger.observe(&bus.mount(20, slew, settled()));
+        let job = solve(trigger.frame_archived(light("altaz", 25), t(30)));
+        assert_eq!((job.reason, job.hint), (SolveReason::PostSlew, None));
+        trigger.job_finished(&job, None, None, t(35));
+
+        // A hinted post-slew solve that fails is retried without the hint.
+        let second = Some(CommandId::new());
+        trigger.observe(&bus.mount(200, second, commanded(M67)));
+        trigger.observe(&bus.mount(210, second, settled()));
+        let job = solve(trigger.frame_archived(light("m67", 215), t(220)));
+        assert_eq!(job.hint, Some(M67));
+        trigger.job_finished(&job, None, None, t(225));
+        let pending = trigger.status().pending.unwrap();
+        assert_eq!(
+            (pending.reason, pending.hint),
+            (SolveReason::PostSlew, None)
+        );
+        let retry = solve(trigger.frame_archived(light("m67b", 400), t(400)));
+        assert_eq!(retry.hint, None);
+
+        // An equatorial target in an unknown frame with no native target is
+        // no hint either.
+        let unknown = EventKind::SlewCommanded {
+            target: EqCoord::new(8.0, 20.0, EqFrame::Unknown),
+            native_target: None,
+            altaz: None,
+        };
+        trigger.observe(&bus.mount(500, None, unknown));
+        assert_eq!(trigger.status().pending.unwrap().hint, None);
     }
 
     #[test]

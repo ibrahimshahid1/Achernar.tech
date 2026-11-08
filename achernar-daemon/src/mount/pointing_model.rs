@@ -8,13 +8,21 @@
 //!   reading is converted at mid-exposure before the sample is written. The
 //!   mount's native frame and its JNow flavour are part of the model key, so
 //!   a "mean" and an "apparent" series are never mixed (M-4 gap 1).
-//! - **Pier side and sync generation.** A model is fitted for one mount
-//!   identity, one sync generation (a sync changes the mount's own model)
-//!   and one pier side. A sample from another side or generation never
-//!   enters the fit.
+//! - **Pier side, connection and sync generation.** A model is fitted for
+//!   one mount identity, one connection, one sync generation (a sync changes
+//!   the mount's own model) and one pier side. The mount runtime's
+//!   `sync_generation` restarts at 0 with every connection and every daemon
+//!   start, so a generation number alone does not name a mount model: the
+//!   key also carries the connection's segment start
+//!   ([`note_connection_sample`]), and a sample exposed before it belongs to
+//!   an earlier connection. A sample from another side, connection or
+//!   generation never enters the fit; every reconnect starts a new model.
 //! - **RA in hours, with wrap.** Positions are hour angle (hours) and
 //!   declination; the fit runs on unit vectors of (HA, Dec), so RA and HA
-//!   wrap at 24 h and the pole are no special cases.
+//!   wrap at 24 h and the pole are no special cases. The hour angle is LST
+//!   minus the mount's native-frame RA (as H12 stores it) and the Dec is
+//!   J2000; a prediction is asked at the target's hour angle in the mount's
+//!   native frame.
 //! - **Tangent plane.** A residual is the gnomonic offset (xi east, eta
 //!   north, arcsec) of the mount reading on the plane tangent to the sky at
 //!   the truth, not a raw RA difference that blows up near the pole. A
@@ -35,10 +43,14 @@
 //! the mount runtime already applies the solved offset, and applying both
 //! would correct twice.
 
-use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
+use std::sync::{Mutex, PoisonError};
+
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sqlx::SqlitePool;
+use uuid::Uuid;
 
 use crate::equipment::events::PointingSampleRecord;
 use crate::equipment::types::{EqCoord, EqFrame, JNowFlavour, PierSide};
@@ -61,6 +73,51 @@ const REFIT_LIMIT: u32 = 500;
 /// Spline smoothing: plate-solve residuals carry arcsecond noise.
 const SMOOTHING: f64 = 1.0e-4;
 
+/// Where each mount connection's pointing samples begin: the earliest
+/// mid-exposure of a sample written under it in this process.
+///
+/// `pointing_samples` has no connection column, and the generation numbers
+/// of different connections collide. A sample of an earlier connection was
+/// exposed before this one opened: H12 writes a sample only when every
+/// mount reading of its window comes from the connection it is filed under.
+/// So a sample exposed before the segment start is never this connection's.
+static CONNECTION_SEGMENTS: Mutex<BTreeMap<Uuid, DateTime<Utc>>> = Mutex::new(BTreeMap::new());
+
+/// Note a sample of `connection_id` exposed at `mid_exposure`; returns the
+/// connection's segment start (the earliest such instant).
+///
+/// The start is floored to whole milliseconds, the precision
+/// `pointing_samples.mid_exposure_utc` is stored at, so the stored copy of
+/// the sample that set it is never earlier than the start itself.
+pub fn note_connection_sample(connection_id: Uuid, mid_exposure: DateTime<Utc>) -> DateTime<Utc> {
+    let mid_exposure = floor_to_millis(mid_exposure);
+    let mut segments = CONNECTION_SEGMENTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let start = segments.entry(connection_id).or_insert(mid_exposure);
+    if mid_exposure < *start {
+        *start = mid_exposure;
+    }
+    *start
+}
+
+/// `at` without its sub-millisecond part (storage precision, see
+/// `storage::columns::time`).
+fn floor_to_millis(at: DateTime<Utc>) -> DateTime<Utc> {
+    let nanos = at.nanosecond();
+    at.with_nanosecond(nanos - nanos % 1_000_000).unwrap_or(at)
+}
+
+/// The segment start of `connection_id`; `None` when no sample has been
+/// written under it, so it has no model yet.
+pub fn connection_segment_start(connection_id: Uuid) -> Option<DateTime<Utc>> {
+    CONNECTION_SEGMENTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&connection_id)
+        .copied()
+}
+
 /// What one model is fitted for.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelKey {
@@ -70,16 +127,23 @@ pub struct ModelKey {
     /// The mount's native frame and how its JNow is read; residuals are J2000.
     pub mount_frame: EqFrame,
     pub jnow_flavour: JNowFlavour,
+    /// The connection's segment start ([`connection_segment_start`]). A
+    /// sample exposed earlier, or with no exposure time, is another
+    /// connection's, whatever its generation number.
+    pub segment_start: DateTime<Utc>,
 }
 
 impl ModelKey {
-    pub fn of(record: &PointingSampleRecord) -> Self {
+    /// The key of `record`, taken under the connection whose segment starts
+    /// at `segment_start`.
+    pub fn of(record: &PointingSampleRecord, segment_start: DateTime<Utc>) -> Self {
         Self {
             mount_identity_key: record.mount_identity_key.clone(),
             sync_generation: record.sync_generation,
             pier_side: record.pier_side,
             mount_frame: record.mount_frame,
             jnow_flavour: record.jnow_flavour,
+            segment_start,
         }
     }
 
@@ -89,6 +153,9 @@ impl ModelKey {
             && record.pier_side == self.pier_side
             && record.mount_frame == self.mount_frame
             && record.jnow_flavour == self.jnow_flavour
+            && record
+                .mid_exposure_utc
+                .is_some_and(|mid| mid >= self.segment_start)
     }
 }
 
@@ -98,7 +165,8 @@ impl ModelKey {
 pub struct PointingSample {
     pub truth: EqCoord,
     pub mount: EqCoord,
-    /// Hour angle of the truth at mid-exposure, hours.
+    /// Hour angle at mid-exposure, hours: LST minus the mount's native-frame
+    /// RA, as H12 stores it (`pointing_samples.ha_h`).
     pub ha_h: f64,
     pub at: Option<DateTime<Utc>>,
 }
@@ -324,7 +392,9 @@ impl PointingModel {
 
     /// The command for sky truth `target` (J2000) at hour angle `ha_h` on
     /// `pier_side`: the target moved by the predicted mount error on the
-    /// tangent plane, clamped to [`MAX_CORRECTION_ARCMIN`].
+    /// tangent plane, clamped to [`MAX_CORRECTION_ARCMIN`]. `ha_h` follows
+    /// the samples' convention: LST minus the target's RA in the mount's
+    /// native frame.
     pub fn correct(
         &self,
         target: EqCoord,
@@ -407,6 +477,9 @@ impl PointingModel {
             "residual_frame": "j2000",
             "residual": "mount_minus_truth_tangent_plane_arcsec",
             "coordinates": "hour_angle_h_dec_deg",
+            "hour_angle": "lst_minus_native_frame_ra",
+            "dec": "j2000",
+            "segment": "mount_connection",
             "max_correction_arcmin": MAX_CORRECTION_ARCMIN,
             "outlier_arcmin": OUTLIER_ARCMIN,
             "max_extrapolation_deg": MAX_EXTRAPOLATION_DEG,
@@ -506,14 +579,16 @@ fn solve_linear(matrix: &[Vec<f64>], rhs: &[f64]) -> Option<Vec<f64>> {
 
 /// Refit the model the new `record` belongs to and write a
 /// `pointing_model_snapshots` row once it has [`MIN_CORRECTION_SAMPLES`]
-/// samples. `rig_id` is kept only when that `rigs` row exists. Returns the
-/// snapshot written, if any.
+/// samples. `segment_start` is the connection's
+/// ([`note_connection_sample`]). `rig_id` is kept only when that `rigs` row
+/// exists. Returns the snapshot written, if any.
 pub async fn refit_snapshot(
     pool: &SqlitePool,
     rig_id: Option<&str>,
     record: &PointingSampleRecord,
+    segment_start: DateTime<Utc>,
 ) -> Result<Option<pointing_model_repo::PointingModelSnapshot>, sqlx::Error> {
-    let key = ModelKey::of(record);
+    let key = ModelKey::of(record, segment_start);
     let records = pointing_samples_repo::for_mount(
         pool,
         &key.mount_identity_key,
@@ -559,6 +634,7 @@ mod tests {
             pier_side: side,
             mount_frame: EqFrame::JNowApparent,
             jnow_flavour: JNowFlavour::Apparent,
+            segment_start: Utc::now() - chrono::Duration::hours(1),
         }
     }
 
@@ -729,18 +805,59 @@ mod tests {
         let mut mean = record(2, PierSide::East, 5.8, 0.9);
         mean.jnow_flavour = JNowFlavour::Mean;
         records.push(mean);
+        // Generation 2 of an earlier connection (its counter restarted): a
+        // different mount model under the same number.
+        let mut earlier = record(2, PierSide::East, 6.0, 1.1);
+        earlier.mid_exposure_utc = Some(Utc::now() - chrono::Duration::hours(3));
+        records.push(earlier);
+        let mut untimed = record(2, PierSide::East, 6.2, 1.3);
+        untimed.mid_exposure_utc = None;
+        records.push(untimed);
         let model = PointingModel::from_records(key(PierSide::East), &records);
         assert_eq!(model.sample_count(), 2);
+    }
+
+    #[test]
+    fn a_connection_segment_starts_at_its_earliest_sample() {
+        let connection = Uuid::new_v4();
+        assert_eq!(connection_segment_start(connection), None);
+        // A mid-exposure with sub-millisecond digits, as a live clock gives.
+        let exact = Utc::now()
+            .with_nanosecond(123_456_789)
+            .expect("valid nanosecond");
+        let t0 = note_connection_sample(connection, exact);
+        assert_eq!(t0, exact.with_nanosecond(123_000_000).unwrap());
+        // The stored copy of that sample (millisecond text) is in the
+        // segment it started, not before it.
+        let stored = crate::storage::columns::parse_time(&crate::storage::columns::time(&exact))
+            .expect("stored time parses");
+        assert!(stored >= t0);
+        // An older frame of the same connection solved later moves it back.
+        let earlier = t0 - chrono::Duration::minutes(5);
+        assert_eq!(note_connection_sample(connection, earlier), earlier);
+        assert_eq!(
+            note_connection_sample(connection, t0 + chrono::Duration::minutes(5)),
+            earlier
+        );
+        assert_eq!(connection_segment_start(connection), Some(earlier));
+        assert_eq!(connection_segment_start(Uuid::new_v4()), None);
     }
 
     #[tokio::test]
     async fn each_refit_writes_a_snapshot_with_its_key_and_epoch() {
         let pool = crate::storage::test_pool().await;
+        // Generation 2 of an earlier connection, stored first: never fitted.
+        let mut earlier = record(2, PierSide::East, 4.0, -0.5);
+        earlier.mid_exposure_utc = Some(Utc::now() - chrono::Duration::hours(6));
+        pointing_samples_repo::upsert(&pool, &earlier)
+            .await
+            .unwrap();
+        let segment_start = Utc::now() - chrono::Duration::seconds(1);
         let mut last = None;
         for (i, ha) in [0.1, 0.4, 0.8].iter().enumerate() {
             let sample = record(2, PierSide::East, 5.0 + i as f64 * 0.3, *ha);
             pointing_samples_repo::upsert(&pool, &sample).await.unwrap();
-            last = refit_snapshot(&pool, Some("no-such-rig"), &sample)
+            last = refit_snapshot(&pool, Some("no-such-rig"), &sample, segment_start)
                 .await
                 .unwrap();
             if i < 2 {
@@ -752,6 +869,10 @@ mod tests {
         assert_eq!(snapshot.rig_id, None);
         assert_eq!(snapshot.model_data["key"]["pier_side"], json!("east"));
         assert_eq!(snapshot.model_data["key"]["sync_generation"], json!(2));
+        assert_eq!(
+            snapshot.model_data["key"]["segment_start"],
+            serde_json::to_value(segment_start).unwrap()
+        );
         assert_eq!(
             snapshot.model_data["key"]["mount_frame"],
             json!("jnow_apparent")

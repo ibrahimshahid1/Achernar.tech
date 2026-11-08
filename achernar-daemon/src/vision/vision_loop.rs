@@ -14,10 +14,15 @@
 //!   to the arrival (`clock_quality = host_arrival`).
 //! - **H14, COC context** from `EquipmentReader::coc_context()`.
 //! - **H15, TED evidence:** the trail on the sensor always; on the sky only
-//!   with the newest solve's WCS, of the same camera, with the pier side and
-//!   rotator unchanged; plus the window's tracking, pulses and wind.
+//!   with the newest solve's WCS, of the same camera, taken under the mount
+//!   connection now in use within the session, with the pier side and
+//!   rotator unchanged, and on a mount that is not equatorial only while the
+//!   field cannot have rotated (a recent solve, no repointing since); plus
+//!   the window's tracking, pulses and wind.
 //! - **Plate-solve state** (`last_solve_at`, `pointing_error_arcmin`) is read
 //!   from `plate_solve_events`, never carried forward.
+//! - H2, H14 and the plate-solve state do not depend on the pixels: a frame
+//!   whose pixels cannot be analysed still carries them.
 //! - **M-3 Recovery:** a cloud-cleared event asks for a recovery solve, and
 //!   the loop subscribes the plate-solve trigger to the bus at startup.
 
@@ -29,11 +34,11 @@ use tokio::sync::broadcast::{self, error::TryRecvError};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
-use crate::equipment::events::EquipmentEvent;
+use crate::equipment::events::{EquipmentEvent, EventKind};
 use crate::equipment::hub::EquipmentHub;
 use crate::equipment::snapshot::{CocContext, DeviceWindow, EquipmentSnapshot, Quiescence};
 use crate::equipment::traits::EquipmentReader;
-use crate::equipment::types::{ClockQuality, DeviceKind, PierSide};
+use crate::equipment::types::{AlignmentMode, ClockQuality, DeviceKind, PierSide};
 use crate::hardware::camera::FrameData;
 use crate::state::AppState;
 use crate::storage::plate_solve_repo::LatestSolve;
@@ -271,6 +276,46 @@ fn equipment_validity(
     validity
 }
 
+/// An event after which the field of a mount that is not equatorial sits
+/// at another angle: a slew, a jog, a flip, a park or a home. Guide pulses
+/// and dithers move it too little to matter; a center loop's own slews are
+/// `slew_*` events, and its `centered` follows its last solve.
+fn repoints_mount(event: &EquipmentEvent) -> bool {
+    event.name().starts_with("slew_")
+        || matches!(
+            event.event,
+            EventKind::MoveAxis { .. }
+                | EventKind::MeridianFlip { .. }
+                | EventKind::ArrivedOffTarget { .. }
+                | EventKind::Parked { .. }
+                | EventKind::Unparked
+                | EventKind::Homed
+        )
+}
+
+/// Whether `solve` was taken under the mount connection now in use: its
+/// pointing sample is of this mount, and was exposed inside this
+/// connection's segment. `None` when either side is unknown.
+fn solve_on_connection(
+    solve: &LatestSolve,
+    mount_identity_key: Option<&str>,
+    segment_start: Option<DateTime<Utc>>,
+    mount_connected: bool,
+) -> Option<bool> {
+    if !mount_connected {
+        return None;
+    }
+    let sample_mid = solve.sample_mid_exposure_utc?;
+    if let (Some(solved), Some(now)) = (solve.mount_identity_key.as_deref(), mount_identity_key) {
+        if solved != now {
+            return Some(false);
+        }
+    }
+    // No segment: nothing has been sampled under this connection yet, so
+    // the solve's sample is an earlier connection's.
+    Some(segment_start.is_some_and(|start| sample_mid >= start))
+}
+
 /// What the equipment layer and the archive say about one frame.
 #[derive(Debug, Clone, Default)]
 pub struct ObservationContext {
@@ -284,6 +329,13 @@ pub struct ObservationContext {
     pub rotator_angle_deg: Option<f64>,
     /// The exposure window's device state, for TED.
     pub window: Option<DeviceWindow>,
+    /// When the context was gathered.
+    pub at: Option<DateTime<Utc>>,
+    pub alignment_mode: Option<AlignmentMode>,
+    /// The solve belongs to the mount connection now in use.
+    pub solve_on_this_connection: Option<bool>,
+    /// The mount repointed after the solved exposure ([`repoints_mount`]).
+    pub mount_repointed_since_solve: Option<bool>,
 }
 
 impl ObservationContext {
@@ -305,6 +357,42 @@ impl ObservationContext {
             .read()
             .ok()
             .and_then(|runtime| runtime.camera_name.clone());
+        let at = Utc::now();
+        let alignment_mode = snapshot
+            .mount
+            .as_ref()
+            .and_then(|m| m.capabilities.alignment_mode);
+        let mount_identity_key = crate::api::plate_solve::mount_handle(state)
+            .map(|handle| handle.identity().identity_key.clone());
+        let segment_start = snapshot
+            .mount
+            .as_ref()
+            .and_then(|m| crate::mount::pointing_model::connection_segment_start(m.connection_id));
+        let solve_on_this_connection = solve.as_ref().and_then(|solve| {
+            solve_on_connection(
+                solve,
+                mount_identity_key.as_deref(),
+                segment_start,
+                snapshot.mount.is_some(),
+            )
+        });
+        // Only a mount that is not equatorial needs the journal: there a
+        // repointing turns the field.
+        let equatorial = matches!(
+            alignment_mode,
+            Some(AlignmentMode::Polar | AlignmentMode::GermanPolar)
+        );
+        let mount_repointed_since_solve = solve
+            .as_ref()
+            .and_then(|solve| solve.exposure_started_at.or(solve.solved_at))
+            .filter(|_| !equatorial)
+            .filter(|from| at - *from <= trailing::FIELD_ROTATION_BUDGET)
+            .map(|from| {
+                hub.bus()
+                    .events_between(from, at)
+                    .iter()
+                    .any(|event| repoints_mount(event))
+            });
         Self {
             equipment: Some(equipment),
             coc: Some(hub.coc_context()),
@@ -319,7 +407,28 @@ impl ObservationContext {
                 .as_ref()
                 .and_then(|r| r.state.position_deg.known().copied()),
             window: device_window,
+            at: Some(at),
+            alignment_mode,
+            solve_on_this_connection,
+            mount_repointed_since_solve,
         }
+    }
+
+    /// The parts of an observation that do not depend on the pixels: H2
+    /// validity, the H14 COC context and the plate-solve state. Applied to
+    /// every observation of the tick, measured or not.
+    fn apply(&self, mut observation: SharedObservation) -> SharedObservation {
+        let solve = self.solve.as_ref();
+        // From plate_solve_events, never carried forward from a previous
+        // observation.
+        observation.pointing_error_arcmin = solve
+            .and_then(|s| s.pointing_error_arcmin)
+            .map(|e| e as f32);
+        observation.last_solve_at = solve.and_then(|s| s.solved_at);
+        observation.last_solve_event_id = solve.map(|s| s.event_id.clone());
+        observation.equipment = self.equipment.clone();
+        observation.coc_context = self.coc.clone();
+        observation
     }
 
     /// A frame that moved never adapts the cloud baselines.
@@ -404,7 +513,7 @@ pub async fn run(state: AppState, rate_hz: f64) {
                 // A preview/unknown domain must replace the old measurement;
                 // leaving the previous bus entry would falsely label new pixels.
                 trends = VisionTrendState::default();
-                SharedObservation::analysis_unavailable(error.to_string())
+                context.apply(SharedObservation::analysis_unavailable(error.to_string()))
             }
         };
         let cleared = observation.cloud_event == CloudEvent::ClearedUp;
@@ -467,7 +576,7 @@ fn observation_with_context(
         Ok(luma) => luma,
         Err(error) => {
             *trends = VisionTrendState::default();
-            return Ok(SharedObservation::analysis_unavailable(error.to_string()));
+            return Ok(context.apply(SharedObservation::analysis_unavailable(error.to_string())));
         }
     };
     let previous = previous.filter(|observation| {
@@ -494,6 +603,7 @@ fn observation_with_context(
         camera: solve.camera_name.as_deref(),
         pier_side: solve.pier_side,
         rotator_angle_deg: solve.rotator_angle_deg,
+        exposed_at: solve.exposure_started_at.or(solve.solved_at),
     });
     let geometry = trailing::FrameGeometry {
         camera: context.camera.as_deref(),
@@ -501,6 +611,10 @@ fn observation_with_context(
         height: luma.height,
         pier_side: context.pier_side,
         rotator_angle_deg: context.rotator_angle_deg,
+        at: context.at,
+        alignment_mode: context.alignment_mode,
+        solve_on_this_connection: context.solve_on_this_connection,
+        mount_repointed_since_solve: context.mount_repointed_since_solve,
     };
     let trailing = trailing::attribute(
         trailing::estimate_trailing(&luma, &background),
@@ -569,7 +683,7 @@ fn observation_with_context(
     };
 
     let observation_valid = quality.observation_valid();
-    Ok(SharedObservation {
+    Ok(context.apply(SharedObservation {
         timestamp: chrono::Utc::now(),
         analysis_descriptor: luma.analysis_descriptor.clone(),
         analysis_unavailable_reason: None,
@@ -604,18 +718,17 @@ fn observation_with_context(
         snr_proxy_median: background.snr_proxy_median,
         saturation_fraction: background.saturation_fraction,
         saturation_gate: quality.saturation_gate,
-        // From plate_solve_events, never carried forward from `previous`.
-        pointing_error_arcmin: solve
-            .and_then(|s| s.pointing_error_arcmin)
-            .map(|e| e as f32),
+        // Filled by `context.apply`: from plate_solve_events and the hub,
+        // never carried forward from `previous`.
+        pointing_error_arcmin: None,
         wcs_residual_arcsec: None,
         last_solve_confidence: None,
-        last_solve_at: solve.and_then(|s| s.solved_at),
-        last_solve_event_id: solve.map(|s| s.event_id.clone()),
-        equipment: context.equipment.clone(),
-        coc_context: context.coc.clone(),
+        last_solve_at: None,
+        last_solve_event_id: None,
+        equipment: None,
+        coc_context: None,
         observation_valid,
-    })
+    }))
 }
 
 fn update_cloud_probability(
@@ -1197,8 +1310,24 @@ mod analysis_domain_tests {
             pointing_error_arcmin: Some(2.5),
             camera_name: Some(camera.into()),
             pier_side: Some(pier),
+            mount_identity_key: Some("sim:mount".into()),
+            sample_mid_exposure_utc: Some(DateTime::from_timestamp(1_792_029_590, 0).unwrap()),
             rotator_angle_deg: None,
             exposure: None,
+        }
+    }
+
+    /// The frame an hour after `latest_solve`, on the same German
+    /// equatorial mount connection.
+    fn same_rig_context() -> ObservationContext {
+        ObservationContext {
+            solve: Some(latest_solve("SV105", PierSide::East)),
+            camera: Some("SV105".into()),
+            pier_side: Some(PierSide::East),
+            at: Some(DateTime::from_timestamp(1_792_033_200, 0).unwrap()),
+            alignment_mode: Some(AlignmentMode::GermanPolar),
+            solve_on_this_connection: Some(true),
+            ..ObservationContext::default()
         }
     }
 
@@ -1272,12 +1401,7 @@ mod analysis_domain_tests {
         assert_eq!(ted.sky_axis, None);
         assert_eq!(ted.sky_withheld.as_deref(), Some("no_plate_solve"));
 
-        let same_rig = ObservationContext {
-            solve: Some(latest_solve("SV105", PierSide::East)),
-            camera: Some("SV105".into()),
-            pier_side: Some(PierSide::East),
-            ..ObservationContext::default()
-        };
+        let same_rig = same_rig_context();
         let solved = analyse(&same_rig);
         assert_eq!(solved.trailing_axis.as_deref(), Some("RA"));
         assert_eq!(
@@ -1295,5 +1419,109 @@ mod analysis_domain_tests {
             withheld.ted.unwrap().sky_withheld.as_deref(),
             Some("solved_with_another_camera")
         );
+
+        // An Alt/Az mount an hour later: the field has rotated.
+        let altaz = ObservationContext {
+            alignment_mode: Some(AlignmentMode::AltAz),
+            ..same_rig.clone()
+        };
+        let rotated = analyse(&altaz);
+        assert_eq!(rotated.trailing_axis.as_deref(), Some("sensor_x"));
+        assert_eq!(
+            rotated.ted.unwrap().sky_withheld.as_deref(),
+            Some("field_rotation_since_solve")
+        );
+        // The mount reconnected since the solve.
+        let reconnected = ObservationContext {
+            solve_on_this_connection: Some(false),
+            ..same_rig
+        };
+        assert_eq!(
+            analyse(&reconnected).ted.unwrap().sky_withheld.as_deref(),
+            Some("solve_from_another_mount_connection")
+        );
+    }
+
+    #[test]
+    fn a_solve_belongs_to_the_connection_whose_segment_holds_its_sample() {
+        let solve = latest_solve("SV105", PierSide::East);
+        let sample = solve.sample_mid_exposure_utc.unwrap();
+        let before = sample - chrono::Duration::seconds(1);
+        let after = sample + chrono::Duration::seconds(1);
+        assert_eq!(
+            solve_on_connection(&solve, Some("sim:mount"), Some(before), true),
+            Some(true)
+        );
+        // This connection's samples all began after the solve's.
+        assert_eq!(
+            solve_on_connection(&solve, Some("sim:mount"), Some(after), true),
+            Some(false)
+        );
+        assert_eq!(
+            solve_on_connection(&solve, Some("sim:mount"), None, true),
+            Some(false),
+            "nothing sampled on this connection yet"
+        );
+        assert_eq!(
+            solve_on_connection(&solve, Some("alpaca:other"), Some(before), true),
+            Some(false)
+        );
+        assert_eq!(solve_on_connection(&solve, None, Some(before), false), None);
+        let unsampled = LatestSolve {
+            sample_mid_exposure_utc: None,
+            ..solve
+        };
+        assert_eq!(
+            solve_on_connection(&unsampled, Some("sim:mount"), Some(before), true),
+            None
+        );
+    }
+
+    #[test]
+    fn only_repointing_events_turn_an_alt_az_field() {
+        let clock = ManualClock::new();
+        let event = |kind| EquipmentEvent::new(kind, &clock);
+        assert!(repoints_mount(&event(EventKind::SlewStarted)));
+        assert!(repoints_mount(&event(EventKind::Homed)));
+        assert!(!repoints_mount(&event(EventKind::SettleBegin)));
+        assert!(!repoints_mount(&event(EventKind::Centered {
+            error_arcmin: 0.5,
+            attempts: 2,
+        })));
+    }
+
+    /// H2, H14 and the plate-solve state do not need the pixels.
+    #[test]
+    fn an_unmeasurable_frame_still_carries_its_equipment_and_solve_context() {
+        let mut frame = mono_frame();
+        frame.format = OlsStreamType::Mjpeg;
+        let context = ObservationContext {
+            equipment: Some(validity(Some(true))),
+            coc: Some(CocContext::default()),
+            ..same_rig_context()
+        };
+        let observation = observation_with_context(
+            &frame,
+            &mut VisionTrendState::default(),
+            None,
+            None,
+            &context,
+        )
+        .unwrap();
+        assert!(observation.analysis_unavailable_reason.is_some());
+        assert_eq!(
+            observation.equipment.as_ref().and_then(|e| e.quiescent),
+            Some(true)
+        );
+        assert!(observation.coc_context.is_some());
+        assert_eq!(observation.last_solve_event_id.as_deref(), Some("solve-9"));
+        assert_eq!(observation.pointing_error_arcmin, Some(2.5));
+        assert_eq!(
+            observation.last_solve_at,
+            Some(DateTime::from_timestamp(1_792_029_600, 0).unwrap())
+        );
+        let applied = context.apply(SharedObservation::analysis_unavailable("x".into()));
+        assert_eq!(applied.last_solve_event_id.as_deref(), Some("solve-9"));
+        assert!(applied.equipment.is_some() && applied.coc_context.is_some());
     }
 }
