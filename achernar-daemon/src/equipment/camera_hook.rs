@@ -23,15 +23,23 @@ use super::types::{ClockQuality, DeviceError, DeviceResult, Observed, Source};
 use crate::hardware::health::{DeviceKind, DeviceRegistry};
 use crate::state::{CameraActivity as CameraState, CameraRuntimeState};
 
-/// Exposure clock quality per OLS driver id (§2.14).
+/// Exposure clock quality per OLS driver id (§2.14, A06).
+///
+/// Every OLS stream driver (ZWO, SVBony, ToupTek, Alpaca, INDI, INDIGO, UVC
+/// and the watch directory) stamps a frame with the host clock when the SDK
+/// delivers it, so its exposures are timed by arrival, never by a driver
+/// exposure start. gphoto2 takes stills, bracketed by the host clock around
+/// the trigger. The OLS simulator replays recorded frames. This matches
+/// `api::camera::equipment::clock_quality` for each driver's acquisition
+/// path.
 pub fn clock_quality(driver_id: Option<&str>) -> ClockQuality {
     match driver_id {
-        Some("sim") => ClockQuality::Simulator,
+        Some("sim" | "simulator") => ClockQuality::Simulator,
         Some("gphoto2" | "dslr") => ClockQuality::HostTriggerBracket,
-        Some("uvc" | "webcam" | "wdir" | "watchdir") => ClockQuality::HostArrival,
-        Some("asi" | "svb" | "toup" | "alpaca" | "indi" | "indigo") => {
-            ClockQuality::DriverExposureStart
-        }
+        Some(
+            "asi" | "svb" | "toup" | "alpaca" | "indi" | "indigo" | "uvc" | "webcam" | "wdir"
+            | "watchdir",
+        ) => ClockQuality::HostArrival,
         _ => ClockQuality::Unknown,
     }
 }
@@ -150,6 +158,54 @@ mod tests {
             Arc::new(ManualClock::new()),
         );
         (hook, runtime, devices)
+    }
+
+    /// OLS stream drivers stamp frames on delivery (host arrival); only
+    /// gphoto2 stills carry a host trigger bracket. No OLS driver reports a
+    /// driver exposure start.
+    #[test]
+    fn stream_drivers_are_timed_by_arrival_and_stills_by_the_trigger_bracket() {
+        for driver in [
+            "asi", "svb", "toup", "alpaca", "indi", "indigo", "uvc", "webcam", "wdir", "watchdir",
+        ] {
+            assert_eq!(
+                clock_quality(Some(driver)),
+                ClockQuality::HostArrival,
+                "{driver}"
+            );
+        }
+        for driver in ["gphoto2", "dslr"] {
+            assert_eq!(
+                clock_quality(Some(driver)),
+                ClockQuality::HostTriggerBracket,
+                "{driver}"
+            );
+        }
+        assert_eq!(clock_quality(Some("sim")), ClockQuality::Simulator);
+        assert_eq!(clock_quality(Some("mystery")), ClockQuality::Unknown);
+        assert_eq!(clock_quality(None), ClockQuality::Unknown);
+        // The hook agrees with the capture path's per-driver, per-path rule.
+        use crate::api::camera::equipment::{clock_quality as capture_quality, AcquisitionPath};
+        for driver in [
+            "asi", "svb", "toup", "alpaca", "indi", "indigo", "uvc", "wdir",
+        ] {
+            assert_eq!(
+                clock_quality(Some(driver)),
+                capture_quality(Some(driver), AcquisitionPath::Stream),
+                "{driver}"
+            );
+        }
+        assert_eq!(
+            clock_quality(Some("gphoto2")),
+            capture_quality(Some("gphoto2"), AcquisitionPath::Still)
+        );
+        for driver in ["asi", "gphoto2", "sim"] {
+            assert_ne!(
+                clock_quality(Some(driver)),
+                ClockQuality::DriverExposureStart,
+                "{driver}"
+            );
+        }
     }
 
     #[test]
