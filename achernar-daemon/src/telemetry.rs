@@ -63,11 +63,13 @@ pub fn equipment_status(state: &AppState) -> Value {
     let busy = serde_json::to_value(*state.equipment.busy().borrow()).unwrap_or(Value::Null);
     let resume_blocks = serde_json::to_value(state.equipment.resume_blocks().borrow().clone())
         .unwrap_or(Value::Null);
+    // The combined safety state (SafetyGate), from the same watch reads.
+    let safety = crate::api::safety::status_block(state);
     json!({"connected":any_device,
         "camera":camera_status,"mount":mount_status,"focuser":focuser_status,"filter_wheel":filter_status,
         "guider":guiding,"guiding":guiding,"rotator":rotator,"cover_calibrator":cover,"switch":switch,
         "weather":weather,"safety_monitor":safety_monitor,"dome":dome,
-        "busy":busy,"resume_blocks":resume_blocks,
+        "busy":busy,"resume_blocks":resume_blocks,"safety":safety,
         "device_health":devices.0})
 }
 
@@ -109,6 +111,7 @@ pub fn telemetry_event(state: &AppState) -> Value {
             "dome": block("dome"),
             "busy": block("busy"),
             "resume_blocks": block("resume_blocks"),
+            "safety": block("safety"),
             "ai": {
                 // Null (not 0.0) when there is no valid measurement — 0 HFR would
                 // read as perfect focus on a blank frame. The same reasoning

@@ -5,7 +5,9 @@
 //! health only; nothing here touches a driver (`health_tests.rs`: `/status`
 //! never enters a driver). Today's keys keep their meaning and their null
 //! semantics; every new key is additive and nullable. Unknown values are
-//! null, never a synthesised 0 (D5).
+//! null, never a synthesised 0 (D5). Every device block names its
+//! `identity_key` (§2.6), the stable key the frontend keys hardware on,
+//! beside the per-connection `connection_id`.
 
 use serde_json::{json, Map, Value};
 
@@ -70,6 +72,7 @@ pub fn mount_block(
     );
     if let Value::Object(map) = &mut value {
         map.insert("driver".into(), json!(identity.driver));
+        map.insert("identity_key".into(), json!(identity.identity_key));
         map.insert("connection_id".into(), json!(identity.connection_id));
         map.insert(
             "qualification".into(),
@@ -115,6 +118,7 @@ pub fn focuser_block(
         "observed_at": s.position.observed_at.or(s.is_moving.observed_at),
         "age_ms": age_ms(now_mono_ns, observed),
         "driver": identity.driver,
+        "identity_key": identity.identity_key,
         "connection_id": identity.connection_id,
         "qualification": identity.qualification,
     });
@@ -153,6 +157,7 @@ pub fn filter_wheel_block(
         "observed_at": snapshot.position.observed_at,
         "age_ms": age_ms(now_mono_ns, snapshot.position.mono_ns),
         "driver": identity.driver,
+        "identity_key": identity.identity_key,
         "connection_id": identity.connection_id,
         "qualification": identity.qualification,
     });
@@ -204,6 +209,7 @@ pub fn guiding_block(
         "observed_at": snapshot.app_state.observed_at,
         "age_ms": age_ms(now_mono_ns, snapshot.app_state.mono_ns),
         "driver": identity.driver,
+        "identity_key": identity.identity_key,
         "connection_id": identity.connection_id,
         "qualification": identity.qualification,
     });
@@ -248,6 +254,7 @@ pub fn weather_block(
         "observed_at": snapshot.published_at,
         "age_ms": age_ms(now_mono_ns, Some(snapshot.published_mono_ns)),
         "driver": identity.driver,
+        "identity_key": identity.identity_key,
         "connection_id": identity.connection_id,
         "qualification": identity.qualification,
     });
@@ -274,6 +281,7 @@ pub fn safety_monitor_block(
         "observed_at": snapshot.level.observed_at,
         "age_ms": age_ms(now_mono_ns, snapshot.level.mono_ns),
         "driver": identity.driver,
+        "identity_key": identity.identity_key,
         "connection_id": identity.connection_id,
         "qualification": identity.qualification,
     });
@@ -295,6 +303,79 @@ mod tests {
 
     fn ready() -> HealthState {
         HealthState::ready(Utc::now(), 1)
+    }
+
+    /// Every device block carries the identity key beside the connection
+    /// id, so a client can tell a reconnect of the same device from a new
+    /// one.
+    #[test]
+    fn every_device_block_names_its_identity_key() {
+        let blocks = [
+            (
+                DeviceKind::Mount,
+                mount_block(
+                    &MountSnapshot::default(),
+                    &fake_identity(DeviceKind::Mount),
+                    &ready(),
+                    None,
+                    0,
+                ),
+            ),
+            (
+                DeviceKind::Focuser,
+                focuser_block(
+                    &FocuserSnapshot::default(),
+                    &fake_identity(DeviceKind::Focuser),
+                    &ready(),
+                    0,
+                ),
+            ),
+            (
+                DeviceKind::FilterWheel,
+                filter_wheel_block(
+                    &FilterWheelSnapshot::default(),
+                    &fake_identity(DeviceKind::FilterWheel),
+                    &ready(),
+                    0,
+                ),
+            ),
+            (
+                DeviceKind::Guider,
+                guiding_block(
+                    &GuiderSnapshot::default(),
+                    &fake_identity(DeviceKind::Guider),
+                    &ready(),
+                    0,
+                ),
+            ),
+            (
+                DeviceKind::Weather,
+                weather_block(
+                    &WeatherSnapshot::default(),
+                    &fake_identity(DeviceKind::Weather),
+                    &ready(),
+                    0,
+                ),
+            ),
+            (
+                DeviceKind::SafetyMonitor,
+                safety_monitor_block(
+                    &SafetySnapshot::default(),
+                    &fake_identity(DeviceKind::SafetyMonitor),
+                    &ready(),
+                    0,
+                ),
+            ),
+        ];
+        for (kind, block) in blocks {
+            let identity = fake_identity(kind);
+            assert_eq!(
+                block["identity_key"],
+                serde_json::json!(identity.identity_key),
+                "{kind:?}"
+            );
+            assert!(block["connection_id"].is_string(), "{kind:?}");
+        }
     }
 
     #[test]

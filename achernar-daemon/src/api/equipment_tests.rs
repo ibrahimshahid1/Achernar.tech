@@ -576,6 +576,13 @@ async fn weather_and_safety_report_readings_and_safety_is_none_without_a_monitor
     let (directory, state) = state().await;
     // No monitor: the combined state is `none` (§5.7 Tier 1 item 6).
     assert_eq!(super::safety::status_value(&state)["state"], "none");
+    // `/status` and TELEMETRY_UPDATE carry the same combined state.
+    assert_eq!(status(&state)["safety"]["state"], "none");
+    assert!(status(&state)["safety"].get("changed_at").is_some());
+    assert_eq!(
+        crate::telemetry::telemetry_event(&state)["payload"]["safety"]["state"],
+        "none"
+    );
 
     connect(&state, "weather", "sim", "").await;
     connect(&state, "safety_monitor", "sim", "").await;
@@ -596,6 +603,18 @@ async fn weather_and_safety_report_readings_and_safety_is_none_without_a_monitor
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(status(&state)["weather"].is_object());
+    let value = status(&state);
+    assert_eq!(value["safety"]["state"], "safe", "{}", value["safety"]);
+    assert_eq!(
+        value["safety"]["changed_at"],
+        super::safety::status_value(&state)["changed_at"]
+    );
+    assert_eq!(
+        crate::telemetry::telemetry_event(&state)["payload"]["safety"]["state"],
+        "safe"
+    );
+    // The identity key travels with the device blocks (§2.6).
+    assert_eq!(value["weather"]["identity_key"], "sim:weather");
     cleanup(directory, state).await;
 }
 

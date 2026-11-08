@@ -14,12 +14,30 @@ use crate::equipment::snapshot::{ResumeBlockKind, SafetySummary};
 use crate::equipment::traits::EquipmentReader;
 use crate::state::AppState;
 
-pub fn status_value(state: &AppState) -> Value {
-    let summary: SafetySummary = state
+/// The combined safety state: the safety supervisor's (WP1A-8) when one
+/// runs, else the hub's derived one (`none` without a monitor). Watch reads
+/// only; no driver is touched.
+pub fn summary(state: &AppState) -> SafetySummary {
+    state
         .equipment_ctx
         .safety_supervisor()
         .map(|supervisor| supervisor.summary())
-        .unwrap_or_else(|| state.equipment.snapshot().safety.clone());
+        .unwrap_or_else(|| state.equipment.snapshot().safety.clone())
+}
+
+/// The `safety {state, changed_at}` block of `/status` and
+/// `TELEMETRY_UPDATE` (additive, §2.13), so a client can show the combined
+/// safety state without polling `GET safety`.
+pub fn status_block(state: &AppState) -> Value {
+    let summary = summary(state);
+    json!({
+        "state": summary.state,
+        "changed_at": summary.changed_at,
+    })
+}
+
+pub fn status_value(state: &AppState) -> Value {
+    let summary = summary(state);
     let now = state.equipment.clock().now_mono_ns();
     let monitor = state
         .equipment

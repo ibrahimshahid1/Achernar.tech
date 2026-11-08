@@ -89,6 +89,12 @@ export type SafetyLevel = "safe" | "warning" | "unsafe";
 /** The combined safety state of every monitor (§3.10, §2.8 fail-safe rule). */
 export type SafetyGate = "none" | "safe" | "unsafe" | "unknown";
 
+/** The `/status` and TELEMETRY_UPDATE `safety` block: the combined state. */
+export interface SafetyStatusBlock {
+    state: SafetyGate;
+    changed_at?: string | null;
+}
+
 export interface Site {
     lat_deg: number;
     lon_deg: number;
@@ -368,6 +374,7 @@ export interface EquipmentState {
     dome?: (DeviceBlockCommon & Record<string, unknown>) | null;
     busy?: BusySet | null;
     resume_blocks?: ResumeBlock[] | null;
+    safety?: SafetyStatusBlock | null;
 }
 
 export interface DaemonSummary {
@@ -406,6 +413,7 @@ export interface TelemetryUpdateEvent {
         device_health?: Record<string, DeviceHealthEntry>;
         busy?: BusySet | null;
         resume_blocks?: ResumeBlock[] | null;
+        safety?: SafetyStatusBlock | null;
         // Null means the frame was never analysed. `observation_valid: false`
         // means it was analysed and the result was unusable — different facts.
         ai?: {
