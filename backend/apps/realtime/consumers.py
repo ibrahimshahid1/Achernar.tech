@@ -102,7 +102,10 @@ class DaemonConsumer(AsyncWebsocketConsumer):
     async def receive(self, text_data):
         """
         Receive telemetry updates from daemon.
-        
+
+        Handled types: TELEMETRY_UPDATE, HELLO, COMMAND_RESULT, FRAME_PREVIEW,
+        EQUIPMENT_EVENT and HEARTBEAT. Anything else is dropped.
+
         Expected message format:
         {
             "type": "TELEMETRY_UPDATE",
@@ -170,9 +173,30 @@ class DaemonConsumer(AsyncWebsocketConsumer):
                     }
                 )
             
+            elif message_type == 'EQUIPMENT_EVENT':
+                # One equipment journal event (daemon spec §2.13, §4.2),
+                # forwarded to this daemon's browsers as the daemon sent it.
+                # Guide steps are included; they arrive at PHD2's exposure
+                # cadence, so they are not throttled here.
+                event = data.get('event')
+                if not isinstance(event, dict) or not isinstance(event.get('kind'), str):
+                    logger.warning(f"Dropped malformed EQUIPMENT_EVENT from daemon {self.daemon_id}")
+                    return
+                # A socket that has been replaced must not deliver late events
+                # from the old session, as for telemetry and previews.
+                if not await self.is_current_gateway():
+                    return
+                await self.channel_layer.group_send(
+                    f'daemon_{self.daemon_id}_clients',
+                    {
+                        'type': 'equipment_event',
+                        'data': {'type': 'EQUIPMENT_EVENT', 'event': event},
+                    }
+                )
+
             elif message_type == 'HEARTBEAT':
                 await self.update_daemon_heartbeat()
-        
+
         except json.JSONDecodeError:
             logger.error(f"Invalid JSON from daemon {self.daemon_id}")
         except Exception as e:
@@ -198,6 +222,14 @@ class DaemonConsumer(AsyncWebsocketConsumer):
                 },
             },
         )
+
+    @database_sync_to_async
+    def is_current_gateway(self):
+        """True while this socket owns the daemon's live gateway session."""
+        from .models import DaemonConnection
+        return DaemonConnection.objects.filter(
+            id=self.daemon_id, gateway_channel_name=self.channel_name, is_connected=True,
+        ).exists()
 
     @database_sync_to_async
     def daemon_exists(self):
@@ -384,7 +416,11 @@ class TelemetryConsumer(AsyncWebsocketConsumer):
 
     async def frame_preview(self, event):
         await self.send(text_data=json.dumps(event['data']))
-    
+
+    async def equipment_event(self, event):
+        """Send one EQUIPMENT_EVENT from the daemon to the browser."""
+        await self.send(text_data=json.dumps(event['data']))
+
     @database_sync_to_async
     def get_latest_telemetry(self):
         """Return latest telemetry snapshot for a newly connected client."""

@@ -36,5 +36,8 @@ export function useDaemonStatus() {
         refetchIntervalInBackground: true,
     });
     const data = freshEquipmentStatus(query.data, query.isError, query.dataUpdatedAt, now);
-    return { ...query, data, online: data !== undefined };
+    // `data` is only a fresh status; `lastKnown` is the last one this
+    // transport returned, kept through failed or late polls. Only the abort
+    // paths read it (D19): they must not depend on the poll succeeding.
+    return { ...query, data, lastKnown: query.data, online: data !== undefined };
 }

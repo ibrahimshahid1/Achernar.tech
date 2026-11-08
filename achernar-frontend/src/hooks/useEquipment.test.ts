@@ -86,6 +86,13 @@ describe("card construction: unmeasured values", () => {
         expect(build({ camera: { name: "Cached Canon", cooling: false, temperature: null } })).toEqual([]);
     });
 
+    it("does not call a focuser idle when IsMoving was never read", () => {
+        const [card] = build({ focuser: { name: "Focuser", connected: true, position: 100, moving: null } });
+        expect(card.tags).toContain("motion unknown");
+        expect(card.tags).not.toContain("idle");
+        expect(card.meta!.Moving).toBe(UNKNOWN);
+    });
+
     it("clears a previous camera when the next snapshot is null or stale", () => {
         const camera = { connected: true, name: "Canon", cooling: false, temperature: null };
         expect(build({ camera })).toHaveLength(1);
@@ -93,5 +100,45 @@ describe("card construction: unmeasured values", () => {
         expect(build({ camera, connected: false })).toEqual([]);
         expect(build({ camera, telemetry_stale: true })).toEqual([]);
         expect(build({ camera, daemon_connected: false })).toEqual([]);
+    });
+});
+
+describe("equipment-layer cards (WP1B-5)", () => {
+    it("marks a degraded device as a warning and tags its qualification", () => {
+        const [card] = build({ mount: { name: "ESP32", connected: true, ra: 1, dec: 2, tracking: true, link_state: "degraded",
+            qualification: { state: "implemented_unqualified" } } });
+        expect(card.status).toBe("warning");
+        expect(card.tags).toContain("unqualified");
+        const [ready] = build({ mount: { name: "ESP32", connected: true, ra: 1, dec: 2, tracking: true, link_state: "ready" } });
+        expect(ready.status).toBe("nominal");
+    });
+
+    it("builds a guider card without inventing an arcsec RMS when PHD2 has no pixel scale", () => {
+        const [card] = build({ guiding: { connected: true, name: "PHD2", state: "guiding", rms_total: null, rms_total_px: 0.4, snr: 31.2 } });
+        expect(card.type).toBe("guider");
+        expect(card.summary).toBe(`guiding · RMS ${UNKNOWN}`);
+        expect(card.metrics!.find((m) => m.label === "RMS")!.value).toBe(UNKNOWN);
+        const [scaled] = build({ guiding: { connected: true, state: "guiding", rms_total: 0.82 } });
+        expect(scaled.metrics!.find((m) => m.label === "RMS")!.value).toBe("0.82\"");
+    });
+
+    it("builds weather and safety cards, and an unknown safety reading is not nominal", () => {
+        const cards = build({
+            weather: { connected: true, name: "Boltwood", temperature: 0, humidity: null, fields: { cloud_cover_pct: { value: 12 } } },
+            safety_monitor: { connected: true, name: "Roof", level: "safe", is_safe: null },
+        });
+        const weather = cards.find((card) => card.type === "weather")!;
+        expect(weather.summary).toBe(`0.0 C · RH ${UNKNOWN}`);
+        expect(weather.metrics!.find((m) => m.label === "Cloud")!.value).toBe("12 %");
+        const safety = cards.find((card) => card.type === "safety-monitor")!;
+        expect(safety.status).toBe("warning");
+        expect(safety.summary).toBe("UNKNOWN");
+        const [safe] = build({ safety_monitor: { connected: true, level: "safe", is_safe: true, link_state: "ready" } });
+        expect(safe.status).toBe("nominal");
+    });
+
+    it("reports a filter wheel's verification", () => {
+        const [card] = build({ filter_wheel: { connected: true, name: "Wheel", slot: 1, filter: "Ha", verified: false } });
+        expect(card.tags).toContain("unverified");
     });
 });

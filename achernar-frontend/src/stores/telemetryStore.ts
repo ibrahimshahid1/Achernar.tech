@@ -76,12 +76,21 @@ export const useTelemetryStore = create<TelemetryState>((set) => ({
                           name: focuser.name,
                           connected: focuser.connected ?? false,
                           position: focuser.position ?? null,
-                          moving: focuser.moving ?? false,
+                          // IsMoving never read is unknown, not stopped.
+                          moving: focuser.moving ?? null,
                       }
                     : undefined,
+                filter_wheel: evt.payload.filter_wheel?.connected === true ? evt.payload.filter_wheel : undefined,
+                weather: evt.payload.weather?.connected === true ? evt.payload.weather : undefined,
+                safety_monitor: evt.payload.safety_monitor?.connected === true ? evt.payload.safety_monitor : undefined,
+                busy: evt.payload.busy ?? null,
+                resume_blocks: evt.payload.resume_blocks ?? null,
+                device_health: evt.payload.device_health ?? {},
                 // The daemon is connected; whether any hardware is, is the
                 // per-device `connected` flag above.
-                connected: Boolean(mount?.connected || camera?.connected || focuser?.connected),
+                connected: Boolean(mount?.connected || camera?.connected || focuser?.connected
+                    || evt.payload.filter_wheel?.connected || evt.payload.guiding?.connected
+                    || evt.payload.weather?.connected || evt.payload.safety_monitor?.connected),
             },
             guiding: evt.payload.guiding ?? null,
             ai: evt.payload.ai ?? null,

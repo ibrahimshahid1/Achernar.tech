@@ -203,6 +203,71 @@ class RelayLifecycleTests(TransactionTestCase):
         for name in HARDWARE_FIELDS:
             self.assertIsNone(event['payload'][name])
 
+    def equipment_event(self, **overrides):
+        event = {
+            'seq': 7,
+            'event_id': '2f6f4a52-8a55-4a64-9d0a-3d8f0c5b7a11',
+            'at_utc': '2026-10-26T20:00:00.000Z',
+            'mono_ns': 1_000_000,
+            'device_kind': 'mount',
+            'connection_id': 'mount-session',
+            'command_id': None,
+            'device_time': None,
+            'kind': 'slew_settled',
+            'payload': {'position': {'ra_h': 5.5, 'dec_deg': -5.4}},
+        }
+        event.update(overrides)
+        return event
+
+    def test_equipment_event_is_forwarded_to_the_daemons_browsers_unchanged(self):
+        event = self.equipment_event()
+        async_to_sync(self.consumer.receive)(json.dumps({'type': 'EQUIPMENT_EVENT', 'event': event}))
+        group, message = self.consumer.channel_layer.group_send.call_args.args
+        self.assertEqual(group, f'daemon_{self.daemon.id}_clients')
+        self.assertEqual(message, {
+            'type': 'equipment_event',
+            'data': {'type': 'EQUIPMENT_EVENT', 'event': event},
+        })
+
+    def test_guide_steps_are_forwarded_too(self):
+        event = self.equipment_event(kind='guide_step', device_kind='guider', payload={'frame': 12, 'dx': 0.3, 'dy': -0.1})
+        async_to_sync(self.consumer.receive)(json.dumps({'type': 'EQUIPMENT_EVENT', 'event': event}))
+        message = self.consumer.channel_layer.group_send.call_args.args[1]
+        self.assertEqual(message['data']['event']['kind'], 'guide_step')
+
+    def test_equipment_event_from_a_replaced_gateway_is_dropped(self):
+        self.consumer.channel_name = 'gateway.old'
+        async_to_sync(self.consumer.receive)(json.dumps({'type': 'EQUIPMENT_EVENT', 'event': self.equipment_event()}))
+        self.consumer.channel_layer.group_send.assert_not_called()
+
+    def test_equipment_event_after_the_gateway_disconnected_is_dropped(self):
+        DaemonConnection.objects.filter(pk=self.daemon.pk).update(is_connected=False)
+        async_to_sync(self.consumer.receive)(json.dumps({'type': 'EQUIPMENT_EVENT', 'event': self.equipment_event()}))
+        self.consumer.channel_layer.group_send.assert_not_called()
+
+    def test_malformed_equipment_event_is_dropped(self):
+        for message in (
+            {'type': 'EQUIPMENT_EVENT'},
+            {'type': 'EQUIPMENT_EVENT', 'event': 'slew_settled'},
+            {'type': 'EQUIPMENT_EVENT', 'event': {'seq': 1}},
+        ):
+            async_to_sync(self.consumer.receive)(json.dumps(message))
+        self.consumer.channel_layer.group_send.assert_not_called()
+
+    def test_equipment_event_does_not_touch_the_saved_snapshot(self):
+        async_to_sync(self.consumer.receive)(json.dumps({'type': 'EQUIPMENT_EVENT', 'event': self.equipment_event()}))
+        self.snapshot.refresh_from_db()
+        self.assertTrue(self.snapshot.camera_state['connected'])
+        self.assertEqual(self.snapshot.mount_state['connection_id'], 'mount-session')
+
+    def test_browser_receives_the_forwarded_equipment_event(self):
+        consumer = TelemetryConsumer()
+        consumer.send = AsyncMock()
+        data = {'type': 'EQUIPMENT_EVENT', 'event': self.equipment_event(kind='estop', device_kind=None)}
+        async_to_sync(consumer.equipment_event)({'type': 'equipment_event', 'data': data})
+        sent = json.loads(consumer.send.call_args.kwargs['text_data'])
+        self.assertEqual(sent, data)
+
     def test_broadcast_sends_canonical_disconnected_snapshot(self):
         async_to_sync(self.consumer.receive)(json.dumps({
             'type': 'TELEMETRY_UPDATE', 'payload': dict.fromkeys(HARDWARE_FIELDS),
