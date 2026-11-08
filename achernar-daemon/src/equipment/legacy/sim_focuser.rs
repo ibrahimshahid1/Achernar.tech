@@ -5,15 +5,14 @@
 //! `0..=max_range` (50000 unless a test sets another range), moves that
 //! complete at once, and the stalled-driver test hook that keeps `IsMoving`
 //! true until a halt. It has no temperature probe, StepSize or TempComp, so
-//! those members are `Unsupported`. The native simulator with a kinematic
-//! model is `sim/focuser.rs`; this adapter exists so the daemon's current
-//! `sim` focuser can run through the same worker until the spine switches
-//! the `sim` driver id over.
+//! those members are `Unsupported`. The `sim` driver id runs the native
+//! simulator with a kinematic model (`sim/focuser.rs`); this adapter keeps
+//! the older simulator's tests (`health_tests.rs`, the focus fixtures)
+//! running through the same worker.
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use super::ols_focuser::map_error;
 use crate::equipment::snapshot::{FocuserCapabilities, FocuserState};
 use crate::equipment::traits::{
     AbortPath, Clock, ConnectPath, ConnectReport, Device, FocuserDriver, PollMethod, PollPlan,
@@ -23,7 +22,20 @@ use crate::equipment::types::{
     ascom_error, identity_key, DeviceError, DeviceIdentity, DeviceKind, DeviceResult, DriverId,
     Endpoint, Observed, Source,
 };
+use crate::error::{AchernarError, HardwareError};
 use crate::hardware::focuser::SimFocuser;
+
+/// Map a daemon error from the simulator onto the device vocabulary.
+fn map_error(err: AchernarError) -> DeviceError {
+    match err {
+        AchernarError::Hardware(HardwareError::Timeout(m)) => DeviceError::timeout(m),
+        AchernarError::Hardware(HardwareError::Unsupported(m)) => DeviceError::unsupported(m),
+        AchernarError::Hardware(HardwareError::DeviceNotFound(m)) => DeviceError::not_connected(m),
+        AchernarError::Hardware(HardwareError::DeviceBusy(m)) => DeviceError::invalid_operation(m),
+        AchernarError::Hardware(HardwareError::Communication(m)) => DeviceError::transport(m),
+        other => DeviceError::driver(other.to_string()),
+    }
+}
 
 fn lock(sim: &Mutex<SimFocuser>) -> MutexGuard<'_, SimFocuser> {
     sim.lock().unwrap_or_else(|e| e.into_inner())

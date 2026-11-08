@@ -1,7 +1,7 @@
 //! Focuser behaviour shared by every focuser driver (spec §3.3, F-a to F-i).
 //!
-//! Drivers (`alpaca/focuser.rs`, `sim/focuser.rs`, the legacy adapters and,
-//! in Tier 2, the INDI focuser) implement
+//! Drivers (`alpaca/focuser.rs`, `sim/focuser.rs`, the older test simulator
+//! in `legacy/sim_focuser.rs` and, in Tier 2, the INDI focuser) implement
 //! [`FocuserDriver`](crate::equipment::traits::FocuserDriver): the raw device
 //! position, IsMoving, Temperature and TempComp. Everything above the raw
 //! device lives here and is identical for every driver:

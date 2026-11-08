@@ -2,8 +2,10 @@
  * ols_bridge.h - C API bridge to OpenLiveStacker C++ drivers
  *
  * This header exposes a flat C API that Rust can call via FFI.
- * All OLS C++ classes (Camera, Mount, Focuser) are wrapped behind
- * opaque handles with C-compatible error reporting.
+ * The OLS C++ classes the daemon still uses (Camera, and Mount for the
+ * interim INDI mount, owner decision O3) are wrapped behind opaque handles
+ * with C-compatible error reporting. The OLS Alpaca mount and the OLS
+ * focuser were removed at the end of Tier 1 (owner decision O2).
  */
 #ifndef OLS_BRIDGE_H
 #define OLS_BRIDGE_H
@@ -586,7 +588,9 @@ OlsError ols_mount_driver_list(OlsMountInterface* mi,
                                 OlsMountDriverInfo* out_drivers, int32_t max_drivers,
                                 int32_t* out_count);
 
-/** Load a mount driver by name (e.g., "alpaca"). */
+/** Load a mount driver by name ("indi:remote" where compiled with libindi).
+ *  "alpaca" is refused with OLS_ERR_NOT_SUPPORTED: the OLS Alpaca mount was
+ *  removed (O2) and the daemon's native Alpaca client replaces it. */
 OlsError ols_mount_load_driver(OlsMountInterface* mi,
                                 const char* driver_name, const char* option);
 
@@ -663,64 +667,6 @@ OlsError ols_mount_shutdown(OlsMountInterface* mi);
 
 /** Destroy the mount interface. */
 void ols_mount_interface_destroy(OlsMountInterface* mi);
-
-/* ═══════════════════════════════════════════════════════════════════
- *  Focuser Types & Structures
- * ═══════════════════════════════════════════════════════════════════ */
-
-typedef struct {
-    char name[128];
-    char option[128];
-} OlsFocuserDriverInfo;
-
-/* ─── Focuser Opaque Handle ─── */
-typedef struct OlsFocuserInterface_t OlsFocuserInterface;
-
-/* ═══════════════════════════════════════════════════════════════════
- *  Focuser API
- * ═══════════════════════════════════════════════════════════════════ */
-
-/** Create a focuser interface. */
-OlsError ols_focuser_interface_create(OlsFocuserInterface** out_fi);
-
-/** List available focuser drivers. */
-OlsError ols_focuser_driver_list(OlsFocuserInterface* fi,
-                                  OlsFocuserDriverInfo* out_drivers, int32_t max_drivers,
-                                  int32_t* out_count);
-
-/** Load a focuser driver by name and option. */
-OlsError ols_focuser_load_driver(OlsFocuserInterface* fi,
-                                  const char* driver_name, const char* option);
-
-/** Check if focuser is loaded. */
-int32_t ols_focuser_is_loaded(OlsFocuserInterface* fi);
-
-/** Get current focuser position. */
-OlsError ols_focuser_position(OlsFocuserInterface* fi, int32_t* out_position);
-
-/** Move to absolute position. */
-OlsError ols_focuser_move_to(OlsFocuserInterface* fi, int32_t position);
-
-/** Move by relative steps. */
-OlsError ols_focuser_move_by(OlsFocuserInterface* fi, int32_t delta);
-
-/** Abort focuser motion. */
-OlsError ols_focuser_abort(OlsFocuserInterface* fi);
-
-/** Check if focuser is currently moving. */
-OlsError ols_focuser_is_moving(OlsFocuserInterface* fi, int32_t* out_moving);
-
-/** Check if focuser uses absolute positioning. */
-OlsError ols_focuser_is_absolute(OlsFocuserInterface* fi, int32_t* out_absolute);
-
-/** Get maximum range of focuser. */
-OlsError ols_focuser_max_range(OlsFocuserInterface* fi, int32_t* out_range);
-
-/** Unload focuser driver. */
-OlsError ols_focuser_unload(OlsFocuserInterface* fi);
-
-/** Destroy the focuser interface. */
-void ols_focuser_interface_destroy(OlsFocuserInterface* fi);
 
 #ifdef __cplusplus
 }

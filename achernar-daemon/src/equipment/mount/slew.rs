@@ -314,7 +314,7 @@ impl Operation<DynMount> for SlewOp {
                     self.phase = Phase::Settling { until_mono_ns };
                     OpProgress::Settling { until_mono_ns }
                 }
-                // No completion property at all (the OLS legacy adapter):
+                // No completion property at all (the OLS INDI legacy adapter):
                 // arrival cannot be observed, so the outcome is unknown
                 // (C-5, C-6) rather than a guess or a 10-minute timeout.
                 _ if state.slewing.state == ObsState::Unsupported => {

@@ -121,8 +121,9 @@ variable is **unset**; it prints `ACHERNAR_MOUNT_SIM is not set; skipping
 this local-only interop test` (visible with `--nocapture`). A variable that
 is set but does not name an existing file fails the test with the path, so a
 mistyped path cannot pass. A pass with a variable unset proves nothing about
-that fixture: for the O2 gate (deleting the OLS mount and focuser) and for a
-rig session, run with both variables set and check the output for the
+that fixture: for an acceptance run (the O2 gate that retired the OLS Alpaca
+mount and the OLS focuser, §1.4) and for a rig session, run with both
+variables set and check the output for the
 host-sim and OmniSim lines (`host sim: ...`, `OmniSim on port ...`). An
 OmniSim log is removed after a pass and kept, with its path printed, after a
 failure.
@@ -176,6 +177,31 @@ curl -s -X POST $D/connect -H "$J" -d '{"equipment_type":"safety_monitor","drive
 Simulator identities are `sim:{kind}` and their `device_connections` rows
 have `driver = 'sim'`, so simulator runs never mix with hardware evidence.
 Simulator runs never update a real rig's drift model or focuser scale (D18).
+
+### 1.4 Retired: the OLS Alpaca mount and the OLS focuser (O2)
+
+Once every acceptance suite of the native Alpaca mount and focuser passed
+(the unit and fake-transport tests, the in-process Alpaca server scenario of
+§1.1, and the ESP32 host-simulator and OmniSim interop of §1.2), the OLS
+Alpaca mount and the OLS focuser were deleted, with no fallback (owner
+decision O2). Cameras stay on OLS (O1), and so does the interim OLS INDI
+mount (`indi`, `ols_indi`, where the bridge has libindi; O3) until the
+native INDI client of Tier 2.
+
+- The public driver ids are unchanged: `alpaca` and `sim` (or `simulator`)
+  for the mount and the focuser reach the native drivers.
+- The hidden id `ols_alpaca` is refused with
+  `400 {"error": {"code": "driver_retired", ...}}`, whose message names its
+  replacement: connect with `"driver": "alpaca"` and the same option
+  (`http(s)://host:port#device=N`). The device that is connected stays
+  connected.
+- Identity keys: the OLS adapter keyed a device by its address
+  (`alpaca:{host}:{port}/{type}/{n}`); the native driver uses the same key
+  unless the device reports a UniqueID, and then `alpaca:{UniqueID}` (§2.6).
+  A profile written while a device with a UniqueID was connected through
+  `ols_alpaca` is therefore not found under the native key: read the new
+  key from `identity.identity_key` in the `/connect` reply and declare the
+  profile again under it (§3.2).
 
 ---
 

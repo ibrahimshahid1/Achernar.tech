@@ -104,13 +104,18 @@ set(BRIDGE_SOURCES
     ${BRIDGE_SRC}/ols_bridge.cpp
     ${BRIDGE_SRC}/camera_base.cpp
 
-    # OLS Alpaca drivers (no vendor SDK needed)
+    # OLS Alpaca camera and its client (no vendor SDK needed)
     ${OLS_SRC}/alpaca_camera.cpp
-    ${OLS_SRC}/mount.cpp
-    ${OLS_SRC}/alpaca_mount.cpp
-    ${OLS_SRC}/focuser.cpp
-    ${OLS_SRC}/alpaca_focuser.cpp
     ${OLS_SRC}/alpaca_client.cpp
+
+    # OLS mount interface, for the interim INDI mount (owner decision O3;
+    # indi_mount.cpp is added below where libindi is found). OLS's Alpaca
+    # mount (alpaca_mount.cpp) and its focuser (focuser.cpp,
+    # alpaca_focuser.cpp) were removed at the end of Tier 1 (owner decision
+    # O2): the daemon's native equipment layer drives them. ols_bridge.cpp
+    # defines the alpaca_start_driver entry point mount.cpp names, as a
+    # refusal.
+    ${OLS_SRC}/mount.cpp
 
     # OLS utilities (needed by sim camera for file I/O)
     ${OLS_SRC}/util.cpp
@@ -496,7 +501,7 @@ endif()
 # ─── Status Summary ───
 message(STATUS "")
 message(STATUS "═══ OLS Bridge Build Summary ═══")
-message(STATUS "  Core:     Camera (Sim, Alpaca, WatchDir), Mount (Alpaca), Focuser (Alpaca)")
+message(STATUS "  Core:     Camera (Sim, Alpaca, WatchDir); mount interface for INDI")
 get_directory_property(COMPILE_DEFS COMPILE_DEFINITIONS)
 if("WITH_ASI" IN_LIST COMPILE_DEFS)
     message(STATUS "  Camera:   ✅ ASI (ZWO)")

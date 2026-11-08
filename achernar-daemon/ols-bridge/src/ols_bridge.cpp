@@ -6,16 +6,17 @@
  * opaque C handles. cppcms/booster dependencies are replaced with
  * header-only shims (nlohmann/json, minimal socket wrappers).
  *
- * Supports: Sim camera, Alpaca camera, Alpaca mount, Alpaca focuser.
- * Vendor SDK cameras (ASI, SVB, Toup) are conditionally compiled.
+ * Supports: Sim camera, Alpaca camera, and OLS's mount interface for the
+ * interim INDI mount (owner decision O3, only with libindi). Vendor SDK
+ * cameras (ASI, SVB, Toup) are conditionally compiled. The OLS Alpaca mount
+ * and the OLS focuser were removed at the end of Tier 1 (owner decision O2):
+ * the daemon's native equipment layer drives Alpaca mounts and focusers.
  */
 
 #include "ols_bridge.h"
 #include "camera.h"
 #include "mount.h"
-#include "focuser.h"
 #include "alpaca_mount.h"
-#include "alpaca_focuser.h"
 #include "os_util.h"
 #include "tiffmat.h"
 #include "util.h"
@@ -413,6 +414,27 @@ struct CallbackTrampoline {
 };
 
 } // namespace ols_bridge
+
+// ═══════════════════════════════════════════════════════════════════
+//  Retired OLS Alpaca mount (owner decision O2)
+// ═══════════════════════════════════════════════════════════════════
+//
+// OLS's Alpaca mount (alpaca_mount.cpp) is no longer compiled: the daemon's
+// native Alpaca client drives Alpaca mounts. OLS's MountInterface (mount.cpp,
+// kept for the interim INDI mount, O3) still names this entry point for its
+// "alpaca" driver, so the bridge defines it to refuse instead of linking it.
+
+static const char *const kRetiredAlpacaMount =
+    "The OLS Alpaca mount was removed (owner decision O2); connect the mount "
+    "with the daemon's native 'alpaca' driver";
+
+namespace ols {
+std::unique_ptr<MountDriver> alpaca_start_driver(std::string const &,
+                                                 MountErrorCode &e) {
+  e = std::string(kRetiredAlpacaMount);
+  return nullptr;
+}
+} // namespace ols
 
 // ═══════════════════════════════════════════════════════════════════
 //  C API Implementation
@@ -1330,6 +1352,12 @@ OlsError ols_mount_driver_list(OlsMountInterface *mi,
   try {
     auto g = mi->iface->guard();
     auto drivers = mi->iface->drivers_list();
+    // OLS still lists its retired "alpaca" mount driver (O2); hide it.
+    drivers.erase(std::remove_if(drivers.begin(), drivers.end(),
+                                 [](auto const &d) {
+                                   return d.name == "alpaca";
+                                 }),
+                  drivers.end());
     *out_count = std::min((int32_t)drivers.size(), max_drivers);
     for (int32_t i = 0; i < *out_count; i++) {
       strncpy(out_drivers[i].name, drivers[i].name.c_str(), 127);
@@ -1346,6 +1374,8 @@ OlsError ols_mount_driver_list(OlsMountInterface *mi,
 
 OlsError ols_mount_load_driver(OlsMountInterface *mi,
                                 const char *driver_name, const char *option) {
+  if (driver_name && std::string(driver_name) == "alpaca")
+    return set_error(OLS_ERR_NOT_SUPPORTED, kRetiredAlpacaMount);
   try {
     mi->iface->load_driver(driver_name, option ? option : "auto");
     return OLS_OK;
@@ -1628,179 +1658,5 @@ OlsError ols_mount_shutdown(OlsMountInterface *mi) {
 }
 
 void ols_mount_interface_destroy(OlsMountInterface *mi) { delete mi; }
-
-// ═══════════════════════════════════════════════════════════════════
-//  Focuser API Implementation
-// ═══════════════════════════════════════════════════════════════════
-
-struct OlsFocuserInterface_t {
-  // We use the OLS singleton directly but wrap access
-  bool driver_loaded = false;
-};
-
-OlsError ols_focuser_interface_create(OlsFocuserInterface **out_fi) {
-  try {
-    auto *fi = new OlsFocuserInterface_t();
-    *out_fi = fi;
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
-}
-
-OlsError ols_focuser_driver_list(OlsFocuserInterface *fi,
-                                  OlsFocuserDriverInfo *out_drivers, int32_t max_drivers,
-                                  int32_t *out_count) {
-  (void)fi;
-  try {
-    auto drivers = ols::FocuserInterface::instance().drivers_list();
-    *out_count = std::min((int32_t)drivers.size(), max_drivers);
-    for (int32_t i = 0; i < *out_count; i++) {
-      strncpy(out_drivers[i].name, drivers[i].name.c_str(), 127);
-      out_drivers[i].name[127] = '\0';
-      strncpy(out_drivers[i].option, drivers[i].opt.c_str(), 127);
-      out_drivers[i].option[127] = '\0';
-    }
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
-}
-
-OlsError ols_focuser_load_driver(OlsFocuserInterface *fi,
-                                  const char *driver_name, const char *option) {
-  try {
-    ols::FocuserInfo info;
-    info.name = driver_name;
-    info.opt = option ? option : "auto";
-    ols::FocuserErrorCode e;
-    ols::FocuserInterface::instance().load_driver(info, e);
-    if (e) return set_error(OLS_ERR_IO, e.message());
-    fi->driver_loaded = true;
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
-}
-
-int32_t ols_focuser_is_loaded(OlsFocuserInterface *fi) {
-  (void)fi;
-  return ols::FocuserInterface::focuser() != nullptr ? 1 : 0;
-}
-
-OlsError ols_focuser_position(OlsFocuserInterface *fi, int32_t *out_position) {
-  (void)fi;
-  try {
-    auto *f = ols::FocuserInterface::focuser();
-    if (!f) return set_error(OLS_ERR_NOT_CONNECTED, "Focuser not loaded");
-    ols::FocuserErrorCode e;
-    *out_position = f->position(e);
-    if (e) return set_error(OLS_ERR_IO, e.message());
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
-}
-
-OlsError ols_focuser_move_to(OlsFocuserInterface *fi, int32_t position) {
-  (void)fi;
-  try {
-    auto *f = ols::FocuserInterface::focuser();
-    if (!f) return set_error(OLS_ERR_NOT_CONNECTED, "Focuser not loaded");
-    ols::FocuserErrorCode e;
-    f->move_to(position, e);
-    if (e) return set_error(OLS_ERR_IO, e.message());
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
-}
-
-OlsError ols_focuser_move_by(OlsFocuserInterface *fi, int32_t delta) {
-  (void)fi;
-  try {
-    auto *f = ols::FocuserInterface::focuser();
-    if (!f) return set_error(OLS_ERR_NOT_CONNECTED, "Focuser not loaded");
-    ols::FocuserErrorCode e;
-    f->move_by(delta, e);
-    if (e) return set_error(OLS_ERR_IO, e.message());
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
-}
-
-OlsError ols_focuser_abort(OlsFocuserInterface *fi) {
-  (void)fi;
-  try {
-    auto *f = ols::FocuserInterface::focuser();
-    if (!f) return set_error(OLS_ERR_NOT_CONNECTED, "Focuser not loaded");
-    ols::FocuserErrorCode e;
-    f->abort(e);
-    if (e) return set_error(OLS_ERR_IO, e.message());
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
-}
-
-OlsError ols_focuser_is_moving(OlsFocuserInterface *fi, int32_t *out_moving) {
-  (void)fi;
-  try {
-    auto *f = ols::FocuserInterface::focuser();
-    if (!f) return set_error(OLS_ERR_NOT_CONNECTED, "Focuser not loaded");
-    ols::FocuserErrorCode e;
-    *out_moving = f->is_moving(e) ? 1 : 0;
-    if (e) return set_error(OLS_ERR_IO, e.message());
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
-}
-
-OlsError ols_focuser_is_absolute(OlsFocuserInterface *fi, int32_t *out_absolute) {
-  (void)fi;
-  try {
-    auto *f = ols::FocuserInterface::focuser();
-    if (!f) return set_error(OLS_ERR_NOT_CONNECTED, "Focuser not loaded");
-    ols::FocuserErrorCode e;
-    *out_absolute = f->is_absolute(e) ? 1 : 0;
-    if (e) return set_error(OLS_ERR_IO, e.message());
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
-}
-
-OlsError ols_focuser_max_range(OlsFocuserInterface *fi, int32_t *out_range) {
-  (void)fi;
-  try {
-    auto *f = ols::FocuserInterface::focuser();
-    if (!f) return set_error(OLS_ERR_NOT_CONNECTED, "Focuser not loaded");
-    ols::FocuserErrorCode e;
-    *out_range = f->max_range(e);
-    if (e) return set_error(OLS_ERR_IO, e.message());
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
-}
-
-OlsError ols_focuser_unload(OlsFocuserInterface *fi) {
-  try {
-    ols::FocuserInterface::instance().unload_driver();
-    fi->driver_loaded = false;
-    return OLS_OK;
-  } catch (std::exception const &ex) {
-    return set_error(OLS_ERR_GENERIC, ex);
-  }
-}
-
-void ols_focuser_interface_destroy(OlsFocuserInterface *fi) {
-  if (fi && fi->driver_loaded) {
-    ols::FocuserInterface::instance().unload_driver();
-  }
-  delete fi;
-}
 
 } // extern "C"

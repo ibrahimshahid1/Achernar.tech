@@ -937,10 +937,30 @@ async fn a_refused_or_unreachable_replacement_leaves_the_connected_mount_connect
         assert_eq!(err.status.as_u16(), 400, "{option:?}: {}", err.message);
         still_connected(option);
     }
-    // The legacy OLS adapter gets the same D13 refusal.
-    let err = connect_err(&state, "mount", "ols_alpaca", "auto").await;
-    assert_eq!(err.code, "broadcast_discovery_disabled");
-    still_connected("ols_alpaca auto");
+    // The retired OLS Alpaca adapter id (O2) is refused before anything is
+    // touched, with its replacement named; nothing falls back to it.
+    for kind in ["mount", "focuser"] {
+        let err = connect_err(
+            &state,
+            kind,
+            "ols_alpaca",
+            "http://127.0.0.1:11111#device=0",
+        )
+        .await;
+        assert_eq!(
+            (err.status.as_u16(), err.code),
+            (400, "driver_retired"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message.contains("use driver 'alpaca'"),
+            "{}",
+            err.message
+        );
+        still_connected("ols_alpaca");
+    }
+    assert!(eq::focuser_handle(&state).is_err(), "no focuser");
     // The relay too (D12).
     let relayed = crate::relay_commands::execute(
         state.clone(),

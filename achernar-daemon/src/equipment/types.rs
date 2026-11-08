@@ -469,8 +469,9 @@ impl<T> Observed<T> {
 // Drivers, endpoints and identity
 // ---------------------------------------------------------------------------
 
-/// Driver implementations. `OlsAlpaca` lives until the end of Tier 1 (O2);
-/// `OlsIndi` until the native INDI client is accepted (O3).
+/// Driver implementations. `OlsIndi` lives until the native INDI client is
+/// accepted (O3). The OLS Alpaca adapter (`ols_alpaca`) was deleted at the
+/// end of Tier 1 (O2); `/connect` refuses that id and names `alpaca`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverId {
@@ -480,7 +481,6 @@ pub enum DriverId {
     #[serde(rename = "direct")]
     DirectGuider,
     Sim,
-    OlsAlpaca,
     OlsIndi,
 }
 
@@ -492,7 +492,6 @@ impl DriverId {
             DriverId::Phd2 => "phd2",
             DriverId::DirectGuider => "direct",
             DriverId::Sim => "sim",
-            DriverId::OlsAlpaca => "ols_alpaca",
             DriverId::OlsIndi => "ols_indi",
         }
     }
@@ -505,7 +504,6 @@ impl DriverId {
             "phd2" => Some(DriverId::Phd2),
             "direct" => Some(DriverId::DirectGuider),
             "sim" | "simulator" => Some(DriverId::Sim),
-            "ols_alpaca" => Some(DriverId::OlsAlpaca),
             "ols_indi" => Some(DriverId::OlsIndi),
             _ => None,
         }
@@ -1414,6 +1412,7 @@ mod tests {
         );
         assert_eq!(DriverId::parse("simulator"), Some(DriverId::Sim));
         assert_eq!(DriverId::parse("lx200"), None, "O4 removed native LX200");
+        assert_eq!(DriverId::parse("ols_alpaca"), None, "O2 removed it");
         assert_eq!(
             serde_json::to_value(ClockQuality::HostTriggerBracket).unwrap(),
             json!("host_trigger_bracket")

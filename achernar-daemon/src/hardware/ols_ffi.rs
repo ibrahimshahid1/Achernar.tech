@@ -2,7 +2,8 @@
 //!
 //! These are unsafe C function declarations that map 1:1 to the
 //! functions defined in `ols-bridge/include/ols_bridge.h`.
-//! Safe wrappers live in sibling modules (camera.rs, mount.rs, focuser.rs).
+//! Safe wrappers live in sibling modules (camera.rs, and mount.rs for the
+//! interim OLS INDI mount).
 
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
@@ -336,17 +337,6 @@ pub struct OlsMountDriverInfo {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-//  Focuser Types
-// ═══════════════════════════════════════════════════════════════════
-
-#[repr(C)]
-#[derive(Debug, Clone)]
-pub struct OlsFocuserDriverInfo {
-    pub name: [c_char; 128],
-    pub option: [c_char; 128],
-}
-
-// ═══════════════════════════════════════════════════════════════════
 //  Opaque Handle Types
 // ═══════════════════════════════════════════════════════════════════
 
@@ -362,11 +352,6 @@ pub struct OlsCamera {
 
 #[repr(C)]
 pub struct OlsMountInterface {
-    _private: [u8; 0],
-}
-
-#[repr(C)]
-pub struct OlsFocuserInterface {
     _private: [u8; 0],
 }
 
@@ -639,42 +624,6 @@ extern "C" {
     pub fn ols_mount_shutdown(mi: *mut OlsMountInterface) -> c_int;
 
     pub fn ols_mount_interface_destroy(mi: *mut OlsMountInterface);
-
-    // ═══ Focuser API ═══
-    pub fn ols_focuser_interface_create(out_fi: *mut *mut OlsFocuserInterface) -> c_int;
-
-    pub fn ols_focuser_driver_list(
-        fi: *mut OlsFocuserInterface,
-        out_drivers: *mut OlsFocuserDriverInfo,
-        max_drivers: i32,
-        out_count: *mut i32,
-    ) -> c_int;
-
-    pub fn ols_focuser_load_driver(
-        fi: *mut OlsFocuserInterface,
-        driver_name: *const c_char,
-        option: *const c_char,
-    ) -> c_int;
-
-    pub fn ols_focuser_is_loaded(fi: *mut OlsFocuserInterface) -> i32;
-
-    pub fn ols_focuser_position(fi: *mut OlsFocuserInterface, out_position: *mut i32) -> c_int;
-
-    pub fn ols_focuser_move_to(fi: *mut OlsFocuserInterface, position: i32) -> c_int;
-
-    pub fn ols_focuser_move_by(fi: *mut OlsFocuserInterface, delta: i32) -> c_int;
-
-    pub fn ols_focuser_abort(fi: *mut OlsFocuserInterface) -> c_int;
-
-    pub fn ols_focuser_is_moving(fi: *mut OlsFocuserInterface, out_moving: *mut i32) -> c_int;
-
-    pub fn ols_focuser_is_absolute(fi: *mut OlsFocuserInterface, out_absolute: *mut i32) -> c_int;
-
-    pub fn ols_focuser_max_range(fi: *mut OlsFocuserInterface, out_range: *mut i32) -> c_int;
-
-    pub fn ols_focuser_unload(fi: *mut OlsFocuserInterface) -> c_int;
-
-    pub fn ols_focuser_interface_destroy(fi: *mut OlsFocuserInterface);
 }
 
 // ═══════════════════════════════════════════════════════════════════

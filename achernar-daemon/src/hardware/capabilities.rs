@@ -7,8 +7,9 @@
 //! driver has been proven (`planned`, `implemented_unqualified`,
 //! `qualified`). Only a rig acceptance record makes a device identity
 //! `qualified` (§5.7, WP1B-6), so every implemented driver here is
-//! `implemented_unqualified`. The hidden legacy ids `ols_alpaca` and
-//! `ols_indi` stay connectable but are not listed.
+//! `implemented_unqualified`. The hidden legacy id `ols_indi` (O3) stays
+//! connectable but is not listed. `ols_alpaca` was removed with the OLS
+//! Alpaca mount and focuser (O2); `/connect` refuses it and names `alpaca`.
 
 use serde::Serialize;
 use std::ffi::CStr;

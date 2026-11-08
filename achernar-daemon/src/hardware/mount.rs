@@ -1,7 +1,10 @@
 //! Mount hardware abstraction via OLS bridge.
 //!
-//! Provides a safe Rust wrapper around the OLS C++ mount drivers
-//! (currently ASCOM Alpaca, with INDI as a conditional compile target).
+//! Provides a safe Rust wrapper around the OLS C++ mount interface. Its one
+//! remaining driver is OLS's INDI client (`indi:remote`, compiled only with
+//! libindi), behind the interim `ols_indi` adapter (`equipment/legacy`,
+//! owner decision O3). OLS's Alpaca mount was deleted at the end of Tier 1
+//! (O2): Alpaca mounts use the native client (`equipment/alpaca`).
 //! All methods translate to FFI calls through the OLS bridge.
 
 use serde::{Deserialize, Serialize};
@@ -14,11 +17,10 @@ use super::ols_ffi;
 //  Public Types
 // ═══════════════════════════════════════════════════════════════════
 
+/// The OLS mount driver the wrapper loads. Only INDI remains (O3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MountDriver {
-    Alpaca,
     Indi,
-    Simulator,
 }
 
 impl MountDriver {
@@ -30,9 +32,7 @@ impl MountDriver {
     /// embedded-INDI Android variant), which the daemon's bridge never enables.
     pub fn ols_name(&self) -> &str {
         match self {
-            MountDriver::Alpaca => "alpaca",
             MountDriver::Indi => "indi:remote",
-            MountDriver::Simulator => "alpaca",
         }
     }
 
@@ -42,7 +42,7 @@ impl MountDriver {
             MountDriver::Indi if option.is_empty() || option == "auto" => {
                 "localhost:7624".to_string()
             }
-            _ => option.to_string(),
+            MountDriver::Indi => option.to_string(),
         }
     }
 }
@@ -194,7 +194,8 @@ impl Mount {
         self.connect_with_option("auto")
     }
 
-    /// Connect to the mount with a specific driver option (e.g., Alpaca URL).
+    /// Connect to the mount with a specific driver option (an indiserver
+    /// `host[:port]`).
     pub fn connect_with_option(&mut self, option: &str) -> crate::error::Result<()> {
         let driver_name = CString::new(self.driver_type.ols_name()).map_err(|_| {
             crate::error::HardwareError::Communication("Invalid driver name".into())
@@ -481,20 +482,5 @@ mod tests {
             MountDriver::Indi.ols_option("10.0.0.5:7625"),
             "10.0.0.5:7625"
         );
-    }
-
-    #[test]
-    fn alpaca_and_sim_options_unchanged() {
-        assert_eq!(MountDriver::Alpaca.ols_name(), "alpaca");
-        assert_eq!(MountDriver::Simulator.ols_name(), "alpaca");
-        for option in [
-            "auto",
-            "",
-            "http://127.0.0.1:11111#device=0",
-            "http://mount.local:11111",
-        ] {
-            assert_eq!(MountDriver::Alpaca.ols_option(option), option);
-            assert_eq!(MountDriver::Simulator.ols_option(option), option);
-        }
     }
 }

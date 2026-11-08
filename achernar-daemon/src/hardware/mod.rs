@@ -1,17 +1,16 @@
 // Hardware abstraction modules
-// Real camera/mount/focuser support via OpenLiveStacker C++ drivers
+// Camera support via OpenLiveStacker C++ drivers (O1); every other device
+// class lives in the native equipment layer (`equipment`)
 
 pub mod camera;
 pub mod capabilities;
 pub mod discovery;
 pub mod dslr_controls;
-// The OLS mount and focuser wrappers now run only behind the equipment
-// layer's legacy adapters (`equipment/legacy`), and the old filter-wheel
-// stub is superseded by the native wheel. They are deleted as their own work
-// package once the native drivers pass acceptance (owner decision O2); until
-// then their unused parts are expected.
-#[allow(dead_code)]
-pub mod filter_wheel;
+// The OLS Alpaca mount, the OLS focuser and the old filter-wheel stub were
+// deleted at the end of Tier 1 once the native drivers passed acceptance
+// (owner decision O2). `focuser` keeps only the older in-process simulator
+// the tests use, and `mount` the OLS wrapper behind the interim INDI adapter
+// (`equipment/legacy`, O3); their unused parts are expected.
 #[allow(dead_code)]
 pub mod focuser;
 pub mod health;

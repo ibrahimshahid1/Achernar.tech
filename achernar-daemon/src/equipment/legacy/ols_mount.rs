@@ -1,10 +1,11 @@
-//! OLS legacy mount adapters `ols_alpaca` and `ols_indi` (D1, O2, O3), run
-//! through the same worker as the native drivers. Owner: WP1A-4.
+//! The OLS legacy mount adapter `ols_indi` (D1, O3), run through the same
+//! worker as the native drivers. Owner: WP1A-4.
 //!
-//! `ols_alpaca` is deleted at the end of Tier 1, once the native Alpaca
-//! mount passes acceptance (O2); `ols_indi` once the native INDI client is
-//! accepted (O3). Until then, Tier 1 routes the public `indi` mount id to
-//! `ols_indi` where `WITH_INDI` is compiled.
+//! It fronts the OLS `indi:remote` mount and is deleted once the native INDI
+//! client passes acceptance in Tier 2 (O3). Until then, Tier 1 routes the
+//! public `indi` mount id here where `WITH_INDI` is compiled. Its Alpaca
+//! twin `ols_alpaca` was deleted at the end of Tier 1, with the OLS Alpaca
+//! mount itself, once the native Alpaca mount passed acceptance (O2).
 //!
 //! What the OLS wrapper (`D/hardware/mount.rs`) can and cannot do, per the
 //! §7.1 "O" column, is published honestly instead of hidden:
@@ -19,8 +20,8 @@
 //! - The tracking-rate write is refused: the OLS wrapper sets Lunar when
 //!   asked for Solar.
 //! - AbortSlew is attempted with OLS `stop()`, which halts manual motion but
-//!   does not abort a GoTo (`D/hardware/mount.rs`); the abort therefore
-//!   reports `Unsupported` rather than claiming success.
+//!   does not abort a GoTo; the abort therefore reports `Unsupported` rather
+//!   than claiming success.
 //! - OLS itself forces tracking on for a GoTo and applies the limits in
 //!   `~/.ols_mount_config.txt`; Achernar's gate checks still run first.
 //!
@@ -134,42 +135,13 @@ impl OlsMountBackend for crate::hardware::mount::Mount {
     }
 }
 
-/// Which OLS mount driver the adapter fronts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OlsFlavour {
-    /// OLS `alpaca:remote`; option `http(s)://host:port#device=N`.
-    Alpaca,
-    /// OLS `indi:remote`; option `host[:port]` of an indiserver.
-    Indi,
-}
-
-impl OlsFlavour {
-    pub fn driver_id(self) -> DriverId {
-        match self {
-            OlsFlavour::Alpaca => DriverId::OlsAlpaca,
-            OlsFlavour::Indi => DriverId::OlsIndi,
-        }
-    }
-
-    pub fn hardware_driver(self) -> crate::hardware::mount::MountDriver {
-        match self {
-            OlsFlavour::Alpaca => crate::hardware::mount::MountDriver::Alpaca,
-            OlsFlavour::Indi => crate::hardware::mount::MountDriver::Indi,
-        }
-    }
-
-    /// The option handed to the OLS wrapper. The public INDI option is
-    /// `host:port#device=<INDI device name>` (§2.12); OLS `indi:remote`
-    /// takes only `host[:port]` and picks the telescope itself, so the
-    /// interim adapter drops the fragment (the native INDI client of Tier 2
-    /// uses it). The Alpaca option is OLS's own format, `#device=N` included.
-    pub fn backend_option(self, option: &str) -> String {
-        let option = match self {
-            OlsFlavour::Alpaca => option,
-            OlsFlavour::Indi => option.split('#').next().unwrap_or_default().trim(),
-        };
-        self.hardware_driver().ols_option(option)
-    }
+/// The option handed to the OLS wrapper. The public INDI option is
+/// `host:port#device=<INDI device name>` (§2.12); OLS `indi:remote` takes
+/// only `host[:port]` and picks the telescope itself, so the interim adapter
+/// drops the fragment (the native INDI client of Tier 2 uses it).
+pub fn backend_option(option: &str) -> String {
+    let option = option.split('#').next().unwrap_or_default().trim();
+    crate::hardware::mount::MountDriver::Indi.ols_option(option)
 }
 
 /// The `#device=` fragment of an option, if one names a device.
@@ -194,54 +166,24 @@ fn host_port(option: &str, default_port: u16) -> (String, u16) {
     }
 }
 
-/// The identity of an OLS legacy mount for `option` (§2.6 identity keys).
-pub fn ols_identity(flavour: OlsFlavour, option: &str) -> DeviceIdentity {
-    let option = option.trim();
-    let (endpoint, key) = match flavour {
-        OlsFlavour::Alpaca => {
-            let (host, port) = host_port(option, 11111);
-            let number = option
-                .split_once("#device=")
-                .and_then(|(_, n)| n.trim().parse().ok())
-                .unwrap_or(0);
-            let base = option
-                .split('#')
-                .next()
-                .unwrap_or(option)
-                .trim_end_matches('/')
-                .to_string();
-            (
-                Endpoint::AlpacaHttp {
-                    base,
-                    device_type: "telescope".into(),
-                    number,
-                },
-                identity_key::alpaca(None, &host, port, "telescope", number),
-            )
-        }
-        OlsFlavour::Indi => {
-            let (host, port) = host_port(option, 7624);
-            let host = if host.is_empty() {
-                "localhost".to_string()
-            } else {
-                host
-            };
-            (
-                Endpoint::Indi {
-                    host: host.clone(),
-                    port,
-                    device: "telescope".into(),
-                },
-                identity_key::indi(&host, port, "telescope"),
-            )
-        }
+/// The identity of the OLS INDI mount for `option` (§2.6 identity keys).
+pub fn ols_identity(option: &str) -> DeviceIdentity {
+    let (host, port) = host_port(option.trim(), 7624);
+    let host = if host.is_empty() {
+        "localhost".to_string()
+    } else {
+        host
     };
     let mut identity = DeviceIdentity::new(
         DeviceKind::Mount,
-        flavour.driver_id(),
-        endpoint,
-        key,
-        format!("OLS {} mount", flavour.driver_id()),
+        DriverId::OlsIndi,
+        Endpoint::Indi {
+            host: host.clone(),
+            port,
+            device: "telescope".into(),
+        },
+        identity_key::indi(&host, port, "telescope"),
+        format!("OLS {} mount", DriverId::OlsIndi),
     );
     identity.driver_info = Some("OpenLiveStacker mount wrapper (legacy adapter)".into());
     identity
@@ -280,6 +222,10 @@ fn write<B>(lock: &RwLock<B>) -> RwLockWriteGuard<'_, B> {
     lock.write().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Why an abort through the adapter reports `Unsupported`.
+const ABORT_UNSUPPORTED: &str =
+    "OLS stop() halts manual motion but cannot abort a GoTo through the interim INDI adapter";
+
 /// OLS `stop()`, then an honest `Unsupported`: OLS cannot abort a GoTo.
 pub struct OlsMountAbort<B: OlsMountBackend> {
     backend: Arc<RwLock<B>>,
@@ -288,9 +234,7 @@ pub struct OlsMountAbort<B: OlsMountBackend> {
 impl<B: OlsMountBackend> AbortPath for OlsMountAbort<B> {
     fn abort(&self) -> DeviceResult<()> {
         read(&self.backend).stop().map_err(DeviceError::transport)?;
-        Err(DeviceError::unsupported(
-            "OLS stop() halts manual motion but cannot abort a GoTo; use the native alpaca driver",
-        ))
+        Err(DeviceError::unsupported(ABORT_UNSUPPORTED))
     }
 
     fn tracking_off(&self) -> DeviceResult<()> {
@@ -313,7 +257,6 @@ struct Sample {
 pub struct OlsMountAdapter<B: OlsMountBackend> {
     identity: DeviceIdentity,
     backend: Arc<RwLock<B>>,
-    flavour: OlsFlavour,
     option: String,
     clock: Arc<dyn Clock>,
     options: MountDriverOptions,
@@ -327,7 +270,6 @@ impl<B: OlsMountBackend> OlsMountAdapter<B> {
     pub fn new(
         identity: DeviceIdentity,
         backend: B,
-        flavour: OlsFlavour,
         option: impl Into<String>,
         clock: Arc<dyn Clock>,
         options: MountDriverOptions,
@@ -335,7 +277,6 @@ impl<B: OlsMountBackend> OlsMountAdapter<B> {
         Self {
             identity,
             backend: Arc::new(RwLock::new(backend)),
-            flavour,
             option: option.into(),
             clock,
             options,
@@ -354,20 +295,18 @@ impl<B: OlsMountBackend> OlsMountAdapter<B> {
     }
 }
 
-/// Create the OLS mount wrapper and its adapter (does not connect). Calls
-/// into the OLS bridge, so it is never used by tests.
+/// Create the OLS INDI mount wrapper and its adapter (does not connect).
+/// Calls into the OLS bridge, so it is never used by tests.
 pub fn open_ols_mount(
-    flavour: OlsFlavour,
     option: &str,
     clock: Arc<dyn Clock>,
     options: MountDriverOptions,
 ) -> DeviceResult<OlsMountAdapter<crate::hardware::mount::Mount>> {
-    let mount = crate::hardware::mount::Mount::new(flavour.hardware_driver())
+    let mount = crate::hardware::mount::Mount::new(crate::hardware::mount::MountDriver::Indi)
         .map_err(|e| DeviceError::driver(e.to_string()))?;
     Ok(OlsMountAdapter::new(
-        ols_identity(flavour, option),
+        ols_identity(option),
         mount,
-        flavour,
         option,
         clock,
         options,
@@ -381,15 +320,13 @@ impl<B: OlsMountBackend> Device for OlsMountAdapter<B> {
 
     fn connect(&mut self, _timeout: Duration) -> DeviceResult<ConnectReport> {
         let started = self.clock.now_mono_ns();
-        if self.flavour == OlsFlavour::Indi {
-            if let Some(device) = device_fragment(&self.option) {
-                tracing::warn!(
-                    "the OLS INDI mount adapter cannot select INDI device {device:?}; OLS uses \
-                     the first telescope on the server (the native INDI client will honour it)"
-                );
-            }
+        if let Some(device) = device_fragment(&self.option) {
+            tracing::warn!(
+                "the OLS INDI mount adapter cannot select INDI device {device:?}; OLS uses the \
+                 first telescope on the server (the native INDI client will honour it)"
+            );
         }
-        let option = self.flavour.backend_option(&self.option);
+        let option = backend_option(&self.option);
         write(&self.backend)
             .connect(&option)
             .map_err(DeviceError::transport)?;
@@ -403,16 +340,14 @@ impl<B: OlsMountBackend> Device for OlsMountAdapter<B> {
         drop(backend);
         self.connected = true;
         Ok(ConnectReport {
-            path: match self.flavour {
-                OlsFlavour::Alpaca => ConnectPath::Platform6,
-                OlsFlavour::Indi => ConnectPath::Indi,
-            },
+            path: ConnectPath::Indi,
             interface_version: None,
             device_state: false,
             unsupported_members: UNAVAILABLE.iter().map(|m| (*m).to_string()).collect(),
             warnings: vec![
-                "legacy OLS adapter: Slewing, AtPark, SideOfPier and guide rates are unavailable, \
-                 so GoTo outcomes are unknown; migrate to the native driver (O2, O3)"
+                "legacy OLS INDI adapter: Slewing, AtPark, SideOfPier and guide rates are \
+                 unavailable, so GoTo outcomes are unknown; the native INDI client replaces it \
+                 in Tier 2 (O3)"
                     .into(),
             ],
             duration_ms: self.clock.now_mono_ns().saturating_sub(started) / 1_000_000,
@@ -546,9 +481,7 @@ impl<B: OlsMountBackend> MountDriver for OlsMountAdapter<B> {
 
     fn abort_slew(&mut self) -> DeviceResult<()> {
         self.backend()?.stop().map_err(DeviceError::transport)?;
-        Err(DeviceError::unsupported(
-            "OLS stop() halts manual motion but cannot abort a GoTo; use the native alpaca driver",
-        ))
+        Err(DeviceError::unsupported(ABORT_UNSUPPORTED))
     }
 
     fn sync(&mut self, target: EqCoord) -> DeviceResult<()> {
@@ -726,16 +659,12 @@ mod tests {
         }
     }
 
-    fn adapter(
-        flavour: OlsFlavour,
-        option: &str,
-    ) -> (FakeOls, Arc<ManualClock>, OlsMountAdapter<FakeOls>) {
+    fn adapter(option: &str) -> (FakeOls, Arc<ManualClock>, OlsMountAdapter<FakeOls>) {
         let fake = FakeOls::default();
         let clock = Arc::new(ManualClock::new());
         let adapter = OlsMountAdapter::new(
-            ols_identity(flavour, option),
+            ols_identity(option),
             fake.clone(),
-            flavour,
             option,
             clock.clone(),
             MountDriverOptions::default(),
@@ -744,19 +673,12 @@ mod tests {
     }
 
     #[test]
-    fn identities_follow_the_alpaca_and_indi_key_rules() {
-        let id = ols_identity(OlsFlavour::Alpaca, "http://10.0.0.5:11111#device=1");
-        assert_eq!(id.driver, DriverId::OlsAlpaca);
-        assert_eq!(id.identity_key, "alpaca:10.0.0.5:11111/telescope/1");
-        assert_eq!(
-            id.endpoint.describe(),
-            "http://10.0.0.5:11111/api/v1/telescope/1"
-        );
-        let id = ols_identity(OlsFlavour::Indi, "pi.local:7625");
+    fn identities_follow_the_indi_key_rule() {
+        let id = ols_identity("pi.local:7625");
         assert_eq!(id.driver, DriverId::OlsIndi);
         assert_eq!(id.identity_key, "indi:pi.local:7625/telescope");
         assert_eq!(
-            ols_identity(OlsFlavour::Indi, "").identity_key,
+            ols_identity("").identity_key,
             "indi:localhost:7624/telescope"
         );
     }
@@ -764,8 +686,7 @@ mod tests {
     /// §2.12's INDI option `host:port#device=<name>`: OLS `indi:remote`
     /// takes only `host[:port]` (without a port it would take the whole
     /// string as the host name), so the interim adapter drops the fragment;
-    /// the identity keeps its host and port. The Alpaca option keeps its
-    /// `#device=N`, which OLS reads itself.
+    /// the identity keeps its host and port.
     #[test]
     fn the_indi_device_fragment_never_reaches_ols() {
         for (option, ols) in [
@@ -775,18 +696,14 @@ mod tests {
             ("#device=EQMod Mount", "localhost:7624"),
             ("", "localhost:7624"),
         ] {
-            assert_eq!(OlsFlavour::Indi.backend_option(option), ols, "{option:?}");
-            let (fake, _clock, mut drv) = adapter(OlsFlavour::Indi, option);
+            assert_eq!(backend_option(option), ols, "{option:?}");
+            let (fake, _clock, mut drv) = adapter(option);
             drv.connect(Duration::from_secs(1)).unwrap();
             assert_eq!(fake.state().option, ols, "{option:?}");
         }
         assert_eq!(
-            ols_identity(OlsFlavour::Indi, "pi.local:7625#device=EQMod Mount").identity_key,
+            ols_identity("pi.local:7625#device=EQMod Mount").identity_key,
             "indi:pi.local:7625/telescope"
-        );
-        assert_eq!(
-            OlsFlavour::Alpaca.backend_option("http://h:11111#device=1"),
-            "http://h:11111#device=1"
         );
         assert_eq!(device_fragment("h:1#device= EQMod "), Some("EQMod"));
         assert_eq!(device_fragment("h:1#device="), None);
@@ -795,7 +712,7 @@ mod tests {
 
     #[test]
     fn the_adapter_publishes_what_ols_cannot_do_as_unsupported() {
-        let (fake, _clock, mut drv) = adapter(OlsFlavour::Indi, "auto");
+        let (fake, _clock, mut drv) = adapter("auto");
         let report = drv.connect(Duration::from_secs(1)).unwrap();
         assert_eq!(
             fake.state().option,
@@ -826,7 +743,7 @@ mod tests {
 
     #[test]
     fn pulses_map_to_the_ols_sign_convention() {
-        let (fake, _clock, mut drv) = adapter(OlsFlavour::Alpaca, "http://h:11111#device=0");
+        let (fake, _clock, mut drv) = adapter("pi.local:7624");
         drv.connect(Duration::from_secs(1)).unwrap();
         for dir in [
             GuideDirection::North,
@@ -844,7 +761,7 @@ mod tests {
 
     #[test]
     fn abort_is_attempted_but_reported_as_unsupported() {
-        let (fake, _clock, mut drv) = adapter(OlsFlavour::Alpaca, "http://h:11111");
+        let (fake, _clock, mut drv) = adapter("pi.local:7624");
         drv.connect(Duration::from_secs(1)).unwrap();
         let err = drv.abort_path().unwrap().abort().unwrap_err();
         assert_eq!(err.class, ErrorClass::Unsupported);
@@ -854,7 +771,7 @@ mod tests {
 
     #[test]
     fn a_legacy_goto_ends_unknown_because_slewing_cannot_be_read() {
-        let (fake, clock, mut drv) = adapter(OlsFlavour::Alpaca, "http://h:11111");
+        let (fake, clock, mut drv) = adapter("pi.local:7624");
         drv.connect(Duration::from_secs(1)).unwrap();
         drv.poll(&PollPlan::default()).unwrap();
         let site = Site {
@@ -913,7 +830,7 @@ mod tests {
 
     #[test]
     fn a_failed_read_leaves_stale_values_and_disconnect_never_parks() {
-        let (fake, _clock, mut drv) = adapter(OlsFlavour::Alpaca, "http://h:11111");
+        let (fake, _clock, mut drv) = adapter("pi.local:7624");
         drv.connect(Duration::from_secs(1)).unwrap();
         drv.poll(&PollPlan::default()).unwrap();
         fake.state().fail_position = true;

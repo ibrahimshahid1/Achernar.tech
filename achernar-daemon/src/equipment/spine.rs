@@ -44,8 +44,7 @@ use super::guider::service::Phd2Connection;
 use super::handle::{DeviceHandle, Permit};
 use super::hub::EquipmentHub;
 use super::kinds::{FilterWheelKind, FocuserKind, MountKind, SafetyKind, WeatherKind};
-use super::legacy::ols_focuser::OlsFocuserAdapter;
-use super::legacy::ols_mount::{open_ols_mount, OlsFlavour};
+use super::legacy::ols_mount::open_ols_mount;
 use super::mount::limits::{MountLimits, MountLimitsCheck};
 use super::mount::{MountRuntime, MountSettings, MountShared};
 
@@ -90,16 +89,14 @@ pub enum DriverChoice {
     Alpaca,
     /// The in-process simulator.
     Sim,
-    /// The hidden OLS Alpaca legacy adapter (mount and focuser, until O2).
-    OlsAlpaca,
     /// The OLS `indi:remote` mount (O3 interim; where compiled).
     OlsIndi,
     /// PHD2's event server (guider).
     Phd2,
 }
 
-/// Why a driver id cannot be used for a kind: 400 for an unknown id, 501
-/// for one that is planned or not compiled into this build.
+/// Why a driver id cannot be used for a kind: 400 for an unknown or a
+/// retired id, 501 for one that is planned or not compiled into this build.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DriverRefusal {
     pub status: u16,
@@ -112,6 +109,16 @@ impl DriverRefusal {
         Self {
             status: 501,
             code: "driver_not_available",
+            message: message.into(),
+        }
+    }
+
+    /// A driver id that was removed: refused with its replacement named,
+    /// never mapped to another driver behind the caller's back.
+    fn retired(message: impl Into<String>) -> Self {
+        Self {
+            status: 400,
+            code: "driver_retired",
             message: message.into(),
         }
     }
@@ -137,7 +144,9 @@ pub fn ols_indi_compiled() -> bool {
 /// Resolve `driver` for `kind` (§2.12). INDI reaches the OLS `indi:remote`
 /// mount where compiled (D1, O3) and is otherwise Tier 2; LX200, MoonLite
 /// and USB serial are reached through indiserver or ASCOM Remote (O4);
-/// rotator, cover, switch and dome are Tier 2 (WP2-0, WP2-5).
+/// rotator, cover, switch and dome are Tier 2 (WP2-0, WP2-5). The OLS
+/// Alpaca adapter's hidden id `ols_alpaca` was removed with the OLS Alpaca
+/// mount and focuser (O2) and is refused with `alpaca` named instead.
 pub fn resolve_driver(kind: DeviceKind, driver: &str) -> Result<DriverChoice, DriverRefusal> {
     let driver = driver.trim().to_ascii_lowercase();
     let tier2 = |what: &str| {
@@ -145,11 +154,19 @@ pub fn resolve_driver(kind: DeviceKind, driver: &str) -> Result<DriverChoice, Dr
             "{what} is planned for Tier 2 and is not available in this build"
         ))
     };
+    let ols_alpaca_retired = || {
+        DriverRefusal::retired(format!(
+            "driver 'ols_alpaca' (the OLS Alpaca {} adapter) was removed at the end of Tier 1 \
+             (owner decision O2); use driver 'alpaca', the native Alpaca client, with the same \
+             option (http(s)://host:port#device=N)",
+            super::types::kind_name(kind)
+        ))
+    };
     match kind {
         DeviceKind::Mount => match driver.as_str() {
             "alpaca" => Ok(DriverChoice::Alpaca),
             "sim" | "simulator" => Ok(DriverChoice::Sim),
-            "ols_alpaca" => Ok(DriverChoice::OlsAlpaca),
+            "ols_alpaca" => Err(ols_alpaca_retired()),
             "indi" | "ols_indi" if ols_indi_compiled() => Ok(DriverChoice::OlsIndi),
             "indi" | "ols_indi" => Err(DriverRefusal::planned(
                 "INDI mounts need the OLS bridge built with libindi (interim, O3) or the \
@@ -164,7 +181,7 @@ pub fn resolve_driver(kind: DeviceKind, driver: &str) -> Result<DriverChoice, Dr
         DeviceKind::Focuser => match driver.as_str() {
             "alpaca" => Ok(DriverChoice::Alpaca),
             "sim" | "simulator" => Ok(DriverChoice::Sim),
-            "ols_alpaca" => Ok(DriverChoice::OlsAlpaca),
+            "ols_alpaca" => Err(ols_alpaca_retired()),
             "indi" => Err(tier2("The native INDI focuser")),
             "moonlite" | "usb" | "usb_serial" => Err(DriverRefusal::planned(
                 "MoonLite and USB serial focusers are reached through indi_moonlite (native \
@@ -749,15 +766,14 @@ pub enum ConnectTarget {
     Discovery,
     /// PHD2's event server.
     Phd2 { host: String, port: u16 },
-    /// The in-process simulator, or an OLS legacy adapter (the OLS bridge
+    /// The in-process simulator, or the OLS INDI adapter (the OLS bridge
     /// opens its own connection).
     Local,
 }
 
 /// §2.6 step 1: parse and validate a `/connect` option without opening
 /// anything (no socket, no OLS call): the Alpaca URL and `#device=N`, the
-/// D13 refusal of an empty or `"auto"` option (also for the OLS Alpaca
-/// adapter, whose `"auto"` broadcasts), and PHD2's `host:port`. The API
+/// D13 refusal of an empty or `"auto"` option, and PHD2's `host:port`. The API
 /// runs it before it touches a connected device, so a refused or malformed
 /// option leaves that device connected.
 pub fn validate_connect_option(
@@ -771,10 +787,6 @@ pub fn validate_connect_option(
             AlpacaOption::Address(address) => ConnectTarget::Alpaca(address),
             AlpacaOption::Broadcast => ConnectTarget::Discovery,
         },
-        DriverChoice::OlsAlpaca => {
-            discovery::parse_option(option, allow)?;
-            ConnectTarget::Local
-        }
         DriverChoice::Phd2 => {
             let (host, port) = super::guider::service::parse_option(option)?;
             ConnectTarget::Phd2 { host, port }
@@ -790,7 +802,7 @@ pub fn validate_connect_option(
 /// requested type and number when the server provides one. A mistyped
 /// address or device number is then refused while the current device stays
 /// connected. Nothing is sent to a device (D16). Discovery, the simulator
-/// and the OLS adapters are not checked.
+/// and the OLS INDI adapter are not checked.
 pub fn preflight_replacement(
     ctx: &SpineContext,
     kind: DeviceKind,
@@ -924,21 +936,7 @@ pub fn prepare_mount(
             lock(&ctx.sims).mount = Some(sim.control());
             Box::new(sim)
         }
-        DriverChoice::OlsAlpaca | DriverChoice::OlsIndi => {
-            let flavour = if choice == DriverChoice::OlsIndi {
-                OlsFlavour::Indi
-            } else {
-                // D13 also for the legacy Alpaca adapter: OLS "auto" broadcasts.
-                discovery::parse_option(option, configs.equipment.allow_broadcast_discovery)?;
-                OlsFlavour::Alpaca
-            };
-            Box::new(open_ols_mount(
-                flavour,
-                option,
-                Arc::clone(&clock),
-                options,
-            )?)
-        }
+        DriverChoice::OlsIndi => Box::new(open_ols_mount(option, Arc::clone(&clock), options)?),
         DriverChoice::Phd2 => return Err(DeviceError::invalid_value("phd2 is not a mount driver")),
     };
     let report = driver.connect(ctx.connect_timeout())?;
@@ -1034,10 +1032,6 @@ pub fn prepare_focuser(
             lock(&ctx.sims).focuser = Some(sim.control());
             Box::new(sim)
         }
-        DriverChoice::OlsAlpaca => {
-            discovery::parse_option(option, ctx.configs.equipment.allow_broadcast_discovery)?;
-            Box::new(OlsFocuserAdapter::open(option, Arc::clone(&clock))?)
-        }
         DriverChoice::OlsIndi | DriverChoice::Phd2 => {
             return Err(DeviceError::invalid_value("not a focuser driver"))
         }
@@ -1046,7 +1040,7 @@ pub fn prepare_focuser(
 }
 
 /// A focuser connected from an existing driver (also used by tests with a
-/// scripted simulator, and for the legacy `SimFocuser` behind its adapter).
+/// scripted simulator, and with the older `SimFocuser` behind its adapter).
 pub fn prepare_focuser_with(
     ctx: &SpineContext,
     mut driver: Box<dyn FocuserDriver>,
@@ -1457,10 +1451,6 @@ mod tests {
         use DeviceKind::*;
         assert_eq!(resolve_driver(Mount, "alpaca"), Ok(DriverChoice::Alpaca));
         assert_eq!(resolve_driver(Mount, "Simulator"), Ok(DriverChoice::Sim));
-        assert_eq!(
-            resolve_driver(Mount, "ols_alpaca"),
-            Ok(DriverChoice::OlsAlpaca)
-        );
         assert_eq!(resolve_driver(Focuser, "sim"), Ok(DriverChoice::Sim));
         assert_eq!(resolve_driver(Guider, "phd2"), Ok(DriverChoice::Phd2));
         // INDI reaches the OLS indi:remote mount only where compiled (O3).
@@ -1483,6 +1473,63 @@ mod tests {
             assert_eq!(resolve_driver(kind, id).unwrap_err().status, 501, "{id}");
         }
         assert_eq!(resolve_driver(Mount, "nonsense").unwrap_err().status, 400);
+    }
+
+    /// O2: with the OLS Alpaca mount and focuser deleted, every public
+    /// driver id an existing setup can name still resolves, the Alpaca ids
+    /// to the native client (D1), and the removed hidden id `ols_alpaca` is
+    /// refused with its replacement named, never routed to another driver.
+    #[test]
+    fn every_public_driver_id_still_resolves_and_ols_alpaca_names_its_replacement() {
+        use crate::equipment::types::kind_name;
+        use DeviceKind::*;
+        for kind in [Mount, Focuser, FilterWheel, Weather, SafetyMonitor] {
+            for (id, choice) in [
+                ("alpaca", DriverChoice::Alpaca),
+                (" Alpaca ", DriverChoice::Alpaca),
+                ("sim", DriverChoice::Sim),
+                ("simulator", DriverChoice::Sim),
+            ] {
+                assert_eq!(resolve_driver(kind, id), Ok(choice), "{kind:?} {id:?}");
+            }
+        }
+        assert_eq!(resolve_driver(Guider, "phd2"), Ok(DriverChoice::Phd2));
+        for id in ["indi", "ols_indi"] {
+            match resolve_driver(Mount, id) {
+                Ok(choice) => {
+                    assert!(ols_indi_compiled(), "{id}");
+                    assert_eq!(choice, DriverChoice::OlsIndi);
+                }
+                Err(refusal) => {
+                    assert!(!ols_indi_compiled(), "{id}");
+                    assert_eq!(
+                        (refusal.status, refusal.code),
+                        (501, "driver_not_available")
+                    );
+                }
+            }
+        }
+        for kind in [Mount, Focuser] {
+            for id in ["ols_alpaca", "OLS_ALPACA"] {
+                let refusal = resolve_driver(kind, id).unwrap_err();
+                assert_eq!(
+                    (refusal.status, refusal.code),
+                    (400, "driver_retired"),
+                    "{id}"
+                );
+                assert!(
+                    refusal.message.contains("use driver 'alpaca'")
+                        && refusal.message.contains(kind_name(kind)),
+                    "{}",
+                    refusal.message
+                );
+            }
+        }
+        // It was never an id of any other kind.
+        assert_eq!(
+            resolve_driver(FilterWheel, "ols_alpaca").unwrap_err().code,
+            "unsupported_driver"
+        );
     }
 
     #[test]

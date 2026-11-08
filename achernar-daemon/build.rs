@@ -185,10 +185,7 @@ fn main() {
     for path in [
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_camera.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_client.cpp",
-        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_mount.cpp",
-        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/alpaca_focuser.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/mount.cpp",
-        "../OpenLiveStacker_Drivers/OpenLiveStacker/src/focuser.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/util.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/tiffmat.cpp",
         "../OpenLiveStacker_Drivers/OpenLiveStacker/src/asi_camera.cpp",
