@@ -44,9 +44,10 @@ fn lock(trigger: &Mutex<PlateSolveTrigger>) -> std::sync::MutexGuard<'_, PlateSo
 /// true when this call started the subscription. A disabled trigger, or a
 /// caller outside a tokio runtime, starts nothing.
 ///
-/// The vision loop calls this at startup, so the subscription runs from
-/// boot; every other entry point calls it too, so a state built without the
-/// vision loop (tests, tools) still follows the bus.
+/// `main.rs` calls this at startup, once the journal's sequence numbers are
+/// continued, so the subscription runs from boot; the vision loop and every
+/// other entry point call it too, so a state built without `main.rs`
+/// (tests, tools) still follows the bus.
 pub fn attach(state: &AppState) -> bool {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
         return false;
