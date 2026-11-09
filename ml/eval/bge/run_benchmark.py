@@ -187,6 +187,8 @@ def run_python(sc, method, bg_params=None) -> tuple[dict, dict]:
 
 #: backend_error text of a daemon revision that has the bridge but not the SEP adapter.
 SEP_NOT_BUILT_MARKER = "not built into this revision"
+#: Daemon quality statuses meaning the detector never ran on the frame.
+DETECTION_NOT_RUN = ("BackgroundUnavailable", "DetectionUnavailable")
 
 
 def run_rust_parse(sc, out_dir, backend, revision=None) -> tuple[dict, dict]:
@@ -209,15 +211,20 @@ def run_rust_parse(sc, out_dir, backend, revision=None) -> tuple[dict, dict]:
     else:
         b_hat = np.float64(bgr["level"]) if level_ok and bgr.get("level") is not None else None
         r_hat = np.float64(bgr["rms"]) if noise_ok and bgr.get("rms") is not None else None
-    candidates = j.get("candidates")
     quality = j.get("quality") or {}
-    accepted = quality.get("used_stars")
+    q_status = quality.get("status")
+    # The bridge emits empty lists when detection never ran; those are not
+    # zero-completeness measurements.
+    detection_ran = j.get("detection") is not None and q_status not in DETECTION_NOT_RUN
+    candidates = j.get("candidates") if detection_ran else None
+    accepted = quality.get("used_stars") if detection_ran else None
     stages = {
         "background": {"status": "completed" if level_ok else "unsupported", "reason": None if level_ok else reasons},
         "noise": {"status": "completed" if noise_ok else "unsupported",
                   "reason": None if noise_ok else f"noise {bgr.get('noise_status')}: {reasons}"},
-        "detection": {"status": "completed" if candidates is not None else "unsupported",
-                      "reason": None if candidates is not None else f"no candidates (quality status {quality.get('status')})"},
+        "detection": {"status": "completed" if detection_ran else "unsupported",
+                      "reason": None if detection_ran else
+                      f"detection not run (quality status {q_status}; catalog_error {j.get('catalog_error')})"},
     }
     if (j.get("detection") or {}).get("noise_floor_applied"):
         stages["detection"]["note"] = "ran with the legacy 1 ADU noise floor (noise_floor_applied), a labelled heuristic"
@@ -274,12 +281,39 @@ def parity(py_art, rs_art, py_rec, rs_rec) -> dict:
     rl = (rs_rec.get("background_result") or {})
     out["python_level_status"], out["rust_level_status"] = pl.get("level_status"), rl.get("level_status")
     out["python_noise_status"], out["rust_noise_status"] = pl.get("noise_status"), rl.get("noise_status")
-    pc, rc = py_art.get("candidates"), rs_art.get("candidates")
+    pc = py_art.get("candidates")
+    rc = rs_art.get("catalog") if rs_art.get("catalog") is not None else rs_art.get("candidates")
     if pc is not None and rc is not None:
-        out["n_candidates_python"], out["n_candidates_rust"] = len(pc), len(rc)
-        m = MT.match_greedy([(c["x"], c["y"]) for c in pc], [(c["x"], c["y"]) for c in rc], [0.5] * len(rc))
-        out["n_matched_within_0p5px"] = len(m)
-        out["max_centroid_diff_px"] = max((d for _, _, d in m), default=None)
+        out.update(catalog_parity(pc, rc))
+    return out
+
+
+def catalog_parity(pc, rc) -> dict:
+    """SEP catalogs compared object by object against the D-006 bounds."""
+    out = {"n_candidates_python": len(pc), "n_candidates_rust": len(rc)}
+    m = MT.match_greedy([(c["x"], c["y"]) for c in pc], [(c["x"], c["y"]) for c in rc], [0.5] * len(rc))
+    out["n_matched_within_0p5px"] = len(m)
+    out["max_centroid_diff_px"] = max((d for _, _, d in m), default=None)
+    int_keys = ("npix", "xmin", "xmax", "ymin", "ymax", "flags")
+    mism = {k: 0 for k in int_keys}
+    worst = {"x": 0.0, "y": 0.0, "flux_rel": 0.0, "a_rel": 0.0, "b_rel": 0.0, "theta": 0.0}
+    for i, j, _ in m:
+        a, b = pc[i], rc[j]
+        for k in int_keys:
+            if k in a and k in b and int(a[k]) != int(b[k]):
+                mism[k] += 1
+        for k in ("x", "y"):
+            worst[k] = max(worst[k], abs(a[k] - b[k]))
+        for k in ("flux", "a", "b"):
+            if k in a and k in b:
+                worst[f"{k}_rel"] = max(worst[f"{k}_rel"], abs(a[k] - b[k]) / max(abs(a[k]), 1e-5))
+        if "theta" in a and "theta" in b:
+            worst["theta"] = max(worst["theta"], abs(a["theta"] - b["theta"]))
+    out["integer_field_mismatches"] = mism
+    out["max_abs_diff"] = worst
+    out["catalog_within_d006"] = bool(
+        len(pc) == len(rc) == len(m) and not any(mism.values()) and worst["x"] <= 1e-4 and worst["y"] <= 1e-4
+        and worst["flux_rel"] <= 1e-5 and worst["a_rel"] <= 1e-5 and worst["b_rel"] <= 1e-5 and worst["theta"] <= 1e-5)
     return out
 
 
@@ -653,7 +687,9 @@ def render_summary(doc, core, sweeps) -> str:
          f"harness `{doc['harness_version']}`; created {doc['created_utc']}",
          f"- Environment: Python {doc['environment']['python']}, numpy {doc['environment']['numpy']}, "
          f"scipy {doc['environment']['scipy']}, sep {doc['environment']['sep']}",
-         f"- Rust bridge: **{doc['rust_bridge']['status']}** {doc['rust_bridge'].get('reason') or ''}",
+         f"- Rust bridge: **{doc['rust_bridge']['status']}** {doc['rust_bridge'].get('reason') or ''} "
+         f"(daemon revision `{(doc['rust_bridge'].get('revision') or {}).get('commit')}`, "
+         f"binary `{doc['rust_bridge'].get('binary')}` sha256 `{(doc['rust_bridge'].get('binary_sha256') or '')[:16]}`)",
          f"- Config hashes: SEP background `{doc['configs']['python_sep_background']['sha256'][:12]}...` "
          f"(matches daemon default: {_fmt(doc['contract_check']['background_hash_matches_daemon_default'])}), "
          f"SEP detection `{doc['configs']['python_sep_detection']['sha256'][:12]}...` "
@@ -766,9 +802,16 @@ def render_summary(doc, core, sweeps) -> str:
                          _fmt(p.get("back_within_d006_bound")), _fmt(p.get("rms_max_abs_diff"), 6),
                          _fmt(p.get("rms_within_d006_bound")),
                          f"{_fmt(p.get('n_candidates_python'))}/{_fmt(p.get('n_candidates_rust'))}",
-                         _fmt(p.get("n_matched_within_0p5px")), _fmt(p.get("max_centroid_diff_px"), 5)])
+                         _fmt(p.get("n_matched_within_0p5px")), _fmt(p.get("max_centroid_diff_px"), 6),
+                         _fmt(p.get("catalog_within_d006"))])
         L.append(_table(["case", "level py/rs", "noise py/rs", "max |dB|", "B in bound", "max |dR|", "R in bound",
-                         "candidates py/rs", "matched <=0.5 px", "max centroid diff"], rows))
+                         "objects py/rs", "matched <=0.5 px", "max centroid diff", "catalog in bound"], rows))
+        n_cases = len(cross["cases"])
+        n_maps = sum(1 for p in cross["cases"].values() if p.get("back_within_d006_bound") and p.get("rms_within_d006_bound"))
+        n_cat = sum(1 for p in cross["cases"].values() if p.get("catalog_within_d006"))
+        L.insert(len(L) - 1, f"Maps within D-006 in {n_maps}/{n_cases} cases with maps on both sides; catalogs within "
+                             f"D-006 in {n_cat}/{n_cases}.")
+        L.insert(len(L) - 1, "")
     L += ["", f"## 3. {SECTION_REAL}", "",
           "`ml/eval/bge/real_frames.py` can load a real-frame manifest for a future run; it refuses accuracy or "
           "pass/fail output without a predeclared thresholds file and never reads hold-out frames in this run.", ""]

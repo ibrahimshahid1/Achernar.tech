@@ -232,6 +232,13 @@ def run_bridge(manifest_path: Path, out_dir: Path, repo_root: Path, cargo_target
         return dict(info, status="failed", reason="bridge test failed (see log)")
     if re.search(r"running 0 tests", text) and not re.search(r"running [1-9]\d* tests?", text):
         return dict(info, status="skipped", reason=f"{UNAVAILABLE}: no test matched bge_eval_bridge")
+    exe = re.search(r"Running unittests src/main\.rs \(([^)]+)\)", text)
+    if exe:
+        info["binary"] = exe.group(1)
+        try:
+            info["binary_sha256"] = _sha256_file(Path(exe.group(1)))
+        except OSError:
+            info["binary_sha256"] = None
     return dict(info, status="completed", reason=None)
 
 

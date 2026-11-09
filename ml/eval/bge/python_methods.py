@@ -6,7 +6,8 @@ Methods (identifiers used in results):
     Reference: the pinned SEP 1.4.1 wheel called directly with the same
     canonical configuration as the Rust defaults. Background on the frame
     with mask = invalid | bad_pixel | edge | native_saturation | non-finite;
-    extraction on ``I - B(x,y)`` with masked pixels set to 0, ``err = R(x,y)``.
+    extraction on ``I - B(x,y)`` with masked pixels set to 0, the same mask
+    passed to ``sep.extract``, ``err = R(x,y)`` (as the daemon adapter does).
 ``python_global_scalar``
     Python comparator, *not* the Rust legacy method: one iteratively
     sigma-clipped median and standard deviation over all usable pixels,
@@ -452,8 +453,13 @@ def detect_and_measure(image: np.ndarray, masks: dict, estimate: BackgroundEstim
     err = float(err) if np.isscalar(err) else np.ascontiguousarray(err, dtype=np.float32)
     try:
         sep.set_extract_pixstack(det["pixstack"])
+        # The detector mask also goes to sep.extract, as in the daemon adapter:
+        # under CONV with a noise array a masked pixel's threshold becomes
+        # thresh*1e30, so a masked (e.g. clipped) core cannot join a footprint
+        # through its neighbours' filtered signal.
         objects = sep.extract(
-            resid, det["thresh_sigma"], err=err, minarea=det["minarea"],
+            resid, det["thresh_sigma"], err=err, mask=np.ascontiguousarray(bad.astype(np.uint8)), maskthresh=0.0,
+            minarea=det["minarea"],
             filter_kernel=np.asarray(det["filter_kernel"], dtype=np.float32), filter_type=det["filter_type"],
             deblend_nthresh=det["deblend_nthresh"], deblend_cont=det["deblend_cont"],
             clean=det["clean"], clean_param=det["clean_param"],

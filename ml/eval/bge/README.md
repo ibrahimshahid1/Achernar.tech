@@ -48,7 +48,7 @@ Tests: `python -m pytest -q ml/tests/test_bge_fixtures.py`.
 
 | id | kind | what it is |
 | --- | --- | --- |
-| `python_sep` | reference | `sep.Background` (bw=bh=64, fw=fh=3, fthresh=0) with mask = invalid, bad_pixel, edge, native_saturation, non-finite (non-finite pixels also set to 0); `sep.extract` on `I - B(x,y)` with masked pixels 0, `err = R(x,y)`, thresh 5, minarea 5, 3x3 `[[1,2,1],[2,4,2],[1,2,1]]` kernel, `filter_type="conv"`, deblend 32 / 0.005, clean 1.0, pixstack 300000. Config hashes equal the daemon defaults (`80eab0fb...`, `4f4499cd...`). |
+| `python_sep` | reference | `sep.Background` (bw=bh=64, fw=fh=3, fthresh=0) with mask = invalid, bad_pixel, edge, native_saturation, non-finite (non-finite pixels also set to 0); `sep.extract` on `I - B(x,y)` with masked pixels 0 and the same mask passed (as the daemon adapter does), `err = R(x,y)`, thresh 5, minarea 5, 3x3 `[[1,2,1],[2,4,2],[1,2,1]]` kernel, `filter_type="conv"`, deblend 32 / 0.005, clean 1.0, pixstack 300000. Config hashes equal the daemon defaults (`80eab0fb...`, `4f4499cd...`). |
 | `python_global_scalar` | comparator | One iteratively 3-sigma-clipped median and std over usable pixels, used as constant B and R. Not the Rust legacy method. |
 | `oracle_true_background` | oracle | The truth B and sky noise R fed to the same detection/HFR path. Separates background error from detector/estimator effects. Not a method. |
 | `rust_legacy_global_clip` | Rust | Daemon default path through the bridge. |

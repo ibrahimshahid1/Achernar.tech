@@ -390,7 +390,8 @@ def _fake_bridge_output(out_dir, sc, backend, back=None, rms=None, level=None, e
         "background": {"method": "sep_spatial_mesh" if spatial else "legacy_global_clip", "level_status": "measured",
                        "noise_status": "measured", "reasons": [], "level": level, "rms": 10.0, "config": {},
                        "config_sha256": "x"},
-        "detection": None,
+        "detection": {"method": "sep_extract" if spatial else "legacy_connected_components",
+                      "noise_floor_applied": False},
         "catalog": None,
         "candidates": [{"x": s.x, "y": s.y, "xmin": int(s.x) - 3, "xmax": int(s.x) + 3, "ymin": int(s.y) - 3,
                         "ymax": int(s.y) + 3, "npix": 30, "flux": s.flux, "peak": s.peak_adu} for s in sc.sources],
@@ -428,6 +429,34 @@ def test_bridge_output_reader_and_scoring_on_fake_outputs(tmp_path):
     _fake_bridge_output(tmp_path, sc, "legacy_global_clip", level=1.0, error="boom")
     failed, _ = RB.run_rust_parse(sc, tmp_path, "legacy_global_clip")
     assert failed["status"] == "failed" and failed["reason"] == "boom"
+
+
+def test_rust_detection_not_run_is_not_scored_as_zero_completeness(tmp_path):
+    sc = SC.build_scenario("sparse_gaussian_stars")
+    _fake_bridge_output(tmp_path, sc, "sep", back=sc.background, rms=sc.noise_std_sky)
+    stem = bridge.output_stem(tmp_path, sc.id, "sep").with_suffix(".json")
+    payload = json.loads(stem.read_text())
+    payload["background"].update(noise_status="unresolved", reasons=["invalid_rms_map"])
+    payload.update(detection=None, candidates=[], catalog=None, catalog_error="noise_unresolved")
+    payload["quality"].update(status="DetectionUnavailable", used_stars=[], hfr_px=None)
+    stem.write_text(json.dumps(payload))
+    rec, art = RB.run_rust_parse(sc, tmp_path, "sep")
+    assert rec["status"] == "unsupported"
+    assert rec["stages"]["detection"]["status"] == "unsupported" and "DetectionUnavailable" in rec["stages"]["detection"]["reason"]
+    assert "detection" not in rec["metrics"] and "hfr" not in rec["metrics"] and "noise" not in rec["metrics"]
+    assert art["candidates"] is None and "background" in rec["metrics"]
+
+
+def test_catalog_parity_against_d006_bounds():
+    row = {"x": 10.0, "y": 20.0, "npix": 30, "xmin": 7, "xmax": 13, "ymin": 17, "ymax": 23, "flags": 0,
+           "flux": 1000.0, "a": 2.0, "b": 1.5, "theta": 0.3}
+    same = RB.catalog_parity([row], [dict(row, x=10.00005)])
+    assert same["catalog_within_d006"] and same["n_matched_within_0p5px"] == 1
+    off = RB.catalog_parity([row], [dict(row, flux=1000.1)])
+    assert not off["catalog_within_d006"] and off["max_abs_diff"]["flux_rel"] == pytest.approx(1e-4)
+    npix = RB.catalog_parity([row], [dict(row, npix=31)])
+    assert not npix["catalog_within_d006"] and npix["integer_field_mismatches"]["npix"] == 1
+    assert not RB.catalog_parity([row], [row, dict(row, x=50.0)])["catalog_within_d006"]
 
 
 def test_rust_revision_without_sep_adapter_is_skipped_not_scored(tmp_path):
