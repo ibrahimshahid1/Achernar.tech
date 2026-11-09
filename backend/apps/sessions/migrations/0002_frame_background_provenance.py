@@ -62,6 +62,10 @@ class Migration(migrations.Migration):
         ),
         migrations.AddConstraint(
             model_name='frame',
+            constraint=models.CheckConstraint(check=models.Q(('background_schema_version__isnull', True), models.Q(('background_level_status__isnull', False), ('background_noise_status__isnull', False)), _connector='OR'), name='frame_background_statuses_when_versioned'),
+        ),
+        migrations.AddConstraint(
+            model_name='frame',
             constraint=models.CheckConstraint(check=models.Q(('background_schema_version__isnull', True), ('background_adu__isnull', True), ('background_level_status', 'measured'), _connector='OR'), name='frame_background_level_only_when_measured'),
         ),
         migrations.AddConstraint(

@@ -74,6 +74,35 @@ class BackgroundContractTests(TestCase):
                 background_adu=100.0, background_noise_status='unresolved', background_sigma=0.0,
             ).save()
 
+    def test_versioned_row_without_statuses_is_rejected(self):
+        # SQL CHECKs accept NULL results; the statuses constraint closes that.
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self.frame(
+                'null-status', background_schema_version=1, background_adu=0.0,
+                background_sigma=0.0,
+            ).save()
+
+    def test_serializer_rejects_what_the_constraints_reject(self):
+        base = {
+            'daemon_id': 'api', 'session': self.session.pk, 'exposure_s': 5.0,
+            'captured_at': timezone.now().isoformat(),
+        }
+        for bad in (
+            {'background_schema_version': 1, 'background_adu': 0.0},
+            {'background_schema_version': 1, 'background_level_status': 'unavailable',
+             'background_noise_status': 'unavailable', 'background_adu': 0.0},
+            {'background_schema_version': 1, 'background_level_status': 'measured',
+             'background_noise_status': 'unresolved', 'background_adu': 100.0,
+             'background_sigma': 0.0},
+        ):
+            serializer = FrameSerializer(data={**base, **bad})
+            self.assertFalse(serializer.is_valid(), bad)
+        ok = FrameSerializer(data={
+            **base, 'background_schema_version': 1, 'background_level_status': 'measured',
+            'background_noise_status': 'unresolved', 'background_adu': 100.0,
+        })
+        self.assertTrue(ok.is_valid(), ok.errors)
+
     def test_serializer_reports_provenance_and_nulls(self):
         measured = self.frame(
             'ok', background_schema_version=1, background_method='sep_spatial_mesh',

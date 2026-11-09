@@ -101,6 +101,19 @@ class Frame(models.Model):
     class Meta:
         ordering = ['captured_at']
         constraints = [
+            # A versioned row states both statuses. Without this, a NULL
+            # status makes the clauses below evaluate to NULL, which a SQL
+            # CHECK accepts.
+            models.CheckConstraint(
+                name='frame_background_statuses_when_versioned',
+                check=(
+                    models.Q(background_schema_version__isnull=True)
+                    | (
+                        models.Q(background_level_status__isnull=False)
+                        & models.Q(background_noise_status__isnull=False)
+                    )
+                ),
+            ),
             # A versioned row may only carry a level/sigma that was measured.
             models.CheckConstraint(
                 name='frame_background_level_only_when_measured',
