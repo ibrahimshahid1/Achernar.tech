@@ -438,16 +438,14 @@ def _mesh_support(excluded: np.ndarray, bw: int, bh: int) -> tuple[int, int, int
     h, w = excluded.shape
     nx = (w - 1) // bw + 1
     ny = (h - 1) // bh + 1
-    usable = ~excluded
-    supported = 0
-    for j in range(ny):
-        y0, y1 = j * bh, min(h, (j + 1) * bh)
-        row = usable[y0:y1]
-        for i in range(nx):
-            x0, x1 = i * bw, min(w, (i + 1) * bw)
-            area = (y1 - y0) * (x1 - x0)
-            if float(row[:, x0:x1].sum()) >= float(area) * SEP_BACK_MINGOODFRAC:
-                supported += 1
+    row_starts = np.arange(ny) * bh
+    col_starts = np.arange(nx) * bw
+    usable = (~excluded).astype(np.int64)
+    counts = np.add.reduceat(np.add.reduceat(usable, row_starts, axis=0), col_starts, axis=1)
+    heights = np.minimum(row_starts + bh, h) - row_starts
+    widths = np.minimum(col_starts + bw, w) - col_starts
+    area = heights[:, None] * widths[None, :]
+    supported = int((counts.astype(np.float64) >= area.astype(np.float64) * SEP_BACK_MINGOODFRAC).sum())
     return nx, ny, supported, nx * ny
 
 
@@ -602,6 +600,7 @@ def estimate_spatial_background(
 class Rejection(str, Enum):
     SATURATED = "saturated"
     MASKED_SUPPORT = "masked_support"
+    NO_USABLE_PIXELS = "no_usable_pixels"
     EDGE_TRUNCATED = "edge_truncated"
     LOW_SNR = "low_snr"
     NOISE_UNRESOLVED = "noise_unresolved"
@@ -1147,7 +1146,7 @@ def measure_star(
         if estimate.level is None:
             return StarMeasurement(
                 w / 2.0, h / 2.0, 0.0, float("nan"), None, None, None, None, 0.0, False,
-                [Rejection.NOISE_UNRESOLVED.value],
+                [Rejection.NO_USABLE_PIXELS.value],
             )
         sky, sky_rms = estimate.level, estimate.rms
     noise_resolved = sky_rms is not None and np.isfinite(sky_rms) and sky_rms > 0
@@ -1558,6 +1557,8 @@ def measure_frame_sep(
     if gain_e_per_adu is not None:
         _require_finite("gain_e_per_adu", gain_e_per_adu, minimum=0.0, strict=True)
         gain_e_per_adu = float(gain_e_per_adu)
+    if source_mask_background:
+        _require_int("source_mask_dilation_px", source_mask_dilation_px, 0)
 
     sep = require_sep()
     version = sep.__version__
@@ -1607,7 +1608,6 @@ def measure_frame_sep(
         if source_mask_background:
             from scipy.ndimage import binary_dilation
 
-            _require_int("source_mask_dilation_px", source_mask_dilation_px, 0)
             source_mask = segmap > 0
             if source_mask_dilation_px > 0:
                 source_mask = binary_dilation(source_mask, iterations=int(source_mask_dilation_px))
