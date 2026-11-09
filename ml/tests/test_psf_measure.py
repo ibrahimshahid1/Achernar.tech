@@ -188,7 +188,11 @@ class TestCropPlateauNoise(unittest.TestCase):
         self.assertEqual(detailed.noise_status, "unresolved")
         self.assertEqual(detailed.reasons, ("zero_empirical_scatter",))
         self.assertIsNone(detailed.rms)
-        self.assertEqual(estimate_background(img), (100.0, 0.0))
+        # The scalar form keeps the measured level and reports the unresolved
+        # scale as nan, not as a numeric 0.0 that a caller could floor.
+        level, rms = estimate_background(img)
+        self.assertEqual(level, 100.0)
+        self.assertTrue(np.isnan(rms))
 
     def test_flat_float_plateau_was_floored_now_unresolved(self):
         img = render_psf(gaussian(3.0))
@@ -196,6 +200,13 @@ class TestCropPlateauNoise(unittest.TestCase):
         self.assertLess(old_rms, 1e-6)  # pre-v2 measure_star then used max(old_rms, 1e-6)
         detailed = estimate_background_detailed(img)
         self.assertEqual((detailed.noise_status, detailed.rms), ("unresolved", None))
+
+    def test_direct_hfr_baseline_is_invalid_when_noise_is_unresolved(self):
+        from eval.baselines import direct_hfr_measure
+
+        self.assertTrue(np.isnan(direct_hfr_measure(np.round(render_psf(gaussian(3.0))))))
+        self.assertTrue(np.isnan(direct_hfr_measure(np.full((32, 32), np.nan))))
+        self.assertTrue(np.isfinite(direct_hfr_measure(noisy_render(gaussian(3.0), seed=0))))
 
     def test_crop_gates_refuse_to_threshold_an_unresolved_noise(self):
         m = measure_star(render_psf(gaussian(3.0)), saturation_level=65535.0)

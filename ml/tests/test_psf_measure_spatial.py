@@ -39,6 +39,21 @@ from labels.psf_measure import (  # noqa: E402
 DEFAULT_BACKGROUND_SHA256 = "80eab0fbae4abf9f60f348adb7de3004067a3873cca29f996289e9dc14040b84"
 DEFAULT_DETECTION_SHA256 = "4f4499cda7067107c0fe6d64319684c13d1ec62f590b4bee4b346c1459dc99df"
 
+# Non-default, non-dyadic and small values (review F3). These are the exact
+# Python json.dumps strings; the Rust canonical_json must reproduce them.
+NONDEFAULT_DETECTION_JSON = (
+    '{"accept_deblended_for_focus":false,"clean":true,"clean_param":1.0,"deblend_cont":1e-05,'
+    '"deblend_nthresh":32,"filter_kernel":[[1.0,2.0,1.0],[2.0,4.0,2.0],[1.0,2.0,1.0]],'
+    '"filter_type":"conv","library":"sep","library_version":"1.4.1","method":"sep_extract",'
+    '"minarea":5,"noise":"background_rms_map","pixstack":300000,"thresh_sigma":1.2}'
+)
+NONDEFAULT_DETECTION_SHA256 = "fd6c2088782a5017c1a69a18cf4f4aee73665b029927083266e664f5f1718554"
+NONDEFAULT_BACKGROUND_JSON = (
+    '{"bh":64,"bw":64,"fh":3,"fthresh":0.1,"fw":3,"library":"sep","library_version":"1.4.1",'
+    '"maskthresh":0.0,"method":"sep_spatial_mesh","method_version":1,"min_meshes_per_axis":2}'
+)
+NONDEFAULT_BACKGROUND_SHA256 = "1d87974ba87e717a55e01ee098d2892de8bc2f77807e56823f36265e6cbf48a1"
+
 
 def _gaussian(xs, ys, cx, cy, amp, sigma):
     return amp * np.exp(-((xs - cx) ** 2 + (ys - cy) ** 2) / (2.0 * sigma**2))
@@ -95,6 +110,14 @@ class TestConfigContract(unittest.TestCase):
         self.assertEqual(config["noise"], "background_rms_map")
         self.assertEqual(config["filter_kernel"], [[1.0, 2.0, 1.0], [2.0, 4.0, 2.0], [1.0, 2.0, 1.0]])
         self.assertEqual(SepDetectionParams().config_sha256(), DEFAULT_DETECTION_SHA256)
+
+    def test_nondefault_configs_pin_the_cross_language_strings(self):
+        detection = SepDetectionParams(thresh_sigma=1.2, deblend_cont=1e-5).config()
+        self.assertEqual(pm.canonical_json(detection), NONDEFAULT_DETECTION_JSON)
+        self.assertEqual(pm.config_sha256(detection), NONDEFAULT_DETECTION_SHA256)
+        background = SepBackgroundParams(fthresh=0.1).config()
+        self.assertEqual(pm.canonical_json(background), NONDEFAULT_BACKGROUND_JSON)
+        self.assertEqual(pm.config_sha256(background), NONDEFAULT_BACKGROUND_SHA256)
 
     def test_hash_is_sha256_of_canonical_json(self):
         config = SepDetectionParams(filter_type="matched", accept_deblended_for_focus=True).config()
@@ -536,6 +559,9 @@ class TestGainAndMetadata(SepTestCase):
         self.assertEqual(payload["label_method"], "sep_spatial_mesh+sep_extract+sep_flux_radius")
         self.assertEqual(payload["status"], "measured")
         bg = payload["background"]
+        self.assertEqual(bg["producer"], "python_sep_label")
+        self.assertEqual(bg["schema"], "achernar.python_sep_background_provenance.v1")
+        self.assertNotIn("schema_version", bg)  # that key belongs to the Rust BackgroundResult
         self.assertEqual(bg["method"], "sep_spatial_mesh")
         self.assertEqual(bg["library_version"], "1.4.1")
         self.assertEqual(bg["config_sha256"], DEFAULT_BACKGROUND_SHA256)
@@ -563,13 +589,17 @@ class TestGainAndMetadata(SepTestCase):
         sources, label = measure_frame_sep(image, fit_fwhm=False)
         children = [s for s in sources if s.deblended]
         self.assertEqual(len(children), 2)
-        self.assertTrue(all(Rejection.BLENDED.value in s.rejections for s in children))
+        # A policy-rejected SEP child is "deblended" (Rust StarRejectionTallies
+        # .deblended); "blended" stays the crop two-peak heuristic.
+        self.assertTrue(all(s.rejections == [Rejection.DEBLENDED.value] for s in children))
+        self.assertEqual(label.rejection_counts.get("deblended"), 2)
+        self.assertNotIn("blended", label.rejection_counts)
         self.assertEqual(label.sep_flag_counts.get("obj_merged"), 2)
         accepting = SepDetectionParams(accept_deblended_for_focus=True)
         sources, label = measure_frame_sep(image, fit_fwhm=False, detection_params=accepting)
         children = [s for s in sources if s.deblended]
         self.assertEqual(len(children), 2)
-        self.assertFalse(any(Rejection.BLENDED.value in s.rejections for s in children))
+        self.assertFalse(any(Rejection.DEBLENDED.value in s.rejections for s in children))
         self.assertEqual(label.detection["config_sha256"], accepting.config_sha256())
 
     def test_source_mask_pass_is_off_by_default_and_never_enters_the_detector_mask(self):
