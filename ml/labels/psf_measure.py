@@ -71,6 +71,11 @@ SEP_PINNED_VERSION = "1.4.1"
 LABEL_SCHEMA_VERSION = "fqe-sep-label-v2"
 
 BACKGROUND_METHOD_SEP = "sep_spatial_mesh"
+# Discriminator of SpatialBackground.provenance(). quality_json["background"]
+# can also hold the daemon's Rust BackgroundResult (it has "schema_version");
+# this Python reference object says which shape it is instead.
+BACKGROUND_PROVENANCE_PRODUCER = "python_sep_label"
+BACKGROUND_PROVENANCE_SCHEMA = "achernar.python_sep_background_provenance.v1"
 BACKGROUND_METHOD_SEP_VERSION = 1
 DETECTION_METHOD_SEP = "sep_extract"
 
@@ -369,8 +374,14 @@ class SpatialBackground:
         return self.noise_status == STATUS_MEASURED
 
     def provenance(self) -> dict:
-        """JSON-serialisable summary (no maps) for label metadata and manifests."""
+        """JSON-serialisable summary (no maps) for label metadata and manifests.
+
+        ``producer`` / ``schema`` identify this Python reference shape; it is
+        not the Rust ``BackgroundResult`` written by the daemon.
+        """
         return {
+            "producer": BACKGROUND_PROVENANCE_PRODUCER,
+            "schema": BACKGROUND_PROVENANCE_SCHEMA,
             "method": self.method,
             "method_version": BACKGROUND_METHOD_SEP_VERSION,
             "library": "sep",
@@ -606,7 +617,11 @@ class Rejection(str, Enum):
     NOISE_UNRESOLVED = "noise_unresolved"
     TOO_FEW_PIXELS = "too_few_pixels"
     ELONGATED = "elongated"
+    # Crop-path two-core-peak heuristic (Rust StarRejectionTallies.blended).
     BLENDED = "blended"
+    # SEP-deblended child (OBJ_MERGED) rejected by the focus policy
+    # (Rust StarRejectionTallies.deblended); not the same population as BLENDED.
+    DEBLENDED = "deblended"
     FIT_FAILED = "fit_failed"
 
 
@@ -740,16 +755,19 @@ def estimate_background_detailed(image: np.ndarray, sigma: float = 3.0, iters: i
 def estimate_background(image: np.ndarray, sigma: float = 3.0, iters: int = 5) -> tuple[float, float]:
     """Scalar form of :func:`estimate_background_detailed` (custom, not SEP).
 
-    Returns ``(level, rms)``. When the noise is unresolved (zero MAD plateau)
-    ``rms`` is ``0.0`` — the empirical scatter actually measured, as the Rust
-    helper reports it — never the inflated std of the unclipped crop. When no
-    pixel is finite both values are ``nan``. Callers that must distinguish
-    these states use the detailed form; the crop measurement functions here do.
+    Returns ``(level, rms)``. When the noise is unresolved (zero-MAD plateau)
+    ``rms`` is ``nan``: an unresolved scale has no numeric value, and a 0.0
+    would be indistinguishable from a measurement (and invites a silent floor
+    such as ``max(rms, 1e-6)``). It is never the inflated std of the unclipped
+    crop. When no pixel is finite both values are ``nan``. Callers that must
+    distinguish these states use the detailed form; the crop measurement
+    functions here do, and :func:`curve_of_growth_hfr` treats a non-finite
+    ``sky_rms`` as "no core threshold".
     """
     result = estimate_background_detailed(image, sigma, iters)
     if result.level is None:
         return float("nan"), float("nan")
-    return result.level, (result.rms if result.rms is not None else 0.0)
+    return result.level, (result.rms if result.rms is not None else float("nan"))
 
 
 # --------------------------------------------------------------------------- #
@@ -887,7 +905,8 @@ def curve_of_growth_hfr(
 
     ``sky`` is used as given: this function never re-estimates it. ``sky_rms``
     only sets the 3-sigma core threshold used to *locate* the centroid; when it
-    is ``None`` or not positive the centroid uses all positive residual.
+    is ``None``, non-finite (unresolved) or not positive the centroid uses all
+    positive residual.
 
     Returns ``None`` when no positive stellar flux is present — an explicit
     "no width", never a spuriously-perfect 0.
@@ -1539,7 +1558,7 @@ def measure_frame_sep(
     not make clipped wings a valid width. ``saturation_level`` is an extra
     legacy gate on the raw unmasked footprint peak; it is never inferred here,
     and ``None`` records the gate as ``not_performed``. SEP flags:
-    ``OBJ_MERGED`` -> ``blended`` unless ``accept_deblended_for_focus``;
+    ``OBJ_MERGED`` -> ``deblended`` unless ``accept_deblended_for_focus``;
     ``OBJ_TRUNC`` / ``APER_TRUNC`` -> ``edge_truncated``.
 
     ``thresh_sigma``, ``deblend_cont`` and ``min_area`` are kept as overrides of
@@ -1683,7 +1702,7 @@ def measure_frame_sep(
 
             deblended = bool(flag & sep.OBJ_MERGED)
             if deblended and not detection_params.accept_deblended_for_focus:
-                rej.append(Rejection.BLENDED.value)
+                rej.append(Rejection.DEBLENDED.value)
             if flag & sep.OBJ_TRUNC or (r_flag | a_flag) & sep.APER_TRUNC:
                 rej.append(Rejection.EDGE_TRUNCATED.value)
 

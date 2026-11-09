@@ -83,11 +83,14 @@ def direct_hfr_measure(crop: np.ndarray) -> float:
     (``python_crop_iterative_clip``) + aperture-bounded signed curve-of-growth
     HFR (``python_signed_curve_of_growth``). A Python reference of the same
     idea as the daemon's crop path, not the daemon's implementation and not
-    SEP. A crop whose sky noise is unresolved still gets its level; the noise
-    only steers the centroid core threshold."""
+    SEP. A crop whose sky level is unavailable or whose noise is unresolved
+    (``estimate_background`` returns nan) gets nan — an invalid baseline
+    measurement, counted against ``measured_fraction`` — never a width."""
     from labels.psf_measure import curve_of_growth_hfr, estimate_background
 
     sky, rms = estimate_background(np.asarray(crop, dtype=np.float64))
+    if not (np.isfinite(sky) and np.isfinite(rms)):
+        return float("nan")
     hfr = curve_of_growth_hfr(np.asarray(crop, dtype=np.float64), sky, sky_rms=rms)
     return float(hfr) if hfr is not None and np.isfinite(hfr) else float("nan")
 

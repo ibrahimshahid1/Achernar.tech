@@ -54,6 +54,7 @@ import sqlite3
 import sys
 import uuid
 from collections import defaultdict
+from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -95,6 +96,23 @@ SATURATION_SOURCE_CONTAINER_8BIT = "container_ceiling_8bit"
 # native-saturation mask; this importer has always written the fraction of
 # detected SEP SOURCES rejected as saturated. The explicit key below carries the
 # importer's meaning under an unambiguous name.
+# Units of the measured pixel values. Only linear native samples (mono 8/16-bit
+# PNG/TIFF as the daemon writes them, FITS) are "adu". Rec.601 luma of a JPEG
+# is display-referred and gamma-encoded; luma of an RGB PNG/TIFF has an unknown
+# transfer function. Neither is detector ADU.
+UNITS_NATIVE = "adu"
+UNITS_JPEG_LUMA = "display_luma_8bit_nonlinear"
+UNITS_RGB_LUMA = "unverified"
+UNITS_NOTES = {
+    UNITS_NATIVE: "linear native samples of a mono PNG/TIFF/FITS frame",
+    UNITS_JPEG_LUMA: "Rec.601 luma of a display-referred (gamma-encoded) 8-bit JPEG; not linear detector ADU",
+    UNITS_RGB_LUMA: "Rec.601 luma of an RGB PNG/TIFF with unknown transfer function; not verified as detector ADU",
+}
+CHANNEL_CLIP_DEFINITION = (
+    "pixels where any RGB channel sits at the 8-bit container ceiling (255), computed before the "
+    "luma conversion and passed to measure_frame_sep as native_saturation_mask (footprint veto)"
+)
+
 SATURATED_STAR_FRACTION_DEFINITION = (
     "fraction of SEP-detected sources (measure_frame_sep) rejected as saturated: native-mask "
     "footprint or raw footprint peak >= the applied threshold (written only when sources were measured)"
@@ -345,21 +363,35 @@ def night_id_for(timestamp: str, fallback: str) -> str:
 # ─── Frame measurement (for the field V-curve check) ─────────────────────────
 
 
+class LoadedLuma(NamedTuple):
+    """A decoded frame: luma, container ceiling, per-channel clip mask, units."""
+
+    data: object  # 2-D float64 array
+    container_max_adu: float | None
+    channel_clip_mask: object | None  # 2-D bool array for 8-bit RGB inputs, else None
+    units: str
+
+
 def load_luma(path: Path):
     """Read an image file as a 2-D float array, or return None.
 
     See :func:`load_luma_with_container` for the container ceiling.
     """
     loaded = load_luma_with_container(path)
-    return None if loaded is None else loaded[0]
+    return None if loaded is None else loaded.data
 
 
-def load_luma_with_container(path: Path):
-    """Read an image file as ``(2-D float array, container_max_adu)`` or None.
+def load_luma_with_container(path: Path) -> LoadedLuma | None:
+    """Read an image file as a :class:`LoadedLuma`, or None.
 
     ``container_max_adu`` is the full scale of the decoded sample type (255 for
     8-bit, 65535 for 16-bit integer samples) or None when the container has no
     integer ceiling (FITS floats) — never the observed maximum.
+
+    For 8-bit RGB inputs the container ceiling applies per channel: a star
+    clipped in one channel never brings Rec.601 luma near 255, so the clipped
+    pixels are found *before* the luma conversion (``channel_clip_mask``).
+    ``units`` is "adu" only for linear mono/FITS samples (see UNITS_NOTES).
 
     Only formats a hand-run sweep actually produces are handled: the 16-bit PNG
     the daemon writes for focus frames, TIFF, FITS, and the JPEG half of a
@@ -387,7 +419,9 @@ def load_luma_with_container(path: Path):
         with fits.open(path) as hdul:
             for hdu in hdul:
                 if getattr(hdu, "data", None) is not None and hdu.data.ndim == 2:
-                    return np.asarray(hdu.data, dtype=np.float64), container_max_adu(hdu.data)
+                    return LoadedLuma(
+                        np.asarray(hdu.data, dtype=np.float64), container_max_adu(hdu.data), None, UNITS_NATIVE
+                    )
         return None
 
     if suffix in PNG_SUFFIXES or suffix in JPEG_SUFFIXES:
@@ -398,16 +432,24 @@ def load_luma_with_container(path: Path):
         with Image.open(path) as image:
             array = np.asarray(image)
         ceiling = container_max_adu(array)
+        is_jpeg = suffix in JPEG_SUFFIXES
+        clip_mask = None
         if array.ndim == 3:
-            # Rec. 601 luma. Only reached for the JPEG half of a pair; the
-            # daemon's own focus frames are already single-channel. The
-            # weights sum to 1, so the luma keeps the channel ceiling.
-            array = (
-                0.299 * array[..., 0] + 0.587 * array[..., 1] + 0.114 * array[..., 2]
-            )
+            if array.shape[-1] >= 3:
+                colour = array[..., :3]  # drop alpha
+                if ceiling is not None and ceiling <= EIGHT_BIT_MAX_ADU:
+                    clip_mask = (colour >= ceiling).any(axis=-1)
+                # Rec. 601 luma. Reached for the JPEG half of a pair or an RGB
+                # PNG/TIFF; the daemon's own focus frames are single-channel.
+                array = 0.299 * colour[..., 0] + 0.587 * colour[..., 1] + 0.114 * colour[..., 2]
+            else:
+                array = array[..., 0]  # grey + alpha
+            units = UNITS_JPEG_LUMA if is_jpeg else UNITS_RGB_LUMA
+        else:
+            units = UNITS_JPEG_LUMA if is_jpeg else UNITS_NATIVE
         if array.ndim != 2:
             return None
-        return array.astype(np.float64), ceiling
+        return LoadedLuma(array.astype(np.float64), ceiling, clip_mask, units)
 
     return None
 
@@ -502,7 +544,7 @@ def measure_frame_detailed(path: Path, declared_saturation: float | None) -> tup
     loaded = load_luma_with_container(path)
     if loaded is None:
         return None, "unreadable"
-    image, container = loaded
+    image, container, channel_clip_mask, units = loaded
 
     sat, saturation_source = resolve_saturation(container, declared_saturation)
     gate_applied = sat is not None
@@ -514,7 +556,11 @@ def measure_frame_detailed(path: Path, declared_saturation: float | None) -> tup
         return None, "labeler_unavailable"
     try:
         _sources, label = measure_frame_sep(
-            image, saturation_level=threshold, fit_fwhm=False
+            image,
+            saturation_level=threshold,
+            native_saturation_mask=channel_clip_mask,
+            fit_fwhm=False,
+            units=units,
         )
     except MissingPrerequisite as exc:
         return None, str(exc)
@@ -524,18 +570,27 @@ def measure_frame_detailed(path: Path, declared_saturation: float | None) -> tup
     if label.hfr_px_median is None:
         return None, ";".join(label.reasons) or "no_valid_sources"
 
+    # `background` is the Python reference provenance object
+    # (producer "python_sep_label", schema
+    # "achernar.python_sep_background_provenance.v1"), NOT the daemon's Rust
+    # BackgroundResult that api/focus.rs writes under the same key (that one
+    # carries "schema_version"). Readers must dispatch on producer/schema.
     background = dict(label.background)
     background["level"] = label.sky_median_adu
     background["rms"] = label.sky_rms_adu
+    native_units = label.units == UNITS_NATIVE
     return {
         "hfr_px": float(label.hfr_px_median),
         "hfd_px": float(label.hfd_px_median),
         "star_count": int(label.star_count_detected),
         "star_count_used": int(label.star_count_used),
         # Legacy top-level keys, read by the FOP contract. SEP's globalback /
-        # globalrms (mesh medians; see background.level_definition).
-        "background_adu": label.sky_median_adu,
-        "background_sigma": label.sky_rms_adu,
+        # globalrms (mesh medians; see background.level_definition). They are
+        # ADU by name, so they are null (with a reason) when the pixels are not
+        # linear native samples; the nested object keeps the value and units.
+        "background_adu": label.sky_median_adu if native_units else None,
+        "background_sigma": label.sky_rms_adu if native_units else None,
+        **({} if native_units else {"background_adu_unavailable_reason": f"units_not_adu:{label.units}"}),
         "max_adu": container,
         "saturation_adu": sat,
         "saturation_source": saturation_source,
@@ -549,6 +604,12 @@ def measure_frame_detailed(path: Path, declared_saturation: float | None) -> tup
         "label_schema_version": label.label_schema_version,
         "measurement_method": label.label_method,
         "units": label.units,
+        "units_note": UNITS_NOTES.get(label.units),
+        "channel_clip_mask": (
+            None
+            if channel_clip_mask is None
+            else {"pixels": int(channel_clip_mask.sum()), "definition": CHANNEL_CLIP_DEFINITION}
+        ),
         "hfr_definition": label.width_definition.get("hfr"),
         "hfd_definition": label.width_definition.get("hfd"),
         "snr_definition": label.snr_definition,

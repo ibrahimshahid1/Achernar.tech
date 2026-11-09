@@ -80,6 +80,19 @@ def _gaussian(**changes):
     return params
 
 
+def test_aperture_hfr_insists_on_the_pinned_sep():
+    import sys
+    import types
+    from unittest import mock
+    from ml.labels.psf_measure import MissingPrerequisite
+
+    fake = types.ModuleType("sep")
+    fake.__version__ = "1.2.1"
+    with mock.patch.dict(sys.modules, {"sep": fake}):
+        with pytest.raises(MissingPrerequisite, match="missing prerequisite: sep==1.4.1"):
+            aperture_hfr(render_profile(64, _gaussian()), (31.5, 31.5), 24)
+
+
 def test_reference_hfr_is_finite_pixel_not_width_parameter(sep_required):
     image = render_profile(64, _gaussian(), oversample=5)
     hfr = aperture_hfr(image, (31.5, 31.5), 24)
@@ -136,6 +149,7 @@ def test_prepared_schema_splits_masks_and_no_fake_focus_runs(sep_required):
             assert row["focuser_position"] is None
         assert all(len(value) == 1 for value in by_family.values())
         assert manifest["observations"] == 64
+        assert manifest["sep_version"] == "1.4.1"
         obs = np.load(output / "observations.npz", allow_pickle=False)
         assert obs["pixel_flags"].dtype == np.uint8
         assert obs["raw_crops"].shape == (64, 64, 64)
