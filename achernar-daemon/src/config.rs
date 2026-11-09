@@ -1694,6 +1694,35 @@ mod example_config_tests {
             .any(|w| w.contains("[mount.center] exposure_s")));
     }
 
+    /// The example's `[vision.background]` documents the defaults: legacy
+    /// backend, unavailable-on-failure, and the SEP starting values. A
+    /// missing section is the legacy path.
+    #[test]
+    fn the_example_vision_background_section_is_the_default() {
+        use super::*;
+        let config: AchernarConfig = toml::from_str(include_str!("../achernar.example.toml"))
+            .expect("achernar.example.toml must parse");
+        assert_eq!(
+            config.vision.background,
+            crate::vision::background_model::BackgroundSettings::default()
+        );
+        let empty: AchernarConfig = toml::from_str("").unwrap();
+        assert_eq!(
+            empty.vision.background.backend,
+            crate::vision::background_model::BackgroundBackend::LegacyGlobalClip
+        );
+        let sep: AchernarConfig = toml::from_str(
+            "[vision.background]\nbackend = \"sep\"\n[vision.background.sep]\nbw = 32\n",
+        )
+        .unwrap();
+        assert_eq!(
+            sep.vision.background.backend,
+            crate::vision::background_model::BackgroundBackend::Sep
+        );
+        assert_eq!(sep.vision.background.sep.bw, 32);
+        assert_eq!(sep.vision.background.sep.bh, 64);
+    }
+
     /// The example documents the equipment defaults, so a copied example
     /// behaves exactly like no file at all.
     #[test]
