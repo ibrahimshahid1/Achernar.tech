@@ -5,6 +5,8 @@ pub mod background;
 pub mod background_dispatch;
 pub mod background_estimator;
 pub mod background_model;
+#[cfg(test)]
+mod bge_eval;
 pub mod coc_runner;
 pub mod coc_shadow_runner;
 pub mod coc_shadow;

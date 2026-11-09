@@ -28,7 +28,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::background_model::{BackgroundAnalysis, BackgroundField, SourceCatalog};
+use super::background_model::{
+    BackgroundAnalysis, BackgroundField, BackgroundMethod, SourceCatalog,
+};
 use super::quality::LumaFrame;
 use crate::equipment::types::{AlignmentMode, PierSide};
 
@@ -181,7 +183,13 @@ struct Ellipse {
 /// Measure the trail on the sensor. No sky axis is claimed: see [`attribute`].
 pub fn estimate_trailing(frame: &LumaFrame, background: &BackgroundAnalysis) -> TrailingEstimate {
     let (mut ellipses, policy) = match (&background.catalog, background.field.as_ref()) {
-        (_, None) => return unavailable(LEGACY_TRAILING_POLICY, "background_unavailable"),
+        (_, None) => {
+            let policy = match background.result.requested_method {
+                BackgroundMethod::SepSpatialMesh => SEP_TRAILING_POLICY,
+                BackgroundMethod::LegacyGlobalClip => LEGACY_TRAILING_POLICY,
+            };
+            return unavailable(policy, "background_unavailable");
+        }
         (Some(catalog), Some(field)) => {
             (catalog_ellipses(frame, field, catalog), SEP_TRAILING_POLICY)
         }
