@@ -4,22 +4,27 @@
 //! (BGE-01, BGE-02, BGE-11, BGE-16, BGE-23).
 //!
 //! What the adapter adds on top of SEP, and why:
-//! * A detector mask (bad/invalid/edge, native saturation, non-finite), so
-//!   SEP never sees an unusable pixel as data.
+//! * A detector mask (bad/invalid/edge, native saturation, non-finite or
+//!   beyond SEP's 1e30 sentinel), so SEP never sees an unusable pixel as
+//!   data.
 //! * Its own mesh-support count. SEP records nothing about which meshes it
 //!   replaced, and with no supported mesh at all it returns level 0 / RMS 1
 //!   with success (`background.c:filterback`).
 //! * Its own noise validity. SEP's `globalrms` falls back to 1.0, and its
-//!   bicubic RMS map can be zero or negative between meshes; neither is a
-//!   measured noise, so detection does not run on them.
+//!   bicubic RMS map can undershoot far below every mesh sigma it
+//!   interpolates (even below zero); neither is a measured noise, so
+//!   detection does not run on them (see [`RMS_MAP_LOWER_BOUND_FRACTION`]).
+//!
+//! Noise validity is decided for the whole frame: one bad pixel of the RMS
+//! map withholds the catalog everywhere (a documented limitation).
 //!
 //! Everything numeric comes from SEP's own evaluators (`sep_bkg_array`,
 //! `sep_bkg_rmsarray`, `sep_bkg_global(rms)`, `sep_extract`), the same calls
 //! the Python reference makes (`sep.Background.back()/rms()`, `sep.extract`).
 
 use achernar_sep::{
-    extract, flags, Background, BackgroundParams, ExtractParams, FilterType, Kernel, MeshGrid,
-    Noise, SepError,
+    extract, flags, mesh_support, usable_data_value, Background, BackgroundParams, ExtractParams,
+    FilterType, Kernel, MeshGrid, Noise, SepError,
 };
 
 use super::background_model::{
@@ -49,12 +54,36 @@ impl SepBackendFailure {
 }
 
 /// `catalog_error` when detection is skipped because the noise is not
-/// measured (zero, negative or non-finite RMS).
+/// measured (zero scatter or an invalid RMS map).
 pub const NOISE_UNRESOLVED: &str = "noise_unresolved";
 
-/// SEP's `BACK_MINGOODFRAC` (`background.c`): a mesh with fewer usable
-/// pixels than this fraction of its actual size is "bad" and replaced.
-const BACK_MINGOODFRAC: f64 = 0.5;
+/// Decision D-018 (an engineering bound, not from the literature): on a
+/// usable pixel, `R(x,y)` below this fraction of the smallest strictly
+/// positive filtered mesh sigma makes the RMS map invalid. The map is a
+/// natural bicubic spline of the mesh sigmas (`bkg_line_flt_internal`); where
+/// neighbouring sigmas change sharply it undershoots, and an undershoot that
+/// stays positive (review B1: a 600 ADU ridge gives R = 0.55 against mesh
+/// sigmas >= 4.87) turns noise into detections as surely as a negative one.
+/// No measured mesh supports a value below half the smallest one.
+pub const RMS_MAP_LOWER_BOUND_FRACTION: f32 = 0.5;
+
+/// What the adapter found in SEP's RMS map on usable pixels; logged when the
+/// map is rejected so the frame can be diagnosed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RmsMapCheck {
+    /// Smallest finite `R(x,y)` over usable pixels.
+    pub usable_min: Option<f32>,
+    /// Smallest strictly positive filtered mesh sigma.
+    pub mesh_sigma_min_positive: Option<f32>,
+    /// `RMS_MAP_LOWER_BOUND_FRACTION * mesh_sigma_min_positive`.
+    pub lower_bound: Option<f32>,
+    /// Usable pixels with `0 < R < lower_bound`.
+    pub below_bound: u64,
+    /// Usable pixels with `R == 0`.
+    pub zero: u64,
+    /// Usable pixels with `R < 0` or non-finite `R`.
+    pub negative_or_non_finite: u64,
+}
 
 /// Fraction of the declared saturation point treated as clipped on legacy
 /// frames without an analysis descriptor (as the legacy estimator does).
@@ -64,16 +93,21 @@ const LEVEL_DEFINITION: &str = "SEP 1.4.1 sep_bkg_global: median (mean of the tw
      for an even count) of the nx*ny mesh levels after bad-mesh replacement and the fw x fh \
      median filter, which replaces a mesh's level and sigma by the window medians where \
      |median - level| >= fthresh, with windows shrunk symmetrically at the grid edges \
-     (background.c filterback). A mesh level is backguess's estimate from the mesh's usable \
-     pixels after one mean +- 2 sigma clip (backstat) and iterative median +- 3 sigma \
-     histogram clipping: 2.5*median - 1.5*mean when |mean - median| < 0.3*sigma, otherwise \
-     the clipped median (the mean when sigma is 0). Meshes with < 50% usable pixels take the \
-     mean of their nearest supported meshes.";
+     (background.c filterback). A mesh level is backguess's estimate from a histogram of the \
+     mesh's usable pixels: backstat takes their mean and sigma, recomputes both over the \
+     pixels within that mean +- 2 sigma, and uses the recomputed values only to place the \
+     histogram (qzero = mean - 5 sigma, width 10 sigma, at most 4096 bins); backhisto bins \
+     every usable pixel inside that span; backguess clips the histogram iteratively at median \
+     +- 3 sigma (up to 100 passes) and returns 2.5*median - 1.5*mean when |mean - median| < \
+     0.3*sigma, otherwise the clipped median (the mean when sigma is 0). Meshes with < 50% \
+     usable pixels take the mean of their nearest supported meshes.";
 
 const RMS_DEFINITION: &str = "SEP 1.4.1 sep_bkg_globalrms: median of the nx*ny mesh sigmas \
      after bad-mesh replacement and the median filter; a mesh sigma is the standard deviation \
      of its clipped histogram (no truncation correction). Reported only when every mesh sigma \
-     and the interpolated RMS map on every usable pixel are positive and finite; SEP's \
+     is positive and finite and, on every usable pixel, the interpolated RMS map R(x,y) is \
+     finite and at least 0.5 x the smallest positive filtered mesh sigma (decision D-018; \
+     zero R is zero scatter, negative, non-finite or lower R an invalid RMS map); SEP's \
      substitutes for a non-positive median (median of positive sigmas, or 1.0) are never \
      reported.";
 
@@ -100,8 +134,10 @@ pub fn analyze_sep(
     }
     let (width, height) = (frame.width, frame.height);
 
-    // 1 = excluded. Non-finite pixels are excluded here so that SEP never
-    // sees them as data; the safe API would otherwise reject the frame.
+    // 1 = excluded. Pixels SEP cannot use as data (non-finite, or at/beyond
+    // its 1e30 BIG sentinel, e.g. a -1e30 blank value) are excluded here
+    // with the safe API's own predicate, so one such pixel masks itself
+    // instead of failing the frame.
     let mask: Vec<u8> = frame
         .pixels
         .iter()
@@ -110,7 +146,7 @@ pub fn analyze_sep(
             u8::from(
                 !frame.measurement_pixel_valid(i)
                     || frame.native_saturation_at(i)
-                    || !value.is_finite(),
+                    || !usable_data_value(*value),
             )
         })
         .collect();
@@ -149,20 +185,22 @@ pub fn analyze_sep(
         }));
     }
     let grid = MeshGrid::for_frame(width, height, params.bw, params.bh);
-    let supported = mesh_support(&mask, width, height, grid);
+    // SEP's bad-mesh rule (background.c:backstat, BACK_MINGOODFRAC 0.5 of
+    // each mesh's actual, possibly partial, size), from the safe API.
+    let supported = mesh_support(Some(&mask), width, height, grid);
     let meshes_below_support = supported.iter().filter(|ok| !**ok).count();
     if meshes_below_support == supported.len() {
         return Err(SepBackendFailure::new(
             BackgroundReason::InsufficientSupport,
             format!(
-                "all {}x{} meshes have fewer than {:.0}% usable pixels",
-                grid.nx,
-                grid.ny,
-                BACK_MINGOODFRAC * 100.0
+                "all {}x{} meshes have fewer than 50% usable pixels",
+                grid.nx, grid.ny
             ),
         ));
     }
 
+    // Frames whose bad-mesh search would exceed achernar_sep's
+    // MAX_BAD_MESH_WORK fail here with "work bound: ..." before SEP runs.
     let background = Background::estimate(&frame.pixels, width, height, Some(&mask), &params)
         .map_err(|e| backend_failure(&e))?;
     let level_map = background.back_array().map_err(|e| backend_failure(&e))?;
@@ -172,12 +210,23 @@ pub fn analyze_sep(
     if meshes_below_support > 0 {
         reasons.push(BackgroundReason::MeshesInterpolated);
     }
-    let noise = noise_validity(
+    let (noise, check) = noise_validity(
         background.global_rms(),
         background.mesh_rms(),
         &rms_map,
         &mask,
     );
+    if noise.contains(&BackgroundReason::InvalidRmsMap) {
+        tracing::warn!(
+            usable_min = ?check.usable_min,
+            mesh_sigma_min_positive = ?check.mesh_sigma_min_positive,
+            lower_bound = ?check.lower_bound,
+            below_bound = check.below_bound,
+            zero = check.zero,
+            negative_or_non_finite = check.negative_or_non_finite,
+            "SEP RMS map rejected (invalid_rms_map); detection not run"
+        );
+    }
     reasons.extend(noise.iter().copied());
     let noise_measured = noise.is_empty();
 
@@ -259,63 +308,61 @@ fn backend_failure(error: &SepError) -> SepBackendFailure {
     SepBackendFailure::new(BackgroundReason::BackendFailure, error.to_string())
 }
 
-/// SEP's bad-mesh rule from `background.c:backstat`, evaluated on the
-/// detector mask: mesh `(i, j)` spans its *actual* pixels (the last column
-/// and row of meshes are partial), and it is bad iff
-/// `(float)npix < (float)(bw_i * h_j * BACK_MINGOODFRAC)`, where `npix`
-/// counts unmasked pixels with `pix > -BIG` (the mask already excludes every
-/// non-finite pixel). Returns one flag per mesh, row-major, `true` = supported.
-fn mesh_support(mask: &[u8], width: usize, height: usize, grid: MeshGrid) -> Vec<bool> {
-    let mut usable = vec![0u64; grid.nx * grid.ny];
-    for y in 0..height {
-        let row = &mask[y * width..(y + 1) * width];
-        let mesh_row = (y / grid.bh) * grid.nx;
-        for (x, &m) in row.iter().enumerate() {
-            if m == 0 {
-                usable[mesh_row + x / grid.bw] += 1;
-            }
-        }
-    }
-    usable
-        .iter()
-        .enumerate()
-        .map(|(index, &npix)| {
-            let (i, j) = (index % grid.nx, index / grid.nx);
-            let mesh_w = (width - i * grid.bw).min(grid.bw);
-            let mesh_h = (height - j * grid.bh).min(grid.bh);
-            !((npix as f32) < ((mesh_w * mesh_h) as f64 * BACK_MINGOODFRAC) as f32)
-        })
-        .collect()
-}
-
-/// Reasons the empirical noise is not a measurement, empty when it is.
+/// Reasons the empirical noise is not a measurement (empty when it is), and
+/// what the RMS map looked like on usable pixels.
 ///
 /// A zero mesh sigma or zero map value is zero *scatter* (a quantized
-/// plateau), not zero detector noise. A negative or non-finite value is the
-/// natural cubic spline of `bkg_line_flt_internal` overshooting between
-/// meshes whose sigmas differ sharply; it cannot serve as a noise map. Never
-/// replaced by an epsilon.
+/// plateau), not zero detector noise. A negative, non-finite, or positive but
+/// implausibly small map value (below [`RMS_MAP_LOWER_BOUND_FRACTION`] of the
+/// smallest positive mesh sigma, decision D-018) is the natural cubic spline
+/// of `bkg_line_flt_internal` undershooting between meshes whose sigmas
+/// differ sharply; it cannot serve as a noise map. Never replaced by an
+/// epsilon.
 fn noise_validity(
     global_rms: f32,
     mesh_rms: &[f32],
     rms_map: &[f32],
     mask: &[u8],
-) -> Vec<BackgroundReason> {
+) -> (Vec<BackgroundReason>, RmsMapCheck) {
     let (mut zero, mut invalid) = (false, false);
-    let mut classify = |value: f32| {
+    let mut classify_sigma = |value: f32| {
         if !value.is_finite() || value < 0.0 {
             invalid = true;
         } else if value == 0.0 {
             zero = true;
         }
     };
-    classify(global_rms);
-    mesh_rms.iter().copied().for_each(&mut classify);
-    rms_map
+    classify_sigma(global_rms);
+    mesh_rms.iter().copied().for_each(&mut classify_sigma);
+
+    let mesh_sigma_min_positive = mesh_rms
         .iter()
-        .zip(mask)
-        .filter(|(_, &m)| m == 0)
-        .for_each(|(&r, _)| classify(r));
+        .copied()
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .reduce(f32::min);
+    let lower_bound = mesh_sigma_min_positive.map(|s| RMS_MAP_LOWER_BOUND_FRACTION * s);
+    let mut check = RmsMapCheck {
+        usable_min: None,
+        mesh_sigma_min_positive,
+        lower_bound,
+        below_bound: 0,
+        zero: 0,
+        negative_or_non_finite: 0,
+    };
+    for (&r, _) in rms_map.iter().zip(mask).filter(|(_, &m)| m == 0) {
+        if !r.is_finite() || r < 0.0 {
+            check.negative_or_non_finite += 1;
+        } else if r == 0.0 {
+            check.zero += 1;
+        } else if lower_bound.is_some_and(|bound| r < bound) {
+            check.below_bound += 1;
+        }
+        if r.is_finite() {
+            check.usable_min = Some(check.usable_min.map_or(r, |m: f32| m.min(r)));
+        }
+    }
+    zero |= check.zero > 0;
+    invalid |= check.negative_or_non_finite > 0 || check.below_bound > 0;
     let mut reasons = Vec::new();
     if zero {
         reasons.push(BackgroundReason::ZeroEmpiricalScatter);
@@ -323,7 +370,7 @@ fn noise_validity(
     if invalid {
         reasons.push(BackgroundReason::InvalidRmsMap);
     }
-    reasons
+    (reasons, check)
 }
 
 /// Linear interpolation between order statistics (numpy's default
@@ -948,7 +995,7 @@ mod tests {
         // meshes, (2,0) and (3,1), whose levels are ~300 and ~800.
         let grid = MeshGrid::for_frame(width, height, 64, 64);
         let mask: Vec<u8> = f.masks.invalid.clone();
-        let supported = mesh_support(&mask, width, height, grid);
+        let supported = mesh_support(Some(&mask), width, height, grid);
         assert_eq!(
             supported,
             vec![true, true, true, false, true, true, true, true]
@@ -1083,10 +1130,100 @@ mod tests {
         assert!(analysis.catalog_error.unwrap().contains("filter_type"));
     }
 
+    #[test]
+    fn positive_rms_undershoot_below_the_mesh_sigmas_is_an_invalid_map() {
+        // Review B1: a 600 ADU ridge. The spline of the mesh sigmas stays
+        // positive but falls far below every mesh sigma; before D-018 it was
+        // accepted and turned noise into ~100 detections.
+        let (width, height) = (512, 512);
+        let pixels = sky(width, height, 5.0, 4, |x, _| {
+            1000.0 + 600.0 * (-((x - 256.0) / 60.0).powi(2)).exp()
+        });
+        let f = frame(pixels, width, height);
+        let analysis = analyze_sep(&f, &settings()).unwrap();
+        let (_, rms) = map(&analysis);
+        let min = rms.iter().copied().fold(f32::INFINITY, f32::min);
+        let background = Background::estimate(
+            &f.pixels,
+            width,
+            height,
+            Some(&vec![0; width * height]),
+            &BackgroundParams::default(),
+        )
+        .unwrap();
+        let (reasons, check) = noise_validity(
+            background.global_rms(),
+            background.mesh_rms(),
+            rms,
+            &vec![0; width * height],
+        );
+        println!("amp-600 ridge RMS map: min {min}, check {check:?}");
+        assert!(min > 0.0, "this case is the positive undershoot, min {min}");
+        assert_eq!(check.negative_or_non_finite + check.zero, 0);
+        assert!(check.below_bound > 0);
+        assert!(check.usable_min.unwrap() < check.lower_bound.unwrap());
+        assert_eq!(reasons, vec![BackgroundReason::InvalidRmsMap]);
+        let result = &analysis.result;
+        assert!(result.reasons.contains(&BackgroundReason::InvalidRmsMap));
+        assert_eq!(result.noise_status, NoiseStatus::Unresolved);
+        assert_eq!(result.rms, None);
+        assert!(result.level().is_some());
+        assert!(analysis.catalog.is_none());
+        assert_eq!(analysis.catalog_error.as_deref(), Some(NOISE_UNRESOLVED));
+    }
+
+    #[test]
+    fn sep_sentinel_values_are_masked_not_fatal() {
+        // Review B5: a -1e30 blank value or a 1e31 spike is beyond SEP's BIG
+        // sentinel; it is excluded like a NaN instead of failing the frame.
+        let (width, height) = (192, 160);
+        let mut pixels = sky(width, height, 4.0, 16, |_, _| 300.0);
+        pixels[10 * width + 20] = -1e30;
+        pixels[50 * width + 60] = 1e31;
+        pixels[70 * width + 80] = 1e30;
+        let analysis = analyze_sep(&frame(pixels, width, height), &settings()).unwrap();
+        assert_eq!(
+            analysis.result.support.usable_pixels as usize,
+            width * height - 3
+        );
+        assert!((analysis.result.level().unwrap() - 300.0).abs() < 1.0);
+        assert_eq!(analysis.result.noise_status, NoiseStatus::Measured);
+        assert!(analysis.catalog.is_some());
+    }
+
+    #[test]
+    fn bad_mesh_search_above_the_work_bound_is_a_backend_failure() {
+        // Review B7: 8 px meshes on 2000x2000 with the left half invalid make
+        // filterback's bad-mesh search 31,250 x 62,500 = 1.95e9 units, above
+        // achernar_sep::MAX_BAD_MESH_WORK; refused before SEP runs.
+        let (width, height) = (2000, 2000);
+        let mut f = frame(vec![100.0; width * height], width, height);
+        f.masks.invalid = (0..width * height)
+            .map(|i| u8::from(i % width < width / 2))
+            .collect();
+        let mut settings = settings();
+        settings.sep.bw = 8;
+        settings.sep.bh = 8;
+        let failure = analyze_sep(&f, &settings).unwrap_err();
+        assert_eq!(failure.reason, BackgroundReason::BackendFailure);
+        assert!(
+            failure.detail.starts_with("work bound:"),
+            "{}",
+            failure.detail
+        );
+    }
+
     /// The adapter on the crate's Python-reference fixture (sep 1.4.1 wheel,
     /// `achernar-sep/tests/fixtures/parity_v1`): the detector mask (a bad-pixel
     /// mask with NaNs inside it), the residual construction and the catalog
     /// mapping reproduce the wheel within decisions.md D-006.
+    ///
+    /// Deblended children depend on the C library's `rand_r` (review B2): the
+    /// per-child npix/flux/shape checks run only on the fixture's C library
+    /// (`meta.json` `rust_target_os`); everywhere, the family rule of
+    /// `achernar-sep/tests/parity.rs` (fixed from the source before any
+    /// foreign-libc run) is checked, and off that platform the test says the
+    /// per-child values are not verifiable.
     #[test]
     fn adapter_reproduces_the_python_reference_fixture() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/sep/tests/fixtures/parity_v1/");
@@ -1107,13 +1244,18 @@ mod tests {
         let analysis = analyze_sep(&f, &settings).unwrap();
 
         let (level, rms) = map(&analysis);
-        let within = |ours: &[f32], reference: &[f32]| {
-            ours.iter()
-                .zip(reference)
-                .all(|(o, r)| (o - r).abs() as f64 <= 1e-5 * (r.abs() as f64).max(1.0))
+        let within = |name: &str, ours: &[f32], reference: &[f32]| {
+            assert_eq!(ours.len(), width * height, "{name}: map length");
+            assert_eq!(reference.len(), width * height, "{name}: reference length");
+            assert!(
+                ours.iter()
+                    .zip(reference)
+                    .all(|(o, r)| (o - r).abs() as f64 <= 1e-5 * (r.abs() as f64).max(1.0)),
+                "{name}: map exceeds D-006"
+            );
         };
-        assert!(within(level, &f32s("back.f32")), "background map");
-        assert!(within(rms, &f32s("rms.f32")), "RMS map");
+        within("background", level, &f32s("back.f32"));
+        within("RMS", rms, &f32s("rms.f32"));
         let globals = String::from_utf8(read("globals.tsv")).unwrap();
         let global = |key: &str| -> f64 {
             globals
@@ -1142,8 +1284,32 @@ mod tests {
                     .collect()
             })
             .collect();
+        let meta = String::from_utf8(read("meta.json")).unwrap();
+        let fixture_os = meta
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("\"rust_target_os\": \"")
+                    .and_then(|rest| rest.strip_suffix("\","))
+            })
+            .expect("meta.json records rust_target_os");
+        let exact = fixture_os == std::env::consts::OS
+            && std::env::var_os("ACHERNAR_SEP_PARITY_ASSUME_FOREIGN_LIBC").is_none();
+        let merged: Vec<bool> = rows
+            .iter()
+            .map(|r| r["flag"] as u16 & flags::OBJ_MERGED != 0)
+            .collect();
         assert_eq!(catalog.objects.len(), rows.len());
-        for (ours, r) in catalog.objects.iter().zip(&rows) {
+        for (i, (ours, r)) in catalog.objects.iter().zip(&rows).enumerate() {
+            // Child barycentres do not depend on rand_r (analyse.c robust
+            // branch); everything else of a child does.
+            assert_eq!(ours.deblended, merged[i]);
+            assert!(
+                (ours.x as f64 - r["x"]).abs() <= 1e-4 && (ours.y as f64 - r["y"]).abs() <= 1e-4
+            );
+            if merged[i] && !exact {
+                continue;
+            }
             assert_eq!(ours.npix as f64, r["npix"]);
             assert_eq!(
                 [ours.xmin, ours.xmax, ours.ymin, ours.ymax].map(|v| v as f64),
@@ -1152,9 +1318,6 @@ mod tests {
             assert_eq!(ours.flags as f64, r["flag"]);
             assert_eq!(ours.deblended, r["flag"] as u16 & flags::OBJ_MERGED != 0);
             assert_eq!(ours.truncated, r["flag"] as u16 & flags::OBJ_TRUNC != 0);
-            assert!(
-                (ours.x as f64 - r["x"]).abs() <= 1e-4 && (ours.y as f64 - r["y"]).abs() <= 1e-4
-            );
             for (value, key) in [(ours.flux, "flux"), (ours.a, "a"), (ours.b, "b")] {
                 assert!(
                     (value as f64 - r[key]).abs() <= 1e-5 * r[key].abs().max(1.0),
@@ -1170,7 +1333,90 @@ mod tests {
             .chunks_exact(4)
             .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
-        assert_eq!(catalog.segmentation.as_ref().unwrap(), &segmap);
+        assert_eq!(segmap.len(), width * height);
+
+        // Family rule (all platforms): same families, identical union of
+        // footprints and total npix, total flux within D-006, flag union.
+        let mut reference_pixels = vec![Vec::new(); rows.len()];
+        for (p, &id) in segmap.iter().enumerate() {
+            if id > 0 {
+                reference_pixels[id as usize - 1].push(p as u32);
+            }
+        }
+        let families = achernar_sep::deblend_families(
+            reference_pixels
+                .iter()
+                .zip(&merged)
+                .map(|(p, &m)| (p.as_slice(), m)),
+            width,
+            height,
+        );
+        let ours_families = achernar_sep::deblend_families(
+            catalog
+                .objects
+                .iter()
+                .map(|o| (o.pixels.as_slice(), o.deblended)),
+            width,
+            height,
+        );
+        assert_eq!(ours_families, families);
+        assert!(!families.is_empty(), "the fixture holds a deblended pair");
+        let mut family_of = vec![usize::MAX; rows.len()];
+        for (f, members) in families.iter().enumerate() {
+            let sorted = |mut v: Vec<u32>| {
+                v.sort_unstable();
+                v
+            };
+            let ours_union = sorted(
+                members
+                    .iter()
+                    .flat_map(|&i| catalog.objects[i].pixels.clone())
+                    .collect(),
+            );
+            let ref_union = sorted(
+                members
+                    .iter()
+                    .flat_map(|&i| reference_pixels[i].clone())
+                    .collect(),
+            );
+            assert_eq!(ours_union, ref_union, "family {f} pixels");
+            let npix: u32 = members.iter().map(|&i| catalog.objects[i].npix).sum();
+            let ref_npix: f64 = members.iter().map(|&i| rows[i]["npix"]).sum();
+            assert_eq!(npix as f64, ref_npix, "family {f} npix");
+            let flux: f64 = members
+                .iter()
+                .map(|&i| catalog.objects[i].flux as f64)
+                .sum();
+            let ref_flux: f64 = members.iter().map(|&i| rows[i]["flux"]).sum();
+            assert!((flux - ref_flux).abs() <= 1e-5 * ref_flux.abs().max(1.0));
+            let flag_union = |f: &dyn Fn(usize) -> u16| members.iter().fold(0, |a, &i| a | f(i));
+            assert_eq!(
+                flag_union(&|i| catalog.objects[i].flags),
+                flag_union(&|i| rows[i]["flag"] as u16)
+            );
+            for &i in members {
+                family_of[i] = f;
+            }
+        }
+        let ours_segmap = catalog.segmentation.as_ref().unwrap();
+        assert_eq!(ours_segmap.len(), width * height);
+        if exact {
+            assert_eq!(ours_segmap, &segmap);
+        } else {
+            for (&ours, &r) in ours_segmap.iter().zip(&segmap) {
+                assert!(match r {
+                    0 => ours == 0,
+                    r if !merged[r as usize - 1] => ours == r,
+                    r => ours > 0 && family_of[ours as usize - 1] == family_of[r as usize - 1],
+                });
+            }
+            println!(
+                "NOTE: fixture C library differs from this run's (target_os {}): per-child \
+                 npix/flux/shape of SEP_OBJ_MERGED children NOT VERIFIABLE here; checked the \
+                 deblend-family invariants instead",
+                std::env::consts::OS
+            );
+        }
     }
 
     /// Available-host software timing, not a deployment target. Run with
