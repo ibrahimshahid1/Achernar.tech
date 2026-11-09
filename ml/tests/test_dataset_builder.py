@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 from PIL import Image
@@ -58,6 +59,22 @@ def _write_frame_png(path, hfr, rng, size=192):
 
 
 FROZEN_V1 = Path(__file__).resolve().parent.parent / "data_pipeline" / "focus_quality_synth_v1.npz"
+TOOLS_DIR = Path(__file__).resolve().parents[2] / "tools"
+
+
+def _import_session():
+    """tools/import_session.py, the writer of importer quality_json."""
+    if str(TOOLS_DIR) not in sys.path:
+        sys.path.insert(0, str(TOOLS_DIR))
+    import import_session
+
+    return import_session
+
+
+def _write_frame_png_8bit(path, hfr, rng, size=192):
+    # An 8-bit mono frame (UVC/Mono8-like): sky 20, peak ~150, in a uint8 PNG.
+    img = render_star(hfr, size=size, amp=150.0, sky=20.0, read_noise=2.0, rng=rng)
+    Image.fromarray(np.clip(np.round(img), 0, 255).astype(np.uint8)).save(path)
 
 
 def _fixture_db(d, *, n_runs=2, size=192, rng=None):
@@ -327,6 +344,70 @@ class TestLabelProvenance(SepRequired):
             self.assertEqual(label_provenance_status(dict(manifest, saturation_gate="permissive")),
                              PERMISSIVE_SATURATION)
 
+    def test_importer_container_ceiling_round_trips_through_the_builder(self):
+        """Review F1: an importer-written 8-bit container ceiling
+        (saturation_adu 255 + saturation_source container_ceiling_8bit) must
+        not come back as a declared sensor saturation."""
+        imp = _import_session()
+        rng = np.random.default_rng(8)
+        with tempfile.TemporaryDirectory() as d:
+            db_path = os.path.join(d, "achernar.db")
+            con = _make_schema(db_path)
+            con.execute("INSERT INTO focus_runs (id, rig_id) VALUES ('run', 'rig')")
+            for i, hfr in enumerate([2.0, 3.0, 4.0]):
+                png = Path(d) / f"f{i}.png"
+                _write_frame_png_8bit(png, hfr, rng)
+                measurement, reason = imp.measure_frame_detailed(png, None)
+                self.assertIsNone(reason)
+                quality_json = imp.quality_json_for(measurement, None)
+                q = json.loads(quality_json)
+                self.assertEqual((q["saturation_adu"], q["saturation_source"]), (255.0, "container_ceiling_8bit"))
+                threshold, source = saturation_decision_from_quality(quality_json)
+                self.assertAlmostEqual(threshold, 255.0 * 0.98)
+                self.assertEqual(source, "container_ceiling_8bit")
+                con.execute(
+                    "INSERT INTO frames (id, local_path, checksum_sha256, quality_json) VALUES (?, ?, ?, ?)",
+                    (f"f{i}", str(png), hashlib.sha256(png.read_bytes()).hexdigest(), quality_json),
+                )
+                con.execute(
+                    "INSERT INTO focus_samples (run_id, position, hfr, frame_id) VALUES ('run', ?, ?, ?)",
+                    (100 * i, hfr, f"f{i}"),
+                )
+            con.commit()
+            con.close()
+            out = os.path.join(d, "ds.npz")
+            ds = build_dataset(db_path, out)
+            manifest = json.loads(Path(out).with_suffix(".manifest.json").read_text())
+        self.assertEqual(manifest["frames_by_saturation_source"], {"container_ceiling_8bit": 3})
+        self.assertEqual(manifest["frames_by_saturation_gate"], {"applied": 3})
+        self.assertGreater(len(ds["hfr_px"]), 0)
+        self.assertTrue(np.all(ds["saturation_source"] == "container_ceiling_8bit"))
+
+    def test_detection_failures_are_counted(self):
+        """Review F7: a frame whose sep.extract raises has a measured
+        background but no rows; the manifest must say so."""
+        import labels.psf_measure as psf
+
+        calls = {"n": 0}
+        original = psf._sep_extract
+
+        def failing_first(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise Exception("internal pixel buffer full")
+            return original(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as d:
+            db_path = _fixture_db(d, n_runs=1)
+            out = os.path.join(d, "ds.npz")
+            with mock.patch.object(psf, "_sep_extract", failing_first):
+                ds = build_dataset(db_path, out)
+            manifest = json.loads(Path(out).with_suffix(".manifest.json").read_text())
+        self.assertEqual(manifest["frames_detection_backend_failure"], 1)
+        self.assertEqual(manifest["detection_backend_errors"], {"internal pixel buffer full": 1})
+        self.assertEqual(manifest["frames_read"], 3)
+        self.assertEqual(len(set(ds["frame_id"])), 2)
+
     def test_frames_below_the_mesh_grid_are_counted_not_labelled(self):
         with tempfile.TemporaryDirectory() as d:
             db_path = _fixture_db(d, n_runs=1, size=96)
@@ -363,6 +444,20 @@ class TestSaturationGate(unittest.TestCase):
         threshold, source = saturation_decision_from_quality('{"saturation_adu": 16383, "max_adu": 255}')
         self.assertEqual((threshold, source), (16383 * 0.98, "declared_sensor_saturation"))
         self.assertEqual(saturation_decision_from_quality('{"max_adu": 65535}'), (None, None))
+        # An explicit source is honoured; an unknown one is never "declared".
+        self.assertEqual(
+            saturation_decision_from_quality('{"saturation_adu": 255, "saturation_source": "container_ceiling_8bit"}'),
+            (255 * 0.98, "container_ceiling_8bit"),
+        )
+        self.assertEqual(
+            saturation_decision_from_quality(
+                '{"saturation_adu": 16383, "saturation_source": "declared_sensor_saturation"}'),
+            (16383 * 0.98, "declared_sensor_saturation"),
+        )
+        self.assertEqual(
+            saturation_decision_from_quality('{"saturation_adu": 4000, "saturation_source": "guessed"}'),
+            (4000 * 0.98, "unrecognized_saturation_source"),
+        )
 
     def test_explicit_gate_not_applied_overrides_any_value(self):
         q = '{"saturation_adu": 16383, "saturation_gate_applied": false}'

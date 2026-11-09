@@ -73,6 +73,10 @@ EIGHT_BIT_MAX_ADU = 255.0
 
 SATURATION_SOURCE_DECLARED = "declared_sensor_saturation"
 SATURATION_SOURCE_CONTAINER_8BIT = "container_ceiling_8bit"
+# A saturation_adu written with a saturation_source this builder does not
+# recognise: the level is still applied as a gate, but it is never called a
+# declared sensor value.
+SATURATION_SOURCE_UNRECOGNIZED = "unrecognized_saturation_source"
 
 # Label provenance. Bump LABEL_VERSION whenever psf_measure.LABEL_SCHEMA_VERSION,
 # the SEP pin, or the selection policy of this builder changes meaning.
@@ -93,6 +97,13 @@ def saturation_decision_from_quality(quality_json: str) -> tuple[float | None, s
     ``source`` is :data:`SATURATION_SOURCE_DECLARED` for a declared sensor
     value or :data:`SATURATION_SOURCE_CONTAINER_8BIT` for the 8-bit container
     rule. See :func:`saturation_level_from_quality` for the policy.
+
+    A ``saturation_source`` written next to ``saturation_adu`` (by
+    tools/import_session.py) is honoured: ``container_ceiling_8bit`` stays a
+    container ceiling, and any other unrecognised value becomes
+    :data:`SATURATION_SOURCE_UNRECOGNIZED`. Without the key (the daemon, which
+    writes its configured sensor value, and pre-v2 records) ``saturation_adu``
+    is a declared sensor value.
     """
     q = _quality_dict(quality_json)
 
@@ -106,9 +117,16 @@ def saturation_decision_from_quality(quality_json: str) -> tuple[float | None, s
             value = float(declared)
         except (TypeError, ValueError):
             return None, None
-        if value > 0.0 and np.isfinite(value):
-            return value * SATURATION_FRACTION, SATURATION_SOURCE_DECLARED
-        return None, None
+        if not (value > 0.0 and np.isfinite(value)):
+            return None, None
+        written = q.get("saturation_source")
+        if written is None or written == SATURATION_SOURCE_DECLARED:
+            source = SATURATION_SOURCE_DECLARED
+        elif written == SATURATION_SOURCE_CONTAINER_8BIT:
+            source = SATURATION_SOURCE_CONTAINER_8BIT
+        else:
+            source = SATURATION_SOURCE_UNRECOGNIZED
+        return value * SATURATION_FRACTION, source
 
     # No declared value. Only an 8-bit container can supply one on its own.
     max_adu = q.get("max_adu")
@@ -466,6 +484,10 @@ def build_dataset(
     frames_skipped_unknown_saturation = 0
     frames_skipped_ineligible = 0
     frames_background_unavailable: Counter = Counter()
+    # Background measured but sep.extract raised (e.g. pixstack/deblend
+    # overflow in a crowded field): no rows, counted here with the error text.
+    frames_detection_backend_failure = 0
+    detection_backend_errors: Counter = Counter()
     frames_by_saturation_source: Counter = Counter()
     frames_by_saturation_gate: Counter = Counter()
     rejection_counts: Counter = Counter()
@@ -532,6 +554,10 @@ def build_dataset(
         if background.get("level_status") != "measured" or background.get("noise_status") != "measured":
             for reason in background.get("reasons") or ["unknown"]:
                 frames_background_unavailable[reason] += 1
+            continue
+        if frame_label.detection.get("status") != "measured":
+            frames_detection_backend_failure += 1
+            detection_backend_errors[str(frame_label.detection.get("backend_error"))] += 1
             continue
         sources_detected += len(sources)
         sources_valid += sum(source.valid for source in sources)
@@ -611,6 +637,8 @@ def build_dataset(
             hint += f" {frames_skipped_ineligible} frame(s) were excluded by acquisition eligibility."
         if frames_background_unavailable:
             hint += f" SEP background unavailable: {dict(frames_background_unavailable)}."
+        if frames_detection_backend_failure:
+            hint += f" SEP detection failed on {frames_detection_backend_failure} frame(s): {dict(detection_backend_errors)}."
         raise RuntimeError(f"No usable star crops found in {db_path}. {hint}")
 
     dataset = {
@@ -673,6 +701,8 @@ def build_dataset(
         "frames_skipped_unknown_saturation": frames_skipped_unknown_saturation,
         "frames_skipped_ineligible": frames_skipped_ineligible,
         "frames_background_unavailable": dict(frames_background_unavailable),
+        "frames_detection_backend_failure": frames_detection_backend_failure,
+        "detection_backend_errors": dict(detection_backend_errors),
         "frames_by_saturation_source": dict(frames_by_saturation_source),
         "frames_by_saturation_gate": dict(frames_by_saturation_gate),
         "sources_detected": sources_detected,
