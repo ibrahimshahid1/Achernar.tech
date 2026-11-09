@@ -585,7 +585,13 @@ def run_timing(args, out, cargo_target, rust_info, note) -> dict:
             o = bridge.read_output(odir, frame.id, backend, frame.width, frame.height)
             run["timing_ms"] = (o.get("json") or {}).get("timing_ms")
             run["output_status"] = o["status"]
+            run["backend_error"] = ((o.get("json") or {}).get("background") or {}).get("backend_error")
             rows.append(run)
+        if any(SEP_NOT_BUILT_MARKER in (r.get("backend_error") or "") for r in rows):
+            rev = ((rust_info.get("revision") or {}).get("commit") or "unknown")[:12]
+            result["rust"][backend] = {"status": "skipped", "runs": rows,
+                                       "reason": f"skipped: rust sep backend not integrated at {rev}"}
+            continue
         tm = [sum((r["timing_ms"] or {}).values()) for r in rows if r.get("timing_ms")]
         result["rust"][backend] = {
             "status": "completed" if tm else "failed", "binary": binary, "runs": rows,
@@ -782,7 +788,8 @@ def render_summary(doc, core, sweeps) -> str:
             for b, r in rust.items():
                 if not isinstance(r, dict):
                     continue
-                rows.append([f"`rust_{b}`", r.get("status"), _fmt(r.get("bridge_total_ms_median"), 1), "-", "-",
+                rows.append([f"`rust_{b}`", _status(r.get("status"), r.get("reason")),
+                             _fmt(r.get("bridge_total_ms_median"), 1), "-", "-",
                              _fmt((r.get("process_peak_rss_bytes_max") or 0) / 2**20, 0), "-"])
         L.append(_table(["method", "status", "median ms", "p95 ms", "background ms", "peak RSS MiB",
                          "RSS after load MiB"], rows))
