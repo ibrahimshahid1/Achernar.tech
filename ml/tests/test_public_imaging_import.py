@@ -4,12 +4,20 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
+import pytest
 
 from ml.data_pipeline.import_public_imaging import aperture_hfr, moment_shape, prepare_synthetic, render_profile
 from ml.data_pipeline.split_registry import load_registered_splits
+from ml.labels.psf_measure import require_sep
 
 
-def test_fits_intake_preserves_quality_arrays_and_rejects_masked_cores(tmp_path):
+@pytest.fixture
+def sep_required():
+    """SEP-backed tests fail with "missing prerequisite: sep==1.4.1" rather than skip."""
+    return require_sep()
+
+
+def test_fits_intake_preserves_quality_arrays_and_rejects_masked_cores(tmp_path, sep_required):
     from astropy.io import fits
     from ml.data_pipeline.import_public_imaging import prepare_hst
     product='fixture123'
@@ -72,7 +80,7 @@ def _gaussian(**changes):
     return params
 
 
-def test_reference_hfr_is_finite_pixel_not_width_parameter():
+def test_reference_hfr_is_finite_pixel_not_width_parameter(sep_required):
     image = render_profile(64, _gaussian(), oversample=5)
     hfr = aperture_hfr(image, (31.5, 31.5), 24)
     assert abs(image.sum()-10000) < 0.1
@@ -102,7 +110,7 @@ def test_edge_truncation_preserves_lost_flux():
     assert edge.sum() > centered.sum()*0.45
 
 
-def test_prepared_schema_splits_masks_and_no_fake_focus_runs():
+def test_prepared_schema_splits_masks_and_no_fake_focus_runs(sep_required):
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         manifest = prepare_synthetic(root, seed=42, families=32, variants=2, scene_count=2)
@@ -140,7 +148,7 @@ def test_prepared_schema_splits_masks_and_no_fake_focus_runs():
         assert bge["background_truth"].min() > 500
 
 
-def test_same_seed_same_arrays_and_ancestry():
+def test_same_seed_same_arrays_and_ancestry(sep_required):
     with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
         prepare_synthetic(Path(first), seed=83, families=32, variants=1, scene_count=0)
         prepare_synthetic(Path(second), seed=83, families=32, variants=1, scene_count=0)

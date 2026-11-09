@@ -34,7 +34,16 @@ from data_pipeline.build_focus_quality_dataset import (  # noqa: E402
     saturation_decision_from_quality,
     saturation_level_from_quality,
 )
-from labels.psf_measure import SepBackgroundParams, SepDetectionParams  # noqa: E402
+from labels.psf_measure import SepBackgroundParams, SepDetectionParams, require_sep  # noqa: E402
+
+
+class SepRequired(unittest.TestCase):
+    """Builder tests run the SEP labeler: without sep==1.4.1 they fail with
+    "missing prerequisite: sep==1.4.1" instead of skipping."""
+
+    @classmethod
+    def setUpClass(cls):
+        require_sep()
 from data_pipeline.synthetic_psf import render_star  # noqa: E402
 
 
@@ -98,7 +107,7 @@ def _make_schema(db_path):
     return con
 
 
-class TestDatasetBuilder(unittest.TestCase):
+class TestDatasetBuilder(SepRequired):
     def test_acquisition_ineligibility_cannot_be_overridden_by_permissive_saturation(self):
         rng = np.random.default_rng(4)
         with tempfile.TemporaryDirectory() as d:
@@ -214,7 +223,7 @@ class TestDatasetBuilder(unittest.TestCase):
             self.assertLessEqual(ds["crops"].max(), 1.0)
 
 
-class TestLabelProvenance(unittest.TestCase):
+class TestLabelProvenance(SepRequired):
     """BGE-20: new labels carry version + SEP config provenance; frozen
     datasets are never overwritten; legacy rows never enter a qualified
     evaluation."""
@@ -365,6 +374,7 @@ class TestSaturationGate(unittest.TestCase):
             self.assertIsNone(saturation_level_from_quality(q), q)
 
     def test_builder_drops_frames_with_unknown_saturation(self):
+        require_sep()
         rng = np.random.default_rng(1)
         with tempfile.TemporaryDirectory() as d:
             db_path = os.path.join(d, "achernar.db")
