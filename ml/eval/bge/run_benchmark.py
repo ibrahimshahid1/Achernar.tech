@@ -219,6 +219,8 @@ def run_rust_parse(sc, out_dir, backend, revision=None) -> tuple[dict, dict]:
         "detection": {"status": "completed" if candidates is not None else "unsupported",
                       "reason": None if candidates is not None else f"no candidates (quality status {quality.get('status')})"},
     }
+    if (j.get("detection") or {}).get("noise_floor_applied"):
+        stages["detection"]["note"] = "ran with the legacy 1 ADU noise floor (noise_floor_applied), a labelled heuristic"
     if level_ok and spatial and b_hat is None:
         stages["background_map"] = {"status": "unsupported", "reason": "spatial field but no .back.f32 emitted"}
     if not level_ok:
@@ -682,6 +684,8 @@ def render_summary(doc, core, sweeps) -> str:
             mt = r.get("metrics", {})
             bg, nz, det, hf, bl = (mt.get(k) or {} for k in ("background", "noise", "detection", "hfr", "blends"))
             status = _status(r["status"], r.get("reason"))
+            if (r.get("stages", {}).get("detection") or {}).get("note"):
+                status += f" [detection {r['stages']['detection']['note']}]"
             if "honest_absence" in mt:
                 status += f" (honest absence: {_fmt(mt['honest_absence'])})"
             compl = "-" if not det else f"{_fmt(det.get('completeness_bright_stars'))} ({_fmt(det.get('completeness_stars'))})"

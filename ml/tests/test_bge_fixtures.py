@@ -251,6 +251,19 @@ def test_hyperbola_and_parabola_fits_recover_known_minima():
     assert shift["n_frames_valid"] == 13
 
 
+def test_focus_minimum_needs_valid_frames_on_both_sides():
+    p = np.arange(4000, 5201, 100, dtype=float)
+    y = MT.hyperbola(p, 2.5, 4630.0, 80.0)
+    one_sided = np.where(p < 4600, np.nan, y)  # one valid frame left of p0
+    res = MT.focus_shift(p, one_sided, 4630.0)
+    assert res["hyperbola"]["status"] == "failed" and "1/6 valid frames left/right" in res["hyperbola"]["reason"]
+    assert "p0_shift" not in res["hyperbola"]
+    beyond = MT.focus_shift(p, np.where(p <= 4700, np.nan, y), 4630.0)  # minimum outside the valid range
+    assert beyond["hyperbola"]["status"] == "failed" and "p0_shift" not in beyond["hyperbola"]
+    ok = MT.focus_shift(p, y, 4630.0)
+    assert ok["hyperbola"]["valid_frames_left_right"] == [7, 6]
+
+
 def test_focus_fits_report_failures_instead_of_numbers():
     p = np.arange(4000, 5201, 100, dtype=float)
     mono = 2.0 + 0.001 * (p - 3000.0)

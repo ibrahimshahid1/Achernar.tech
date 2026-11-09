@@ -418,12 +418,26 @@ def fit_hyperbola(positions, values, max_iter=200) -> dict:
     return out
 
 
+#: A fitted minimum needs at least this many valid frames on each side.
+MIN_FRAMES_EACH_SIDE = 2
+
+
 def focus_shift(positions, values, p0_true) -> dict:
-    """Estimated minus true best-focus position for both curve models."""
+    """Estimated minus true best-focus position for both curve models.
+
+    A fit whose minimum has fewer than ``MIN_FRAMES_EACH_SIDE`` valid frames
+    on either side is a failed sweep (the minimum is extrapolated)."""
     out = {}
+    pos = np.asarray(positions, dtype=np.float64)
+    ok = np.isfinite(np.asarray(values, dtype=np.float64))
     for name, fit in (("hyperbola", fit_hyperbola(positions, values)), ("parabola", fit_parabola(positions, values))):
         if fit["status"] == "completed":
-            fit["p0_shift"] = fit["p0"] - p0_true
+            left, right = int(np.sum(ok & (pos < fit["p0"]))), int(np.sum(ok & (pos > fit["p0"])))
+            fit["valid_frames_left_right"] = [left, right]
+            if min(left, right) < MIN_FRAMES_EACH_SIDE:
+                fit.update(status="failed", reason=f"only {left}/{right} valid frames left/right of the minimum")
+            else:
+                fit["p0_shift"] = fit["p0"] - p0_true
         out[name] = fit
     vals = np.asarray(values, dtype=np.float64)
     out["n_frames"] = int(vals.size)

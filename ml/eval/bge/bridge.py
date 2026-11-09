@@ -219,7 +219,7 @@ def run_bridge(manifest_path: Path, out_dir: Path, repo_root: Path, cargo_target
     t0 = time.perf_counter()
     try:
         proc = subprocess.run(cmd, env=_cargo_env(cargo_target_dir, manifest_path, out_dir), capture_output=True,
-                              text=True, timeout=timeout_s)
+                              text=True, timeout=timeout_s, cwd=cargo_toml.parent)
     except subprocess.TimeoutExpired:
         return dict(info, status="failed", reason=f"bridge timed out after {timeout_s} s")
     info["wall_s"] = time.perf_counter() - t0
@@ -243,7 +243,8 @@ def bridge_test_binary(repo_root: Path, cargo_target_dir: Path, jobs: int = 4) -
     cmd = [cargo, "test", "--release", "-j", str(jobs), "--no-run", "--message-format=json", "--manifest-path",
            str(Path(repo_root) / "achernar-daemon" / "Cargo.toml")]
     env = dict(os.environ, CARGO_TARGET_DIR=str(cargo_target_dir))
-    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=5400)
+    proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=5400,
+                          cwd=Path(repo_root) / "achernar-daemon")
     for line in proc.stdout.splitlines():
         try:
             msg = json.loads(line)

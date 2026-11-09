@@ -157,7 +157,7 @@ constant maps. e = B_hat - B_true.
   linearised HFR^2 quadratic) and parabola (numpy polyfit) [focuser steps].
   **shift** = fitted p0 - true p0. Failure: < 4 (hyperbola) / < 3 (parabola)
   valid frames, no convergence, downward parabola, minimum outside the sampled
-  range. **Jaccard** = overlap of each frame's accepted truth-star set with the
+  range, or fewer than 2 valid frames on either side of the fitted minimum. **Jaccard** = overlap of each frame's accepted truth-star set with the
   frame nearest p0.
 - **honest absence** (inputs without usable pixels): true iff no level was
   reported as measured.
