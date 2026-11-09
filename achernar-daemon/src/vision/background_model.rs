@@ -15,6 +15,8 @@
 //! coarsely quantized image can have a well-defined level and no resolved
 //! noise (BGE-07): zero empirical scatter is not zero detector noise.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -362,6 +364,14 @@ pub struct BackgroundSupport {
     pub usable_pixels: u64,
     /// Pixels retained after the legacy clip (legacy method only).
     pub clipped_sample_pixels: Option<u64>,
+    /// Which masks constrained the estimate: mask name (`bad_pixel`,
+    /// `invalid`, `edge`, `native_saturation`) to `provided` or
+    /// `unavailable`. A bare array without masks says `unavailable`, so an
+    /// absent mask is never mistaken for a clean detector.
+    pub masks: BTreeMap<String, String>,
+    /// Evidence behind `saturation_fraction`: `native_threshold`,
+    /// `native_mask`, `legacy_peak_threshold`, or `unknown`.
+    pub saturation_evidence: String,
 }
 
 /// The authoritative, versioned background result for one frame.
@@ -413,8 +423,10 @@ pub struct BackgroundResult {
     /// SNR. `None` when no pixel qualifies or the method does not compute it.
     pub bright_pixel_significance: Option<f32>,
     /// Fraction of analysis pixels touched by clipped native support (or, for
-    /// legacy frames without a descriptor, at/above 98% of the declared
-    /// saturation point). `None` without any finite pixel.
+    /// legacy frames without a descriptor, usable pixels at/above 98% of the
+    /// declared saturation point). `None` when the frame has no saturation
+    /// evidence (`support.saturation_evidence == "unknown"`) or no finite
+    /// pixel: 0.0 would otherwise read as "nothing clipped".
     pub saturation_fraction: Option<f32>,
 }
 
@@ -738,6 +750,8 @@ mod tests {
                 total_pixels: 1,
                 usable_pixels: 1,
                 clipped_sample_pixels: Some(1),
+                masks: BTreeMap::new(),
+                saturation_evidence: "unknown".into(),
             },
             level: Some(0.0),
             level_definition: String::new(),

@@ -50,7 +50,59 @@ impl LumaFrame {
             != 0
     }
 
-    fn masks_have_valid_shape(&self) -> bool {
+    /// Which masks constrain measurements on this frame (`provided` or
+    /// `unavailable`), for result provenance. Versioned analysis frames take
+    /// the native-mask states from their descriptor; the reconstruction edge
+    /// mask always exists there. Frames without a descriptor only have the
+    /// masks a caller attached.
+    pub fn mask_provenance(&self) -> std::collections::BTreeMap<String, String> {
+        let attached = |mask: &Vec<u8>| {
+            if mask.len() == self.pixels.len() && !mask.is_empty() {
+                "provided"
+            } else {
+                "unavailable"
+            }
+        };
+        let mut states = std::collections::BTreeMap::new();
+        match &self.analysis_descriptor {
+            Some(descriptor) => {
+                for name in ["bad_pixel", "invalid", "native_saturation"] {
+                    let state = descriptor
+                        .mask_states
+                        .get(name)
+                        .map(String::as_str)
+                        .unwrap_or("unavailable");
+                    states.insert(name.to_string(), state.to_string());
+                }
+                states.insert("edge".to_string(), "provided".to_string());
+            }
+            None => {
+                states.insert("bad_pixel".into(), attached(&self.masks.bad_pixel).into());
+                states.insert("invalid".into(), attached(&self.masks.invalid).into());
+                states.insert("edge".into(), attached(&self.masks.edge).into());
+                states.insert(
+                    "native_saturation".into(),
+                    attached(&self.masks.native_saturation).into(),
+                );
+            }
+        }
+        states
+    }
+
+    /// The evidence a saturation fraction would rest on. `unknown` means a
+    /// fraction of 0 would only say that nothing was tested.
+    pub fn saturation_evidence(&self) -> &'static str {
+        match saturation_gate(self) {
+            SaturationGate::Applied { .. } if self.analysis_descriptor.is_some() => {
+                "native_threshold"
+            }
+            SaturationGate::Applied { .. } => "legacy_peak_threshold",
+            SaturationGate::NativeMaskApplied => "native_mask",
+            SaturationGate::NotPerformed => "unknown",
+        }
+    }
+
+    pub fn masks_have_valid_shape(&self) -> bool {
         [
             &self.masks.bad_pixel,
             &self.masks.invalid,
