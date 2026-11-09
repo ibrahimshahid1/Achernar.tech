@@ -51,6 +51,17 @@ are bit-identical to the wheel with `-ffp-contract=on`. With
 by up to 3.6e-7 relative and theta by up to 4e-6 rad, still within D-006.
 Other platforms and compilers have not been measured.
 
+Deblended children (`SEP_OBJ_MERGED`) depend on the C library's `rand_r`
+(`deblend.c:gatherup`; MSVC maps it to `rand()` with per-thread state). The
+fixture records its platform and C library (`meta.json`); on any other
+platform the test keeps every exact check except per-child npix/flux/shape of
+deblended children, checks a source-derived family rule instead (same family
+pixel set, total npix and total flux within D-006, flag union, child
+barycentres), and prints that the per-child values are not verifiable there.
+Compiling glibc's `rand_r` or an MSVC `rand()` emulation into a scratch copy
+makes the exact checks fail (npix 30/65 and 32/63 instead of 31/64) while the
+family rule holds (family npix 95, flux 38913.397461 in all three).
+
 ## Licensing (owner review required)
 
 The C core is LGPL-3.0-or-later (`src/overlap.h` BSD-3-Clause). This crate

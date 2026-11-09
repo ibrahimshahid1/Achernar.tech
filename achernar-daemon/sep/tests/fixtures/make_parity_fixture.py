@@ -72,6 +72,16 @@ CATALOG_FIELDS = [
 INT_FIELDS = {"npix", "tnpix", "xmin", "xmax", "ymin", "ymax", "xcpeak", "ycpeak", "xpeak", "ypeak", "flag"}
 
 
+RUST_TARGET_OS = {"Darwin": "macos", "Linux": "linux", "Windows": "windows"}
+
+
+def c_library() -> str:
+    if platform.system() == "Darwin":
+        return f"Apple libSystem (macOS {platform.mac_ver()[0]})"
+    name, version = platform.libc_ver()
+    return f"{name} {version}".strip() or platform.system()
+
+
 def synthesise() -> tuple[np.ndarray, np.ndarray]:
     y, x = np.mgrid[0:HEIGHT, 0:WIDTH].astype(np.float64)
     sky = 1000.0 + 0.8 * x - 0.5 * y + 0.004 * (x - 96.0) ** 2 + 0.003 * (y - 80.0) ** 2
@@ -175,6 +185,11 @@ def render(data: np.ndarray, mask: np.ndarray, ref: dict) -> dict[str, bytes]:
         "numpy_version": np.__version__,
         "python_version": platform.python_version(),
         "platform": f"{platform.system()} {platform.machine()}",
+        # Deblended children depend on the C library's rand_r (deblend.c
+        # gatherup); tests compare these with the platform they run on.
+        "rust_target_os": RUST_TARGET_OS.get(platform.system(), platform.system().lower()),
+        "c_library": c_library(),
+        "deblend_rng": "C library rand_r(&randseed), randseed = 1 per sep_extract (deblend.c gatherup)",
         "seed": SEED,
         "width": WIDTH,
         "height": HEIGHT,

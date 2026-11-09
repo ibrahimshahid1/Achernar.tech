@@ -1177,6 +1177,80 @@ pub struct Catalog {
     pub thresh_relative: bool,
 }
 
+/// Groups deblended children (`SEP_OBJ_MERGED`) into families: objects whose
+/// footprints are 8-connected through other children, i.e. the children of
+/// one detected parent. A detection footprint is an 8-connected component
+/// (`lutz.c`), and two separate detections cannot touch, so the families are
+/// the parents.
+///
+/// `objects` yields each object's footprint (linear indices `x + width*y`)
+/// and whether it is a deblended child, in catalog order; the result lists
+/// catalog indices per family, ascending, families ordered by first member.
+///
+/// Within a family, which child receives a faint pixel depends on the C
+/// library's `rand_r` (see the crate docs), while the family's pixel set,
+/// total `npix` and total flux do not.
+pub fn deblend_families<'a>(
+    objects: impl IntoIterator<Item = (&'a [u32], bool)>,
+    width: usize,
+    height: usize,
+) -> Vec<Vec<usize>> {
+    const NONE: usize = usize::MAX;
+    let mut owner = vec![NONE; width * height];
+    let mut merged = Vec::new();
+    for (index, (pixels, is_child)) in objects.into_iter().enumerate() {
+        if is_child {
+            merged.push(index);
+            for &p in pixels {
+                if let Some(slot) = owner.get_mut(p as usize) {
+                    *slot = index;
+                }
+            }
+        }
+    }
+    let count = merged.iter().max().map_or(0, |&m| m + 1);
+    let mut parent: Vec<usize> = (0..count).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let a = owner[y * width + x];
+            if a == NONE {
+                continue;
+            }
+            // Right, below-left, below and below-right cover all 8 neighbours
+            // once per pair.
+            for (dx, dy) in [(1isize, 0isize), (-1, 1), (0, 1), (1, 1)] {
+                let (nx, ny) = (x as isize + dx, y as isize + dy);
+                if nx < 0 || nx >= width as isize || ny >= height as isize {
+                    continue;
+                }
+                let b = owner[ny as usize * width + nx as usize];
+                if b != NONE && b != a {
+                    let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+                    parent[ra.max(rb)] = ra.min(rb);
+                }
+            }
+        }
+    }
+    let mut families: Vec<Vec<usize>> = Vec::new();
+    let mut family_of_root = vec![NONE; count];
+    for &index in &merged {
+        let r = root(&mut parent, index);
+        if family_of_root[r] == NONE {
+            family_of_root[r] = families.len();
+            families.push(Vec::new());
+        }
+        families[family_of_root[r]].push(index);
+    }
+    families
+}
+
 /// Frees a `sep_catalog` on every exit path.
 struct CatalogGuard(*mut ffi::sep_catalog);
 

@@ -706,3 +706,18 @@ fn mesh_support_counts_actual_partial_mesh_sizes() {
     assert!(usable_data_value(9.9e29) && !usable_data_value(-1e30));
     assert!(!usable_data_value(f32::NAN) && !usable_data_value(f32::INFINITY));
 }
+
+#[test]
+fn deblend_families_group_touching_children_only() {
+    // 6x3 image: objects 0 and 1 touch diagonally, 2 is separate, 3 is not a
+    // child even though it touches 2.
+    let width = 6;
+    let footprints: [(Vec<u32>, bool); 4] = [
+        (vec![0, 1], true),
+        (vec![8], true),
+        (vec![4, 5], true),
+        (vec![11, 17], false),
+    ];
+    let families = deblend_families(footprints.iter().map(|(p, m)| (p.as_slice(), *m)), width, 3);
+    assert_eq!(families, vec![vec![0, 1], vec![2]]);
+}
