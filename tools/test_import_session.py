@@ -568,6 +568,10 @@ class TestManualFocusSweep(unittest.TestCase):
         self.assertEqual(len(rows), 7)
         for q in rows:
             bg = q["background"]
+            # Discriminator: the Python reference object, not a Rust BackgroundResult.
+            self.assertEqual(bg["producer"], "python_sep_label")
+            self.assertEqual(bg["schema"], "achernar.python_sep_background_provenance.v1")
+            self.assertNotIn("schema_version", bg)
             self.assertEqual(bg["method"], "sep_spatial_mesh")
             self.assertEqual(bg["library_version"], "1.4.1")
             self.assertEqual(bg["config"], SepBackgroundParams().config())
@@ -589,6 +593,7 @@ class TestManualFocusSweep(unittest.TestCase):
             self.assertEqual(q["hfd_px"], 2.0 * q["hfr_px"])
             self.assertEqual(q["measurement_status"], "measured")
             self.assertEqual(q["label_schema_version"], "fqe-sep-label-v2")
+            self.assertEqual(q["units"], "adu")  # mono 8-bit PNG: linear native samples
 
     def test_unmeasurable_frames_record_a_reason_and_nulls(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -617,6 +622,80 @@ class TestManualFocusSweep(unittest.TestCase):
             self.assertIsNone(q["background_adu"])
             self.assertIsNone(q["background_sigma"])
             self.assertFalse(q["saturation_gate_applied"])
+
+    @staticmethod
+    def _rgb_field(green_clip: bool = True):
+        """Review F2 fixture: four stars on an 8-bit RGB frame; the bright one
+        at (176, 176) clips the GREEN channel only (R and B stay below 255)."""
+        import numpy as np
+
+        rng = np.random.default_rng(1)
+        ys, xs = np.mgrid[0:256, 0:256]
+
+        def star(cx, cy, amp, s=1.8):
+            return amp * np.exp(-((xs - cx) ** 2 + (ys - cy) ** 2) / (2 * s * s))
+
+        base = 20.0 + rng.normal(0, 2.0, xs.shape)
+        field = star(64, 64, 120) + star(192, 64, 120) + star(64, 192, 120)
+        bright = star(176, 176, 600.0 if green_clip else 200.0)
+        r = np.clip(base + field + 0.30 * bright, 0, 255)
+        g = np.clip(base + field + 1.00 * bright, 0, 255)
+        b = np.clip(base + field + 0.20 * bright, 0, 255)
+        return np.stack([r, g, b], -1).round().astype(np.uint8)
+
+    def test_one_channel_clipped_rgb_star_is_vetoed(self):
+        import numpy as np
+        from PIL import Image
+
+        rgb = self._rgb_field()
+        luma = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+        self.assertEqual(int((rgb[..., 1] == 255).sum()), 21)
+        self.assertLess(float(luma.max()), 0.98 * 255)  # the luma threshold alone never fires
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "frame.png"
+            Image.fromarray(rgb, "RGB").save(path)
+            m, reason = measure_frame_detailed(path, None)
+        self.assertIsNone(reason)
+        self.assertEqual(m["saturation_source"], "container_ceiling_8bit")
+        self.assertEqual(m["saturation_gate"], "native_mask_and_threshold_applied")
+        self.assertEqual(m["channel_clip_mask"]["pixels"], 21)
+        self.assertEqual(m["star_count_used"], 3)
+        self.assertGreater(m["rejection_counts"].get("saturated", 0), 0)
+        self.assertGreater(m["saturated_star_fraction"], 0.0)
+
+    def test_units_follow_the_pixel_domain(self):
+        from PIL import Image
+
+        rgb = self._rgb_field(green_clip=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            png = Path(tmp) / "rgb.png"
+            Image.fromarray(rgb, "RGB").save(png)
+            jpeg = Path(tmp) / "rgb.jpg"
+            Image.fromarray(rgb, "RGB").save(jpeg, quality=95)
+            mono = Path(tmp) / "mono.png"
+            write_star_field(mono, 2.0)
+            results = {name: measure_frame_detailed(path, None) for name, path in
+                       (("png", png), ("jpeg", jpeg), ("mono", mono))}
+        for name, (m, reason) in results.items():
+            self.assertIsNone(reason, name)
+        expected = {"png": "unverified", "jpeg": "display_luma_8bit_nonlinear", "mono": "adu"}
+        for name, units in expected.items():
+            m = results[name][0]
+            self.assertEqual(m["units"], units, name)
+            self.assertEqual(m["background"]["units"], units, name)
+            self.assertIsNotNone(m["units_note"])
+        for name in ("png", "jpeg"):
+            m = results[name][0]
+            # ADU-named legacy keys are null for non-ADU pixels, with a reason;
+            # the nested object keeps the value in its own units.
+            self.assertIsNone(m["background_adu"])
+            self.assertIsNone(m["background_sigma"])
+            self.assertEqual(m["background_adu_unavailable_reason"], f"units_not_adu:{expected[name]}")
+            self.assertIsNotNone(m["background"]["level"])
+        mono = results["mono"][0]
+        self.assertEqual(mono["background_adu"], mono["background"]["level"])
+        self.assertNotIn("background_adu_unavailable_reason", mono)
+        self.assertIsNone(mono["channel_clip_mask"])
 
     def test_missing_sep_is_reported_as_the_reason(self):
         from unittest import mock
