@@ -2,6 +2,8 @@ from rest_framework import serializers
 from .models import ImagingSession, Frame
 
 class FrameSerializer(serializers.ModelSerializer):
+    background_provenance = serializers.CharField(read_only=True)
+
     class Meta:
         model = Frame
         fields = '__all__'
