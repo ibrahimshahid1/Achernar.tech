@@ -595,9 +595,12 @@ def run_timing(args, out, cargo_target, rust_info, note) -> dict:
                                        "reason": f"skipped: rust sep backend not integrated at {rev}"}
             continue
         tm = [sum((r["timing_ms"] or {}).values()) for r in rows if r.get("timing_ms")]
+        bg_ms = [r["timing_ms"]["background"] for r in rows if r.get("timing_ms")]
         result["rust"][backend] = {
             "status": "completed" if tm else "failed", "binary": binary, "runs": rows,
             "bridge_total_ms_median": float(np.median(tm)) if tm else None,
+            "bridge_total_ms_p95": float(np.percentile(tm, 95)) if tm else None,
+            "bridge_background_ms_median": float(np.median(bg_ms)) if bg_ms else None,
             "process_peak_rss_bytes_max": max((r["peak_rss_bytes"] or 0) for r in rows) or None,
             "note": "peak RSS of the whole test process (frame load + one backend), from /usr/bin/time -l",
         }
@@ -792,9 +795,10 @@ def render_summary(doc, core, sweeps) -> str:
             for b, r in rust.items():
                 if not isinstance(r, dict):
                     continue
+                rss = r.get("process_peak_rss_bytes_max")
                 rows.append([f"`rust_{b}`", _status(r.get("status"), r.get("reason")),
-                             _fmt(r.get("bridge_total_ms_median"), 1), "-", "-",
-                             _fmt((r.get("process_peak_rss_bytes_max") or 0) / 2**20, 0), "-"])
+                             _fmt(r.get("bridge_total_ms_median"), 1), _fmt(r.get("bridge_total_ms_p95"), 1),
+                             _fmt(r.get("bridge_background_ms_median"), 1), _fmt(rss / 2**20, 0) if rss else "-", "-"])
         L.append(_table(["method", "status", "median ms", "p95 ms", "background ms", "peak RSS MiB",
                          "RSS after load MiB"], rows))
     L.append("")
