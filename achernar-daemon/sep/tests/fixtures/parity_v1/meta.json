@@ -1,0 +1,190 @@
+{
+ "background": {
+  "bh": 32,
+  "bw": 32,
+  "fh": 3,
+  "fthresh": 0.0,
+  "fw": 3,
+  "maskthresh": 0.0
+ },
+ "extract": {
+  "clean": true,
+  "clean_param": 1.0,
+  "deblend_cont": 0.005,
+  "deblend_nthresh": 32,
+  "err": "background_rms_map",
+  "filter_kernel": [
+   [
+    1.0,
+    2.0,
+    1.0
+   ],
+   [
+    2.0,
+    4.0,
+    2.0
+   ],
+   [
+    1.0,
+    2.0,
+    1.0
+   ]
+  ],
+  "filter_type": "conv",
+  "minarea": 5,
+  "residual": "data - back(), masked pixels set to 0.0",
+  "segmentation_map": true,
+  "thresh": 5.0
+ },
+ "fixture": "parity_v1",
+ "generator": "achernar-daemon/sep/tests/fixtures/make_parity_fixture.py",
+ "generator_sha256": "3c8339afc3bbc8b1c8e1baf19f66adb93441a3df6b228ca99d507179d493da2e",
+ "globalback": 1052.110595703125,
+ "globalrms": 12.484267234802246,
+ "height": 160,
+ "layout": "row-major, little-endian; x is the column (fast) index",
+ "mask_rect_x0_x1_y0_y1": [
+  130,
+  170,
+  60,
+  90
+ ],
+ "nan_pixels_xy": [
+  [
+   140,
+   70
+  ],
+  [
+   145,
+   80
+  ],
+  [
+   160,
+   85
+  ]
+ ],
+ "numpy_version": "2.5.4",
+ "objects": 10,
+ "platform": "Darwin arm64",
+ "python_version": "3.12.14",
+ "seed": 20261108,
+ "sep_c_version_string": null,
+ "sep_version": "1.4.1",
+ "sha256": {
+  "back.f32": "74964a38d7d894afbc8645b63a1c3ef300d06226434bca3a7ca64aa29cfbfeae",
+  "catalog.json": "2d5d885b093790bcf45a21420f3b57ff2554349eea2a8deb984bdcfccbb14392",
+  "catalog.tsv": "4b4e62180899e8c41f4e90fc0e0753d058e2dac93e8c732a5dedc97ecd377f1a",
+  "globals.tsv": "e6fb9d3f6d9bddf2dfd7859796445d3c1d941bb60096b54b52f599edea7dda5d",
+  "input.f32": "8465f928f2a7845b28437cd419ba9008d7bd60942cfb64d2130908166afe7f01",
+  "mask.u8": "d04057b43cb1cac67986ae456b7d11331342aa19d62c46d07f2d82580cbac609",
+  "rms.f32": "36e4bdcf74d49162cebf62dada44abb8c6111c50694352d2c266f88ab9ab21f4",
+  "segmap.i32": "bbc64a0e7e33de330ba7d727b36c871f4d22a18e0555abba6ab0bb60b092bc47"
+ },
+ "sky": "1000 + 0.8*x - 0.5*y + 0.004*(x-96)^2 + 0.003*(y-80)^2",
+ "sky_noise_sigma": 8.0,
+ "sources": [
+  [
+   30.3,
+   25.7,
+   "gauss",
+   [
+    1.8
+   ],
+   900.0
+  ],
+  [
+   150.2,
+   40.4,
+   "moffat",
+   [
+    2.5,
+    3.0
+   ],
+   1200.0
+  ],
+  [
+   70.6,
+   110.1,
+   "gauss",
+   [
+    2.2
+   ],
+   600.0
+  ],
+  [
+   120.0,
+   130.5,
+   "moffat",
+   [
+    2.0,
+    2.5
+   ],
+   800.0
+  ],
+  [
+   100.4,
+   60.2,
+   "gauss",
+   [
+    1.6
+   ],
+   1500.0
+  ],
+  [
+   105.6,
+   61.0,
+   "gauss",
+   [
+    1.6
+   ],
+   1000.0
+  ],
+  [
+   1.2,
+   90.3,
+   "gauss",
+   [
+    1.8
+   ],
+   1000.0
+  ],
+  [
+   175.5,
+   140.8,
+   "gauss",
+   [
+    1.5
+   ],
+   400.0
+  ],
+  [
+   55.0,
+   150.0,
+   "moffat",
+   [
+    1.8,
+    3.0
+   ],
+   500.0
+  ],
+  [
+   127.6,
+   75.3,
+   "gauss",
+   [
+    1.7
+   ],
+   700.0
+  ],
+  [
+   150.0,
+   75.0,
+   "gauss",
+   [
+    2.0
+   ],
+   20000.0
+  ]
+ ],
+ "width": 192
+}

@@ -1,0 +1,24 @@
+[package]
+name = "achernar-sep"
+version = "0.1.0"
+edition = "2021"
+description = "Safe Rust API over the vendored, pinned SEP 1.4.1 C library (background and extraction)"
+# The vendored C core is LGPL-3.0-or-later (src/overlap.h BSD-3-Clause); see
+# vendor/sep-1.4.1/SOURCE.md and README.md before redistributing a binary.
+license = "LGPL-3.0-or-later AND BSD-3-Clause"
+publish = false
+# One copy of SEP's process-global state (pixel stack, sub-object limit) per
+# binary; Cargo refuses a second crate that links the same native library.
+links = "sep"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+# No dependencies and no dev-dependencies: the crate is a path dependency of
+# achernar-daemon, not a workspace member, and Cargo refuses to test a
+# non-member that has dev-dependencies (`cargo test -p achernar-sep`).
+[dependencies]
+
+[build-dependencies]
+cc = "1.2"
