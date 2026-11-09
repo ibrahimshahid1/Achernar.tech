@@ -140,7 +140,7 @@ pub fn analyze_sep(
         bh: sep_params.bh as usize,
         fw: sep_params.fw as usize,
         fh: sep_params.fh as usize,
-        fthresh: f64::from(sep_params.fthresh),
+        fthresh: sep_params.fthresh,
     };
     if params.bw == 0 || params.bh == 0 {
         return Err(backend_failure(&SepError::InvalidParameter {
@@ -499,10 +499,18 @@ fn extract_params(
     let filter = if detection.filter_kernel.is_empty() {
         None
     } else {
-        Some(Kernel::from_rows(&detection.filter_kernel).map_err(|e| e.to_string())?)
+        // SEP takes a float32 kernel; narrowing here matches numpy's
+        // astype(float32) in the Python wrapper.
+        let rows: Vec<Vec<f32>> = detection
+            .filter_kernel
+            .iter()
+            .map(|row| row.iter().map(|value| *value as f32).collect())
+            .collect();
+        Some(Kernel::from_rows(&rows).map_err(|e| e.to_string())?)
     };
     Ok(ExtractParams {
-        thresh: detection.thresh_sigma,
+        // SEP's threshold is a C float; the Python wrapper narrows the same way.
+        thresh: detection.thresh_sigma as f32,
         minarea: detection.minarea as usize,
         filter,
         filter_type,
