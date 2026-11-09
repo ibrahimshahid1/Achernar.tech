@@ -1948,6 +1948,22 @@ fn f64_of(value: Option<f32>) -> Option<f64> {
     value.map(f64::from).filter(|v| v.is_finite())
 }
 
+/// FOP #35 input. Absent unless measured, so FOP masks it as
+/// `background_unavailable` instead of training on a stand-in 0. FOP contract
+/// 1.0.0 defines #35 on the legacy global estimator; another method's level
+/// is a different population and is masked rather than mixed in.
+fn fop_background_input(observation: &SharedObservation) -> Option<f64> {
+    observation
+        .background
+        .as_ref()
+        .filter(|background| {
+            background.method == crate::vision::background_model::BackgroundMethod::LegacyGlobalClip
+        })
+        .and_then(|background| background.level())
+        .map(f64::from)
+        .filter(|value| value.is_finite())
+}
+
 /// The tempcomp state recorded with a sample: `on`, `off` or `unavailable`.
 fn tempcomp_state(snapshot: &FocuserSnapshot) -> Option<String> {
     if !snapshot.capabilities.temp_comp_available {
@@ -2024,8 +2040,8 @@ async fn record_sample(
             fqe_hfr_px: f64_of(observation.fqe_hfr_px),
             fqe_sigma_log_hfr: f64_of(observation.fqe_sigma_log_hfr),
             quality_uncertainty: f64_of(observation.quality_uncertainty),
-            background_adu: f64_of(Some(observation.background_adu)),
-            saturation_fraction: f64_of(Some(observation.saturation_fraction)),
+            background_adu: fop_background_input(observation),
+            saturation_fraction: f64_of(observation.saturation_fraction),
             saturation_gate_applied: observation.saturation_gate.was_applied(),
             sensor_temperature_c: sensor_measured,
             ambient: &ambient,
@@ -3285,9 +3301,15 @@ fn autofocus_quality_json(
             "status": observation.status,
             "quality_uncertainty": observation.quality_uncertainty,
             "hfr_log_sigma": observation.hfr_log_sigma,
+            // Deprecated top-level mirrors (the FOP contract names them);
+            // `null` when not measured. `background` is authoritative: method,
+            // configuration hash, level/noise validity, units and support.
+            // Rows without it are legacy-unverified.
             "background_adu": observation.background_adu,
             "background_sigma": observation.background_sigma,
             "saturation_fraction": observation.saturation_fraction,
+            "background": observation.background,
+            "detection": observation.detection,
             // The FQE's own reading of this frame — the Quality(3) group of the
             // Focus Offset Predictor's input (ml/contracts/fop_features.py).
             //
@@ -3914,6 +3936,53 @@ mod tests {
         ] {
             assert!(json[key].is_null(), "{key} should be null when unmeasured");
         }
+    }
+
+    /// quality_json carries the versioned background and detection objects;
+    /// the deprecated top-level mirrors are null, not 0, when unmeasured.
+    #[test]
+    fn quality_json_records_versioned_background_and_null_mirrors() {
+        let empty = quality_json_for(&SharedObservation::empty_for_test());
+        for key in [
+            "background_adu",
+            "background_sigma",
+            "saturation_fraction",
+            "background",
+        ] {
+            assert!(empty[key].is_null(), "{key} should be null when unmeasured");
+        }
+
+        let analysis = crate::vision::quality::background_from_luma(&luma());
+        let mut observation = SharedObservation::empty_for_test();
+        let detection = crate::vision::quality::estimate_quality(&luma(), &analysis).detection;
+        observation.set_background(analysis.result.clone(), detection);
+        let json = quality_json_for(&observation);
+        assert_eq!(json["background"]["schema_version"], 1);
+        assert_eq!(json["background"]["method"], "legacy_global_clip");
+        assert_eq!(
+            json["background"]["config_sha256"],
+            analysis.result.config_sha256.as_str()
+        );
+        assert_eq!(
+            json["background_adu"].as_f64().map(|v| v as f32),
+            analysis.result.level()
+        );
+    }
+
+    /// FOP #35 is defined on the legacy estimator: a SEP level is masked, and
+    /// an unmeasured level is absent.
+    #[test]
+    fn fop_background_feature_only_takes_the_legacy_method() {
+        let analysis = crate::vision::quality::background_from_luma(&luma());
+        let mut observation = SharedObservation::empty_for_test();
+        assert_eq!(fop_background_input(&observation), None);
+        observation.set_background(analysis.result.clone(), None);
+        assert_eq!(fop_background_input(&observation), Some(100.0));
+        let mut sep = analysis.result;
+        sep.method = crate::vision::background_model::BackgroundMethod::SepSpatialMesh;
+        observation.set_background(sep, None);
+        assert!(observation.background_adu.is_some());
+        assert_eq!(fop_background_input(&observation), None);
     }
 
     /// The saturation provenance the FQE dataset builder gates on (defect D1).

@@ -44,8 +44,11 @@ def aperture_hfr(signal: np.ndarray, center: tuple[float, float], radius: float)
     residuals are retained; clipping them would introduce a positive noise
     pedestal.  This finite-aperture reference is not an infinite analytic HFR
     or a physical best-focus label. ``None`` means an invalid measurement.
+    Requires the pinned SEP (MissingPrerequisite otherwise).
     """
-    import sep
+    from ml.labels.psf_measure import require_sep
+
+    sep = require_sep()
 
     y, x = np.indices(signal.shape, dtype=np.float64)
     r = np.hypot(x - center[0], y - center[1])
@@ -64,6 +67,12 @@ def aperture_hfr(signal: np.ndarray, center: tuple[float, float], radius: float)
     if flags[0] or not np.isfinite(result[0]) or result[0] <= 0:
         return None
     return float(result[0])
+
+
+def _pinned_sep_version() -> str:
+    from ml.labels.psf_measure import require_sep
+
+    return require_sep().__version__
 
 
 def moment_shape(signal: np.ndarray, *, angle_threshold: float = 0.02) -> tuple[float, float | None]:
@@ -365,6 +374,7 @@ def prepare_synthetic(root: Path, seed=42, families=800, variants=3, scene_count
         "dataset_id": "stellar_sim_v1", "generator": SIM_VERSION, "seed": seed,
         "generator_source_sha256": sha256_file(output/'generator_source.py'),
         "normalization_source_sha256":sha256_file(output/'normalization_source.py'), "numpy_version": np.__version__,
+        "sep_version": _pinned_sep_version(),
         "families": families, "variants_per_family": variants, "observations": len(rows),
         "fqe_accepted": len(accepted_rows), "fqe_split_counts": registry["counts"],
         "fqe_rejections": dict(Counter(reason for r in rows for reason in r["fqe_rejections"])),
@@ -398,9 +408,18 @@ def prepare_hst(root: Path, *, max_sources=2000, product=HST_ROOT,
     electrons and ERR pipeline estimates are never described as raw Canon ADU
     or physical noise ground truth. Reject masked cores and saturation; retain
     only explicitly identified experimental references with <=2% masked wings.
+
+    Noise: the supplied pipeline ERR array is the detection and aperture noise
+    (``noise_source="pipeline_error"``); SEP's empirical RMS map is computed
+    with the background but not used. Provenance records the SEP version and
+    the effective background/detection configuration with their sha256.
     """
     from astropy.io import fits
-    import sep
+    from ml.labels.psf_measure import (
+        NOISE_PIPELINE_ERROR, SepBackgroundParams, SepDetectionParams, config_sha256,
+        estimate_spatial_background, require_sep,
+    )
+    sep = require_sep()
 
     output = root / dataset_name
     output.mkdir(parents=True, exist_ok=True)
@@ -426,8 +445,16 @@ def prepare_hst(root: Path, *, max_sources=2000, product=HST_ROOT,
     cleaned = image.copy()
     finite_median = float(np.median(image[~mask]))
     cleaned[mask] = finite_median
-    bkg = sep.Background(cleaned, mask=mask)
-    residual = np.ascontiguousarray(cleaned-bkg.back())
+    # Same sep.Background call as before (SEP default mesh 64/64/3/3/0.0, this
+    # mask), now made explicit and checked: masked pixels are excluded by SEP,
+    # so the median fill above does not affect the map. A frame whose meshes
+    # all lack support would get SEP's fabricated 0/1.0 background; refuse it.
+    background_params = SepBackgroundParams()
+    spatial = estimate_spatial_background(image, detector_mask=mask, params=background_params, units="electrons")
+    if not spatial.level_measured:
+        raise ValueError(f"HST SCI1 SEP background unavailable: {list(spatial.reasons)}")
+    background_map = spatial.background_map
+    residual = np.ascontiguousarray(cleaned-background_map)
     # ERR propagates calibration noise; it is a pipeline estimate, not truth.
     safe_error = np.maximum(error, 1e-6)
     safe_error[mask] = max(float(np.median(error[~mask])), 1.0)
@@ -435,11 +462,23 @@ def prepare_hst(root: Path, *, max_sources=2000, product=HST_ROOT,
     # active-pixel stack. Bound allocation by this image; keep the threshold
     # and masks identical, and restore the process-global setting afterwards.
     previous_stack = sep.get_extract_pixstack()
+    effective_stack = max(previous_stack, image.size)
     try:
-        sep.set_extract_pixstack(max(previous_stack, image.size))
+        sep.set_extract_pixstack(effective_stack)
         objects = sep.extract(residual, 6.0, err=safe_error, mask=mask, minarea=5, deblend_nthresh=32, deblend_cont=0.005)
     finally:
         sep.set_extract_pixstack(previous_stack)
+    # Effective extraction settings of the call above: SEP Python defaults for
+    # the kernel/filter (3x3 [[1,2,1],[2,4,2],[1,2,1]], 'matched' — active
+    # because err is an array) and cleaning; the noise is the pipeline ERR.
+    detection_config = SepDetectionParams(
+        thresh_sigma=6.0, filter_type="matched", pixstack=int(effective_stack),
+        accept_deblended_for_focus=False,
+    ).config(sep.__version__)
+    detection_config["noise"] = "pipeline_error_map"
+    detection_sha256 = config_sha256(detection_config)
+    background_config = spatial.config
+    background_sha256 = spatial.config_sha256
     x, y = objects["x"], objects["y"]
     rmax = np.clip(6*objects["a"], 6, 16)
     hfr, hfr_flags = sep.flux_radius(residual, x, y, rmax, 0.5, mask=mask, subpix=5)
@@ -496,6 +535,8 @@ def prepare_hst(root: Path, *, max_sources=2000, product=HST_ROOT,
             "crop_origin_xy": [cx-32, cy-32], "units": "ELECTRONS; calibrated FLT, not raw ADU",
             "hfr_px": float(hfr[i]) if np.isfinite(hfr[i]) else None,
             "hfr_method": "sep.flux_radius; masked background-subtracted; rmax=clip(6a,6,16); subpix5",
+            "background_config_sha256": background_sha256, "detection_config_sha256": detection_sha256,
+            "noise_source": NOISE_PIPELINE_ERROR,
             "hfr_aperture_radius_px": aperture, "measured_ellipticity": ell, "star_snr": snr,
             "rig_id": "HST-ACS-WFC", "camera_id": "HST-ACS-WFC-CCD1",
             "filter_name": ";".join(str(header_summary["primary"][k]) for k in ("FILTER1","FILTER2") if header_summary["primary"][k] and not str(header_summary["primary"][k]).startswith("CLEAR")), "night_id": header_summary["primary"]["DATE-OBS"],
@@ -510,13 +551,13 @@ def prepare_hst(root: Path, *, max_sources=2000, product=HST_ROOT,
                 row["fqe_index"] = len(crops)
                 model_crop = crop.copy()
                 crop_mask = mask[cy-32:cy+32, cx-32:cx+32]
-                model_crop[crop_mask] = bkg.back()[cy-32:cy+32, cx-32:cx+32][crop_mask]
+                model_crop[crop_mask] = background_map[cy-32:cy+32, cx-32:cx+32][crop_mask]
                 crops.append(robust_normalize(model_crop)[0])
                 refs.append(float(hfr[i]))
                 measured.append(float(hfr[i]))
                 fqe_rows.append(row)
         rows.append(row)
-    artifacts = [_write_npz(output / "frame.npz", {"science_electrons": image, "error_pipeline_electrons": error, "dq": dq, "valid_mask": ~mask, "sep_background_estimate_electrons": bkg.back().astype(np.float32)})]
+    artifacts = [_write_npz(output / "frame.npz", {"science_electrons": image, "error_pipeline_electrons": error, "dq": dq, "valid_mask": ~mask, "sep_background_estimate_electrons": background_map.astype(np.float32)})]
     artifacts.append(_write_npz(output / "fqe_diagnostic.npz", _fqe_arrays(crops, refs, measured, fqe_rows)))
     artifacts.append(_write_npz(output / "observations.npz", {"raw_crops64": np.asarray(raw_crops, dtype=np.float32).reshape(-1, 64, 64), "raw_crops32": np.asarray(ted_crops, dtype=np.float32).reshape(-1, 32, 32)}))
     write_jsonl(output / "records.jsonl", rows)
@@ -534,6 +575,11 @@ def prepare_hst(root: Path, *, max_sources=2000, product=HST_ROOT,
         "crop_imputation": "masked input pixels replaced by SEP background before model normalization; originals and DQ retained",
         "strict_saturation_policy": "pipeline DQ flags used instead of invented scalar threshold; no Canon calibration inferred",
         "artifacts": artifacts, "sep_version": sep.__version__, "numpy_version": np.__version__,
+        "background_config": background_config, "background_config_sha256": background_sha256,
+        "detection_config": detection_config, "detection_config_sha256": detection_sha256,
+        "noise_source": NOISE_PIPELINE_ERROR,
+        "noise_policy": "pipeline ERR (electrons) drives detection and apertures; ERR is floored at 1e-6 and masked pixels (nonzero DQ, non-finite SCI/ERR, ERR <= 0) are set to max(median ERR, 1) only to keep the array finite; SEP's empirical RMS map is not used and nothing is added to ERR",
+        "background_provenance": spatial.provenance(),
         "limitations": ["One correlated exposure, frozen as diagnostic test only; cannot establish cross-night or cross-rig transfer.", "HST calibrated electrons and pipeline ERR do not calibrate Canon R50 ADU/gain/read noise.", "Crowded-field detections include nonstellar contaminants; quality gates are conservative and not a human morphology audit.", "SEP labels are measurement references, not independent physical width truth; no focus positions or tracking causes available.", "FLT subarray retains optical distortion, possible residual striping, and no CTE correction; no pixel area map applied."],
         "status": "prepared_external_diagnostic_not_training_campaign",
     }

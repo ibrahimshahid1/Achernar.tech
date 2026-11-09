@@ -54,6 +54,7 @@ import sqlite3
 import sys
 import uuid
 from collections import defaultdict
+from typing import NamedTuple
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -76,11 +77,50 @@ MANIFEST_VERSION = "manifest.v1.json"
 # response goes non-linear below the hard clip, so the gate sits at 98%.
 SATURATION_FRACTION = 0.98
 
-# A container ceiling at or below this is an 8-bit stream, where the container
-# *is* the clip point — the 8-bit arm of `resolve_saturation_adu` in
-# vision/quality.rs. Above it we are looking at a 16-bit container, whose
-# ceiling says nothing about where the sensor actually saturates.
+# An 8-bit container is treated as its own clip point (decision D-011): 255 is
+# the real ceiling of the recorded data, so a star reaching it is clipped in the
+# data whatever the sensor did, and the rule errs toward rejecting stars. Its
+# provenance is recorded as "container_ceiling_8bit", never as a native sensor
+# saturation level. A 16-bit container says nothing about where the sensor
+# saturates and gets no container rule. The container is read from the decoded
+# sample type, never from the observed maximum: a dim 16-bit frame whose pixels
+# all happen to sit below 256 is still a 16-bit frame. (The Rust
+# `resolve_saturation_adu` these comments once cited was removed in 98f6a2b6.)
 EIGHT_BIT_MAX_ADU = 255.0
+SIXTEEN_BIT_MAX_ADU = 65535.0
+SATURATION_SOURCE_DECLARED = "declared_sensor_saturation"
+SATURATION_SOURCE_CONTAINER_8BIT = "container_ceiling_8bit"
+
+# `saturation_fraction` (legacy key, value unchanged) means different things in
+# different writers: the daemon writes the fraction of analysis PIXELS in the
+# native-saturation mask; this importer has always written the fraction of
+# detected SEP SOURCES rejected as saturated. The explicit key below carries the
+# importer's meaning under an unambiguous name.
+# Units of the measured pixel values. Only linear native samples (mono 8/16-bit
+# PNG/TIFF as the daemon writes them, FITS) are "adu". Rec.601 luma of a JPEG
+# is display-referred and gamma-encoded; luma of an RGB PNG/TIFF has an unknown
+# transfer function. Neither is detector ADU.
+UNITS_NATIVE = "adu"
+UNITS_JPEG_LUMA = "display_luma_8bit_nonlinear"
+UNITS_RGB_LUMA = "unverified"
+UNITS_NOTES = {
+    UNITS_NATIVE: "linear native samples of a mono PNG/TIFF/FITS frame",
+    UNITS_JPEG_LUMA: "Rec.601 luma of a display-referred (gamma-encoded) 8-bit JPEG; not linear detector ADU",
+    UNITS_RGB_LUMA: "Rec.601 luma of an RGB PNG/TIFF with unknown transfer function; not verified as detector ADU",
+}
+CHANNEL_CLIP_DEFINITION = (
+    "pixels where any RGB channel sits at the 8-bit container ceiling (255), computed before the "
+    "luma conversion and passed to measure_frame_sep as native_saturation_mask (footprint veto)"
+)
+
+SATURATED_STAR_FRACTION_DEFINITION = (
+    "fraction of SEP-detected sources (measure_frame_sep) rejected as saturated: native-mask "
+    "footprint or raw footprint peak >= the applied threshold (written only when sources were measured)"
+)
+SATURATION_FRACTION_LEGACY_NOTE = (
+    "legacy key: importer value = saturated_star_fraction (a STAR fraction); the daemon writes a "
+    "PIXEL fraction under the same key — do not compare across sources"
+)
 
 # How far from a position's logged timestamp a frame may sit and still be
 # considered part of that position. Only used when the field card gives neither
@@ -323,8 +363,35 @@ def night_id_for(timestamp: str, fallback: str) -> str:
 # ─── Frame measurement (for the field V-curve check) ─────────────────────────
 
 
+class LoadedLuma(NamedTuple):
+    """A decoded frame: luma, container ceiling, per-channel clip mask, units."""
+
+    data: object  # 2-D float64 array
+    container_max_adu: float | None
+    channel_clip_mask: object | None  # 2-D bool array for 8-bit RGB inputs, else None
+    units: str
+
+
 def load_luma(path: Path):
     """Read an image file as a 2-D float array, or return None.
+
+    See :func:`load_luma_with_container` for the container ceiling.
+    """
+    loaded = load_luma_with_container(path)
+    return None if loaded is None else loaded.data
+
+
+def load_luma_with_container(path: Path) -> LoadedLuma | None:
+    """Read an image file as a :class:`LoadedLuma`, or None.
+
+    ``container_max_adu`` is the full scale of the decoded sample type (255 for
+    8-bit, 65535 for 16-bit integer samples) or None when the container has no
+    integer ceiling (FITS floats) — never the observed maximum.
+
+    For 8-bit RGB inputs the container ceiling applies per channel: a star
+    clipped in one channel never brings Rec.601 luma near 255, so the clipped
+    pixels are found *before* the luma conversion (``channel_clip_mask``).
+    ``units`` is "adu" only for linear mono/FITS samples (see UNITS_NOTES).
 
     Only formats a hand-run sweep actually produces are handled: the 16-bit PNG
     the daemon writes for focus frames, TIFF, FITS, and the JPEG half of a
@@ -352,7 +419,9 @@ def load_luma(path: Path):
         with fits.open(path) as hdul:
             for hdu in hdul:
                 if getattr(hdu, "data", None) is not None and hdu.data.ndim == 2:
-                    return np.asarray(hdu.data, dtype=np.float64)
+                    return LoadedLuma(
+                        np.asarray(hdu.data, dtype=np.float64), container_max_adu(hdu.data), None, UNITS_NATIVE
+                    )
         return None
 
     if suffix in PNG_SUFFIXES or suffix in JPEG_SUFFIXES:
@@ -362,36 +431,54 @@ def load_luma(path: Path):
             return None
         with Image.open(path) as image:
             array = np.asarray(image)
+        ceiling = container_max_adu(array)
+        is_jpeg = suffix in JPEG_SUFFIXES
+        clip_mask = None
         if array.ndim == 3:
-            # Rec. 601 luma. Only reached for the JPEG half of a pair; the
-            # daemon's own focus frames are already single-channel.
-            array = (
-                0.299 * array[..., 0] + 0.587 * array[..., 1] + 0.114 * array[..., 2]
-            )
+            if array.shape[-1] >= 3:
+                colour = array[..., :3]  # drop alpha
+                if ceiling is not None and ceiling <= EIGHT_BIT_MAX_ADU:
+                    clip_mask = (colour >= ceiling).any(axis=-1)
+                # Rec. 601 luma. Reached for the JPEG half of a pair or an RGB
+                # PNG/TIFF; the daemon's own focus frames are single-channel.
+                array = 0.299 * colour[..., 0] + 0.587 * colour[..., 1] + 0.114 * colour[..., 2]
+            else:
+                array = array[..., 0]  # grey + alpha
+            units = UNITS_JPEG_LUMA if is_jpeg else UNITS_RGB_LUMA
+        else:
+            units = UNITS_JPEG_LUMA if is_jpeg else UNITS_NATIVE
         if array.ndim != 2:
             return None
-        return array.astype(np.float64)
+        return LoadedLuma(array.astype(np.float64), ceiling, clip_mask, units)
 
     return None
 
 
-def container_max_adu(image) -> float:
-    """Full scale of the container the samples arrived in — 255 or 65535.
+def container_max_adu(image) -> float | None:
+    """Full scale of the container the samples arrived in — 255, 65535 or None.
 
-    The container ceiling, never the sensor's saturation point. Conflating the
-    two is defect D1, and the whole reason `LumaFrame` carries both.
+    Read from the sample type: uint8 -> 255, uint16 -> 65535, anything else
+    (floats, wider integers) -> None. The container ceiling, never the
+    sensor's saturation point (defect D1), and never inferred from the
+    observed maximum.
     """
-    return EIGHT_BIT_MAX_ADU if float(image.max()) <= EIGHT_BIT_MAX_ADU else 65535.0
+    import numpy as np
+
+    dtype = np.asarray(image).dtype
+    if dtype == np.uint8:
+        return EIGHT_BIT_MAX_ADU
+    if dtype == np.uint16:
+        return SIXTEEN_BIT_MAX_ADU
+    return None
 
 
-def resolve_saturation_adu(image, declared: float | None) -> float | None:
-    """The sensor's linear saturation point in this frame's units, or None.
+def resolve_saturation(container_max: float | None, declared: float | None) -> tuple[float | None, str | None]:
+    """``(saturation_adu, source)`` for a frame, or ``(None, None)`` if unknown.
 
-    Mirrors `resolve_saturation_adu` in vision/quality.rs exactly:
-
-    * a declared value always wins (it came from BP-2, per body and ISO);
-    * an 8-bit container *is* its own clip point, because an 8-bit sample
-      physically cannot exceed 255 and one that reads 255 is clipped;
+    * a declared value always wins (it came from BP-2, per body and ISO):
+      source ``declared_sensor_saturation``;
+    * an 8-bit container is its own clip point (D-011): source
+      ``container_ceiling_8bit``;
     * a 16-bit container says nothing — a 14-bit body sends 16-bit samples that
       stop at 16383, and nothing in the pixels reveals that. Return None, so
       the gate reports itself as not performed rather than silently passing.
@@ -400,11 +487,16 @@ def resolve_saturation_adu(image, declared: float | None) -> float | None:
         try:
             value = float(declared)
         except (TypeError, ValueError):
-            return None
-        return value if value > 0.0 else None
+            return None, None
+        return (value, SATURATION_SOURCE_DECLARED) if value > 0.0 else (None, None)
+    if container_max is not None and container_max <= EIGHT_BIT_MAX_ADU:
+        return container_max, SATURATION_SOURCE_CONTAINER_8BIT
+    return None, None
 
-    max_adu = container_max_adu(image)
-    return max_adu if max_adu <= EIGHT_BIT_MAX_ADU else None
+
+def resolve_saturation_adu(image, declared: float | None) -> float | None:
+    """The saturation point in this frame's units, or None (see :func:`resolve_saturation`)."""
+    return resolve_saturation(container_max_adu(image), declared)[0]
 
 
 def readable_path(path: Path) -> Path | None:
@@ -425,52 +517,116 @@ def readable_path(path: Path) -> Path | None:
 def measure_frame(path: Path, declared_saturation: float | None) -> dict | None:
     """Frame-level HFR for a sweep frame, or None when it cannot be measured.
 
+    See :func:`measure_frame_detailed`, which also says why.
+    """
+    return measure_frame_detailed(path, declared_saturation)[0]
+
+
+def measure_frame_detailed(path: Path, declared_saturation: float | None) -> tuple[dict | None, str | None]:
+    """``(measurement, None)`` or ``(None, reason)`` for a sweep frame.
+
     Runs the *same* labeler the dataset builder runs (`measure_frame_sep`), so a
     V-curve inspected at 2 a.m. and the labels produced weeks later come from
     one implementation. This value is a field sanity check, not the training
     label: `build_focus_quality_dataset.py` re-measures every crop from the
     preserved pixels.
 
-    Returns None when the frame is unreadable, has no measurable stars, or SEP
-    is unavailable. None is propagated as "no sample", never as a zero — zero is
-    the mathematically best value for a width metric and would put a blank frame
-    at the bottom of a V-curve.
-    """
-    image = load_luma(path)
-    if image is None:
-        return None
+    No measurement when the frame is unreadable, SEP is missing or not the
+    pinned version, the SEP background is unavailable / its noise unresolved,
+    or no star survives the gates. That is propagated as "no sample", never as
+    a zero — zero is the mathematically best value for a width metric and would
+    put a blank frame at the bottom of a V-curve.
 
-    sat = resolve_saturation_adu(image, declared_saturation)
+    The measurement keeps the legacy top-level keys (`background_adu`,
+    `background_sigma`, `saturation_fraction` — values unchanged in meaning)
+    and adds a nested `background` / `detection` provenance object.
+    """
+    loaded = load_luma_with_container(path)
+    if loaded is None:
+        return None, "unreadable"
+    image, container, channel_clip_mask, units = loaded
+
+    sat, saturation_source = resolve_saturation(container, declared_saturation)
     gate_applied = sat is not None
-    threshold = sat * SATURATION_FRACTION if sat is not None else float("inf")
+    threshold = sat * SATURATION_FRACTION if sat is not None else None
 
     try:
-        from labels.psf_measure import measure_frame_sep
-
-        _sources, label = measure_frame_sep(
-            image, saturation_level=threshold, fit_fwhm=False
-        )
+        from labels.psf_measure import MissingPrerequisite, measure_frame_sep
     except Exception:
-        return None
+        return None, "labeler_unavailable"
+    try:
+        _sources, label = measure_frame_sep(
+            image,
+            saturation_level=threshold,
+            native_saturation_mask=channel_clip_mask,
+            fit_fwhm=False,
+            units=units,
+        )
+    except MissingPrerequisite as exc:
+        return None, str(exc)
+    except Exception as exc:
+        return None, f"measurement_error: {type(exc).__name__}"
 
     if label.hfr_px_median is None:
-        return None
+        return None, ";".join(label.reasons) or "no_valid_sources"
 
+    # `background` is the Python reference provenance object
+    # (producer "python_sep_label", schema
+    # "achernar.python_sep_background_provenance.v1"), NOT the daemon's Rust
+    # BackgroundResult that api/focus.rs writes under the same key (that one
+    # carries "schema_version"). Readers must dispatch on producer/schema.
+    background = dict(label.background)
+    background["level"] = label.sky_median_adu
+    background["rms"] = label.sky_rms_adu
+    native_units = label.units == UNITS_NATIVE
     return {
         "hfr_px": float(label.hfr_px_median),
-        "hfd_px": float(label.hfr_px_median) * 2.0,
+        "hfd_px": float(label.hfd_px_median),
         "star_count": int(label.star_count_detected),
         "star_count_used": int(label.star_count_used),
-        "background_adu": float(label.sky_median_adu),
-        "background_sigma": float(label.sky_rms_adu),
-        "max_adu": container_max_adu(image),
+        # Legacy top-level keys, read by the FOP contract. SEP's globalback /
+        # globalrms (mesh medians; see background.level_definition). They are
+        # ADU by name, so they are null (with a reason) when the pixels are not
+        # linear native samples; the nested object keeps the value and units.
+        "background_adu": label.sky_median_adu if native_units else None,
+        "background_sigma": label.sky_rms_adu if native_units else None,
+        **({} if native_units else {"background_adu_unavailable_reason": f"units_not_adu:{label.units}"}),
+        "max_adu": container,
         "saturation_adu": sat,
+        "saturation_source": saturation_source,
+        "saturation_threshold_adu": threshold,
         "saturation_gate_applied": gate_applied,
+        "saturation_gate": label.saturation_gate,
         "saturation_fraction": float(label.saturated_star_fraction),
-    }
+        "saturation_fraction_definition": SATURATION_FRACTION_LEGACY_NOTE,
+        "saturated_star_fraction": float(label.saturated_star_fraction),
+        "saturated_star_fraction_definition": SATURATED_STAR_FRACTION_DEFINITION,
+        "label_schema_version": label.label_schema_version,
+        "measurement_method": label.label_method,
+        "units": label.units,
+        "units_note": UNITS_NOTES.get(label.units),
+        "channel_clip_mask": (
+            None
+            if channel_clip_mask is None
+            else {"pixels": int(channel_clip_mask.sum()), "definition": CHANNEL_CLIP_DEFINITION}
+        ),
+        "hfr_definition": label.width_definition.get("hfr"),
+        "hfd_definition": label.width_definition.get("hfd"),
+        "snr_definition": label.snr_definition,
+        "rejection_counts": dict(label.rejection_counts),
+        "background": background,
+        "detection": {
+            key: label.detection.get(key)
+            for key in ("method", "library", "library_version", "config", "config_sha256", "noise_source")
+        },
+    }, None
 
 
-def quality_json_for(measurement: dict | None, declared_saturation: float | None) -> str:
+def quality_json_for(
+    measurement: dict | None,
+    declared_saturation: float | None,
+    reason: str | None = None,
+) -> str:
     """The `frames.quality_json` an imported frame carries.
 
     This is not decoration. `build_focus_quality_dataset.py` reads
@@ -482,16 +638,25 @@ def quality_json_for(measurement: dict | None, declared_saturation: float | None
 
     When nothing can be measured, `saturation_gate_applied` is written as
     `false` explicitly. That is the honest record and it makes the builder's
-    refusal legible instead of mysterious.
+    refusal legible instead of mysterious. The measured keys are then explicit
+    nulls with `measurement_status` and, when known, `measurement_reason` —
+    never zeros.
     """
     if measurement is None:
         payload = {
             "source": "offline_import",
             "observation_valid": False,
             "saturation_gate_applied": False,
+            "measurement_status": "not_measured" if reason is None else "unavailable",
+            "hfr_px": None,
+            "background_adu": None,
+            "background_sigma": None,
         }
+        if reason is not None:
+            payload["measurement_reason"] = reason
         if declared_saturation is not None:
             payload["saturation_adu"] = float(declared_saturation)
+            payload["saturation_source"] = SATURATION_SOURCE_DECLARED
             payload["saturation_gate_applied"] = True
         return json.dumps(payload)
 
@@ -499,6 +664,7 @@ def quality_json_for(measurement: dict | None, declared_saturation: float | None
     payload["source"] = "offline_import"
     payload["observation_valid"] = True
     payload["status"] = "Valid"
+    payload["measurement_status"] = "measured"
     return json.dumps(payload)
 
 
@@ -609,6 +775,7 @@ def import_session(
         "focus_samples_inserted": 0,
         "positions_unresolved": 0,
         "samples_unmeasurable": 0,
+        "unmeasurable_reasons": {},
         "timezone_assumed": 0,
     }
     staged: list[Path] = []
@@ -1043,6 +1210,7 @@ def import_focus_runs(
         "focus_samples_inserted": 0,
         "positions_unresolved": 0,
         "samples_unmeasurable": 0,
+        "unmeasurable_reasons": {},
     }
 
     runs = [
@@ -1060,6 +1228,7 @@ def import_focus_runs(
             continue
 
         samples: list[tuple] = []
+        unmeasured: list[tuple[str, str]] = []
         for entry in positions:
             position = position_value(entry, position_unit_um)
             if position is None:
@@ -1075,7 +1244,7 @@ def import_focus_runs(
 
             for frame_id in frame_ids:
                 row = con.execute(
-                    "SELECT local_path, captured_at FROM frames WHERE id = ?",
+                    "SELECT local_path, captured_at, quality_json FROM frames WHERE id = ?",
                     (frame_id,),
                 ).fetchone()
                 if row is None:
@@ -1086,13 +1255,25 @@ def import_focus_runs(
                 if not path.is_absolute():
                     path = capture_root / path
                 source = readable_path(path)
-                measurement = measure_frame(source, declared_saturation) if source else None
+                measurement, reason = (
+                    measure_frame_detailed(source, declared_saturation) if source else (None, "unreadable")
+                )
                 if measurement is None:
                     # `focus_samples.hfr` is NOT NULL and there is no honest
                     # number to put there. Skipping loses this frame from the
                     # run; fabricating one would corrupt the V-curve for every
                     # frame in it.
                     stats["samples_unmeasurable"] += 1
+                    reasons = stats["unmeasurable_reasons"]
+                    reasons[reason] = reasons.get(reason, 0) + 1
+                    try:
+                        previous = json.loads(row[2] or "{}")
+                    except ValueError:
+                        previous = {}
+                    # Record why, but never replace a measurement an earlier
+                    # import already stored for this frame.
+                    if not (isinstance(previous, dict) and previous.get("observation_valid") is True):
+                        unmeasured.append((frame_id, reason))
                     continue
 
                 samples.append(
@@ -1106,6 +1287,13 @@ def import_focus_runs(
                         frame_id,
                         measurement,
                     )
+                )
+
+        if not dry_run:
+            for frame_id, reason in unmeasured:
+                con.execute(
+                    "UPDATE frames SET quality_json = ? WHERE id = ?",
+                    (quality_json_for(None, declared_saturation, reason=reason), frame_id),
                 )
 
         if not samples:
@@ -1333,6 +1521,8 @@ def main() -> int:
             "(too few stars, unreadable format, or RAW without a derived FITS) and "
             "were left out of the run rather than given a fabricated width"
         )
+        for reason, count in sorted(stats.get("unmeasurable_reasons", {}).items()):
+            print(f"      {count} x {reason}")
     if stats["metadata_from_mtime"]:
         print(
             "  ! some timestamps came from file mtime, not the shutter — "

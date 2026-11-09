@@ -118,8 +118,8 @@ pub fn telemetry_event(state: &AppState) -> Value {
                 // applies to every field below: an absent observation is not a
                 // clear sky, not an empty star field, and not a zero exposure.
                 "focus_hfr": observation.as_ref().and_then(|obs| obs.hfr_px),
-                "cloud_prob": observation.as_ref().map(|obs| obs.cloud_probability),
-                "star_count": observation.as_ref().map(|obs| obs.star_count),
+                "cloud_prob": observation.as_ref().and_then(|obs| obs.cloud_probability),
+                "star_count": observation.as_ref().and_then(|obs| obs.measured_star_count()),
                 "star_count_used": observation.as_ref().map(|obs| obs.star_count_used),
                 // False here means "we looked and the observation was not
                 // usable". Null means we never looked at all.

@@ -11,6 +11,11 @@ research note:
   * Invalid / empty crops yield ``None`` widths, never ``0`` (0 would win a
     lower-is-better comparison and mark a blank frame as perfectly focused).
   * Saturated and edge-truncated stars are rejected before they can bias a label.
+  * A zero-MAD crop plateau is an *unresolved* noise scale, never the inflated
+    standard deviation of the unclipped crop (BGE-07).
+
+SEP-backed tests fail with "missing prerequisite: sep==1.4.1" when the pinned
+SEP is absent; they never skip.
 
 Run: ``python -m unittest ml.tests.test_psf_measure`` (from repo root) or
 ``python -m unittest`` inside ``ml/``.
@@ -27,11 +32,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from labels.psf_measure import (  # noqa: E402
     Rejection,
     aggregate_frame,
-    Rejection,
     curve_of_growth_hfr,
     estimate_background,
+    estimate_background_detailed,
     fit_moffat_fwhm,
     measure_star,
+    require_sep,
 )
 
 
@@ -142,10 +148,95 @@ class TestSourceGates(unittest.TestCase):
         self.assertIn(Rejection.LOW_SNR.value, m.rejections)
 
 
+def _pre_v2_estimate_background(image, sigma=3.0, iters=5):
+    """Frozen copy of the pre-v2 crop estimator, kept only to demonstrate its
+    plateau defect (BGE-07)."""
+    data = image[np.isfinite(image)].astype(np.float64).ravel()
+    for _ in range(iters):
+        med = np.median(data)
+        mad = np.median(np.abs(data - med)) * 1.4826
+        if mad <= 0:
+            break
+        keep = np.abs(data - med) <= sigma * mad
+        if keep.all() or keep.sum() < 8:
+            break
+        data = data[keep]
+    return float(np.median(data)), float(np.std(data)) if data.size > 1 else 0.0
+
+
+class TestCropPlateauNoise(unittest.TestCase):
+    """BGE-07. When more than half of a crop's usable pixels share one value the
+    MAD is zero and the robust noise scale is unresolved. The pre-v2 estimator
+    failed in two directions depending on when the plateau appeared:
+
+    * plateau on the first pass (a quantized integer sky): it stopped before
+      clipping and returned np.std of the WHOLE crop, star light included;
+    * plateau after clipping (an exactly flat float sky): it returned ~1e-13,
+      which measure_star then floored to 1e-6 ADU — an invented noise scale
+      that made every positive pixel "significant".
+    """
+
+    def test_quantized_plateau_was_inflated_now_unresolved(self):
+        img = np.round(render_psf(gaussian(3.0)))
+        self.assertGreater(int((img == 100.0).sum()), img.size // 2)  # first-pass plateau
+        _, old_rms = _pre_v2_estimate_background(img)
+        self.assertEqual(old_rms, float(np.std(img)))  # the unclipped crop, stars included
+        self.assertGreater(old_rms, 100.0)
+
+        detailed = estimate_background_detailed(img)
+        self.assertEqual(detailed.level, 100.0)
+        self.assertEqual(detailed.noise_status, "unresolved")
+        self.assertEqual(detailed.reasons, ("zero_empirical_scatter",))
+        self.assertIsNone(detailed.rms)
+        # The scalar form keeps the measured level and reports the unresolved
+        # scale as nan, not as a numeric 0.0 that a caller could floor.
+        level, rms = estimate_background(img)
+        self.assertEqual(level, 100.0)
+        self.assertTrue(np.isnan(rms))
+
+    def test_flat_float_plateau_was_floored_now_unresolved(self):
+        img = render_psf(gaussian(3.0))
+        _, old_rms = _pre_v2_estimate_background(img)
+        self.assertLess(old_rms, 1e-6)  # pre-v2 measure_star then used max(old_rms, 1e-6)
+        detailed = estimate_background_detailed(img)
+        self.assertEqual((detailed.noise_status, detailed.rms), ("unresolved", None))
+
+    def test_direct_hfr_baseline_is_invalid_when_noise_is_unresolved(self):
+        from eval.baselines import direct_hfr_measure
+
+        self.assertTrue(np.isnan(direct_hfr_measure(np.round(render_psf(gaussian(3.0))))))
+        self.assertTrue(np.isnan(direct_hfr_measure(np.full((32, 32), np.nan))))
+        self.assertTrue(np.isfinite(direct_hfr_measure(noisy_render(gaussian(3.0), seed=0))))
+
+    def test_crop_gates_refuse_to_threshold_an_unresolved_noise(self):
+        m = measure_star(render_psf(gaussian(3.0)), saturation_level=65535.0)
+        self.assertIn(Rejection.NOISE_UNRESOLVED.value, m.rejections)
+        self.assertIsNone(m.snr)
+        self.assertFalse(m.valid)
+
+    def test_empty_crop_is_unavailable_not_zero(self):
+        detailed = estimate_background_detailed(np.full((8, 8), np.nan))
+        self.assertIsNone(detailed.level)
+        self.assertEqual(detailed.level_status, "unavailable")
+        level, rms = estimate_background(np.full((8, 8), np.nan))
+        self.assertTrue(np.isnan(level) and np.isnan(rms))
+
+
+def noisy_render(profile, seed, sky=100.0, read_noise=5.0, **kwargs):
+    """A rendered crop with seeded Gaussian sky noise, so its noise is resolved."""
+    rng = np.random.default_rng(seed)
+    img = render_psf(profile, sky=sky, **kwargs)
+    return img + rng.normal(0.0, read_noise, img.shape)
+
+
 class TestAggregation(unittest.TestCase):
     def test_robust_pooling_over_multiple_stars(self):
+        # The fixture carries seeded sky noise: the noiseless version only passed
+        # because its plateau "rms" was floored at 1e-6 ADU (TestCropPlateauNoise).
         sky = 100.0
-        measurements = [measure_star(render_psf(gaussian(3.0)), saturation_level=65535.0) for _ in range(8)]
+        measurements = [
+            measure_star(noisy_render(gaussian(3.0), seed=s), saturation_level=65535.0) for s in range(8)
+        ]
         label = aggregate_frame(measurements, sky_median=sky, sky_rms=5.0)
         self.assertEqual(label.star_count_used, 8)
         self.assertIsNotNone(label.hfr_px_median)
@@ -210,7 +301,9 @@ class TestBlendRejection(unittest.TestCase):
     def test_close_double_is_flagged_blended(self):
         size = 64
         sigma = 2.0 / np.sqrt(2 * np.log(2))
-        a = render_psf(gaussian(sigma), size=size, cx=28, cy=32, sky=100.0, amp=8000.0)
+        # Seeded sky noise keeps the crop noise resolved (TestCropPlateauNoise);
+        # the noiseless pair would now be rejected as noise_unresolved instead.
+        a = noisy_render(gaussian(sigma), seed=3, size=size, cx=28, cy=32, amp=8000.0)
         b = render_psf(gaussian(sigma), size=size, cx=36, cy=32, sky=0.0, amp=8000.0)
         m = measure_star(a + b, saturation_level=65535.0)
         self.assertIn(Rejection.BLENDED.value, m.rejections)
@@ -218,11 +311,12 @@ class TestBlendRejection(unittest.TestCase):
 
 
 class TestSepPath(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Fails (not skips) with "missing prerequisite: sep==1.4.1".
+        require_sep()
+
     def test_measure_frame_sep_recovers_hfr(self):
-        try:
-            import sep  # noqa: F401
-        except ImportError:
-            self.skipTest("sep not installed")
         from labels.psf_measure import measure_frame_sep
 
         # A field of identical 3 px-HFR stars on a noisy sky.
@@ -242,10 +336,6 @@ class TestSepPath(unittest.TestCase):
         self.assertAlmostEqual(label.hfr_px_median, truth, delta=0.5)
 
     def test_measure_frame_sep_uses_aperture_flux_for_moffat_wings(self):
-        try:
-            import sep  # noqa: F401
-        except ImportError:
-            self.skipTest("sep not installed")
         from labels.psf_measure import measure_frame_sep
 
         rng = np.random.default_rng(11)

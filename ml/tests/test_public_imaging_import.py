@@ -4,12 +4,20 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
+import pytest
 
 from ml.data_pipeline.import_public_imaging import aperture_hfr, moment_shape, prepare_synthetic, render_profile
 from ml.data_pipeline.split_registry import load_registered_splits
+from ml.labels.psf_measure import require_sep
 
 
-def test_fits_intake_preserves_quality_arrays_and_rejects_masked_cores(tmp_path):
+@pytest.fixture
+def sep_required():
+    """SEP-backed tests fail with "missing prerequisite: sep==1.4.1" rather than skip."""
+    return require_sep()
+
+
+def test_fits_intake_preserves_quality_arrays_and_rejects_masked_cores(tmp_path, sep_required):
     from astropy.io import fits
     from ml.data_pipeline.import_public_imaging import prepare_hst
     product='fixture123'
@@ -39,7 +47,28 @@ def test_fits_intake_preserves_quality_arrays_and_rejects_masked_cores(tmp_path)
     with np.load(output/'frame.npz',allow_pickle=False) as data:
         np.testing.assert_array_equal(data['science_electrons'],image)
         np.testing.assert_array_equal(data['dq'],dq)
+        background = data['sep_background_estimate_electrons']
     assert manifest['fqe_quality_accepted']==2
+    # SEP provenance (BGE-20). The background is the same SEP call as before
+    # (library-default mesh, DQ/finite/ERR mask); noise stays the pipeline ERR.
+    import sep
+    from ml.labels.psf_measure import config_sha256
+    mask=(dq!=0)|~np.isfinite(image)
+    cleaned=image.copy();cleaned[mask]=float(np.median(image[~mask]))
+    np.testing.assert_array_equal(background,sep.Background(cleaned,mask=mask).back())
+    assert manifest['sep_version']=='1.4.1'
+    assert manifest['noise_source']=='pipeline_error'
+    assert manifest['background_config']['method']=='sep_spatial_mesh'
+    assert (manifest['background_config']['bw'],manifest['background_config']['fw'])==(64,3)
+    assert manifest['background_config_sha256']==config_sha256(manifest['background_config'])
+    detection=manifest['detection_config']
+    assert (detection['thresh_sigma'],detection['filter_type'],detection['noise'])==(6.0,'matched','pipeline_error_map')
+    assert detection['pixstack']>=image.size
+    assert manifest['detection_config_sha256']==config_sha256(detection)
+    assert manifest['background_provenance']['units']=='electrons'
+    assert all(r['noise_source']=='pipeline_error' and r['detection_config_sha256']==manifest['detection_config_sha256'] for r in rows)
+    assert not manifest['training_eligible'] and manifest['split']=='test'
+    assert any('do not calibrate Canon' in item for item in manifest['limitations'])
 
 
 def _gaussian(**changes):
@@ -51,7 +80,20 @@ def _gaussian(**changes):
     return params
 
 
-def test_reference_hfr_is_finite_pixel_not_width_parameter():
+def test_aperture_hfr_insists_on_the_pinned_sep():
+    import sys
+    import types
+    from unittest import mock
+    from ml.labels.psf_measure import MissingPrerequisite
+
+    fake = types.ModuleType("sep")
+    fake.__version__ = "1.2.1"
+    with mock.patch.dict(sys.modules, {"sep": fake}):
+        with pytest.raises(MissingPrerequisite, match="missing prerequisite: sep==1.4.1"):
+            aperture_hfr(render_profile(64, _gaussian()), (31.5, 31.5), 24)
+
+
+def test_reference_hfr_is_finite_pixel_not_width_parameter(sep_required):
     image = render_profile(64, _gaussian(), oversample=5)
     hfr = aperture_hfr(image, (31.5, 31.5), 24)
     assert abs(image.sum()-10000) < 0.1
@@ -81,7 +123,7 @@ def test_edge_truncation_preserves_lost_flux():
     assert edge.sum() > centered.sum()*0.45
 
 
-def test_prepared_schema_splits_masks_and_no_fake_focus_runs():
+def test_prepared_schema_splits_masks_and_no_fake_focus_runs(sep_required):
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         manifest = prepare_synthetic(root, seed=42, families=32, variants=2, scene_count=2)
@@ -107,6 +149,7 @@ def test_prepared_schema_splits_masks_and_no_fake_focus_runs():
             assert row["focuser_position"] is None
         assert all(len(value) == 1 for value in by_family.values())
         assert manifest["observations"] == 64
+        assert manifest["sep_version"] == "1.4.1"
         obs = np.load(output / "observations.npz", allow_pickle=False)
         assert obs["pixel_flags"].dtype == np.uint8
         assert obs["raw_crops"].shape == (64, 64, 64)
@@ -119,7 +162,7 @@ def test_prepared_schema_splits_masks_and_no_fake_focus_runs():
         assert bge["background_truth"].min() > 500
 
 
-def test_same_seed_same_arrays_and_ancestry():
+def test_same_seed_same_arrays_and_ancestry(sep_required):
     with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
         prepare_synthetic(Path(first), seed=83, families=32, variants=1, scene_count=0)
         prepare_synthetic(Path(second), seed=83, families=32, variants=1, scene_count=0)

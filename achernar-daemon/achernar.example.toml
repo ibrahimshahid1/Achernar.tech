@@ -340,3 +340,36 @@ database_path = "achernar.db"
 level = "info"
 json_output = false
 # log_dir = "/var/log/achernar"
+
+[vision.background]                 # frame background for detection, star gates, HFR, trailing
+# "legacy_global_clip" (default): one global clipped median/std; detection by
+# global-threshold components; gates and HFR use each crop's median sky.
+# "sep": opt-in DIAGNOSTIC path through the vendored SEP 1.4.1 C library
+# (achernar-daemon/sep): spatial background/RMS maps feed SEP extraction,
+# the star gates, HFR and trailing. Not a qualified autofocus default.
+backend = "legacy_global_clip"
+# When "sep" cannot produce a result: "unavailable" (default; the frame
+# reports its background and detection unavailable with the reason) or
+# "legacy_global_clip" (runs legacy, labelled fallback_used).
+fallback = "unavailable"
+# retain_segmentation = false       # keep SEP's per-pixel segmentation (diagnostics)
+
+[vision.background.sep]             # sep_background mesh (starting values, not qualified)
+bw = 64                             # mesh width, analysis px
+bh = 64
+fw = 3                              # median filter of the mesh grid, meshes
+fh = 3
+fthresh = 0.0
+min_meshes_per_axis = 2             # smaller frames: frame_smaller_than_mesh_grid
+
+[vision.background.detection]       # sep_extract on I - B(x,y)
+thresh_sigma = 5.0                  # in units of the local RMS R(x,y)
+minarea = 5
+filter_type = "conv"                # "matched" is ~2.67x more sensitive at the same thresh
+# filter_kernel = [[1,2,1],[2,4,2],[1,2,1]]
+deblend_nthresh = 32
+deblend_cont = 0.005
+clean = true
+clean_param = 1.0
+pixstack = 300000
+accept_deblended_for_focus = false  # deblending is SEP's; accepting children is a focus policy

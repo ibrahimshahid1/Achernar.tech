@@ -107,7 +107,9 @@ pub struct SharedObservation {
     /// Robust std-dev of `ln(HFR)` across the stars used. This is between-star
     /// dispersion, not a calibrated standard error of the frame median.
     pub hfr_log_sigma: Option<f32>,
-    /// Stars detected in the frame.
+    /// Stars detected in the frame. Kept as a number for compatibility: when
+    /// `detection` is `None` detection did not run and 0 is not a count; use
+    /// [`SharedObservation::measured_star_count`].
     pub star_count: u32,
     /// Stars that produced a finite HFR.
     pub star_count_used: u32,
@@ -143,11 +145,16 @@ pub struct SharedObservation {
     pub fqe_calibrated: Option<bool>,
 
     // --- From CloudObstructionClassifier ---
-    pub cloud_probability: f32,
+    /// `None` when the frame carried no cloud evidence (analysis unavailable,
+    /// or detection did not run so no star count exists).
+    #[serde(default)]
+    pub cloud_probability: Option<f32>,
     pub cloud_event: CloudEvent,
 
     // --- From TrailingElongationDetector ---
-    pub trailing_severity: f32,
+    /// `None` when trailing was not measured (`trailing_unavailable_reason`).
+    #[serde(default)]
+    pub trailing_severity: Option<f32>,
     /// `RA`, `Dec` or `Ambiguous` only when a WCS still describes the frame
     /// (H15); otherwise the sensor axis: `sensor_x`, `sensor_y` or
     /// `sensor_diagonal`.
@@ -157,13 +164,44 @@ pub struct SharedObservation {
     /// The full TED evidence, with the exposure window's equipment state.
     #[serde(default)]
     pub ted: Option<TedEvidence>,
+    /// Set when trailing could not be measured on this frame; then
+    /// `trailing_severity` is not a measurement.
+    #[serde(default)]
+    pub trailing_unavailable_reason: Option<String>,
+    /// Source-selection policy behind the trailing measurement.
+    #[serde(default)]
+    pub trailing_policy: Option<String>,
 
-    // --- From BackgroundEstimator ---
-    pub background_adu: f32,
-    pub sky_background_adu: f32,
-    pub background_sigma: f32,
-    pub snr_proxy_median: f32,
-    pub saturation_fraction: f32,
+    // --- Background (vision::background_model) ---
+    /// Authoritative versioned background result: method, configuration
+    /// hash, level and noise validity, units, support, and reasons. `None`
+    /// on observations that predate it (legacy-unverified) and when no frame
+    /// was analysed.
+    #[serde(default)]
+    pub background: Option<crate::vision::background_model::BackgroundResult>,
+    /// Detection backbone behind `star_count` and the HFR sample.
+    #[serde(default)]
+    pub detection: Option<crate::vision::background_model::DetectionProvenance>,
+    /// Deprecated mirror of `background.level` (only when measured). Its
+    /// population depends on `background.method`; read `background` for
+    /// what it means. `null` when unavailable, never a stand-in 0.
+    #[serde(default)]
+    pub background_adu: Option<f32>,
+    /// Deprecated duplicate of `background_adu`.
+    #[serde(default)]
+    pub sky_background_adu: Option<f32>,
+    /// Deprecated mirror of `background.rms` (only when measured and
+    /// positive). `null` for unresolved or unavailable noise.
+    #[serde(default)]
+    pub background_sigma: Option<f32>,
+    /// Deprecated name of `background.bright_pixel_significance`, a legacy
+    /// pixel-significance heuristic. Not aperture or PSF SNR.
+    #[serde(default)]
+    pub snr_proxy_median: Option<f32>,
+    /// Mirror of `background.saturation_fraction`; `null` without
+    /// saturation evidence (`saturation_gate` says why).
+    #[serde(default)]
+    pub saturation_fraction: Option<f32>,
     /// Whether the star-saturation gate could run on this frame.
     ///
     /// Without it, `saturation_fraction: 0.0` and `star_rejections.saturated: 0`
@@ -204,6 +242,39 @@ impl SharedObservation {
         Self::empty()
     }
 
+    /// Attach the authoritative background result and refresh the deprecated
+    /// top-level mirrors from it. Mirrors carry only measured values.
+    pub fn set_background(
+        &mut self,
+        result: crate::vision::background_model::BackgroundResult,
+        detection: Option<crate::vision::background_model::DetectionProvenance>,
+    ) {
+        self.background_adu = result.level();
+        self.sky_background_adu = result.level();
+        self.background_sigma = result.rms();
+        self.snr_proxy_median = result.bright_pixel_significance;
+        self.saturation_fraction = result.saturation_fraction;
+        self.background = Some(result);
+        self.detection = detection;
+    }
+
+    /// The detected star count, or `None` when detection did not run.
+    pub fn measured_star_count(&self) -> Option<u32> {
+        self.detection.is_some().then_some(self.star_count)
+    }
+
+    /// How to read the background fields of this observation:
+    /// `current` (a versioned `background` result is attached),
+    /// `legacy_unverified` (only the old top-level numbers exist; a stored 0
+    /// cannot be told apart from an unmeasured frame), or `absent`.
+    pub fn background_provenance_state(&self) -> &'static str {
+        match (&self.background, self.background_adu) {
+            (Some(_), _) => "current",
+            (None, Some(_)) => "legacy_unverified",
+            (None, None) => "absent",
+        }
+    }
+
     pub fn analysis_unavailable(reason: String) -> Self {
         let mut observation = Self::empty();
         observation.status = QualityStatus::AnalysisUnavailable;
@@ -242,17 +313,21 @@ impl SharedObservation {
             fqe_star_count: None,
             fqe_model_version: None,
             fqe_calibrated: None,
-            cloud_probability: 0.0,
+            cloud_probability: None,
             cloud_event: CloudEvent::None,
-            trailing_severity: 0.0,
+            trailing_severity: None,
             trailing_axis: None,
             trailing_direction_pa: None,
             ted: None,
-            background_adu: 0.0,
-            sky_background_adu: 0.0,
-            background_sigma: 0.0,
-            snr_proxy_median: 0.0,
-            saturation_fraction: 0.0,
+            trailing_unavailable_reason: None,
+            trailing_policy: None,
+            background: None,
+            detection: None,
+            background_adu: None,
+            sky_background_adu: None,
+            background_sigma: None,
+            snr_proxy_median: None,
+            saturation_fraction: None,
             saturation_gate: crate::vision::quality::SaturationGate::default(),
             pointing_error_arcmin: None,
             wcs_residual_arcsec: None,
@@ -272,4 +347,88 @@ pub struct VisionCloudEvent {
     pub source: String,
     pub event_type: String,
     pub data: SharedObservation,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SharedObservation;
+    use crate::vision::quality::{background_from_luma, LumaFrame};
+
+    fn analysed() -> SharedObservation {
+        let pixels: Vec<f32> = (0..64 * 64).map(|i| 100.0 + (i % 5) as f32).collect();
+        let frame = LumaFrame {
+            pixels,
+            width: 64,
+            height: 64,
+            max_adu: 65535.0,
+            saturation_adu: Some(65535.0),
+            masks: Default::default(),
+            analysis_descriptor: None,
+        };
+        let analysis = background_from_luma(&frame);
+        let mut observation = SharedObservation::empty();
+        observation.set_background(analysis.result, None);
+        observation
+    }
+
+    #[test]
+    fn empty_observation_publishes_no_background_numbers() {
+        let json = serde_json::to_value(SharedObservation::empty()).unwrap();
+        for key in [
+            "background_adu",
+            "sky_background_adu",
+            "background_sigma",
+            "snr_proxy_median",
+            "saturation_fraction",
+            "background",
+        ] {
+            assert!(json[key].is_null(), "{key} must be null, got {}", json[key]);
+        }
+        assert_eq!(
+            SharedObservation::empty().background_provenance_state(),
+            "absent"
+        );
+    }
+
+    #[test]
+    fn versioned_background_round_trips_and_mirrors_only_measured_values() {
+        let observation = analysed();
+        let json = serde_json::to_string(&observation).unwrap();
+        let back: SharedObservation = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.background, observation.background);
+        assert_eq!(
+            back.background_adu,
+            observation.background.as_ref().unwrap().level()
+        );
+        assert_eq!(back.background_provenance_state(), "current");
+        assert_eq!(
+            back.background.as_ref().unwrap().method.id(),
+            "legacy_global_clip"
+        );
+    }
+
+    #[test]
+    fn legacy_payload_keeps_its_numbers_but_reads_as_unverified() {
+        // An observation serialized before the versioned result existed:
+        // plain numbers, possibly the old 0.0 sentinel, no `background`.
+        let mut json = serde_json::to_value(SharedObservation::empty()).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("background");
+        object.remove("detection");
+        object.remove("trailing_unavailable_reason");
+        object.remove("trailing_policy");
+        for key in [
+            "background_adu",
+            "sky_background_adu",
+            "background_sigma",
+            "snr_proxy_median",
+            "saturation_fraction",
+        ] {
+            object.insert(key.into(), serde_json::json!(0.0));
+        }
+        let legacy: SharedObservation = serde_json::from_value(json).unwrap();
+        assert_eq!(legacy.background_adu, Some(0.0));
+        assert!(legacy.background.is_none());
+        assert_eq!(legacy.background_provenance_state(), "legacy_unverified");
+    }
 }

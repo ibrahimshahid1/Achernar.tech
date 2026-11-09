@@ -7,14 +7,19 @@ model has to earn its place:
   * constant       — predict the training-set median HFR for every crop. The
                      sanity floor; if the CNN cannot beat this on MAE it has
                      learned nothing.
-  * direct_hfr     — the classical curve-of-growth HFR measured straight from the
+  * direct_hfr     — a classical curve-of-growth HFR measured straight from the
                      crop (no learning), EXECUTED and TIMED per crop (not assumed
                      perfect: the audit rightly flagged the old hard-coded 0-MAE
-                     entry). Caveat: it runs on the normalized [0,1] crops the
-                     model sees; the p1/p99 clip slightly flattens bright cores,
-                     so this is the deployable-baseline number, not the label
-                     oracle. The "do we even need a CNN?" question is answered
-                     by comparing the CNN against THIS row.
+                     entry). Method: the custom Python crop helpers
+                     ``python_crop_iterative_clip`` (one global sky for the crop)
+                     + ``python_signed_curve_of_growth`` — NOT SEP, NOT the SEP
+                     labeler that produced the labels, and NOT the daemon's Rust
+                     path (which has its own crop gates and estimator). Caveat:
+                     it runs on the normalized [0,1] crops the model sees; the
+                     p1/p99 clip slightly flattens bright cores, so this is a
+                     deployable-baseline number, not the label oracle. The "do
+                     we even need a CNN?" question is answered by comparing the
+                     CNN against THIS row.
   * tenengrad      — squared-gradient sharpness energy (Pertuz 2013 gradient
                      family), ranked within run.
   * norm_variance  — normalized grey-level variance (Pertuz statistical family).
@@ -22,6 +27,12 @@ model has to earn its place:
 For focus, the decisive metric is WITHIN-RUN rank correlation (does the operator
 order a sweep correctly?), evaluated on grouped splits. HFR MAE is reported where
 a baseline predicts an HFR directly.
+
+Label provenance: this script reads an .npz directly and does not filter rows by
+label version, so its numbers are exploratory, not a *qualified* evaluation. A
+qualified comparison loads labels through
+``data_pipeline.build_focus_quality_dataset.load_qualified_dataset``, which
+excludes ``legacy_unverified`` rows (BGE-20).
 
 Run: python -m eval.baselines --dataset focus_quality_ds_v1.npz
      python -m eval.baselines --synthetic
@@ -68,11 +79,18 @@ def _within_run_rho(score, hfr_px, run_id, sign=-1.0):
 
 
 def direct_hfr_measure(crop: np.ndarray) -> float:
-    """The deployable classical baseline: local sky estimate + aperture-bounded
-    curve-of-growth HFR on the crop, exactly what the daemon computes."""
+    """The deployable classical baseline: the custom crop sky estimate
+    (``python_crop_iterative_clip``) + aperture-bounded signed curve-of-growth
+    HFR (``python_signed_curve_of_growth``). A Python reference of the same
+    idea as the daemon's crop path, not the daemon's implementation and not
+    SEP. A crop whose sky level is unavailable or whose noise is unresolved
+    (``estimate_background`` returns nan) gets nan — an invalid baseline
+    measurement, counted against ``measured_fraction`` — never a width."""
     from labels.psf_measure import curve_of_growth_hfr, estimate_background
 
     sky, rms = estimate_background(np.asarray(crop, dtype=np.float64))
+    if not (np.isfinite(sky) and np.isfinite(rms)):
+        return float("nan")
     hfr = curve_of_growth_hfr(np.asarray(crop, dtype=np.float64), sky, sky_rms=rms)
     return float(hfr) if hfr is not None and np.isfinite(hfr) else float("nan")
 
@@ -113,7 +131,8 @@ def freeze_baselines(dataset: dict, split_seed: int = 0, splits: dict | None = N
             "within_run_rho": _within_run_rho(direct, hfr_px[te], run_id[te], sign=1.0),
             "measured_fraction": float(np.mean(finite)),
             "ms_per_crop": float(ms_per_crop),
-            "note": "measured on normalized [0,1] crops (deployable baseline, not the label oracle)",
+            "method": "python_crop_iterative_clip+python_signed_curve_of_growth",
+            "note": "custom crop helpers, not SEP; measured on normalized [0,1] crops (deployable baseline, not the label oracle)",
         },
         "tenengrad": {
             "within_run_rho": _within_run_rho(ten, hfr_px[te], run_id[te], sign=-1.0),

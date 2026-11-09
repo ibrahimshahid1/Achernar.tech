@@ -7,7 +7,7 @@ loads each 16-bit PNG, detects stars, and labels each star crop with a
 SEP/DAOPHOT-style HFR (labels/psf_measure), grouped by run for leakage-free
 splitting.
 
-Output: an .npz with
+Output: an .npz (plus ``<name>.manifest.json``) with
     crops     (N, S, S) float32  robust-normalized to [0, 1]
     log_hfr   (N,) float32        log(HFR_px) regression target
     hfr_px    (N,) float32        raw HFR label
@@ -17,7 +17,21 @@ Output: an .npz with
     rig_id / camera_id / filter_name / night_id
                                   deployment-strata provenance
     position  (N,) int64          focuser position
-    star_snr  (N,) float32        per-star aperture SNR proxy
+    star_snr  (N,) float32        per-star aperture SNR (background-noise-only proxy)
+    label_version / background_config_sha256 / detection_config_sha256 (N,) str
+                                  per-row label provenance (see below)
+    saturation_source (N,) str    "declared_sensor_saturation" | "container_ceiling_8bit" | "none"
+    local_background_adu / local_rms_adu (N,) float32
+                                  SEP B(x,y) and R(x,y) at the star
+
+LABEL VERSIONS. Labels from this builder carry ``LABEL_VERSION`` per row and
+in the manifest, together with the SEP version and the background/detection
+configurations and their sha256. Frozen datasets built before that (e.g.
+``focus_quality_synth_v1.npz``, ``focus_quality_ds_v1.npz``) have none of it
+and are ``legacy_unverified``: they are never overwritten (a different default
+output path, and an explicit refusal to replace an existing dataset or
+manifest), and :func:`load_qualified_dataset` — the one loader a *qualified*
+evaluation may use — excludes their rows.
 
 REQUIRED DATA (the wall): this needs a populated `achernar.db` + a `frames/`
 directory produced by real autofocus runs on real rigs. Until that exists the
@@ -33,6 +47,7 @@ import json
 import os
 import sqlite3
 import sys
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -45,11 +60,85 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # sensor response goes non-linear below the hard clip, so the gate sits at 98%.
 SATURATION_FRACTION = 0.98
 
-# A container ceiling at or below this is an 8-bit stream, where the container
-# *is* the clip point — mirroring the 8-bit arm of `resolve_saturation_adu` in
-# vision/quality.rs. Above it we are looking at a 16-bit container, whose
-# ceiling says nothing about where the sensor actually saturates.
+# An 8-bit container (max_adu <= 255) is treated as its own clip point
+# (decision D-011): 255 is the real ceiling of the *recorded* data, so a star
+# reaching it is clipped in the data whatever the sensor did, and the rule errs
+# toward rejecting stars. Its provenance is recorded as "container_ceiling_8bit"
+# — a property of the container, not a native sensor saturation level. No
+# container rule exists for 16-bit data: a 14-bit body in a 16-bit container
+# clips near 16383 and nothing in the container says so. (The Rust
+# `resolve_saturation_adu` this once mirrored was removed in 98f6a2b6; the
+# daemon has no container arm.)
 EIGHT_BIT_MAX_ADU = 255.0
+
+SATURATION_SOURCE_DECLARED = "declared_sensor_saturation"
+SATURATION_SOURCE_CONTAINER_8BIT = "container_ceiling_8bit"
+# A saturation_adu written with a saturation_source this builder does not
+# recognise: the level is still applied as a gate, but it is never called a
+# declared sensor value.
+SATURATION_SOURCE_UNRECOGNIZED = "unrecognized_saturation_source"
+
+# Label provenance. Bump LABEL_VERSION whenever psf_measure.LABEL_SCHEMA_VERSION,
+# the SEP pin, or the selection policy of this builder changes meaning.
+LABEL_VERSION = "fqe_sep_spatial_v2"
+LEGACY_UNVERIFIED = "legacy_unverified"
+QUALIFIED = "qualified"
+PERMISSIVE_SATURATION = "unqualified_permissive_saturation"
+DEFAULT_OUTPUT = "focus_quality_ds_v2/focus_quality_ds_v2.npz"
+
+
+class LegacyUnverifiedLabels(RuntimeError):
+    """A qualified evaluation was asked to use labels without v2 provenance."""
+
+
+def saturation_decision_from_quality(quality_json: str) -> tuple[float | None, str | None]:
+    """``(threshold_adu, source)`` for a frame; ``(None, None)`` when unknown.
+
+    ``source`` is :data:`SATURATION_SOURCE_DECLARED` for a declared sensor
+    value or :data:`SATURATION_SOURCE_CONTAINER_8BIT` for the 8-bit container
+    rule. See :func:`saturation_level_from_quality` for the policy.
+
+    A ``saturation_source`` written next to ``saturation_adu`` (by
+    tools/import_session.py) is honoured: ``container_ceiling_8bit`` stays a
+    container ceiling, and any other unrecognised value becomes
+    :data:`SATURATION_SOURCE_UNRECOGNIZED`. Without the key (the daemon, which
+    writes its configured sensor value, and pre-v2 records) ``saturation_adu``
+    is a declared sensor value.
+    """
+    q = _quality_dict(quality_json)
+
+    # An explicit "the gate did not run" is decisive regardless of any value.
+    if q.get("saturation_gate_applied") is False:
+        return None, None
+
+    declared = q.get("saturation_adu")
+    if declared is not None:
+        try:
+            value = float(declared)
+        except (TypeError, ValueError):
+            return None, None
+        if not (value > 0.0 and np.isfinite(value)):
+            return None, None
+        written = q.get("saturation_source")
+        if written is None or written == SATURATION_SOURCE_DECLARED:
+            source = SATURATION_SOURCE_DECLARED
+        elif written == SATURATION_SOURCE_CONTAINER_8BIT:
+            source = SATURATION_SOURCE_CONTAINER_8BIT
+        else:
+            source = SATURATION_SOURCE_UNRECOGNIZED
+        return value * SATURATION_FRACTION, source
+
+    # No declared value. Only an 8-bit container can supply one on its own.
+    max_adu = q.get("max_adu")
+    if max_adu is not None:
+        try:
+            ceiling = float(max_adu)
+        except (TypeError, ValueError):
+            return None, None
+        if 0.0 < ceiling <= EIGHT_BIT_MAX_ADU:
+            return ceiling * SATURATION_FRACTION, SATURATION_SOURCE_CONTAINER_8BIT
+
+    return None, None
 
 
 def saturation_level_from_quality(quality_json: str) -> float | None:
@@ -73,34 +162,12 @@ def saturation_level_from_quality(quality_json: str) -> float | None:
     observing). At training time the honest thing is the opposite: drop the
     frame, because an ungated label cannot be distinguished from a clean one
     once it is in the dataset.
+
+    The 8-bit container rule (``max_adu <= 255``) is a container ceiling, not
+    a sensor saturation level; :func:`saturation_decision_from_quality`
+    returns that provenance alongside the threshold.
     """
-    q = _quality_dict(quality_json)
-
-    # An explicit "the gate did not run" is decisive regardless of any value.
-    if q.get("saturation_gate_applied") is False:
-        return None
-
-    declared = q.get("saturation_adu")
-    if declared is not None:
-        try:
-            value = float(declared)
-        except (TypeError, ValueError):
-            return None
-        if value > 0.0:
-            return value * SATURATION_FRACTION
-        return None
-
-    # No declared value. Only an 8-bit container can supply one on its own.
-    max_adu = q.get("max_adu")
-    if max_adu is not None:
-        try:
-            ceiling = float(max_adu)
-        except (TypeError, ValueError):
-            return None
-        if 0.0 < ceiling <= EIGHT_BIT_MAX_ADU:
-            return ceiling * SATURATION_FRACTION
-
-    return None
+    return saturation_decision_from_quality(quality_json)[0]
 
 
 # Back-compat alias; the old private name is still referenced by older notebooks.
@@ -162,6 +229,126 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _manifest_path(output: Path) -> Path:
+    return output.with_suffix(".manifest.json")
+
+
+def _read_manifest(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def label_provenance_status(manifest: dict | None) -> str:
+    """Dataset-level label status: :data:`QUALIFIED`, :data:`LEGACY_UNVERIFIED`
+    or :data:`PERMISSIVE_SATURATION`.
+
+    Qualified means: the current :data:`LABEL_VERSION`, the pinned SEP version,
+    both SEP configuration objects present and matching their recorded sha256,
+    and an enforced saturation gate. Anything missing is legacy_unverified —
+    old fields are not reinterpreted.
+    """
+    from labels.psf_measure import SEP_PINNED_VERSION, config_sha256
+
+    if not manifest or manifest.get("label_version") != LABEL_VERSION:
+        return LEGACY_UNVERIFIED
+    if manifest.get("sep_version") != SEP_PINNED_VERSION:
+        return LEGACY_UNVERIFIED
+    for kind in ("background", "detection"):
+        config = manifest.get(f"{kind}_config")
+        digest = manifest.get(f"{kind}_config_sha256")
+        if not isinstance(config, dict) or not digest or config_sha256(config) != digest:
+            return LEGACY_UNVERIFIED
+    if manifest.get("saturation_gate") != "enforced":
+        return PERMISSIVE_SATURATION
+    return QUALIFIED
+
+
+def qualified_row_mask(dataset: dict, manifest: dict | None) -> np.ndarray:
+    """Per-row mask of labels a qualified evaluation may use.
+
+    A row qualifies only if the dataset qualifies (:func:`label_provenance_status`)
+    and the row itself carries the current label version and the manifest's
+    configuration hashes. Rows without these columns are legacy_unverified.
+    """
+    n = len(dataset["hfr_px"])
+    if label_provenance_status(manifest) != QUALIFIED:
+        return np.zeros(n, dtype=bool)
+    try:
+        version = np.asarray(dataset["label_version"]).astype(str)
+        background = np.asarray(dataset["background_config_sha256"]).astype(str)
+        detection = np.asarray(dataset["detection_config_sha256"]).astype(str)
+    except KeyError:
+        return np.zeros(n, dtype=bool)
+    return (
+        (version == LABEL_VERSION)
+        & (background == manifest["background_config_sha256"])
+        & (detection == manifest["detection_config_sha256"])
+    )
+
+
+def load_qualified_dataset(dataset_path: str) -> tuple[dict, dict]:
+    """The loader a *qualified* FQE evaluation must use (BGE-20).
+
+    Returns ``(dataset, report)`` with only qualified rows. Rows lacking v2
+    provenance — every row of a dataset without a manifest, or built before
+    ``LABEL_VERSION`` — are excluded and counted as legacy_unverified; a
+    dataset with no qualified row raises :class:`LegacyUnverifiedLabels`.
+    Exploratory scripts that read an .npz directly (e.g. ``eval/baselines.py``,
+    ``eval/eval_quality.py`` today) are not qualified evaluations.
+    """
+    path = Path(dataset_path)
+    with np.load(path, allow_pickle=False) as npz:
+        data = {key: npz[key] for key in npz.files}
+    manifest = _read_manifest(_manifest_path(path))
+    status = label_provenance_status(manifest)
+    mask = qualified_row_mask(data, manifest)
+    n = len(mask)
+    report = {
+        "dataset": str(path),
+        "dataset_status": status,
+        "rows_total": int(n),
+        "rows_qualified": int(mask.sum()),
+        "rows_excluded": int(n - mask.sum()),
+        "rows_legacy_unverified": int(n - mask.sum()) if status != PERMISSIVE_SATURATION else 0,
+    }
+    if not mask.any():
+        raise LegacyUnverifiedLabels(
+            f"{path}: no qualified labels ({status}; {n} row(s) excluded). Rebuild with "
+            f"build_focus_quality_dataset ({LABEL_VERSION}) for a qualified evaluation."
+        )
+    filtered = {key: (value[mask] if getattr(value, "shape", ()) and value.shape[0] == n else value)
+                for key, value in data.items()}
+    return filtered, report
+
+
+def _refuse_overwrite(output: Path, overwrite: bool) -> None:
+    """Never replace a frozen dataset or manifest.
+
+    Without ``overwrite`` any existing output or manifest is an error. With it,
+    only a dataset whose manifest already declares the current LABEL_VERSION
+    may be replaced; a legacy (or manifest-less) artifact never is.
+    """
+    manifest_path = _manifest_path(output)
+    existing = [p for p in (output, manifest_path) if p.exists()]
+    if not existing:
+        return
+    if overwrite:
+        manifest = _read_manifest(manifest_path)
+        if manifest and manifest.get("label_version") == LABEL_VERSION:
+            return
+        raise FileExistsError(
+            f"refusing to overwrite {', '.join(map(str, existing))}: not a {LABEL_VERSION} dataset "
+            "(frozen/legacy artifacts are never replaced; choose a new --output)"
+        )
+    raise FileExistsError(
+        f"refusing to overwrite existing {', '.join(map(str, existing))}; choose a new --output "
+        "(or pass overwrite=True for a dataset built by this label version)"
+    )
+
+
 def _select_spatial_sources(sources, width: int, height: int, limit: int = 16):
     """Choose high-SNR valid stars across a 4x4 field grid before filling spare
     slots. This avoids training almost entirely on the bright central field while
@@ -197,6 +384,7 @@ def build_dataset(
     min_snr: float = 5.0,
     max_stars_per_frame: int = 16,
     allow_missing_saturation: bool = False,
+    overwrite: bool = False,
 ) -> dict:
     """Build the FQE dataset from a daemon SQLite DB + its frame PNGs.
 
@@ -204,11 +392,36 @@ def build_dataset(
     :func:`saturation_level_from_quality`. ``allow_missing_saturation`` restores
     the old permissive behaviour for synthetic fixtures only, and stamps the
     manifest so a dataset built that way can never be mistaken for a clean one.
+
+    Labels come from ``psf_measure.measure_frame_sep`` with its default
+    (explicit, hashed) SEP configuration. Frames whose SEP background is
+    unavailable or whose noise is unresolved yield no label and are counted
+    by reason. An existing output or manifest is never overwritten (see
+    :func:`_refuse_overwrite`).
     """
     from PIL import Image
 
-    from labels.psf_measure import extract_centered_crop, measure_frame_sep
+    from labels.psf_measure import (
+        LABEL_SCHEMA_VERSION,
+        SepBackgroundParams,
+        SepDetectionParams,
+        extract_centered_crop,
+        measure_frame_sep,
+        require_sep,
+    )
     from preprocess.normalize import robust_normalize
+
+    output = Path(output_path)
+    if output.suffix != ".npz":
+        output = output.with_name(output.name + ".npz")
+    _refuse_overwrite(output, overwrite)
+    sep_version = require_sep().__version__
+    background_params = SepBackgroundParams()
+    detection_params = SepDetectionParams()
+    background_config = background_params.config(sep_version)
+    detection_config = detection_params.config(sep_version)
+    background_sha = background_params.config_sha256(sep_version)
+    detection_sha = detection_params.config_sha256(sep_version)
 
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
@@ -263,11 +476,22 @@ def build_dataset(
             "filter_name", "captured_at", "night_id", "label_source",
             "field_x_norm", "field_y_norm", "classical_frame_hfr_px",
             "exposure_s", "gain", "temperature",
+            "label_version", "background_config_sha256", "detection_config_sha256",
+            "saturation_source", "local_background_adu", "local_rms_adu",
         )
     }
     frames_read = 0
     frames_skipped_unknown_saturation = 0
     frames_skipped_ineligible = 0
+    frames_background_unavailable: Counter = Counter()
+    # Background measured but sep.extract raised (e.g. pixstack/deblend
+    # overflow in a crowded field): no rows, counted here with the error text.
+    frames_detection_backend_failure = 0
+    detection_backend_errors: Counter = Counter()
+    frames_by_saturation_source: Counter = Counter()
+    frames_by_saturation_gate: Counter = Counter()
+    rejection_counts: Counter = Counter()
+    sep_flag_counts: Counter = Counter()
     stars_kept = 0
     sources_detected = 0
     sources_valid = 0
@@ -302,28 +526,43 @@ def build_dataset(
 
         # Decide this before opening the image: a frame we cannot gate is a
         # frame we cannot label, so there is no point measuring it.
-        sat = saturation_level_from_quality(row["quality_json"])
+        sat, saturation_source = saturation_decision_from_quality(row["quality_json"])
         if sat is None:
             if not allow_missing_saturation:
                 frames_skipped_unknown_saturation += 1
                 continue
             # Permissive mode: no gate at all, matching the daemon's runtime
             # behaviour of rejecting nothing rather than inventing a threshold.
-            sat = float("inf")
+            # measure_frame_sep records the gate as "not_performed".
+        frames_by_saturation_source[saturation_source or "none"] += 1
 
         with Image.open(path) as image:
             img = np.asarray(image).astype(np.float64)
         if img.ndim != 2:
             continue
         frames_read += 1
-        sources, _frame_label = measure_frame_sep(
+        sources, frame_label = measure_frame_sep(
             img,
             saturation_level=sat,
+            background_params=background_params,
+            detection_params=detection_params,
             min_snr=min_snr,
             fit_fwhm=False,
         )
+        frames_by_saturation_gate[frame_label.saturation_gate] += 1
+        background = frame_label.background
+        if background.get("level_status") != "measured" or background.get("noise_status") != "measured":
+            for reason in background.get("reasons") or ["unknown"]:
+                frames_background_unavailable[reason] += 1
+            continue
+        if frame_label.detection.get("status") != "measured":
+            frames_detection_backend_failure += 1
+            detection_backend_errors[str(frame_label.detection.get("backend_error"))] += 1
+            continue
         sources_detected += len(sources)
         sources_valid += sum(source.valid for source in sources)
+        rejection_counts.update(frame_label.rejection_counts)
+        sep_flag_counts.update(frame_label.sep_flag_counts)
 
         run_key = str(row["run_key"])
         rid = run_index.setdefault(run_key, len(run_index))
@@ -374,6 +613,12 @@ def build_dataset(
                 if row["frame_temperature"] is not None
                 else np.nan
             )
+            columns["label_version"].append(LABEL_VERSION)
+            columns["background_config_sha256"].append(background_sha)
+            columns["detection_config_sha256"].append(detection_sha)
+            columns["saturation_source"].append(saturation_source or "none")
+            columns["local_background_adu"].append(source.local_background)
+            columns["local_rms_adu"].append(source.local_rms)
             stars_kept += 1
 
     if not columns["crops"]:
@@ -390,6 +635,10 @@ def build_dataset(
         )
         if frames_skipped_ineligible:
             hint += f" {frames_skipped_ineligible} frame(s) were excluded by acquisition eligibility."
+        if frames_background_unavailable:
+            hint += f" SEP background unavailable: {dict(frames_background_unavailable)}."
+        if frames_detection_backend_failure:
+            hint += f" SEP detection failed on {frames_detection_backend_failure} frame(s): {dict(detection_backend_errors)}."
         raise RuntimeError(f"No usable star crops found in {db_path}. {hint}")
 
     dataset = {
@@ -407,26 +656,59 @@ def build_dataset(
         "exposure_s": np.asarray(columns["exposure_s"], dtype=np.float32),
         "gain": np.asarray(columns["gain"], dtype=np.float32),
         "temperature": np.asarray(columns["temperature"], dtype=np.float32),
+        "local_background_adu": np.asarray(columns["local_background_adu"], dtype=np.float32),
+        "local_rms_adu": np.asarray(columns["local_rms_adu"], dtype=np.float32),
     }
     for name in (
         "run_key", "frame_id", "frame_checksum", "rig_id", "camera_id",
         "filter_name", "captured_at", "night_id", "label_source",
+        "label_version", "background_config_sha256", "detection_config_sha256",
+        "saturation_source",
     ):
         dataset[name] = np.asarray(columns[name], dtype=np.str_)
     # The original run UUID is the minimum leakage boundary. Keep it explicit so
     # registry files do not depend on a rebuild-specific integer encoding.
     dataset["split_group"] = dataset["run_key"].copy()
-    np.savez_compressed(output_path, **dataset)
-    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output, **dataset)
+    from labels.psf_measure import SEP_WIDTH_DEFINITION, SNR_DEFINITION_BACKGROUND_ONLY
+
     manifest = {
         "dataset": str(output),
         "sha256": _sha256(output),
-        "label_method": "SEP mesh background + deblending + aperture-normalized flux_radius",
+        "label_version": LABEL_VERSION,
+        "label_schema_version": LABEL_SCHEMA_VERSION,
+        "label_method": "sep_spatial_mesh+sep_extract+sep_flux_radius",
+        "label_method_description": (
+            "SEP 1.4.1 mesh background B(x,y)/R(x,y), local-noise extraction with deblending, "
+            "aperture-normalized flux_radius on data - B(x,y)"
+        ),
+        "sep_version": sep_version,
+        "background_config": background_config,
+        "background_config_sha256": background_sha,
+        "detection_config": detection_config,
+        "detection_config_sha256": detection_sha,
+        "noise_source": "empirical_mesh_rms",
+        "units": "adu",
+        "width_definition": dict(SEP_WIDTH_DEFINITION),
+        "snr_definition": SNR_DEFINITION_BACKGROUND_ONLY,
+        "fwhm_fitted": False,
+        "legacy_policy": (
+            f"rows without label_version={LABEL_VERSION} and matching config hashes are "
+            f"{LEGACY_UNVERIFIED} and are excluded by load_qualified_dataset"
+        ),
         "frames_read": frames_read,
         "frames_skipped_unknown_saturation": frames_skipped_unknown_saturation,
         "frames_skipped_ineligible": frames_skipped_ineligible,
+        "frames_background_unavailable": dict(frames_background_unavailable),
+        "frames_detection_backend_failure": frames_detection_backend_failure,
+        "detection_backend_errors": dict(detection_backend_errors),
+        "frames_by_saturation_source": dict(frames_by_saturation_source),
+        "frames_by_saturation_gate": dict(frames_by_saturation_gate),
         "sources_detected": sources_detected,
         "sources_valid": sources_valid,
+        "rejection_counts": dict(rejection_counts),
+        "sep_flag_counts": dict(sep_flag_counts),
         "stars_kept": stars_kept,
         "runs": len(run_index),
         "crop_size": crop_size,
@@ -435,7 +717,7 @@ def build_dataset(
         # and must never be promoted or compared against a gated one.
         "saturation_gate": "permissive" if allow_missing_saturation else "enforced",
     }
-    output.with_suffix(".manifest.json").write_text(json.dumps(manifest, indent=2))
+    _manifest_path(output).write_text(json.dumps(manifest, indent=2))
     print(
         f"✓ {output_path}: {stars_kept} stars from {frames_read} frames "
         f"across {len(run_index)} runs"
@@ -453,7 +735,9 @@ def build_dataset(
 def main():
     parser = argparse.ArgumentParser(description="Build FQE training dataset")
     parser.add_argument("--db", required=True, help="Path to the daemon achernar.db")
-    parser.add_argument("--output", default="focus_quality_ds_v1.npz")
+    # A v2 default distinct from the frozen focus_quality_ds_v1.npz; an existing
+    # output is never overwritten.
+    parser.add_argument("--output", default=DEFAULT_OUTPUT)
     parser.add_argument("--crop-size", type=int, default=64)
     parser.add_argument("--max-stars-per-frame", type=int, default=16)
     parser.add_argument(

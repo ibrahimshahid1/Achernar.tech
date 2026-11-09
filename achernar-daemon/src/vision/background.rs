@@ -1,31 +1,50 @@
-//! Classical background and saturation metrics for the shared vision bus.
+//! Legacy global background estimator (`legacy_global_clip`, method v1).
+//!
+//! A frame median, a robust scale seed, one ±3-seed-sigma clipping pass, then
+//! the clipped median and the clipped population standard deviation. It has
+//! no spatial model and is not SEP or Source Extractor: Bertin & Arnouts
+//! (1996, §2) clip each mesh iteratively and interpolate a map. It is kept,
+//! named and versioned, as the default live path and as the diagnostic
+//! comparator for the opt-in SEP backend.
 
-#[derive(Debug, Clone, Copy)]
-pub struct BackgroundStats {
-    pub background_adu: f32,
-    pub background_sigma: f32,
-    pub snr_proxy_median: f32,
+use super::background_model::{
+    config_sha256, legacy_config_json, BackgroundAnalysis, BackgroundField, BackgroundMethod,
+    BackgroundReason, BackgroundResult, BackgroundSupport, LegacyGlobalClipConfig, LevelStatus,
+    NoiseSource, NoiseStatus, BACKGROUND_SCHEMA_VERSION,
+};
+use super::quality::LumaFrame;
+
+/// Statistics of the legacy estimator over the usable pixels it was given.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LegacyGlobalStats {
+    /// Clipped median (input units).
+    pub level: f32,
+    /// Population standard deviation of the clipped sample (input units).
+    /// Zero on a quantized plateau: zero *scatter*, not zero detector noise.
+    pub sigma: f32,
+    pub finite_pixels: usize,
+    pub clipped_pixels: usize,
+    /// Fraction of finite pixels at/above 98% of `saturation_adu`; 0 when the
+    /// saturation point is unknown (callers decide whether that is evidence).
     pub saturation_fraction: f32,
+    /// Legacy pixel-significance heuristic (formerly `snr_proxy_median`).
+    pub bright_pixel_significance: Option<f32>,
 }
 
-/// Robust sky statistics.
+/// Robust global sky statistics, or `None` without any finite pixel.
 ///
 /// `saturation_adu` is the sensor's linear saturation point, or `None` when it
 /// is unknown — see [`crate::vision::quality::LumaFrame::saturation_adu`].
-/// Unknown means no pixel is excluded and `saturation_fraction` reports 0,
-/// which is safe here in a way it is not for the star gate: the background is a
-/// median/MAD estimate and is robust to a handful of clipped pixels, whereas
-/// HFR is measured *on* the clipped star. Read `saturation_fraction == 0.0`
-/// together with the frame's `SaturationGate` before treating it as evidence.
-pub fn estimate_background(pixels: &[f32], saturation_adu: Option<f32>) -> BackgroundStats {
+/// Unknown means no pixel is excluded and the fraction is 0, which is safe for
+/// this median/MAD estimate (robust to a few clipped pixels) but is not
+/// evidence of an unclipped frame; [`legacy_result`] reports it as absent.
+pub fn estimate_background(
+    pixels: &[f32],
+    saturation_adu: Option<f32>,
+) -> Option<LegacyGlobalStats> {
     let mut finite: Vec<f32> = pixels.iter().copied().filter(|v| v.is_finite()).collect();
     if finite.is_empty() {
-        return BackgroundStats {
-            background_adu: 0.0,
-            background_sigma: 0.0,
-            snr_proxy_median: 0.0,
-            saturation_fraction: 0.0,
-        };
+        return None;
     }
 
     finite.sort_by(|a, b| a.total_cmp(b));
@@ -54,14 +73,14 @@ pub fn estimate_background(pixels: &[f32], saturation_adu: Option<f32>) -> Backg
             .collect()
     };
 
-    let background_adu = if clipped.is_empty() {
+    let level = if clipped.is_empty() {
         median
     } else {
         let mut clipped_sorted = clipped.clone();
         clipped_sorted.sort_by(|a, b| a.total_cmp(b));
         percentile_sorted(&clipped_sorted, 0.5)
     };
-    let background_sigma = if clipped.is_empty() {
+    let sigma = if clipped.is_empty() {
         sigma_seed
     } else {
         stddev(&clipped, mean(&clipped))
@@ -72,13 +91,126 @@ pub fn estimate_background(pixels: &[f32], saturation_adu: Option<f32>) -> Backg
         .iter()
         .filter(|value| **value >= saturation_threshold)
         .count();
-    let snr_proxy_median = snr_proxy_median(pixels, background_adu, background_sigma);
 
-    BackgroundStats {
-        background_adu,
-        background_sigma,
-        snr_proxy_median,
+    Some(LegacyGlobalStats {
+        level,
+        sigma,
+        finite_pixels: finite.len(),
+        clipped_pixels: clipped.len(),
         saturation_fraction: saturated as f32 / finite.len() as f32,
+        bright_pixel_significance: bright_pixel_significance(pixels, level, sigma),
+    })
+}
+
+/// The authoritative legacy result for `frame`, from the statistics of its
+/// finite measurement-valid, non-clipped samples (`None` when there are none).
+pub fn legacy_result(frame: &LumaFrame, stats: Option<&LegacyGlobalStats>) -> BackgroundAnalysis {
+    let config = legacy_config_json(&LegacyGlobalClipConfig::default());
+    let units = frame
+        .analysis_descriptor
+        .as_ref()
+        .map(|descriptor| descriptor.units.clone())
+        .unwrap_or_else(|| "unverified".to_string());
+    let saturation_evidence = frame.saturation_evidence();
+    let saturation_fraction = if saturation_evidence == "unknown" {
+        None
+    } else if frame.analysis_descriptor.is_some() || saturation_evidence == "native_mask" {
+        // Versioned analysis: the fraction of analysis pixels touched by the
+        // reconstruction footprint of clipped native samples.
+        (!frame.pixels.is_empty()).then(|| {
+            frame
+                .masks
+                .native_saturation
+                .iter()
+                .filter(|value| **value != 0)
+                .count() as f32
+                / frame.pixels.len() as f32
+        })
+    } else {
+        stats.map(|stats| stats.saturation_fraction)
+    };
+
+    let mut reasons = vec![];
+    let (level_status, noise_status, level, rms) = match stats {
+        None => {
+            reasons.push(BackgroundReason::NoUsablePixels);
+            (
+                LevelStatus::Unavailable,
+                NoiseStatus::Unavailable,
+                None,
+                None,
+            )
+        }
+        Some(stats) if stats.sigma > 0.0 && stats.sigma.is_finite() => (
+            LevelStatus::Measured,
+            NoiseStatus::Measured,
+            Some(stats.level),
+            Some(stats.sigma),
+        ),
+        Some(stats) => {
+            reasons.push(BackgroundReason::ZeroEmpiricalScatter);
+            (
+                LevelStatus::Measured,
+                NoiseStatus::Unresolved,
+                Some(stats.level),
+                None,
+            )
+        }
+    };
+
+    let result = BackgroundResult {
+        schema_version: BACKGROUND_SCHEMA_VERSION,
+        method: BackgroundMethod::LegacyGlobalClip,
+        method_version: BackgroundMethod::LegacyGlobalClip.method_version(),
+        library: None,
+        library_version: None,
+        requested_method: BackgroundMethod::LegacyGlobalClip,
+        config_sha256: config_sha256(&config),
+        config,
+        level_status,
+        noise_status,
+        reasons,
+        backend_error: None,
+        units,
+        coordinate_frame: "analysis_pixel".to_string(),
+        width: frame.width as u32,
+        height: frame.height as u32,
+        noise_source: if stats.is_some() {
+            NoiseSource::EmpiricalGlobalClip
+        } else {
+            NoiseSource::Unavailable
+        },
+        support: BackgroundSupport {
+            total_pixels: frame.pixels.len() as u64,
+            usable_pixels: stats.map_or(0, |stats| stats.finite_pixels as u64),
+            clipped_sample_pixels: stats.map(|stats| stats.clipped_pixels as u64),
+            masks: frame.mask_provenance(),
+            saturation_evidence: saturation_evidence.to_string(),
+        },
+        level,
+        level_definition: "median of the usable pixels kept by one pass of |v - median| <= \
+                           3*max(1.4826*MAD, 0.5*(p84 - p16)) around the usable-pixel median \
+                           (the median plateau when that scale is 0)"
+            .to_string(),
+        rms,
+        rms_definition: "population standard deviation of that clipped sample (no truncation \
+                         correction); absent when it is zero"
+            .to_string(),
+        mesh: None,
+        plane: None,
+        plane_unavailable_reason: Some(BackgroundReason::NoSpatialModel),
+        bright_pixel_significance: stats.and_then(|stats| stats.bright_pixel_significance),
+        saturation_fraction,
+    };
+    let field = stats.map(|stats| BackgroundField::Uniform {
+        level: stats.level,
+        sigma: stats.sigma,
+    });
+    BackgroundAnalysis {
+        result,
+        field,
+        catalog: None,
+        catalog_error: None,
     }
 }
 
@@ -141,29 +273,47 @@ fn saturation_threshold(saturation_adu: Option<f32>) -> f32 {
     }
 }
 
-fn snr_proxy_median(pixels: &[f32], background_adu: f32, background_sigma: f32) -> f32 {
-    let noise = (background_sigma * background_sigma + 9.0).sqrt().max(1.0);
-    let mut snr_values: Vec<f32> = pixels
+/// Legacy heuristic, unchanged: median of `(v-B)/sqrt(sigma^2+9)` over pixels
+/// with `v-B > 3*max(sigma,1)`. The fixed 9 ADU^2 term and the 1 ADU floor
+/// are not a camera calibration; this is a pixel-significance proxy, not
+/// aperture or PSF SNR. `None` when no pixel qualifies.
+fn bright_pixel_significance(pixels: &[f32], level: f32, sigma: f32) -> Option<f32> {
+    let noise = (sigma * sigma + 9.0).sqrt().max(1.0);
+    let mut values: Vec<f32> = pixels
         .iter()
         .copied()
         .filter(|value| value.is_finite())
         .filter_map(|value| {
-            let signal = value - background_adu;
-            (signal > 3.0 * background_sigma.max(1.0)).then_some(signal / noise)
+            let signal = value - level;
+            (signal > 3.0 * sigma.max(1.0)).then_some(signal / noise)
         })
         .collect();
 
-    if snr_values.is_empty() {
-        return 0.0;
+    if values.is_empty() {
+        return None;
     }
 
-    snr_values.sort_by(|a, b| a.total_cmp(b));
-    percentile_sorted(&snr_values, 0.5)
+    values.sort_by(|a, b| a.total_cmp(b));
+    Some(percentile_sorted(&values, 0.5))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{estimate_background, percentile_sorted};
+    use super::{estimate_background, legacy_result, percentile_sorted};
+    use crate::vision::background_model::{BackgroundReason, LevelStatus, NoiseStatus};
+    use crate::vision::quality::LumaFrame;
+
+    fn frame(pixels: Vec<f32>, saturation_adu: Option<f32>) -> LumaFrame {
+        LumaFrame {
+            width: pixels.len(),
+            height: 1,
+            pixels,
+            max_adu: 65535.0,
+            saturation_adu,
+            masks: Default::default(),
+            analysis_descriptor: None,
+        }
+    }
 
     #[test]
     fn percentile_uses_linear_interpolation_for_even_samples() {
@@ -175,10 +325,10 @@ mod tests {
         let mut pixels = vec![100.0_f32; 100];
         pixels.extend([102.0, 98.0, 65535.0, 65534.0]);
 
-        let stats = estimate_background(&pixels, Some(65535.0));
+        let stats = estimate_background(&pixels, Some(65535.0)).unwrap();
 
-        assert!((98.0..=102.0).contains(&stats.background_adu));
-        assert!(stats.background_sigma < 10.0);
+        assert!((98.0..=102.0).contains(&stats.level));
+        assert!(stats.sigma < 10.0);
         assert!(stats.saturation_fraction > 0.0);
     }
 
@@ -187,9 +337,72 @@ mod tests {
         let mut pixels = vec![100.0_f32; 90];
         pixels.extend(vec![10_000.0_f32; 10]);
 
-        let stats = estimate_background(&pixels, Some(65_535.0));
+        let stats = estimate_background(&pixels, Some(65_535.0)).unwrap();
 
-        assert_eq!(stats.background_adu, 100.0);
-        assert_eq!(stats.background_sigma, 0.0);
+        assert_eq!(stats.level, 100.0);
+        assert_eq!(stats.sigma, 0.0);
+    }
+
+    #[test]
+    fn no_finite_pixel_is_no_estimate_rather_than_zero_sky() {
+        assert!(estimate_background(&[f32::NAN, f32::INFINITY], Some(1000.0)).is_none());
+        assert!(estimate_background(&[], None).is_none());
+
+        let analysis = legacy_result(&frame(vec![f32::NAN; 4], Some(1000.0)), None);
+        assert_eq!(analysis.result.level_status, LevelStatus::Unavailable);
+        assert_eq!(analysis.result.noise_status, NoiseStatus::Unavailable);
+        assert_eq!(analysis.result.level, None);
+        assert_eq!(analysis.result.rms, None);
+        assert_eq!(analysis.result.saturation_fraction, None);
+        assert_eq!(
+            analysis.result.reasons,
+            vec![BackgroundReason::NoUsablePixels]
+        );
+        assert!(analysis.field.is_none());
+        let json = serde_json::to_value(&analysis.result).unwrap();
+        assert!(json["level"].is_null() && json["rms"].is_null());
+    }
+
+    #[test]
+    fn zero_scatter_plateau_has_a_level_but_unresolved_noise() {
+        // Quantized flat sky: a level exists, but zero empirical scatter is
+        // not zero detector noise (BGE-07).
+        let pixels = vec![100.0_f32; 64];
+        let stats = estimate_background(&pixels, None).unwrap();
+        let analysis = legacy_result(&frame(pixels, None), Some(&stats));
+        assert_eq!(analysis.result.level(), Some(100.0));
+        assert_eq!(analysis.result.noise_status, NoiseStatus::Unresolved);
+        assert_eq!(analysis.result.rms(), None);
+        assert!(analysis
+            .result
+            .reasons
+            .contains(&BackgroundReason::ZeroEmpiricalScatter));
+    }
+
+    #[test]
+    fn measured_zero_sky_is_a_value_and_unknown_saturation_is_not_zero() {
+        // Calibrated residual frames can legitimately sit at 0.
+        let pixels: Vec<f32> = (0..256).map(|i| ((i % 7) as f32 - 3.0) * 0.5).collect();
+        let stats = estimate_background(&pixels, None).unwrap();
+        let analysis = legacy_result(&frame(pixels, None), Some(&stats));
+        assert_eq!(analysis.result.level(), Some(0.0));
+        assert!(analysis.result.rms().unwrap() > 0.0);
+        assert_eq!(analysis.result.support.saturation_evidence, "unknown");
+        assert_eq!(analysis.result.saturation_fraction, None);
+        assert_eq!(analysis.result.units, "unverified");
+        assert_eq!(
+            analysis
+                .result
+                .support
+                .masks
+                .get("native_saturation")
+                .map(String::as_str),
+            Some("unavailable")
+        );
+        assert!(analysis.result.plane.is_none());
+        assert_eq!(
+            analysis.result.plane_unavailable_reason,
+            Some(BackgroundReason::NoSpatialModel)
+        );
     }
 }

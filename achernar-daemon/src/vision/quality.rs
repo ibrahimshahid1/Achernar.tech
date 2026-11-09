@@ -2,13 +2,17 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::focus::classical_focus_solver::ClassicalFocusSolver;
+use crate::focus::classical_focus_solver::{ClassicalFocusSolver, CropSky};
 use crate::hardware::camera::FrameData;
 use crate::processing::debayer::{
     analyze, AnalysisDescriptor, AnalysisMasks, NativeMasks, SampleType, SensorFrame,
 };
 
-use super::background::BackgroundStats;
+use super::background::{estimate_background, legacy_result};
+use super::background_model::{
+    config_sha256, BackgroundAnalysis, BackgroundField, BackgroundReason, CropSkySource,
+    DetectionMethod, DetectionProvenance, NoiseStatus, SourceCatalog,
+};
 
 #[derive(Debug, Clone)]
 pub struct LumaFrame {
@@ -50,7 +54,59 @@ impl LumaFrame {
             != 0
     }
 
-    fn masks_have_valid_shape(&self) -> bool {
+    /// Which masks constrain measurements on this frame (`provided` or
+    /// `unavailable`), for result provenance. Versioned analysis frames take
+    /// the native-mask states from their descriptor; the reconstruction edge
+    /// mask always exists there. Frames without a descriptor only have the
+    /// masks a caller attached.
+    pub fn mask_provenance(&self) -> std::collections::BTreeMap<String, String> {
+        let attached = |mask: &Vec<u8>| {
+            if mask.len() == self.pixels.len() && !mask.is_empty() {
+                "provided"
+            } else {
+                "unavailable"
+            }
+        };
+        let mut states = std::collections::BTreeMap::new();
+        match &self.analysis_descriptor {
+            Some(descriptor) => {
+                for name in ["bad_pixel", "invalid", "native_saturation"] {
+                    let state = descriptor
+                        .mask_states
+                        .get(name)
+                        .map(String::as_str)
+                        .unwrap_or("unavailable");
+                    states.insert(name.to_string(), state.to_string());
+                }
+                states.insert("edge".to_string(), "provided".to_string());
+            }
+            None => {
+                states.insert("bad_pixel".into(), attached(&self.masks.bad_pixel).into());
+                states.insert("invalid".into(), attached(&self.masks.invalid).into());
+                states.insert("edge".into(), attached(&self.masks.edge).into());
+                states.insert(
+                    "native_saturation".into(),
+                    attached(&self.masks.native_saturation).into(),
+                );
+            }
+        }
+        states
+    }
+
+    /// The evidence a saturation fraction would rest on. `unknown` means a
+    /// fraction of 0 would only say that nothing was tested.
+    pub fn saturation_evidence(&self) -> &'static str {
+        match saturation_gate(self) {
+            SaturationGate::Applied { .. } if self.analysis_descriptor.is_some() => {
+                "native_threshold"
+            }
+            SaturationGate::Applied { .. } => "legacy_peak_threshold",
+            SaturationGate::NativeMaskApplied => "native_mask",
+            SaturationGate::NotPerformed => "unknown",
+        }
+    }
+
+    pub fn masks_have_valid_shape(&self) -> bool {
         [
             &self.masks.bad_pixel,
             &self.masks.invalid,
@@ -66,9 +122,16 @@ impl LumaFrame {
     }
 }
 
-/// Background operates only on usable linear samples. The saturation fraction
-/// is the fraction of analysis pixels touched by clipped native support.
-pub fn background_from_luma(frame: &LumaFrame) -> BackgroundStats {
+/// Legacy background (`legacy_global_clip`) over usable linear samples:
+/// finite pixels outside the bad/invalid/edge and native-saturation masks.
+/// Malformed geometry or masks give an unavailable result, never zeros.
+pub fn background_from_luma(frame: &LumaFrame) -> BackgroundAnalysis {
+    if !frame_geometry_valid(frame) {
+        let mut analysis = legacy_result(frame, None);
+        analysis.result.reasons = vec![BackgroundReason::MalformedGeometry];
+        analysis.result.saturation_fraction = None;
+        return analysis;
+    }
     let valid: Vec<f32> = frame
         .pixels
         .iter()
@@ -78,7 +141,7 @@ pub fn background_from_luma(frame: &LumaFrame) -> BackgroundStats {
         })
         .map(|(_, value)| *value)
         .collect();
-    let mut background = super::background::estimate_background(
+    let stats = estimate_background(
         &valid,
         if frame.analysis_descriptor.is_some() {
             None
@@ -86,16 +149,17 @@ pub fn background_from_luma(frame: &LumaFrame) -> BackgroundStats {
             frame.saturation_adu
         },
     );
-    if frame.analysis_descriptor.is_some() {
-        background.saturation_fraction = frame
-            .masks
-            .native_saturation
-            .iter()
-            .filter(|value| **value != 0)
-            .count() as f32
-            / frame.pixels.len().max(1) as f32;
-    }
-    background
+    legacy_result(frame, stats.as_ref())
+}
+
+/// Pixel count matches the geometry and every mask is a 0/1 plane of the
+/// right size (or absent on a frame without a descriptor).
+pub fn frame_geometry_valid(frame: &LumaFrame) -> bool {
+    !frame.pixels.is_empty()
+        && frame.width > 0
+        && frame.height > 0
+        && frame.pixels.len() == frame.width.saturating_mul(frame.height)
+        && frame.masks_have_valid_shape()
 }
 
 /// Whether the star-saturation gate could be applied to a frame.
@@ -144,6 +208,11 @@ pub enum QualityStatus {
     AnalysisUnavailable,
     NoSources,
     NoUsableStars,
+    /// No background level exists, so detection did not run.
+    BackgroundUnavailable,
+    /// A background level exists but detection could not run (unresolved
+    /// noise for a relative threshold, or a backend extraction failure).
+    DetectionUnavailable,
 }
 
 /// Specific reasons a frame was rejected, for diagnostics and dashboards.
@@ -153,6 +222,9 @@ pub enum QualityRejectionReason {
     UnqualifiedPixelDomain,
     NoStellarSources,
     NoValidHfr,
+    BackgroundUnavailable,
+    NoiseUnresolved,
+    DetectionFailed,
 }
 
 /// Classical per-frame quality measurements.
@@ -200,6 +272,12 @@ pub struct QualityMetrics {
     /// nothing was checked, and a training label built from the frame inherits
     /// whatever clipped cores were present.
     pub saturation_gate: SaturationGate,
+    /// Detection backbone, configuration and sky source behind the sample.
+    /// `None` when detection did not run.
+    pub detection: Option<DetectionProvenance>,
+    /// Sources the detector handed to the star gates (diagnostics and
+    /// evaluation; not serialized onto the bus).
+    pub candidates: Vec<StarCandidate>,
 }
 
 impl QualityMetrics {
@@ -209,19 +287,33 @@ impl QualityMetrics {
     }
 }
 
-#[derive(Debug, Clone)]
-struct StarCandidate {
-    x: f32,
-    y: f32,
-    area: usize,
-    flux: f32,
-    peak: f32,
-    /// Bounding box of the above-threshold pixels (inclusive, frame coords).
+/// A detected source handed to the star gates.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StarCandidate {
+    pub x: f32,
+    pub y: f32,
+    pub area: usize,
+    /// Legacy: sum of `max(I-B,0)` over the component. SEP: unfiltered
+    /// residual flux over the footprint. Used for ranking only.
+    pub flux: f32,
+    /// Raw input value at the brightest pixel (legacy peak saturation gate).
+    pub peak: f32,
+    /// Bounding box of the detection footprint (inclusive, frame coords).
     /// Drives the adaptive crop size and the edge-truncation gate.
-    min_x: usize,
-    max_x: usize,
-    min_y: usize,
-    max_y: usize,
+    pub min_x: usize,
+    pub max_x: usize,
+    pub min_y: usize,
+    pub max_y: usize,
+    /// The detector split this source out of a blend (SEP deblending).
+    pub deblended: bool,
+}
+
+/// Focus-star acceptance policy that is independent of the detector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FocusSourcePolicy {
+    /// Accept deblended children as focus stars. Off by default: a split
+    /// blend's wings are shared with its neighbour.
+    pub accept_deblended: bool,
 }
 
 /// Per-reason counts of stars examined but rejected by the source-validity
@@ -257,6 +349,10 @@ pub struct StarRejectionTallies {
     /// Source measurement support touches bad, invalid or reconstruction-edge pixels.
     #[serde(default)]
     pub masked_support: u32,
+    /// The detector deblended the source and the focus policy does not
+    /// accept deblended children.
+    #[serde(default)]
+    pub deblended: u32,
 }
 
 /// A star that survived every validity gate and produced a finite HFR. The
@@ -322,25 +418,66 @@ pub fn luma_from_analysis(analysis: crate::processing::debayer::AnalysisFrame) -
     }
 }
 
-pub fn estimate_quality(frame: &LumaFrame, background: &BackgroundStats) -> QualityMetrics {
+pub fn estimate_quality(frame: &LumaFrame, background: &BackgroundAnalysis) -> QualityMetrics {
+    estimate_quality_with_policy(frame, background, FocusSourcePolicy::default())
+}
+
+/// Detect and measure focus stars against the frame's background analysis.
+///
+/// Detection uses the SEP catalog when the backend produced one, otherwise
+/// the legacy global-threshold components of a uniform background. The star
+/// gates and HFR use the same background: the parent spatial map evaluated in
+/// each crop, or (legacy) the crop's own median sky.
+pub fn estimate_quality_with_policy(
+    frame: &LumaFrame,
+    background: &BackgroundAnalysis,
+    policy: FocusSourcePolicy,
+) -> QualityMetrics {
     let gate = saturation_gate(frame);
 
-    if frame.pixels.is_empty()
-        || frame.width == 0
-        || frame.height == 0
-        || frame.pixels.len() != frame.width.saturating_mul(frame.height)
-        || !frame.masks_have_valid_shape()
-    {
+    if !frame_geometry_valid(frame) {
         return invalid_metrics(
             QualityStatus::EmptyFrame,
             QualityRejectionReason::NoFinitePixels,
             0,
             StarRejectionTallies::default(),
             gate,
+            None,
         );
     }
 
-    let mut stars = detect_star_candidates(frame, background);
+    let Some(field) = background.field.as_ref() else {
+        return invalid_metrics(
+            QualityStatus::BackgroundUnavailable,
+            QualityRejectionReason::BackgroundUnavailable,
+            0,
+            StarRejectionTallies::default(),
+            gate,
+            None,
+        );
+    };
+
+    let (mut stars, detection) = match (&background.catalog, field) {
+        (Some(catalog), _) => (candidates_from_catalog(catalog), catalog.provenance.clone()),
+        (None, BackgroundField::Uniform { level, sigma }) => {
+            detect_star_candidates(frame, *level, *sigma)
+        }
+        (None, BackgroundField::Map { .. }) => {
+            let reason = if background.result.noise_status == NoiseStatus::Measured {
+                QualityRejectionReason::DetectionFailed
+            } else {
+                QualityRejectionReason::NoiseUnresolved
+            };
+            return invalid_metrics(
+                QualityStatus::DetectionUnavailable,
+                reason,
+                0,
+                StarRejectionTallies::default(),
+                gate,
+                None,
+            );
+        }
+    };
     stars.sort_by(|a, b| {
         b.flux
             .total_cmp(&a.flux)
@@ -356,10 +493,11 @@ pub fn estimate_quality(frame: &LumaFrame, background: &BackgroundStats) -> Qual
             0,
             StarRejectionTallies::default(),
             gate,
+            Some(detection),
         );
     }
 
-    let (used_stars, star_rejections) = measure_stars(frame, &stars);
+    let (used_stars, star_rejections) = measure_stars(frame, &stars, field, policy);
     let hfrs: Vec<f32> = used_stars.iter().map(|star| star.hfr_px).collect();
     let star_count_used = hfrs.len() as u32;
     let hfr_px = median(&hfrs);
@@ -385,18 +523,25 @@ pub fn estimate_quality(frame: &LumaFrame, background: &BackgroundStats) -> Qual
                 star_rejections,
                 used_stars,
                 saturation_gate: gate,
+                detection: Some(detection),
+                candidates: stars,
             }
         }
         // Stars were detected but none survived the validity gates with a usable
         // HFR. `star_count_detected` and the per-reason tallies stay as real
         // diagnostics; widths remain None.
-        _ => invalid_metrics(
-            QualityStatus::NoUsableStars,
-            QualityRejectionReason::NoValidHfr,
-            star_count_detected,
-            star_rejections,
-            gate,
-        ),
+        _ => {
+            let mut metrics = invalid_metrics(
+                QualityStatus::NoUsableStars,
+                QualityRejectionReason::NoValidHfr,
+                star_count_detected,
+                star_rejections,
+                gate,
+                Some(detection),
+            );
+            metrics.candidates = stars;
+            metrics
+        }
     }
 }
 
@@ -406,6 +551,7 @@ fn invalid_metrics(
     star_count_detected: u32,
     star_rejections: StarRejectionTallies,
     saturation_gate: SaturationGate,
+    detection: Option<DetectionProvenance>,
 ) -> QualityMetrics {
     QualityMetrics {
         status,
@@ -420,6 +566,8 @@ fn invalid_metrics(
         star_rejections,
         used_stars: Vec::new(),
         saturation_gate,
+        detection,
+        candidates: Vec::new(),
     }
 }
 
@@ -462,9 +610,35 @@ fn robust_log_sigma(hfrs: &[f32]) -> Option<f32> {
     Some(mad)
 }
 
-fn detect_star_candidates(frame: &LumaFrame, background: &BackgroundStats) -> Vec<StarCandidate> {
-    let sigma = background.background_sigma.max(1.0);
-    let threshold = (background.background_adu + sigma * 5.0).max(background.background_adu + 8.0);
+/// Canonical configuration of the legacy detector (its floors are labelled
+/// heuristics, not a camera calibration).
+pub fn legacy_detection_config_json() -> serde_json::Value {
+    serde_json::json!({
+        "method": DetectionMethod::LegacyConnectedComponents.id(),
+        "method_version": 1,
+        "threshold": "max(B + 5*max(sigma,1), B + 8) with the global level B and scale sigma",
+        "thresh_sigma": 5.0,
+        "sigma_floor": 1.0,
+        "min_excess": 8.0,
+        "connectivity": 8,
+        "min_area": 2,
+        "max_area": MAX_SOURCE_AREA,
+        "centroid_weight": "max(I-B,0)",
+    })
+}
+
+/// Largest detection footprint treated as a candidate star (both detectors).
+const MAX_SOURCE_AREA: usize = 5_000;
+
+/// Legacy detector: 8-connected components above a global threshold.
+fn detect_star_candidates(
+    frame: &LumaFrame,
+    level: f32,
+    measured_sigma: f32,
+) -> (Vec<StarCandidate>, DetectionProvenance) {
+    let sigma = measured_sigma.max(1.0);
+    let noise_floor_applied = !(measured_sigma >= 1.0);
+    let threshold = (level + sigma * 5.0).max(level + 8.0);
     let mut visited = vec![false; frame.pixels.len()];
     let mut stars = Vec::new();
 
@@ -492,7 +666,7 @@ fn detect_star_candidates(frame: &LumaFrame, background: &BackgroundStats) -> Ve
 
         while let Some(current) = stack.pop() {
             let current_value = frame.pixels[current];
-            let signal = (current_value - background.background_adu).max(0.0);
+            let signal = (current_value - level).max(0.0);
             let x = current % frame.width;
             let y = current / frame.width;
 
@@ -531,7 +705,7 @@ fn detect_star_candidates(frame: &LumaFrame, background: &BackgroundStats) -> Ve
             }
         }
 
-        if area >= 2 && area <= 5_000 && flux > 0.0 {
+        if area >= 2 && area <= MAX_SOURCE_AREA && flux > 0.0 {
             stars.push(StarCandidate {
                 x: weighted_x / flux,
                 y: weighted_y / flux,
@@ -542,11 +716,88 @@ fn detect_star_candidates(frame: &LumaFrame, background: &BackgroundStats) -> Ve
                 max_x: bb_max_x,
                 min_y: bb_min_y,
                 max_y: bb_max_y,
+                deblended: false,
             });
         }
     }
 
-    stars
+    let provenance = DetectionProvenance {
+        method: DetectionMethod::LegacyConnectedComponents,
+        config_sha256: config_sha256(&legacy_detection_config_json()),
+        crop_sky_source: CropSkySource::LegacyCropMedian,
+        noise_floor_applied,
+        objects_detected: stars.len() as u32,
+        objects_deblended: 0,
+        objects_truncated: 0,
+    };
+    (stars, provenance)
+}
+
+/// SEP catalog objects as star candidates, with the same footprint-size and
+/// positive-flux limits as the legacy detector.
+fn candidates_from_catalog(catalog: &SourceCatalog) -> Vec<StarCandidate> {
+    catalog
+        .objects
+        .iter()
+        .filter(|object| {
+            (object.npix as usize) <= MAX_SOURCE_AREA
+                && object.flux > 0.0
+                && object.flux.is_finite()
+        })
+        .map(|object| StarCandidate {
+            x: object.x,
+            y: object.y,
+            area: object.npix as usize,
+            flux: object.flux,
+            peak: object.peak_raw,
+            min_x: object.xmin,
+            max_x: object.xmax,
+            min_y: object.ymin,
+            max_y: object.ymax,
+            deblended: object.deblended,
+        })
+        .collect()
+}
+
+/// The sky the star gates subtract inside one measurement crop.
+enum GateSky {
+    /// Legacy: the crop's median and 1.4826*MAD (with the legacy 1e-6 noise
+    /// floor), one value for the crop.
+    Crop { sky: f32, noise: f32 },
+    /// The parent spatial background and RMS maps evaluated over the crop.
+    Map { level: Vec<f32>, rms: Vec<f32> },
+}
+
+impl GateSky {
+    fn level(&self, index: usize) -> f32 {
+        match self {
+            GateSky::Crop { sky, .. } => *sky,
+            GateSky::Map { level, .. } => level[index],
+        }
+    }
+
+    fn noise(&self, index: usize) -> f32 {
+        match self {
+            GateSky::Crop { noise, .. } => *noise,
+            GateSky::Map { rms, .. } => rms[index],
+        }
+    }
+}
+
+fn window(
+    values: &[f32],
+    frame_width: usize,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+) -> Vec<f32> {
+    let mut out = Vec::with_capacity(w * h);
+    for y in y0..y0 + h {
+        let row = y * frame_width + x0;
+        out.extend_from_slice(&values[row..row + w]);
+    }
+    out
 }
 
 /// Measure HFRs for the brightest stars that pass the source-validity gates.
@@ -561,6 +812,8 @@ fn detect_star_candidates(frame: &LumaFrame, background: &BackgroundStats) -> Ve
 fn measure_stars(
     frame: &LumaFrame,
     stars: &[StarCandidate],
+    field: &BackgroundField,
+    policy: FocusSourcePolicy,
 ) -> (Vec<UsedStar>, StarRejectionTallies) {
     let saturation_adu = match saturation_gate(frame) {
         SaturationGate::Applied { threshold_adu } => Some(threshold_adu),
@@ -603,6 +856,13 @@ fn measure_stars(
             rejected = true;
         }
 
+        // Gate 2b — deblending policy. The detector splitting a blend is not
+        // the same decision as accepting its children for a focus width.
+        if star.deblended && !policy.accept_deblended {
+            tallies.deblended += 1;
+            rejected = true;
+        }
+
         if rejected {
             continue;
         }
@@ -633,18 +893,32 @@ fn measure_stars(
             continue;
         }
 
-        // Local sky for the gates (median + MAD), matching what compute_hfr
-        // uses internally and what the Python labeler does per crop.
-        let (sky, rms) = local_sky_stats(&crop);
-        let noise = rms.max(1e-6);
+        // Sky for the gates. Legacy: the crop median + MAD. Spatial: the
+        // parent maps over exactly this crop, so gates and HFR share the
+        // detection's background (BGE-13).
+        let sky = match field {
+            BackgroundField::Uniform { .. } => {
+                let (sky, rms) = local_sky_stats(&crop);
+                GateSky::Crop {
+                    sky,
+                    noise: rms.max(1e-6),
+                }
+            }
+            BackgroundField::Map { level, rms, .. } => GateSky::Map {
+                level: window(level, frame.width, start_x, start_y, cw, ch),
+                rms: window(rms, frame.width, start_x, start_y, cw, ch),
+            },
+        };
         let cx = (star.x - start_x as f32).clamp(0.0, (cw - 1) as f32);
         let cy = (star.y - start_y as f32).clamp(0.0, (ch - 1) as f32);
 
         // Gate 3 — aperture SNR + core pixel count. The sky-subtracted sum is
         // UNCLIPPED so zero-mean noise cancels; clipping first would rectify
-        // noise and inflate the SNR of a blank patch.
+        // noise and inflate the SNR of a blank patch. The noise is the
+        // background scale only (no source Poisson term: gain is unknown).
         let r_ap = (cw.min(ch) as f32 / 8.0).max(4.0);
         let mut ap_signal = 0.0_f32;
+        let mut ap_variance = 0.0_f32;
         let mut n_ap = 0_usize;
         let mut core_pixels = 0_usize;
         for y in 0..ch {
@@ -652,8 +926,11 @@ fn measure_stars(
                 let dx = x as f32 - cx;
                 let dy = y as f32 - cy;
                 if dx * dx + dy * dy <= r_ap * r_ap {
-                    let resid = crop[y * cw + x] - sky;
+                    let index = y * cw + x;
+                    let noise = sky.noise(index);
+                    let resid = crop[index] - sky.level(index);
                     ap_signal += resid;
+                    ap_variance += noise * noise;
                     n_ap += 1;
                     if resid > 3.0 * noise {
                         core_pixels += 1;
@@ -661,7 +938,10 @@ fn measure_stars(
                 }
             }
         }
-        let snr = ap_signal / (noise * (n_ap.max(1) as f32).sqrt());
+        let snr = match &sky {
+            GateSky::Crop { noise, .. } => ap_signal / (noise * (n_ap.max(1) as f32).sqrt()),
+            GateSky::Map { .. } => ap_signal / ap_variance.max(f32::MIN_POSITIVE).sqrt(),
+        };
         if snr < MIN_APERTURE_SNR {
             tallies.low_snr += 1;
             rejected = true;
@@ -672,7 +952,7 @@ fn measure_stars(
         }
 
         // Gate 4 — second-moment ellipticity (trailed/astigmatic source).
-        let ellipticity = second_moment_ellipticity(&crop, cw, ch, sky);
+        let ellipticity = second_moment_ellipticity(&crop, cw, ch, |index| sky.level(index));
         if ellipticity > MAX_ELLIPTICITY {
             tallies.elongated += 1;
             rejected = true;
@@ -680,8 +960,19 @@ fn measure_stars(
 
         // Gate 5 — blend test: >=2 distinct core peaks means a close double.
         // Runs unconditionally (like the Python labeler) so every triggered
-        // reason is tallied, not just the first.
-        if count_core_peaks(&crop, cw, ch, sky, noise) >= 2 {
+        // reason is tallied, not just the first. Peaks are local maxima of the
+        // residual above 5 noise; with a uniform sky that is the raw crop.
+        let peaks = match &sky {
+            GateSky::Crop { sky, noise } => {
+                let threshold = sky + 5.0 * noise;
+                count_core_peaks(&crop, cw, ch, |_| threshold)
+            }
+            GateSky::Map { level, rms } => {
+                let residual: Vec<f32> = crop.iter().zip(level).map(|(v, b)| v - b).collect();
+                count_core_peaks(&residual, cw, ch, |index| 5.0 * rms[index])
+            }
+        };
+        if peaks >= 2 {
             tallies.blended += 1;
             rejected = true;
         }
@@ -690,7 +981,25 @@ fn measure_stars(
             continue;
         }
 
-        let hfr = ClassicalFocusSolver::compute_hfr(&crop, cw, ch);
+        // HFR integrates against the explicitly chosen sky: the legacy crop
+        // median (named, not silent) or the parent maps over the crop.
+        let hfr = match &sky {
+            GateSky::Crop { .. } => {
+                let (level, sigma) = ClassicalFocusSolver::legacy_crop_sky(&crop);
+                ClassicalFocusSolver::compute_hfr_with_sky(
+                    &crop,
+                    cw,
+                    ch,
+                    &CropSky::Uniform { level, sigma },
+                )
+            }
+            GateSky::Map { level, rms } => ClassicalFocusSolver::compute_hfr_with_sky(
+                &crop,
+                cw,
+                ch,
+                &CropSky::PerPixel { level, sigma: rms },
+            ),
+        };
         if hfr.is_finite() && hfr > 0.0 {
             used.push(UsedStar {
                 x: star.x,
@@ -729,6 +1038,14 @@ fn saturation_gate(frame: &LumaFrame) -> SaturationGate {
         {
             SaturationGate::NativeMaskApplied
         }
+        // A caller-attached native clipping mask on a frame without a
+        // descriptor is applied by the footprint veto too.
+        _ if frame.analysis_descriptor.is_none()
+            && !frame.masks.native_saturation.is_empty()
+            && frame.masks.native_saturation.len() == frame.pixels.len() =>
+        {
+            SaturationGate::NativeMaskApplied
+        }
         _ => SaturationGate::NotPerformed,
     }
 }
@@ -751,13 +1068,18 @@ fn local_sky_stats(crop: &[f32]) -> (f32, f32) {
 /// sky-subtracted (clipped) signal — the SExtractor A/B formalism, identical to
 /// `psf_measure.second_moment_shape`. Clipping is fine here: this locates and
 /// shapes the star; only flux *integration* must stay unclipped.
-fn second_moment_ellipticity(crop: &[f32], width: usize, height: usize, sky: f32) -> f32 {
+fn second_moment_ellipticity(
+    crop: &[f32],
+    width: usize,
+    height: usize,
+    sky: impl Fn(usize) -> f32,
+) -> f32 {
     let mut total = 0.0_f32;
     let mut cx = 0.0_f32;
     let mut cy = 0.0_f32;
     for y in 0..height {
         for x in 0..width {
-            let f = (crop[y * width + x] - sky).max(0.0);
+            let f = (crop[y * width + x] - sky(y * width + x)).max(0.0);
             total += f;
             cx += x as f32 * f;
             cy += y as f32 * f;
@@ -774,7 +1096,7 @@ fn second_moment_ellipticity(crop: &[f32], width: usize, height: usize, sky: f32
     let mut mxy = 0.0_f32;
     for y in 0..height {
         for x in 0..width {
-            let f = (crop[y * width + x] - sky).max(0.0);
+            let f = (crop[y * width + x] - sky(y * width + x)).max(0.0);
             let dx = x as f32 - cx;
             let dy = y as f32 - cy;
             mxx += f * dx * dx;
@@ -796,19 +1118,25 @@ fn second_moment_ellipticity(crop: &[f32], width: usize, height: usize, sky: f32
     (1.0 - b2.sqrt() / a).clamp(0.0, 1.0)
 }
 
-/// Count distinct local maxima above `sky + 5*noise` — a cheap deblend test
-/// (port of `psf_measure._count_core_peaks`). A pixel is a peak when it equals
-/// the maximum of its `(2*BLEND_MIN_SEPARATION+1)^2` window; touching plateau
+/// Count distinct local maxima above a per-pixel threshold (legacy: `sky +
+/// 5*noise` on the raw crop; spatial: `5*R` on the residual) — a cheap
+/// rejection heuristic, not a deblender (port of
+/// `psf_measure._count_core_peaks`). A pixel is a peak when it equals the
+/// maximum of its `(2*BLEND_MIN_SEPARATION+1)^2` window; touching plateau
 /// peaks collapse into one via connected components.
-fn count_core_peaks(crop: &[f32], width: usize, height: usize, sky: f32, noise: f32) -> usize {
-    let threshold = sky + 5.0 * noise;
+fn count_core_peaks(
+    crop: &[f32],
+    width: usize,
+    height: usize,
+    threshold: impl Fn(usize) -> f32,
+) -> usize {
     let win = BLEND_MIN_SEPARATION;
     let mut is_peak = vec![false; crop.len()];
 
     for y in 0..height {
         for x in 0..width {
             let value = crop[y * width + x];
-            if !value.is_finite() || value <= threshold {
+            if !value.is_finite() || value <= threshold(y * width + x) {
                 continue;
             }
             let mut window_max = f32::NEG_INFINITY;
@@ -882,8 +1210,7 @@ fn extract_crop(
 
 #[cfg(test)]
 mod tests {
-    use super::{estimate_quality, local_sky_stats, LumaFrame};
-    use crate::vision::background::estimate_background;
+    use super::{background_from_luma, estimate_quality, local_sky_stats, LumaFrame};
 
     #[test]
     fn local_sky_matches_numpy_median_for_even_samples() {
@@ -916,7 +1243,7 @@ mod tests {
             masks: Default::default(),
             analysis_descriptor: None,
         };
-        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let background = background_from_luma(&frame);
         let quality = estimate_quality(&frame, &background);
 
         assert!(quality.observation_valid());
@@ -983,7 +1310,7 @@ mod tests {
             masks: Default::default(),
             analysis_descriptor: None,
         };
-        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let background = background_from_luma(&frame);
         let quality = estimate_quality(&frame, &background);
 
         assert_eq!(quality.star_count_detected, 1);
@@ -1030,7 +1357,7 @@ mod tests {
     #[test]
     fn clipped_14bit_star_is_rejected_when_saturation_is_declared() {
         let frame = clipped_14bit_star_frame(Some(16_383.0));
-        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let background = background_from_luma(&frame);
         let quality = estimate_quality(&frame, &background);
 
         assert!(quality.saturation_gate.was_applied());
@@ -1043,7 +1370,7 @@ mod tests {
     #[test]
     fn unknown_saturation_reports_not_performed_rather_than_passing() {
         let frame = clipped_14bit_star_frame(None);
-        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let background = background_from_luma(&frame);
         let quality = estimate_quality(&frame, &background);
 
         // The star is NOT rejected — we cannot tell it is clipped. That is the
@@ -1056,8 +1383,13 @@ mod tests {
             "gate must report NotPerformed so a dataset builder can exclude this frame"
         );
         assert_eq!(quality.saturation_gate, super::SaturationGate::NotPerformed);
+        // This frame holds a clipped 14-bit core, so a saturation fraction of
+        // 0.0 would be false; with no saturation evidence it is absent. The
+        // background still excludes no pixel for an unknown saturation point.
+        assert_eq!(background.result.saturation_fraction, None);
+        assert_eq!(background.result.support.saturation_evidence, "unknown");
         assert_eq!(
-            background.saturation_fraction, 0.0,
+            background.result.support.usable_pixels, background.result.support.total_pixels,
             "unknown saturation must exclude no pixels from the background"
         );
     }
@@ -1077,7 +1409,7 @@ mod tests {
             masks: Default::default(),
             analysis_descriptor: None,
         };
-        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let background = background_from_luma(&frame);
         let quality = estimate_quality(&frame, &background);
 
         assert_eq!(quality.star_count_used, 0);
@@ -1103,7 +1435,7 @@ mod tests {
             masks: Default::default(),
             analysis_descriptor: None,
         };
-        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let background = background_from_luma(&frame);
         let quality = estimate_quality(&frame, &background);
 
         assert_eq!(quality.star_count_used, 0);
@@ -1135,7 +1467,7 @@ mod tests {
             masks: Default::default(),
             analysis_descriptor: None,
         };
-        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let background = background_from_luma(&frame);
         let quality = estimate_quality(&frame, &background);
 
         // Trailed sources are measured by vision::trailing; they must not
@@ -1172,7 +1504,7 @@ mod tests {
             masks: Default::default(),
             analysis_descriptor: None,
         };
-        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let background = background_from_luma(&frame);
         let quality = estimate_quality(&frame, &background);
 
         assert!(quality.observation_valid());
@@ -1194,7 +1526,7 @@ mod tests {
             masks: Default::default(),
             analysis_descriptor: None,
         };
-        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let background = background_from_luma(&frame);
         let quality = estimate_quality(&frame, &background);
 
         assert!(!quality.observation_valid());
@@ -1238,7 +1570,7 @@ mod tests {
             masks: Default::default(),
             analysis_descriptor: None,
         };
-        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let background = background_from_luma(&frame);
         let quality = estimate_quality(&frame, &background);
 
         assert!(quality.observation_valid());
@@ -1323,7 +1655,7 @@ mod tests {
         frame.masks.bad_pixel = vec![0; frame.pixels.len()];
         frame.masks.bad_pixel[0] = 1;
         let after = super::background_from_luma(&frame);
-        assert_eq!(before.background_adu, after.background_adu);
+        assert_eq!(before.result.level(), after.result.level());
         frame.masks.bad_pixel[32 * frame.width + 32] = 1;
         let quality = estimate_quality(&frame, &after);
         assert_eq!(quality.star_count_used, 0);
@@ -1333,5 +1665,243 @@ mod tests {
             estimate_quality(&frame, &after).status,
             super::QualityStatus::EmptyFrame
         );
+    }
+
+    // --- Spatial background path (synthetic maps and catalog; the SEP
+    // backend itself is tested in sep_backend.rs) ---
+
+    use crate::vision::background_model::{
+        BackgroundAnalysis, BackgroundField, CatalogSource, CropSkySource, DetectionMethod,
+        DetectionProvenance, NoiseStatus, SourceCatalog,
+    };
+
+    /// Deterministic zero-mean noise in [-amp, amp).
+    fn noise(index: usize, amp: f32) -> f32 {
+        let mut x = (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0xD1B5_4A32_D192_ED03;
+        x ^= x >> 31;
+        x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        x ^= x >> 29;
+        ((x >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0) * amp
+    }
+
+    /// A 3 px-HFR Gaussian star on a steep linear ramp, with the true maps.
+    fn star_on_ramp() -> (LumaFrame, Vec<f32>, Vec<f32>) {
+        let (width, height) = (160usize, 128usize);
+        let level: Vec<f32> = (0..width * height)
+            .map(|i| 1000.0 + 25.0 * (i % width) as f32)
+            .collect();
+        let mut pixels: Vec<f32> = level
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b + noise(i, 10.0))
+            .collect();
+        let sigma = 3.0 / (2.0 * std::f32::consts::LN_2).sqrt();
+        add_gaussian(&mut pixels, width, 80.0, 64.0, 3000.0, sigma, 20);
+        // Uniform noise on [-a, a) has standard deviation a/sqrt(3).
+        let rms = vec![10.0 / 3.0_f32.sqrt(); width * height];
+        let frame = LumaFrame {
+            pixels,
+            width,
+            height,
+            max_adu: 65535.0,
+            saturation_adu: Some(65535.0),
+            masks: Default::default(),
+            analysis_descriptor: None,
+        };
+        (frame, level, rms)
+    }
+
+    fn spatial_analysis(
+        frame: &LumaFrame,
+        level: Vec<f32>,
+        rms: Vec<f32>,
+        deblended: bool,
+    ) -> BackgroundAnalysis {
+        let mut analysis = background_from_luma(frame);
+        let (x0, x1, y0, y1) = (74usize, 86usize, 58usize, 70usize);
+        let pixels: Vec<u32> = (y0..=y1)
+            .flat_map(|y| (x0..=x1).map(move |x| (y * frame.width + x) as u32))
+            .collect();
+        let object = CatalogSource {
+            x: 80.0,
+            y: 64.0,
+            xmin: x0,
+            xmax: x1,
+            ymin: y0,
+            ymax: y1,
+            npix: pixels.len() as u32,
+            flux: 1.0e5,
+            peak_residual: 3000.0,
+            peak_raw: frame.pixels[64 * frame.width + 80],
+            a: 2.5,
+            b: 2.5,
+            theta: 0.0,
+            flags: if deblended { 1 } else { 0 },
+            deblended,
+            truncated: false,
+            pixels,
+        };
+        analysis.catalog = Some(SourceCatalog {
+            provenance: DetectionProvenance {
+                method: DetectionMethod::SepExtract,
+                config_sha256: "test".into(),
+                crop_sky_source: CropSkySource::ParentBackgroundMap,
+                noise_floor_applied: false,
+                objects_detected: 1,
+                objects_deblended: deblended as u32,
+                objects_truncated: 0,
+            },
+            objects: vec![object],
+            segmentation: None,
+        });
+        analysis.field = Some(BackgroundField::Map {
+            level,
+            rms,
+            width: frame.width,
+            height: frame.height,
+        });
+        analysis
+    }
+
+    #[test]
+    fn parent_map_drives_gates_and_hfr_on_a_gradient() {
+        let (frame, level, rms) = star_on_ramp();
+        let spatial = estimate_quality(&frame, &spatial_analysis(&frame, level, rms, false));
+        assert_eq!(spatial.status, super::QualityStatus::Valid, "{spatial:?}");
+        let hfr = spatial.hfr_px.unwrap();
+        assert!((hfr - 3.0).abs() < 0.3, "spatial HFR {hfr}");
+        assert_eq!(
+            spatial.detection.as_ref().unwrap().crop_sky_source,
+            CropSkySource::ParentBackgroundMap
+        );
+
+        // The legacy global threshold and crop median on the same pixels do
+        // not recover the width (no star, or a worse one).
+        let legacy = estimate_quality(&frame, &background_from_luma(&frame));
+        assert!(legacy
+            .hfr_px
+            .map_or(true, |legacy| (legacy - 3.0).abs() > (hfr - 3.0).abs()));
+    }
+
+    #[test]
+    fn deblended_children_follow_the_focus_policy_not_the_detector() {
+        let (frame, level, rms) = star_on_ramp();
+        let analysis = spatial_analysis(&frame, level, rms, true);
+        let rejected = estimate_quality(&frame, &analysis);
+        assert_eq!(rejected.status, super::QualityStatus::NoUsableStars);
+        assert_eq!(rejected.star_rejections.deblended, 1);
+        let accepted = super::estimate_quality_with_policy(
+            &frame,
+            &analysis,
+            super::FocusSourcePolicy {
+                accept_deblended: true,
+            },
+        );
+        assert_eq!(accepted.status, super::QualityStatus::Valid);
+    }
+
+    #[test]
+    fn missing_background_or_detection_is_reported_not_measured() {
+        let (frame, level, rms) = star_on_ramp();
+        let mut no_catalog = spatial_analysis(&frame, level, rms, false);
+        no_catalog.catalog = None;
+        no_catalog.result.noise_status = NoiseStatus::Unresolved;
+        let quality = estimate_quality(&frame, &no_catalog);
+        assert_eq!(quality.status, super::QualityStatus::DetectionUnavailable);
+        assert_eq!(
+            quality.rejection_reasons,
+            vec![super::QualityRejectionReason::NoiseUnresolved]
+        );
+        assert!(quality.hfr_px.is_none() && quality.detection.is_none());
+
+        let mut no_level = no_catalog;
+        no_level.field = None;
+        let quality = estimate_quality(&frame, &no_level);
+        assert_eq!(quality.status, super::QualityStatus::BackgroundUnavailable);
+        assert!(quality.hfr_px.is_none());
+    }
+
+    #[test]
+    fn background_excludes_native_saturation_and_edge_support() {
+        // A block of mid-level masked pixels would move the median if used.
+        let width = 64;
+        let mut pixels: Vec<f32> = (0..width * width).map(|i| 100.0 + noise(i, 2.0)).collect();
+        let mut native_saturation = vec![0u8; pixels.len()];
+        let mut edge = vec![0u8; pixels.len()];
+        for index in 0..pixels.len() / 2 + 200 {
+            pixels[index] = 900.0;
+            if index % 2 == 0 {
+                native_saturation[index] = 1;
+            } else {
+                edge[index] = 1;
+            }
+        }
+        let frame = LumaFrame {
+            pixels,
+            width,
+            height: width,
+            max_adu: 65535.0,
+            saturation_adu: None,
+            masks: crate::processing::debayer::AnalysisMasks {
+                bad_pixel: vec![],
+                invalid: vec![],
+                edge,
+                native_saturation,
+            },
+            analysis_descriptor: None,
+        };
+        let level = background_from_luma(&frame).result.level().unwrap();
+        assert!((level - 100.0).abs() < 3.0, "level {level}");
+    }
+
+    #[test]
+    fn faint_star_tallies_low_snr_and_too_few_core_pixels() {
+        // Characterization of the legacy gates: a source just above the
+        // detection threshold but with almost no aperture signal.
+        let width = 64;
+        let mut pixels: Vec<f32> = (0..width * width).map(|i| 100.0 + noise(i, 3.0)).collect();
+        for (dx, dy) in [(0, 0), (1, 0), (0, 1)] {
+            pixels[(32 + dy) * width + 32 + dx] = 112.0;
+        }
+        let frame = LumaFrame {
+            pixels,
+            width,
+            height: width,
+            max_adu: 65535.0,
+            saturation_adu: Some(65535.0),
+            masks: Default::default(),
+            analysis_descriptor: None,
+        };
+        let quality = estimate_quality(&frame, &background_from_luma(&frame));
+        assert!(quality.star_count_detected >= 1);
+        assert_eq!(quality.star_count_used, 0);
+        assert!(quality.star_rejections.low_snr >= 1);
+        assert!(quality.star_rejections.too_few_pixels >= 1);
+    }
+
+    #[test]
+    fn attached_native_mask_without_descriptor_is_an_applied_gate() {
+        // Before: the footprint veto used the mask while the gate said
+        // NotPerformed and the fraction was absent.
+        let mut frame = clipped_14bit_star_frame(None);
+        let mut mask = vec![0u8; frame.pixels.len()];
+        for index in 0..frame.pixels.len() {
+            if frame.pixels[index] >= 16_000.0 {
+                mask[index] = 1;
+            }
+        }
+        let clipped = mask.iter().filter(|m| **m == 1).count();
+        assert!(clipped > 0);
+        frame.masks.native_saturation = mask;
+        let background = background_from_luma(&frame);
+        let quality = estimate_quality(&frame, &background);
+        assert_eq!(
+            quality.saturation_gate,
+            super::SaturationGate::NativeMaskApplied
+        );
+        assert!(quality.star_rejections.saturated > 0);
+        assert_eq!(background.result.support.saturation_evidence, "native_mask");
+        let fraction = background.result.saturation_fraction.unwrap();
+        assert!((fraction - clipped as f32 / frame.pixels.len() as f32).abs() < 1e-6);
     }
 }

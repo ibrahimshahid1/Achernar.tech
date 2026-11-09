@@ -22,12 +22,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ml"))
 
 from import_session import (  # noqa: E402
     classify,
+    container_max_adu,
     exif_datetime,
     group_by_capture,
     import_session,
+    measure_frame_detailed,
     night_id_for,
     position_value,
+    resolve_saturation,
 )
+from labels.psf_measure import SepBackgroundParams, SepDetectionParams, require_sep  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 MIGRATIONS = REPO / "achernar-daemon" / "migrations"
@@ -304,6 +308,7 @@ def write_star_field(
     bit_depth: int = 8,
     seed: int = 7,
     noise_seed: int = 0,
+    value_ceiling: float | None = None,
 ) -> None:
     """A synthetic star field whose PSF width is set by `hfr_sigma`.
 
@@ -323,6 +328,10 @@ def write_star_field(
     star_rng = np.random.default_rng(seed)
     noise_rng = np.random.default_rng(1000 + noise_seed)
     ceiling = 255.0 if bit_depth == 8 else 65535.0
+    if value_ceiling is not None:
+        # Scale the scene independently of the container (e.g. a dim frame
+        # stored in a 16-bit PNG).
+        ceiling = value_ceiling
     sky = ceiling * 0.08
     image = noise_rng.normal(sky, ceiling * 0.006, size=(size, size))
 
@@ -378,6 +387,13 @@ def sweep_log(
 
 
 class TestManualFocusSweep(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # The sweep measurements need the pinned SEP. Without it these tests
+        # fail with "missing prerequisite: sep==1.4.1" instead of reporting a
+        # confusing zero-sample import.
+        require_sep()
+
     def _setup(self, d: Path):
         db = d / "achernar.db"
         apply_migrations(db)
@@ -462,11 +478,13 @@ class TestManualFocusSweep(unittest.TestCase):
 
             for row in rows:
                 q = json.loads(row["quality_json"])
-                # 8-bit container: the container IS the clip point, so the gate
-                # fires by construction — the SV105 case.
+                # 8-bit container: the container IS the clip point (D-011), so
+                # the gate fires by construction — the SV105 case — and says
+                # it came from the container, not the sensor.
                 self.assertTrue(q["saturation_gate_applied"])
                 self.assertEqual(q["max_adu"], 255.0)
                 self.assertEqual(q["saturation_adu"], 255.0)
+                self.assertEqual(q["saturation_source"], "container_ceiling_8bit")
                 self.assertGreater(q["hfr_px"], 0)
                 self.assertGreater(q["star_count"], 0)
                 self.assertEqual(row["night_id"], "2026-09-14")
@@ -496,6 +514,205 @@ class TestManualFocusSweep(unittest.TestCase):
             self.assertIsNone(q["saturation_adu"])
             self.assertEqual(q["max_adu"], 65535.0)
             con.close()
+
+    def test_dim_sixteen_bit_frame_is_not_mistaken_for_eight_bit(self):
+        """A 16-bit PNG whose pixels all sit below 256 (short exposure, dark
+        sky). The pre-v2 container rule read the OBSERVED maximum, called the
+        frame 8-bit and gated it at 0.98 * 255 ADU: a saturation level invented
+        from pixel values. The container is the sample type."""
+        import numpy as np
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            db, files, root = self._setup(d)
+            positions = [1180, 1194, 1208, 1222, 1236, 1250, 1264]
+            names = []
+            for i, sigma in enumerate([3.4, 2.8, 2.2, 1.8, 2.2, 2.8, 3.4]):
+                name = f"DIM_{i:03d}.png"
+                write_star_field(files / name, sigma, bit_depth=16, noise_seed=i, value_ceiling=255.0)
+                names.append([name])
+            with Image.open(files / names[0][0]) as image:
+                dim = np.asarray(image)
+            self.assertEqual(dim.dtype, np.uint16)
+            self.assertLessEqual(float(dim.max()), 255.0)  # the old rule's trigger
+            self.assertEqual(container_max_adu(dim), 65535.0)
+
+            log = d / "session.json"
+            log.write_text(json.dumps(sweep_log(positions, names)))
+            stats = import_session(db_path=db, files_dir=files, capture_root=root,
+                                   log_path=log, migrations_dir=MIGRATIONS)
+            self.assertEqual(stats["focus_samples_inserted"], 7)
+            con = sqlite3.connect(db)
+            for (raw,) in con.execute("SELECT quality_json FROM frames"):
+                q = json.loads(raw)
+                self.assertFalse(q["saturation_gate_applied"])
+                self.assertIsNone(q["saturation_adu"])
+                self.assertIsNone(q["saturation_source"])
+                self.assertEqual(q["max_adu"], 65535.0)
+                self.assertEqual(q["saturation_gate"], "not_performed")
+            con.close()
+
+    def test_quality_json_carries_background_and_detection_provenance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            db, files, root = self._setup(d)
+            positions, names = self._write_v_curve(files)
+            log = d / "session.json"
+            log.write_text(json.dumps(sweep_log(positions, names)))
+            import_session(db_path=db, files_dir=files, capture_root=root,
+                           log_path=log, migrations_dir=MIGRATIONS)
+            con = sqlite3.connect(db)
+            rows = [json.loads(r[0]) for r in con.execute("SELECT quality_json FROM frames")]
+            con.close()
+        self.assertEqual(len(rows), 7)
+        for q in rows:
+            bg = q["background"]
+            # Discriminator: the Python reference object, not a Rust BackgroundResult.
+            self.assertEqual(bg["producer"], "python_sep_label")
+            self.assertEqual(bg["schema"], "achernar.python_sep_background_provenance.v1")
+            self.assertNotIn("schema_version", bg)
+            self.assertEqual(bg["method"], "sep_spatial_mesh")
+            self.assertEqual(bg["library_version"], "1.4.1")
+            self.assertEqual(bg["config"], SepBackgroundParams().config())
+            self.assertEqual(bg["config_sha256"], SepBackgroundParams().config_sha256())
+            self.assertEqual((bg["level_status"], bg["noise_status"]), ("measured", "measured"))
+            self.assertEqual(bg["noise_source"], "empirical_mesh_rms")
+            self.assertIn("level_definition", bg)
+            self.assertIn("rms_definition", bg)
+            # Legacy top-level keys stay, and agree with the nested object.
+            self.assertEqual(q["background_adu"], bg["level"])
+            self.assertEqual(q["background_sigma"], bg["rms"])
+            self.assertGreater(q["background_sigma"], 0.0)
+            self.assertEqual(q["detection"]["config_sha256"], SepDetectionParams().config_sha256())
+            self.assertEqual(q["detection"]["config"]["thresh_sigma"], 5.0)
+            # Star fraction under an explicit name; the legacy key keeps its value.
+            self.assertEqual(q["saturated_star_fraction"], q["saturation_fraction"])
+            self.assertIn("STAR fraction", q["saturation_fraction_definition"])
+            self.assertIn("sources", q["saturated_star_fraction_definition"])
+            self.assertEqual(q["hfd_px"], 2.0 * q["hfr_px"])
+            self.assertEqual(q["measurement_status"], "measured")
+            self.assertEqual(q["label_schema_version"], "fqe-sep-label-v2")
+            self.assertEqual(q["units"], "adu")  # mono 8-bit PNG: linear native samples
+
+    def test_unmeasurable_frames_record_a_reason_and_nulls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            db, files, root = self._setup(d)
+            positions, names = self._write_v_curve(files)
+            write_star_field(files / names[2][0], 2.2, n_stars=0, noise_seed=99)
+            # A frame on the card that is not part of any sweep.
+            write_star_field(files / "LOOSE_000.png", 2.0, noise_seed=50)
+            log = d / "session.json"
+            log.write_text(json.dumps(sweep_log(positions, names)))
+            stats = import_session(db_path=db, files_dir=files, capture_root=root,
+                                   log_path=log, migrations_dir=MIGRATIONS)
+            self.assertEqual(stats["unmeasurable_reasons"], {"no_valid_sources": 1})
+            con = sqlite3.connect(db)
+            rows = [json.loads(r[0]) for r in con.execute(
+                "SELECT quality_json FROM frames WHERE focuser_position IS NULL")]
+            con.close()
+        self.assertEqual(len(rows), 2)  # the starless sweep frame and the loose frame
+        self.assertEqual(
+            sorted((q["measurement_status"], q.get("measurement_reason")) for q in rows),
+            [("not_measured", None), ("unavailable", "no_valid_sources")],
+        )
+        for q in rows:
+            self.assertIsNone(q["hfr_px"])
+            self.assertIsNone(q["background_adu"])
+            self.assertIsNone(q["background_sigma"])
+            self.assertFalse(q["saturation_gate_applied"])
+
+    @staticmethod
+    def _rgb_field(green_clip: bool = True):
+        """Review F2 fixture: four stars on an 8-bit RGB frame; the bright one
+        at (176, 176) clips the GREEN channel only (R and B stay below 255)."""
+        import numpy as np
+
+        rng = np.random.default_rng(1)
+        ys, xs = np.mgrid[0:256, 0:256]
+
+        def star(cx, cy, amp, s=1.8):
+            return amp * np.exp(-((xs - cx) ** 2 + (ys - cy) ** 2) / (2 * s * s))
+
+        base = 20.0 + rng.normal(0, 2.0, xs.shape)
+        field = star(64, 64, 120) + star(192, 64, 120) + star(64, 192, 120)
+        bright = star(176, 176, 600.0 if green_clip else 200.0)
+        r = np.clip(base + field + 0.30 * bright, 0, 255)
+        g = np.clip(base + field + 1.00 * bright, 0, 255)
+        b = np.clip(base + field + 0.20 * bright, 0, 255)
+        return np.stack([r, g, b], -1).round().astype(np.uint8)
+
+    def test_one_channel_clipped_rgb_star_is_vetoed(self):
+        import numpy as np
+        from PIL import Image
+
+        rgb = self._rgb_field()
+        luma = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+        self.assertEqual(int((rgb[..., 1] == 255).sum()), 21)
+        self.assertLess(float(luma.max()), 0.98 * 255)  # the luma threshold alone never fires
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "frame.png"
+            Image.fromarray(rgb, "RGB").save(path)
+            m, reason = measure_frame_detailed(path, None)
+        self.assertIsNone(reason)
+        self.assertEqual(m["saturation_source"], "container_ceiling_8bit")
+        self.assertEqual(m["saturation_gate"], "native_mask_and_threshold_applied")
+        self.assertEqual(m["channel_clip_mask"]["pixels"], 21)
+        self.assertEqual(m["star_count_used"], 3)
+        self.assertGreater(m["rejection_counts"].get("saturated", 0), 0)
+        self.assertGreater(m["saturated_star_fraction"], 0.0)
+
+    def test_units_follow_the_pixel_domain(self):
+        from PIL import Image
+
+        rgb = self._rgb_field(green_clip=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            png = Path(tmp) / "rgb.png"
+            Image.fromarray(rgb, "RGB").save(png)
+            jpeg = Path(tmp) / "rgb.jpg"
+            Image.fromarray(rgb, "RGB").save(jpeg, quality=95)
+            mono = Path(tmp) / "mono.png"
+            write_star_field(mono, 2.0)
+            results = {name: measure_frame_detailed(path, None) for name, path in
+                       (("png", png), ("jpeg", jpeg), ("mono", mono))}
+        for name, (m, reason) in results.items():
+            self.assertIsNone(reason, name)
+        expected = {"png": "unverified", "jpeg": "display_luma_8bit_nonlinear", "mono": "adu"}
+        for name, units in expected.items():
+            m = results[name][0]
+            self.assertEqual(m["units"], units, name)
+            self.assertEqual(m["background"]["units"], units, name)
+            self.assertIsNotNone(m["units_note"])
+        for name in ("png", "jpeg"):
+            m = results[name][0]
+            # ADU-named legacy keys are null for non-ADU pixels, with a reason;
+            # the nested object keeps the value in its own units.
+            self.assertIsNone(m["background_adu"])
+            self.assertIsNone(m["background_sigma"])
+            self.assertEqual(m["background_adu_unavailable_reason"], f"units_not_adu:{expected[name]}")
+            self.assertIsNotNone(m["background"]["level"])
+        mono = results["mono"][0]
+        self.assertEqual(mono["background_adu"], mono["background"]["level"])
+        self.assertNotIn("background_adu_unavailable_reason", mono)
+        self.assertIsNone(mono["channel_clip_mask"])
+
+    def test_missing_sep_is_reported_as_the_reason(self):
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "frame.png"
+            write_star_field(path, 2.0)
+            with mock.patch.dict(sys.modules, {"sep": None}):
+                measurement, reason = measure_frame_detailed(path, None)
+        self.assertIsNone(measurement)
+        self.assertIn("missing prerequisite: sep==1.4.1", reason)
+
+    def test_saturation_resolution_provenance(self):
+        self.assertEqual(resolve_saturation(65535.0, 16383.0), (16383.0, "declared_sensor_saturation"))
+        self.assertEqual(resolve_saturation(255.0, None), (255.0, "container_ceiling_8bit"))
+        self.assertEqual(resolve_saturation(65535.0, None), (None, None))
+        self.assertEqual(resolve_saturation(None, None), (None, None))
 
     def test_declared_saturation_gates_a_sixteen_bit_sweep(self):
         """…and BP-2's measured value closes it."""
