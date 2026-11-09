@@ -85,7 +85,9 @@ export interface SharedObservation {
     imageFwhmArcsec: number | null;
     qualityUncertainty: number | null;
     hfrLogSigma: number | null;
-    starCount: number;
+    /** `null` when the daemon reports that detection did not run (a current
+     *  payload whose `detection` is null); legacy payloads keep their number. */
+    starCount: number | null;
     starCountUsed: number;
     /** Why detected stars were not used ("14 detected / 5 used" explained). */
     starRejections: StarRejectionTallies;
@@ -184,7 +186,7 @@ export function mapSharedObservation(raw: unknown): SharedObservation | null {
         imageFwhmArcsec: num(obs.image_fwhm_arcsec),
         qualityUncertainty: num(obs.quality_uncertainty),
         hfrLogSigma: num(obs.hfr_log_sigma),
-        starCount: num(obs.star_count) ?? 0,
+        starCount: background && !detection ? null : (num(obs.star_count) ?? 0),
         starCountUsed: num(obs.star_count_used) ?? 0,
         starRejections: { ...EMPTY_TALLIES, ...(record(obs.star_rejections) ?? {}) },
         fqeHfrPx: num(obs.fqe_hfr_px),

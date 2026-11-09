@@ -44,7 +44,7 @@ use crate::state::AppState;
 use crate::storage::plate_solve_repo::LatestSolve;
 
 use super::background_dispatch;
-use super::background_model::BackgroundSettings;
+use super::background_model::{BackgroundSettings, LevelStatus};
 use super::fqe_runner::{aggregate_fqe, FqeRunner};
 use super::observed_frame::ObservedFrame;
 use super::shared_observation::{CloudEvent, EquipmentValidity, SharedObservation};
@@ -722,22 +722,34 @@ fn observation_with_context(
             }
         }
     }
-    trends.follow_background_identity(background.result.identity());
+    // An unavailable frame is not a change of measurement semantics; only a
+    // measured result can restart the references (BGE-19).
+    if background.result.level_status == LevelStatus::Measured {
+        trends.follow_background_identity(background.result.identity());
+    }
     let new_frame = trends.last_frame_counter != Some(frame.frame_counter);
     trends.last_frame_counter = Some(frame.frame_counter);
     // H2: a frame exposed while equipment moved is not evidence about cloud.
     let counts = new_frame && !context.moved();
-    let cloud_probability = update_cloud_probability(
-        trends,
-        quality.star_count_detected,
-        background.result.level(),
-        quality.observation_valid(),
-        counts,
-    );
-    let cloud_event = if counts {
-        update_cloud_event(trends, cloud_probability)
+    // Detection that did not run (no background, unresolved noise, failed
+    // extraction, malformed frame) is no evidence about cloud: no star count,
+    // no reference update, and the event counters neither advance nor reset.
+    let (cloud_probability, cloud_event) = if quality.detection.is_some() {
+        let probability = update_cloud_probability(
+            trends,
+            quality.star_count_detected,
+            background.result.level(),
+            quality.observation_valid(),
+            counts,
+        );
+        let event = if counts {
+            update_cloud_event(trends, probability)
+        } else {
+            CloudEvent::None
+        };
+        (Some(probability), event)
     } else {
-        CloudEvent::None
+        (None, CloudEvent::None)
     };
 
     let observation_valid = quality.observation_valid();
@@ -767,7 +779,10 @@ fn observation_with_context(
         fqe_calibrated,
         cloud_probability,
         cloud_event,
-        trailing_severity: trailing.severity,
+        trailing_severity: trailing
+            .unavailable_reason
+            .is_none()
+            .then_some(trailing.severity),
         trailing_axis: trailing.axis_label(),
         trailing_direction_pa: trailing.sensor_pa_deg,
         ted: Some(ted),
@@ -998,6 +1013,105 @@ mod analysis_domain_tests {
         descriptor.height = h;
         descriptor.row_stride_bytes = w;
         frame
+    }
+
+    fn sep_context(edit: impl FnOnce(&mut BackgroundSettings)) -> ObservationContext {
+        let mut settings = BackgroundSettings {
+            backend: crate::vision::background_model::BackgroundBackend::Sep,
+            ..Default::default()
+        };
+        edit(&mut settings);
+        ObservationContext {
+            background_settings: settings,
+            ..Default::default()
+        }
+    }
+
+    /// Analyse `frame` as the live loop does: with the previous observation
+    /// (the descriptor-continuity check otherwise restarts the trends).
+    fn analyse_in_sequence(
+        frame: &FrameData,
+        trends: &mut VisionTrendState,
+        previous: &mut Option<SharedObservation>,
+        context: &ObservationContext,
+    ) -> SharedObservation {
+        let observation =
+            observation_with_context(frame, trends, previous.as_ref(), None, context).unwrap();
+        *previous = Some(observation.clone());
+        observation
+    }
+
+    #[test]
+    fn failed_detection_is_no_cloud_star_or_trail_evidence() {
+        let good = sep_context(|_| {});
+        // A pixel stack far too small makes every SEP extraction fail; the
+        // background stays measured (adapter contract), detection does not.
+        let failing = sep_context(|settings| settings.detection.pixstack = 10);
+        let (mut trends, mut previous) = (VisionTrendState::default(), None);
+        let mut frame = ramp_star_frame();
+        for counter in 0..3 {
+            frame.frame_counter = 100 + counter;
+            analyse_in_sequence(&frame, &mut trends, &mut previous, &good);
+        }
+        let stars = trends.clear_star_baseline;
+        assert!(stars.is_some());
+        for counter in 0..5 {
+            frame.frame_counter = 200 + counter;
+            let observation = analyse_in_sequence(&frame, &mut trends, &mut previous, &failing);
+            assert_eq!(
+                observation.status,
+                quality::QualityStatus::DetectionUnavailable
+            );
+            assert!(observation.background.as_ref().unwrap().level().is_some());
+            assert!(observation.detection.is_none());
+            assert_eq!(observation.measured_star_count(), None);
+            assert_eq!(observation.cloud_probability, None);
+            assert_eq!(observation.cloud_event, CloudEvent::None);
+            assert_eq!(observation.trailing_severity, None);
+            let ted = observation.ted.as_ref().unwrap();
+            assert_eq!(ted.severity, None);
+            assert_eq!(ted.trailing_detected, None);
+            assert!(ted.unavailable_reason.is_some());
+        }
+        // Five frames without detection neither declare cloud nor move the
+        // clear-sky star reference.
+        assert_eq!(trends.consecutive_cloudy, 0);
+        assert_eq!(trends.clear_star_baseline, stars);
+    }
+
+    #[test]
+    fn one_unavailable_frame_does_not_restart_the_cloud_references() {
+        let good = sep_context(|_| {});
+        // 200 px meshes do not fit twice into a 256x192 frame: no background.
+        let unavailable = sep_context(|settings| {
+            settings.sep.bw = 200;
+            settings.sep.bh = 200;
+        });
+        let (mut trends, mut previous) = (VisionTrendState::default(), None);
+        let mut frame = ramp_star_frame();
+        for counter in 0..4 {
+            frame.frame_counter = 300 + counter;
+            analyse_in_sequence(&frame, &mut trends, &mut previous, &good);
+        }
+        let stars = trends.clear_star_baseline;
+        let sky = trends.clear_background_baseline;
+        assert!(stars.is_some() && sky.is_some());
+
+        frame.frame_counter = 400;
+        let missing = analyse_in_sequence(&frame, &mut trends, &mut previous, &unavailable);
+        assert_eq!(
+            missing.status,
+            quality::QualityStatus::BackgroundUnavailable
+        );
+        assert_eq!(missing.background_adu, None);
+        assert_eq!(missing.cloud_probability, None);
+        assert_eq!(trends.clear_star_baseline, stars);
+        assert_eq!(trends.clear_background_baseline, sky);
+
+        frame.frame_counter = 401;
+        analyse_in_sequence(&frame, &mut trends, &mut previous, &good);
+        assert_eq!(trends.clear_star_baseline, stars);
+        assert!(trends.clear_background_baseline.is_some());
     }
 
     #[test]
@@ -1597,7 +1711,7 @@ mod analysis_domain_tests {
             .unwrap()
         };
         let unsolved = analyse(&ObservationContext::default());
-        assert!(unsolved.trailing_severity > 0.15);
+        assert!(unsolved.trailing_severity.unwrap() > 0.15);
         assert_eq!(unsolved.trailing_axis.as_deref(), Some("sensor_x"));
         let ted = unsolved.ted.unwrap();
         assert_eq!(ted.sky_axis, None);

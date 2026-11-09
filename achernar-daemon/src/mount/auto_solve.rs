@@ -217,8 +217,9 @@ fn readings(state: &AppState) -> TriggerReadings {
         .ok()
         .and_then(|bus| bus.clone());
     if let Some(observation) = observation {
-        readings.star_count = Some(observation.star_count);
-        readings.cloud_probability = Some(f64::from(observation.cloud_probability));
+        // Absent, not 0, when detection did not run on the frame.
+        readings.star_count = observation.measured_star_count();
+        readings.cloud_probability = observation.cloud_probability.map(f64::from);
         let age = (Utc::now() - observation.timestamp)
             .num_milliseconds()
             .max(0);

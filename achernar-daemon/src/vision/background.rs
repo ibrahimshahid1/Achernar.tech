@@ -114,7 +114,7 @@ pub fn legacy_result(frame: &LumaFrame, stats: Option<&LegacyGlobalStats>) -> Ba
     let saturation_evidence = frame.saturation_evidence();
     let saturation_fraction = if saturation_evidence == "unknown" {
         None
-    } else if frame.analysis_descriptor.is_some() {
+    } else if frame.analysis_descriptor.is_some() || saturation_evidence == "native_mask" {
         // Versioned analysis: the fraction of analysis pixels touched by the
         // reconstruction footprint of clipped native samples.
         (!frame.pixels.is_empty()).then(|| {

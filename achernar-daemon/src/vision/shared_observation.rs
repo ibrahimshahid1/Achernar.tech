@@ -107,7 +107,9 @@ pub struct SharedObservation {
     /// Robust std-dev of `ln(HFR)` across the stars used. This is between-star
     /// dispersion, not a calibrated standard error of the frame median.
     pub hfr_log_sigma: Option<f32>,
-    /// Stars detected in the frame.
+    /// Stars detected in the frame. Kept as a number for compatibility: when
+    /// `detection` is `None` detection did not run and 0 is not a count; use
+    /// [`SharedObservation::measured_star_count`].
     pub star_count: u32,
     /// Stars that produced a finite HFR.
     pub star_count_used: u32,
@@ -143,11 +145,16 @@ pub struct SharedObservation {
     pub fqe_calibrated: Option<bool>,
 
     // --- From CloudObstructionClassifier ---
-    pub cloud_probability: f32,
+    /// `None` when the frame carried no cloud evidence (analysis unavailable,
+    /// or detection did not run so no star count exists).
+    #[serde(default)]
+    pub cloud_probability: Option<f32>,
     pub cloud_event: CloudEvent,
 
     // --- From TrailingElongationDetector ---
-    pub trailing_severity: f32,
+    /// `None` when trailing was not measured (`trailing_unavailable_reason`).
+    #[serde(default)]
+    pub trailing_severity: Option<f32>,
     /// `RA`, `Dec` or `Ambiguous` only when a WCS still describes the frame
     /// (H15); otherwise the sensor axis: `sensor_x`, `sensor_y` or
     /// `sensor_diagonal`.
@@ -251,6 +258,11 @@ impl SharedObservation {
         self.detection = detection;
     }
 
+    /// The detected star count, or `None` when detection did not run.
+    pub fn measured_star_count(&self) -> Option<u32> {
+        self.detection.is_some().then_some(self.star_count)
+    }
+
     /// How to read the background fields of this observation:
     /// `current` (a versioned `background` result is attached),
     /// `legacy_unverified` (only the old top-level numbers exist; a stored 0
@@ -301,9 +313,9 @@ impl SharedObservation {
             fqe_star_count: None,
             fqe_model_version: None,
             fqe_calibrated: None,
-            cloud_probability: 0.0,
+            cloud_probability: None,
             cloud_event: CloudEvent::None,
-            trailing_severity: 0.0,
+            trailing_severity: None,
             trailing_axis: None,
             trailing_direction_pa: None,
             ted: None,

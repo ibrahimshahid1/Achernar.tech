@@ -38,10 +38,13 @@ fn sep_backend(
 
 /// Apply the fallback policy around a SEP backend call.
 ///
-/// A SEP result whose level was measured but whose catalog is missing only
-/// because the noise is unresolved is *not* a backend failure: it is
-/// returned as is, and detection reports itself unavailable. An extraction
-/// error is a failure.
+/// A SEP result whose background was measured is kept even when detection
+/// could not run (unresolved noise, or an extraction error in
+/// `catalog_error`): the frame then reports detection unavailable, not a
+/// missing background. Only the configured legacy fallback replaces such a
+/// result, and then the whole analysis (background and detection) is the
+/// labelled legacy method. An `Err` (no SEP background at all) is
+/// unavailable by default.
 pub fn analyze_with_sep(
     frame: &LumaFrame,
     settings: &BackgroundSettings,
@@ -51,7 +54,8 @@ pub fn analyze_with_sep(
         Ok(analysis) => match &analysis.catalog_error {
             Some(error)
                 if analysis.catalog.is_none()
-                    && analysis.result.noise_status == NoiseStatus::Measured =>
+                    && analysis.result.noise_status == NoiseStatus::Measured
+                    && settings.fallback == BackgroundFallback::LegacyGlobalClip =>
             {
                 (BackgroundReason::BackendFailure, error.clone())
             }
@@ -220,7 +224,9 @@ mod tests {
     }
 
     #[test]
-    fn extraction_failure_is_a_failure_but_unresolved_noise_is_not() {
+    fn extraction_failure_keeps_the_measured_background_unless_falling_back() {
+        // The adapter contract: an extraction error keeps B(x,y) and sets
+        // catalog_error. Detection is then unavailable, not the background.
         let measured_without_catalog = |noise_status| {
             let mut ok = background_from_luma(&frame());
             ok.result.method = BackgroundMethod::SepSpatialMesh;
@@ -228,17 +234,32 @@ mod tests {
             ok.catalog_error = Some("pixstack full".into());
             ok
         };
-        let failed = analyze_with_sep(
+        let kept = analyze_with_sep(
             &frame(),
             &sep_settings(BackgroundFallback::Unavailable),
             |_, _| Ok(measured_without_catalog(NoiseStatus::Measured)),
         );
-        assert_eq!(failed.result.level_status, LevelStatus::Unavailable);
+        assert_eq!(kept.result.method, BackgroundMethod::SepSpatialMesh);
+        assert_eq!(kept.result.level_status, LevelStatus::Measured);
+        assert!(kept.catalog.is_none());
+        assert_eq!(kept.catalog_error.as_deref(), Some("pixstack full"));
+
+        let fallback = analyze_with_sep(
+            &frame(),
+            &sep_settings(BackgroundFallback::LegacyGlobalClip),
+            |_, _| Ok(measured_without_catalog(NoiseStatus::Measured)),
+        );
+        assert_eq!(fallback.result.method, BackgroundMethod::LegacyGlobalClip);
         assert_eq!(
-            failed.result.backend_error.as_deref(),
+            fallback.result.backend_error.as_deref(),
             Some("pixstack full")
         );
+        assert!(fallback
+            .result
+            .reasons
+            .contains(&BackgroundReason::FallbackUsed));
 
+        // Unresolved noise is not a backend failure: no fallback.
         let unresolved = analyze_with_sep(
             &frame(),
             &sep_settings(BackgroundFallback::LegacyGlobalClip),

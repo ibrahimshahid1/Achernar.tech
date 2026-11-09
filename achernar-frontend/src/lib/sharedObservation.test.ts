@@ -60,6 +60,13 @@ describe("mapSharedObservation background contract", () => {
         )!;
         expect(obs.backgroundProvenance).toBe("current");
         expect(obs.background?.level).toBe(812.4);
+        // A current payload without detection provenance has no star count.
+        expect(obs.starCount).toBeNull();
+        const detected = mapSharedObservation(
+            observation({ background: measuredBackground, detection: { method: "sep_extract" } }),
+        )!;
+        expect(detected.starCount).toBe(12);
+        expect(detected.detectionMethod).toBe("sep_extract");
         expect(obs.background?.gradientXPerPx).toBeNull();
         expect(displayBackgroundLevel(obs)).toEqual({ text: "812.4 adu", note: null });
         expect(displayBackgroundNoise(obs)).toEqual({ text: "9.50 adu", note: null });
@@ -92,6 +99,8 @@ describe("mapSharedObservation background contract", () => {
         expect(obs.backgroundSigma).toBeNull();
         expect(obs.saturationFraction).toBeNull();
         expect(obs.trailingSeverity).toBeNull();
+        // Detection did not run: no star count, not a count of 0.
+        expect(obs.starCount).toBeNull();
         expect(displayBackgroundLevel(obs)).toEqual({ text: "—", note: "frame_smaller_than_mesh_grid" });
         expect(displayBackgroundNoise(obs).text).toBe("—");
     });
@@ -127,6 +136,7 @@ describe("mapSharedObservation background contract", () => {
         )!;
         expect(obs.backgroundProvenance).toBe("legacy_unverified");
         expect(obs.backgroundAdu).toBe(0);
+        expect(obs.starCount).toBe(12);
         expect(displayBackgroundLevel(obs)).toEqual({ text: "0.0 ADU", note: "legacy record, unverified" });
     });
 

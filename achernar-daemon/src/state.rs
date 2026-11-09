@@ -479,8 +479,7 @@ impl AppState {
         self
     }
 
-    /// Arm the automatic solve rules from `[plate_solve]`, with the startup
-    /// rule pending.
+    /// `[vision.background]` for the vision loop (legacy by default).
     pub fn with_background_settings(
         mut self,
         settings: crate::vision::background_model::BackgroundSettings,
@@ -489,6 +488,8 @@ impl AppState {
         self
     }
 
+    /// Arm the automatic solve rules from `[plate_solve]`, with the startup
+    /// rule pending.
     pub fn with_auto_solve(self, config: &crate::config::PlateSolveConfig) -> Self {
         if config.auto_solve {
             *self.plate_solve_trigger.lock().unwrap() =

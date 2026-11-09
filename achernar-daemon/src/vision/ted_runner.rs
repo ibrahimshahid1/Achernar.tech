@@ -33,9 +33,15 @@ use crate::equipment::types::{AlignmentMode, DriveRate, PierSide};
 pub struct TedEvidence {
     /// `classical`, or the learned model's path once one exists.
     pub model: String,
-    pub severity: f32,
-    pub trailing_detected: bool,
-    pub elongation_ratio: f64,
+    /// `None` when trailing could not be measured (see `unavailable_reason`);
+    /// never a 0 that would read as an untrailed frame.
+    pub severity: Option<f32>,
+    pub trailing_detected: Option<bool>,
+    pub elongation_ratio: Option<f64>,
+    /// Why the pixel measurement is absent (no background, unresolved noise,
+    /// detection failure).
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
     pub sensor_pa_deg: Option<f32>,
     pub sensor_axis: Option<SensorAxis>,
     pub sky_axis: Option<SkyAxis>,
@@ -92,14 +98,16 @@ impl TedRunner {
         estimate: &TrailingEstimate,
         window: Option<&DeviceWindow>,
     ) -> TedEvidence {
+        let measured = estimate.unavailable_reason.is_none();
         let mut evidence = TedEvidence {
             model: self
                 .model_path
                 .clone()
                 .unwrap_or_else(|| "classical".to_string()),
-            severity: estimate.severity,
-            trailing_detected: self.detected(estimate),
-            elongation_ratio: elongation_ratio(estimate.severity),
+            severity: measured.then_some(estimate.severity),
+            trailing_detected: measured.then(|| self.detected(estimate)),
+            elongation_ratio: measured.then(|| elongation_ratio(estimate.severity)),
+            unavailable_reason: estimate.unavailable_reason.clone(),
             sensor_pa_deg: estimate.sensor_pa_deg,
             sensor_axis: estimate.sensor_axis,
             sky_axis: estimate.sky.as_ref().map(|s| s.axis),
@@ -293,7 +301,7 @@ mod tests {
         let evidence =
             TedRunner::new(None).evidence(&trailed(), Some(&window([Some(true), Some(true)])));
         assert_eq!(evidence.model, "classical");
-        assert!(evidence.trailing_detected);
+        assert_eq!(evidence.trailing_detected, Some(true));
         assert_eq!(evidence.tracking, Some(true));
         assert_eq!(evidence.slewing_any, Some(false));
         assert_eq!(evidence.pulse_guiding_any, Some(true));

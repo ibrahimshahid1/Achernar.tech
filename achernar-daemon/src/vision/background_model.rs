@@ -75,8 +75,10 @@ pub enum LevelStatus {
 pub enum NoiseStatus {
     /// A positive noise scale was measured from the declared source.
     Measured,
-    /// The level is known but the empirical scatter is zero (for example a
-    /// quantized plateau). Detector noise is not known to be zero.
+    /// The level is known but no valid noise scale exists: the empirical
+    /// scatter is zero (a quantized plateau; `zero_empirical_scatter`) or the
+    /// interpolated RMS map is not a usable noise (`invalid_rms_map`). The
+    /// reasons say which. Detector noise is not known to be zero.
     Unresolved,
     /// No noise estimate exists (for example because no level exists).
     Unavailable,

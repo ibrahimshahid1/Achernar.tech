@@ -1038,6 +1038,14 @@ fn saturation_gate(frame: &LumaFrame) -> SaturationGate {
         {
             SaturationGate::NativeMaskApplied
         }
+        // A caller-attached native clipping mask on a frame without a
+        // descriptor is applied by the footprint veto too.
+        _ if frame.analysis_descriptor.is_none()
+            && !frame.masks.native_saturation.is_empty()
+            && frame.masks.native_saturation.len() == frame.pixels.len() =>
+        {
+            SaturationGate::NativeMaskApplied
+        }
         _ => SaturationGate::NotPerformed,
     }
 }
@@ -1869,5 +1877,31 @@ mod tests {
         assert_eq!(quality.star_count_used, 0);
         assert!(quality.star_rejections.low_snr >= 1);
         assert!(quality.star_rejections.too_few_pixels >= 1);
+    }
+
+    #[test]
+    fn attached_native_mask_without_descriptor_is_an_applied_gate() {
+        // Before: the footprint veto used the mask while the gate said
+        // NotPerformed and the fraction was absent.
+        let mut frame = clipped_14bit_star_frame(None);
+        let mut mask = vec![0u8; frame.pixels.len()];
+        for index in 0..frame.pixels.len() {
+            if frame.pixels[index] >= 16_000.0 {
+                mask[index] = 1;
+            }
+        }
+        let clipped = mask.iter().filter(|m| **m == 1).count();
+        assert!(clipped > 0);
+        frame.masks.native_saturation = mask;
+        let background = background_from_luma(&frame);
+        let quality = estimate_quality(&frame, &background);
+        assert_eq!(
+            quality.saturation_gate,
+            super::SaturationGate::NativeMaskApplied
+        );
+        assert!(quality.star_rejections.saturated > 0);
+        assert_eq!(background.result.support.saturation_evidence, "native_mask");
+        let fraction = background.result.saturation_fraction.unwrap();
+        assert!((fraction - clipped as f32 / frame.pixels.len() as f32).abs() < 1e-6);
     }
 }
