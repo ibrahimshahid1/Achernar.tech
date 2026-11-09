@@ -21,9 +21,20 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from data_pipeline.build_focus_quality_dataset import (  # noqa: E402
+    DEFAULT_OUTPUT,
+    LABEL_VERSION,
+    LEGACY_UNVERIFIED,
+    PERMISSIVE_SATURATION,
+    QUALIFIED,
+    LegacyUnverifiedLabels,
     build_dataset,
+    label_provenance_status,
+    load_qualified_dataset,
+    qualified_row_mask,
+    saturation_decision_from_quality,
     saturation_level_from_quality,
 )
+from labels.psf_measure import SepBackgroundParams, SepDetectionParams  # noqa: E402
 from data_pipeline.synthetic_psf import render_star  # noqa: E402
 
 
@@ -35,6 +46,37 @@ def _write_frame_png(path, hfr, rng, size=192):
     # reported unavailable (test_psf_measure_spatial: frame_smaller_than_mesh_grid).
     img = render_star(hfr, size=size, amp=12000.0, sky=200.0, rng=rng).astype(np.uint16)
     Image.fromarray(img).save(path)
+
+
+FROZEN_V1 = Path(__file__).resolve().parent.parent / "data_pipeline" / "focus_quality_synth_v1.npz"
+
+
+def _fixture_db(d, *, n_runs=2, size=192, rng=None):
+    """A daemon-shaped DB with declared-saturation frames; returns the DB path."""
+    rng = rng or np.random.default_rng(0)
+    db_path = os.path.join(d, "achernar.db")
+    con = _make_schema(db_path)
+    for run in range(n_runs):
+        con.execute(
+            "INSERT INTO focus_runs (id, rig_id, filter_name, started_at) VALUES (?, ?, ?, ?)",
+            (f"run-{run}", f"rig-{run}", "L", f"2026-07-{20 + run:02d}T01:00:00Z"),
+        )
+        for i, hfr in enumerate([2.0, 3.5, 5.0]):
+            fid = f"frame-{run}-{i}"
+            png = os.path.join(d, f"{fid}.png")
+            _write_frame_png(png, hfr, rng, size=size)
+            con.execute(
+                "INSERT INTO frames (id, local_path, checksum_sha256, quality_json) VALUES (?, ?, ?, ?)",
+                (fid, png, hashlib.sha256(Path(png).read_bytes()).hexdigest(),
+                 '{"max_adu": 65535, "saturation_adu": 16383, "saturation_gate_applied": true}'),
+            )
+            con.execute(
+                "INSERT INTO focus_samples (run_id, position, hfr, frame_id) VALUES (?, ?, ?, ?)",
+                (f"run-{run}", 10000 + i * 250, hfr, fid),
+            )
+    con.commit()
+    con.close()
+    return db_path
 
 
 def _make_schema(db_path):
@@ -172,6 +214,118 @@ class TestDatasetBuilder(unittest.TestCase):
             self.assertLessEqual(ds["crops"].max(), 1.0)
 
 
+class TestLabelProvenance(unittest.TestCase):
+    """BGE-20: new labels carry version + SEP config provenance; frozen
+    datasets are never overwritten; legacy rows never enter a qualified
+    evaluation."""
+
+    def test_manifest_and_rows_carry_sep_provenance(self):
+        with tempfile.TemporaryDirectory() as d:
+            db_path = _fixture_db(d)
+            out = os.path.join(d, "v2", "ds.npz")
+            ds = build_dataset(db_path, out)
+            manifest = json.loads(Path(out).with_suffix(".manifest.json").read_text())
+            self.assertEqual(manifest["label_version"], LABEL_VERSION)
+            self.assertEqual(manifest["sep_version"], "1.4.1")
+            self.assertEqual(manifest["background_config"], SepBackgroundParams().config())
+            self.assertEqual(manifest["background_config_sha256"], SepBackgroundParams().config_sha256())
+            self.assertEqual(manifest["detection_config"], SepDetectionParams().config())
+            self.assertEqual(manifest["detection_config_sha256"], SepDetectionParams().config_sha256())
+            self.assertEqual(manifest["noise_source"], "empirical_mesh_rms")
+            self.assertEqual(set(manifest["width_definition"]), {"hfr", "hfd", "fwhm"})
+            self.assertEqual(manifest["frames_by_saturation_source"], {"declared_sensor_saturation": 6})
+            self.assertEqual(manifest["frames_by_saturation_gate"], {"applied": 6})
+            self.assertIsInstance(manifest["rejection_counts"], dict)
+            self.assertEqual(manifest["frames_background_unavailable"], {})
+            n = len(ds["hfr_px"])
+            self.assertTrue(np.all(ds["label_version"] == LABEL_VERSION))
+            self.assertTrue(np.all(ds["background_config_sha256"] == manifest["background_config_sha256"]))
+            self.assertTrue(np.all(ds["detection_config_sha256"] == manifest["detection_config_sha256"]))
+            self.assertTrue(np.all(ds["saturation_source"] == "declared_sensor_saturation"))
+            self.assertEqual(ds["local_rms_adu"].shape, (n,))
+            self.assertTrue(np.all(ds["local_rms_adu"] > 0))
+            self.assertEqual(label_provenance_status(manifest), QUALIFIED)
+            loaded, report = load_qualified_dataset(out)
+            self.assertEqual(report["rows_qualified"], n)
+            self.assertEqual(len(loaded["hfr_px"]), n)
+
+    def test_existing_dataset_and_manifest_are_never_overwritten(self):
+        self.assertNotEqual(Path(DEFAULT_OUTPUT).name, "focus_quality_ds_v1.npz")
+        with tempfile.TemporaryDirectory() as d:
+            db_path = _fixture_db(d, n_runs=1)
+            # A frozen legacy artifact (a copy of the repository's frozen v1 set)
+            # sitting where the caller points the builder.
+            frozen = Path(d) / "frozen" / "ds.npz"
+            frozen.parent.mkdir()
+            frozen.write_bytes(FROZEN_V1.read_bytes())
+            legacy_manifest = frozen.with_suffix(".manifest.json")
+            legacy_manifest.write_text('{"label_method": "SEP mesh background", "saturation_gate": "enforced"}')
+            before = (hashlib.sha256(frozen.read_bytes()).hexdigest(), legacy_manifest.read_text())
+            for overwrite in (False, True):
+                with self.assertRaises(FileExistsError):
+                    build_dataset(db_path, str(frozen), overwrite=overwrite)
+            self.assertEqual((hashlib.sha256(frozen.read_bytes()).hexdigest(), legacy_manifest.read_text()), before)
+
+            # A manifest alone (dataset moved away) is protected too.
+            lonely = Path(d) / "lonely.npz"
+            lonely.with_suffix(".manifest.json").write_text("{}")
+            with self.assertRaises(FileExistsError):
+                build_dataset(db_path, str(lonely))
+            self.assertFalse(lonely.exists())
+
+            # Rebuilding a v2 dataset in place needs an explicit overwrite.
+            fresh = Path(d) / "fresh.npz"
+            build_dataset(db_path, str(fresh))
+            with self.assertRaises(FileExistsError):
+                build_dataset(db_path, str(fresh))
+            build_dataset(db_path, str(fresh), overwrite=True)
+
+    def test_legacy_rows_are_excluded_from_qualified_evaluation(self):
+        # The repository's frozen synthetic set has no manifest: all legacy.
+        with self.assertRaises(LegacyUnverifiedLabels):
+            load_qualified_dataset(str(FROZEN_V1))
+        self.assertEqual(label_provenance_status(None), LEGACY_UNVERIFIED)
+        self.assertEqual(label_provenance_status({"label_method": "SEP mesh background"}), LEGACY_UNVERIFIED)
+
+        with tempfile.TemporaryDirectory() as d:
+            db_path = _fixture_db(d, n_runs=1)
+            out = Path(d) / "ds.npz"
+            ds = build_dataset(db_path, str(out))
+            manifest = json.loads(out.with_suffix(".manifest.json").read_text())
+            n = len(ds["hfr_px"])
+
+            # Mixed rows: append rows lacking the provenance columns' values.
+            mixed = {k: np.concatenate([v, v]) for k, v in ds.items()}
+            mixed["label_version"][n:] = ""
+            mixed["background_config_sha256"][n:] = ""
+            mask = qualified_row_mask(mixed, manifest)
+            self.assertEqual(int(mask.sum()), n)
+            self.assertFalse(mask[n:].any())
+            mixed_path = Path(d) / "mixed.npz"
+            np.savez_compressed(mixed_path, **mixed)
+            mixed_path.with_suffix(".manifest.json").write_text(json.dumps(manifest))
+            loaded, report = load_qualified_dataset(str(mixed_path))
+            self.assertEqual((report["rows_total"], report["rows_qualified"], report["rows_legacy_unverified"]),
+                             (2 * n, n, n))
+            self.assertEqual(len(loaded["hfr_px"]), n)
+            self.assertTrue(np.all(loaded["label_version"] == LABEL_VERSION))
+
+            # A manifest whose config no longer matches its recorded hash is not trusted.
+            tampered = dict(manifest, detection_config=dict(manifest["detection_config"], thresh_sigma=3.0))
+            self.assertEqual(label_provenance_status(tampered), LEGACY_UNVERIFIED)
+            self.assertFalse(qualified_row_mask(ds, tampered).any())
+            # A permissive (ungated) build is never qualified either.
+            self.assertEqual(label_provenance_status(dict(manifest, saturation_gate="permissive")),
+                             PERMISSIVE_SATURATION)
+
+    def test_frames_below_the_mesh_grid_are_counted_not_labelled(self):
+        with tempfile.TemporaryDirectory() as d:
+            db_path = _fixture_db(d, n_runs=1, size=96)
+            with self.assertRaises(RuntimeError) as ctx:
+                build_dataset(db_path, os.path.join(d, "ds.npz"))
+            self.assertIn("frame_smaller_than_mesh_grid", str(ctx.exception))
+
+
 class TestSaturationGate(unittest.TestCase):
     """The D1 regression: the builder must read `saturation_adu`, not `max_adu`.
 
@@ -190,11 +344,16 @@ class TestSaturationGate(unittest.TestCase):
         self.assertIsNone(saturation_level_from_quality('{"max_adu": 65535}'))
 
     def test_eight_bit_container_is_its_own_clip_point(self):
-        # Mirrors the 8-bit arm of resolve_saturation_adu in vision/quality.rs:
-        # for a UVC/Mono8 stream the container really is where it clips.
+        # Decision D-011: for a UVC/Mono8 stream 255 is the real ceiling of the
+        # recorded data. Its provenance is the container, not the sensor.
         self.assertAlmostEqual(
             saturation_level_from_quality('{"max_adu": 255}'), 255 * 0.98, places=3
         )
+        threshold, source = saturation_decision_from_quality('{"max_adu": 255}')
+        self.assertEqual(source, "container_ceiling_8bit")
+        threshold, source = saturation_decision_from_quality('{"saturation_adu": 16383, "max_adu": 255}')
+        self.assertEqual((threshold, source), (16383 * 0.98, "declared_sensor_saturation"))
+        self.assertEqual(saturation_decision_from_quality('{"max_adu": 65535}'), (None, None))
 
     def test_explicit_gate_not_applied_overrides_any_value(self):
         q = '{"saturation_adu": 16383, "saturation_gate_applied": false}'
