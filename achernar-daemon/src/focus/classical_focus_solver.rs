@@ -20,11 +20,61 @@ pub enum CurveFitMethod {
     Hyperbola,
 }
 
+/// The sky an HFR measurement subtracts, chosen by the caller.
+#[derive(Debug, Clone, Copy)]
+pub enum CropSky<'a> {
+    /// One level and noise scale for the whole crop (input units).
+    Uniform { level: f64, sigma: f64 },
+    /// Per-pixel background and noise, row-major like the crop (for example
+    /// a parent-frame spatial map evaluated over the crop).
+    PerPixel { level: &'a [f32], sigma: &'a [f32] },
+}
+
+impl CropSky<'_> {
+    fn level_at(&self, index: usize) -> f64 {
+        match self {
+            CropSky::Uniform { level, .. } => *level,
+            CropSky::PerPixel { level, .. } => level[index] as f64,
+        }
+    }
+}
+
 /// Classical focus metric solver using HFD/HFR.
 pub struct ClassicalFocusSolver;
 
 impl ClassicalFocusSolver {
-    /// Compute HFR (Half-Flux Radius, px) from a star image crop.
+    /// Compute HFR (Half-Flux Radius, px) from a star image crop, using the
+    /// legacy crop sky ([`Self::legacy_crop_sky`]: nearest-rank median and
+    /// upper-middle MAD x 1.4826 of the whole crop).
+    ///
+    /// This is the legacy convenience entry point. Callers that hold a better
+    /// background (a parent-frame spatial map) must use
+    /// [`Self::compute_hfr_with_sky`] so this crop median never silently
+    /// replaces it (audit BGE-13).
+    pub fn compute_hfr(image_data: &[f32], width: usize, height: usize) -> f64 {
+        if width == 0 || height == 0 || image_data.len() != width * height {
+            return f64::NAN;
+        }
+        let (level, sigma) = Self::legacy_crop_sky(image_data);
+        Self::compute_hfr_with_sky(
+            image_data,
+            width,
+            height,
+            &CropSky::Uniform { level, sigma },
+        )
+    }
+
+    /// The legacy crop sky: `(median, 1.4826*MAD)` of the finite crop pixels,
+    /// with the nearest-rank median and the upper-middle absolute deviation.
+    /// Not numerically identical to `quality::local_sky_stats` on even-sized
+    /// crops (mean of the two middle values there).
+    pub fn legacy_crop_sky(image_data: &[f32]) -> (f64, f64) {
+        let background = percentile(image_data, 0.5) as f64;
+        (background, robust_sigma(image_data, background))
+    }
+
+    /// Compute HFR (Half-Flux Radius, px) from a star crop and the sky chosen
+    /// by the caller.
     ///
     /// Two properties this guarantees (matching the corrected Python labeler in
     /// `ml/labels/psf_measure.py`, and unlike the previous implementation):
@@ -37,24 +87,50 @@ impl ClassicalFocusSolver {
     ///   star (~4x an initial estimate), so a larger crop cannot accumulate more
     ///   noise-only annuli into the total.
     ///
-    /// Returns `NaN` when no positive stellar flux is present.
-    pub fn compute_hfr(image_data: &[f32], width: usize, height: usize) -> f64 {
-        if width == 0 || height == 0 || image_data.len() != width * height {
+    /// The sky's noise scale only sets the 3-sigma core used to *locate* the
+    /// centroid. Returns `NaN` when no positive stellar flux is present, when a
+    /// per-pixel sky does not match the crop, or when a per-pixel noise value
+    /// is not positive (an unresolved noise scale is not replaced here).
+    pub fn compute_hfr_with_sky(
+        image_data: &[f32],
+        width: usize,
+        height: usize,
+        sky: &CropSky<'_>,
+    ) -> f64 {
+        let n = width * height;
+        if width == 0 || height == 0 || image_data.len() != n {
             return f64::NAN;
         }
-
-        let background = percentile(image_data, 0.5) as f64;
-        let sky_sigma = robust_sigma(image_data, background);
+        if let CropSky::PerPixel { level, sigma } = sky {
+            if level.len() != n
+                || sigma.len() != n
+                || sigma
+                    .iter()
+                    .any(|value| !(value.is_finite() && *value > 0.0))
+            {
+                return f64::NAN;
+            }
+        }
 
         // Centroid from the thresholded core only. Clipping is fine for
         // *locating* the star; the bug was clipping when *integrating* its flux.
-        let threshold = 3.0 * sky_sigma.max(1e-6);
         let mut core_total = 0.0_f64;
         let mut x_weighted = 0.0_f64;
         let mut y_weighted = 0.0_f64;
         for y in 0..height {
             for x in 0..width {
-                let core = (image_data[y * width + x] as f64 - background - threshold).max(0.0);
+                let index = y * width + x;
+                let core = match sky {
+                    // Legacy: the 1e-6 floor keeps a zero-scatter crop from
+                    // dividing the core at exactly the sky level.
+                    CropSky::Uniform { level, sigma } => {
+                        (image_data[index] as f64 - level - 3.0 * sigma.max(1e-6)).max(0.0)
+                    }
+                    CropSky::PerPixel { level, sigma } => {
+                        (image_data[index] as f64 - level[index] as f64 - 3.0 * sigma[index] as f64)
+                            .max(0.0)
+                    }
+                };
                 if core > 0.0 {
                     core_total += core;
                     x_weighted += x as f64 * core;
@@ -72,9 +148,10 @@ impl ClassicalFocusSolver {
         let mut radial: Vec<(f64, f64)> = Vec::with_capacity(image_data.len());
         for y in 0..height {
             for x in 0..width {
+                let index = y * width + x;
                 let dx = x as f64 - cx;
                 let dy = y as f64 - cy;
-                let resid = image_data[y * width + x] as f64 - background;
+                let resid = image_data[index] as f64 - sky.level_at(index);
                 radial.push(((dx * dx + dy * dy).sqrt(), resid));
             }
         }
@@ -628,7 +705,7 @@ fn solve_3x3(mut matrix: [[f64; 3]; 3], mut rhs: [f64; 3]) -> Option<[f64; 3]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClassicalFocusSolver, CurveFitMethod};
+    use super::{ClassicalFocusSolver, CropSky, CurveFitMethod};
 
     #[test]
     fn hfr_is_finite_for_centered_star_crop() {
@@ -678,6 +755,88 @@ mod tests {
             }
         }
         pixels
+    }
+
+    #[test]
+    fn legacy_entry_point_is_the_explicit_legacy_crop_sky() {
+        // The legacy wrapper must stay bit-identical to passing its own crop
+        // sky explicitly, so the sky-input API change cannot move legacy HFR.
+        for (size, seed) in [(31usize, 3), (64, 4), (96, 5)] {
+            let img = gaussian_star(size, 2.5, 100.0, 3000.0, 25.0, seed);
+            let (level, sigma) = ClassicalFocusSolver::legacy_crop_sky(&img);
+            let explicit = ClassicalFocusSolver::compute_hfr_with_sky(
+                &img,
+                size,
+                size,
+                &CropSky::Uniform { level, sigma },
+            );
+            let legacy = ClassicalFocusSolver::compute_hfr(&img, size, size);
+            assert_eq!(legacy.to_bits(), explicit.to_bits());
+        }
+    }
+
+    #[test]
+    fn legacy_crop_sky_absorbs_a_constant_offset() {
+        // Characterization (BGE-13): the legacy path re-derives its sky from
+        // the crop, so a constant pedestal leaves HFR unchanged.
+        let img = gaussian_star(64, 3.0, 100.0, 3000.0, 25.0, 9);
+        let shifted: Vec<f32> = img.iter().map(|v| v + 500.0).collect();
+        let a = ClassicalFocusSolver::compute_hfr(&img, 64, 64);
+        let b = ClassicalFocusSolver::compute_hfr(&shifted, 64, 64);
+        assert!((a - b).abs() < 1e-3, "{a} vs {b}");
+    }
+
+    #[test]
+    fn per_pixel_sky_removes_a_gradient_the_crop_median_cannot() {
+        // A 3 px HFR star on a steep linear sky gradient. The crop median is
+        // one number, so half the crop is over- and half under-subtracted and
+        // the residual ramp enters the curve of growth. The true per-pixel sky
+        // recovers the width.
+        let size = 64usize;
+        let truth = 3.0_f32;
+        let star = gaussian_star(size, truth, 0.0, 3000.0, 20.0, 11);
+        let level: Vec<f32> = (0..size * size)
+            .map(|i| 1000.0 + 40.0 * (i % size) as f32)
+            .collect();
+        let img: Vec<f32> = star.iter().zip(&level).map(|(s, b)| s + b).collect();
+        let sigma = vec![20.0_f32 / 3.0_f32.sqrt(); size * size];
+
+        let local = ClassicalFocusSolver::compute_hfr_with_sky(
+            &img,
+            size,
+            size,
+            &CropSky::PerPixel {
+                level: &level,
+                sigma: &sigma,
+            },
+        ) as f32;
+        let legacy = ClassicalFocusSolver::compute_hfr(&img, size, size) as f32;
+        assert!((local - truth).abs() < 0.3, "per-pixel sky HFR {local}");
+        // On this ramp the crop median leaves no positive curve of growth at
+        // all (NaN); in milder gradients it is merely biased.
+        assert!(
+            legacy.is_nan() || (legacy - truth).abs() > (local - truth).abs(),
+            "legacy {legacy} vs per-pixel {local}"
+        );
+    }
+
+    #[test]
+    fn per_pixel_sky_refuses_unresolved_noise_and_mismatched_maps() {
+        let img = gaussian_star(32, 2.0, 100.0, 3000.0, 10.0, 2);
+        let level = vec![100.0_f32; 32 * 32];
+        let mut sigma = vec![5.0_f32; 32 * 32];
+        sigma[7] = 0.0;
+        let sky = CropSky::PerPixel {
+            level: &level,
+            sigma: &sigma,
+        };
+        assert!(ClassicalFocusSolver::compute_hfr_with_sky(&img, 32, 32, &sky).is_nan());
+        let short = vec![5.0_f32; 10];
+        let sky = CropSky::PerPixel {
+            level: &level,
+            sigma: &short,
+        };
+        assert!(ClassicalFocusSolver::compute_hfr_with_sky(&img, 32, 32, &sky).is_nan());
     }
 
     #[test]
