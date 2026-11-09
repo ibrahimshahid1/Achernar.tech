@@ -806,11 +806,17 @@ def render_summary(doc, core, sweeps) -> str:
                          _fmt(p.get("catalog_within_d006"))])
         L.append(_table(["case", "level py/rs", "noise py/rs", "max |dB|", "B in bound", "max |dR|", "R in bound",
                          "objects py/rs", "matched <=0.5 px", "max centroid diff", "catalog in bound"], rows))
-        n_cases = len(cross["cases"])
-        n_maps = sum(1 for p in cross["cases"].values() if p.get("back_within_d006_bound") and p.get("rms_within_d006_bound"))
-        n_cat = sum(1 for p in cross["cases"].values() if p.get("catalog_within_d006"))
-        L.insert(len(L) - 1, f"Maps within D-006 in {n_maps}/{n_cases} cases with maps on both sides; catalogs within "
-                             f"D-006 in {n_cat}/{n_cases}.")
+        cases = list(cross["cases"].values())
+
+        def tally(key):
+            vals = [p[key] for p in cases if p.get(key) is not None]
+            return f"{sum(bool(v) for v in vals)}/{len(vals)}"
+
+        statuses_equal = sum(1 for p in cases if (p["python_level_status"], p["python_noise_status"]) ==
+                             (p["rust_level_status"], p["rust_noise_status"]))
+        L.insert(len(L) - 1, f"{len(cases)} cases. Level/noise statuses identical in {statuses_equal}/{len(cases)}. "
+                             f"Within D-006 where both sides produced the item: B maps {tally('back_within_d006_bound')}, "
+                             f"R maps {tally('rms_within_d006_bound')}, catalogs {tally('catalog_within_d006')}.")
         L.insert(len(L) - 1, "")
     L += ["", f"## 3. {SECTION_REAL}", "",
           "`ml/eval/bge/real_frames.py` can load a real-frame manifest for a future run; it refuses accuracy or "
