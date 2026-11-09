@@ -287,6 +287,10 @@ pub struct AppState {
     /// or the newest `models/focus_quality/<semver>/model.onnx`; disabled when
     /// neither exists. The classical measurement stays the control authority.
     pub fqe_runner: Arc<crate::vision::fqe_runner::FqeRunner>,
+    /// `[vision.background]`: background backend, fallback and parameters
+    /// for the vision loop. Defaults to the legacy estimator; `sep` is an
+    /// opt-in diagnostic path.
+    pub background_settings: Arc<crate::vision::background_model::BackgroundSettings>,
     /// Rendered-preview research diagnostics; never supplies control observations.
     pub coc_shadow: Arc<crate::vision::coc_shadow::CocShadowService>,
 
@@ -404,6 +408,7 @@ impl AppState {
             capture_archive,
             rig_id,
             fqe_runner,
+            background_settings: Arc::new(Default::default()),
             coc_shadow,
             plate_solver: Arc::new(crate::processing::plate_solver::PlateSolver::disabled(
                 "No plate solver was configured for this daemon instance",
@@ -476,6 +481,14 @@ impl AppState {
 
     /// Arm the automatic solve rules from `[plate_solve]`, with the startup
     /// rule pending.
+    pub fn with_background_settings(
+        mut self,
+        settings: crate::vision::background_model::BackgroundSettings,
+    ) -> Self {
+        self.background_settings = Arc::new(settings);
+        self
+    }
+
     pub fn with_auto_solve(self, config: &crate::config::PlateSolveConfig) -> Self {
         if config.auto_solve {
             *self.plate_solve_trigger.lock().unwrap() =

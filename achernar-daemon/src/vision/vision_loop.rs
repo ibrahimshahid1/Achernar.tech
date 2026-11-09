@@ -43,6 +43,8 @@ use crate::hardware::camera::FrameData;
 use crate::state::AppState;
 use crate::storage::plate_solve_repo::LatestSolve;
 
+use super::background_dispatch;
+use super::background_model::BackgroundSettings;
 use super::fqe_runner::{aggregate_fqe, FqeRunner};
 use super::observed_frame::ObservedFrame;
 use super::shared_observation::{CloudEvent, EquipmentValidity, SharedObservation};
@@ -77,6 +79,10 @@ struct VisionTrendState {
     cloud_status: CloudStatus,
     consecutive_cloudy: u8,
     consecutive_clear: u8,
+    /// Identity of the background measurements the references were built
+    /// from (`BackgroundResult::identity`): method, configuration, units and
+    /// noise source. A different identity restarts the references.
+    background_identity: Option<String>,
     /// Camera frame counter last used to adapt the references and advance the
     /// event counters. The loop re-analyses the latest frame on every tick, so
     /// a slow camera would otherwise count one exposure several times.
@@ -91,6 +97,7 @@ impl Default for VisionTrendState {
             cloud_status: CloudStatus::Clear,
             consecutive_cloudy: 0,
             consecutive_clear: 0,
+            background_identity: None,
             last_frame_counter: None,
         }
     }
@@ -104,6 +111,21 @@ impl VisionTrendState {
             last_frame_counter: self.last_frame_counter,
             ..Self::default()
         };
+    }
+
+    /// Restart the references when the background measurement semantics
+    /// change (BGE-19): old and new levels are not comparable. Returns
+    /// whether a restart happened.
+    fn follow_background_identity(&mut self, identity: String) -> bool {
+        if self.background_identity.as_deref() == Some(identity.as_str()) {
+            return false;
+        }
+        let restart = self.background_identity.is_some();
+        if restart {
+            self.segment();
+        }
+        self.background_identity = Some(identity);
+        restart
     }
 }
 
@@ -336,6 +358,9 @@ pub struct ObservationContext {
     pub solve_on_this_connection: Option<bool>,
     /// The mount repointed after the solved exposure ([`repoints_mount`]).
     pub mount_repointed_since_solve: Option<bool>,
+    /// `[vision.background]`: which background backend runs, its fallback
+    /// and parameters. Defaults to the legacy estimator.
+    pub background_settings: BackgroundSettings,
 }
 
 impl ObservationContext {
@@ -411,6 +436,7 @@ impl ObservationContext {
             alignment_mode,
             solve_on_this_connection,
             mount_repointed_since_solve,
+            background_settings: state.background_settings.as_ref().clone(),
         }
     }
 
@@ -501,19 +527,43 @@ pub async fn run(state: AppState, rate_hz: f64) {
         };
         let context = ObservationContext::gather(&state, timing.window(), &segments, solve);
 
-        let observation = match observation_with_context(
-            &frame,
-            &mut trends,
-            previous.as_ref(),
-            Some(state.fqe_runner.as_ref()),
-            &context,
-        ) {
-            Ok(observation) => observation,
-            Err(error) => {
+        // Pixel analysis (background, detection, gates, HFR, trailing, FQE) is
+        // CPU-bound and, on the SEP path, native code: it runs on the blocking
+        // pool so the async workers stay responsive. One frame at a time — the
+        // tick awaits it and missed ticks are skipped.
+        let frame = Arc::new(frame);
+        let analysis_frame = Arc::clone(&frame);
+        let fqe = Arc::clone(&state.fqe_runner);
+        let fallback_context = context.clone();
+        let mut analysis_trends = std::mem::take(&mut trends);
+        let analysed = tokio::task::spawn_blocking(move || {
+            let result = observation_with_context(
+                &analysis_frame,
+                &mut analysis_trends,
+                previous.as_ref(),
+                Some(fqe.as_ref()),
+                &context,
+            );
+            (result, analysis_trends, context)
+        })
+        .await;
+        let observation = match analysed {
+            Ok((Ok(observation), returned_trends, _)) => {
+                trends = returned_trends;
+                observation
+            }
+            Ok((Err(error), _, context)) => {
                 // A preview/unknown domain must replace the old measurement;
                 // leaving the previous bus entry would falsely label new pixels.
                 trends = VisionTrendState::default();
                 context.apply(SharedObservation::analysis_unavailable(error.to_string()))
+            }
+            Err(join_error) => {
+                tracing::error!("Vision analysis task failed: {join_error}");
+                trends = VisionTrendState::default();
+                fallback_context.apply(SharedObservation::analysis_unavailable(format!(
+                    "analysis task failed: {join_error}"
+                )))
             }
         };
         let cleared = observation.cloud_event == CloudEvent::ClearedUp;
@@ -533,7 +583,7 @@ pub async fn run(state: AppState, rate_hz: f64) {
                 *slot = Some(ObservedFrame {
                     frame_counter: frame.frame_counter,
                     capture_unix_time: frame.unix_timestamp,
-                    frame: Arc::new(frame),
+                    frame: Arc::clone(&frame),
                     observation: observation.clone(),
                 });
             }
@@ -590,8 +640,15 @@ fn observation_with_context(
     if previous.is_none() {
         *trends = VisionTrendState::default();
     }
-    let background = quality::background_from_luma(&luma);
-    let quality = quality::estimate_quality(&luma, &background);
+    let settings = &context.background_settings;
+    let background = background_dispatch::analyze_background(&luma, settings);
+    let quality = quality::estimate_quality_with_policy(
+        &luma,
+        &background,
+        quality::FocusSourcePolicy {
+            accept_deblended: settings.detection.accept_deblended_for_focus,
+        },
+    );
 
     // H15: the trail on the sensor; on the sky only with a WCS that still
     // describes this frame.
@@ -665,6 +722,7 @@ fn observation_with_context(
             }
         }
     }
+    trends.follow_background_identity(background.result.identity());
     let new_frame = trends.last_frame_counter != Some(frame.frame_counter);
     trends.last_frame_counter = Some(frame.frame_counter);
     // H2: a frame exposed while equipment moved is not evidence about cloud.
@@ -672,7 +730,7 @@ fn observation_with_context(
     let cloud_probability = update_cloud_probability(
         trends,
         quality.star_count_detected,
-        background.background_adu,
+        background.result.level(),
         quality.observation_valid(),
         counts,
     );
@@ -683,7 +741,8 @@ fn observation_with_context(
     };
 
     let observation_valid = quality.observation_valid();
-    Ok(context.apply(SharedObservation {
+    let detection = quality.detection.clone();
+    let mut observation = SharedObservation {
         timestamp: chrono::Utc::now(),
         analysis_descriptor: luma.analysis_descriptor.clone(),
         analysis_unavailable_reason: None,
@@ -712,11 +771,16 @@ fn observation_with_context(
         trailing_axis: trailing.axis_label(),
         trailing_direction_pa: trailing.sensor_pa_deg,
         ted: Some(ted),
-        background_adu: background.background_adu,
-        sky_background_adu: background.background_adu,
-        background_sigma: background.background_sigma,
-        snr_proxy_median: background.snr_proxy_median,
-        saturation_fraction: background.saturation_fraction,
+        trailing_unavailable_reason: trailing.unavailable_reason.clone(),
+        trailing_policy: Some(trailing.policy.to_string()),
+        // Filled from the authoritative result by `set_background`.
+        background: None,
+        detection: None,
+        background_adu: None,
+        sky_background_adu: None,
+        background_sigma: None,
+        snr_proxy_median: None,
+        saturation_fraction: None,
         saturation_gate: quality.saturation_gate,
         // Filled by `context.apply`: from plate_solve_events and the hub,
         // never carried forward from `previous`.
@@ -728,13 +792,15 @@ fn observation_with_context(
         equipment: None,
         coc_context: None,
         observation_valid,
-    }))
+    };
+    observation.set_background(background.result, detection);
+    Ok(context.apply(observation))
 }
 
 fn update_cloud_probability(
     trends: &mut VisionTrendState,
     star_count: u32,
-    background_adu: f32,
+    background_level: Option<f32>,
     observation_valid: bool,
     new_frame: bool,
 ) -> f32 {
@@ -755,13 +821,18 @@ fn update_cloud_probability(
     const RELAX_ALPHA: f32 = 0.005;
     const CLEAR_STAR_DROP: f32 = 0.2;
 
+    // An unavailable background is no evidence: it neither seeds nor adapts
+    // the clear-sky reference, and contributes nothing to the probability.
+    let level = background_level.filter(|value| value.is_finite());
     let stars = star_count as f32;
     if new_frame && observation_valid {
         if trends.clear_star_baseline.is_none() && star_count > 0 {
             trends.clear_star_baseline = Some(stars.max(1.0));
         }
-        if trends.clear_background_baseline.is_none() && background_adu.is_finite() {
-            trends.clear_background_baseline = Some(background_adu.max(1.0));
+        if trends.clear_background_baseline.is_none() {
+            if let Some(level) = level {
+                trends.clear_background_baseline = Some(level.max(1.0));
+            }
         }
     }
 
@@ -769,14 +840,18 @@ fn update_cloud_probability(
         .clear_star_baseline
         .unwrap_or(stars.max(1.0))
         .max(1.0);
-    let background_baseline = trends
-        .clear_background_baseline
-        .unwrap_or(background_adu.max(1.0))
-        .max(1.0);
+    let background_baseline = level.map(|level| {
+        trends
+            .clear_background_baseline
+            .unwrap_or(level.max(1.0))
+            .max(1.0)
+    });
 
     let star_drop = (1.0 - stars / star_baseline).clamp(0.0, 1.0);
-    let background_rise =
-        ((background_adu - background_baseline) / background_baseline).clamp(0.0, 1.0);
+    let background_rise = match (level, background_baseline) {
+        (Some(level), Some(baseline)) => ((level - baseline) / baseline).clamp(0.0, 1.0),
+        _ => 0.0,
+    };
     let invalid_penalty = if observation_valid { 0.0 } else { 0.15 };
     let probability = (0.70 * star_drop + 0.25 * background_rise + invalid_penalty).clamp(0.0, 1.0);
 
@@ -797,8 +872,8 @@ fn update_cloud_probability(
         trends.clear_star_baseline = Some(exp_smooth(star_baseline, stars, RELAX_ALPHA).max(1.0));
     }
 
-    if background_adu.is_finite() {
-        let background = background_adu.max(1.0);
+    if let (Some(level), Some(background_baseline)) = (level, background_baseline) {
+        let background = level.max(1.0);
         if background < background_baseline && star_drop < CLEAR_STAR_DROP {
             trends.clear_background_baseline = Some(
                 exp_smooth(background_baseline, background, RECOVER_ALPHA)
@@ -973,9 +1048,45 @@ mod analysis_domain_tests {
     fn feed(trends: &mut VisionTrendState, stars: u32, background: f32, frames: usize) -> f32 {
         let mut probability = 0.0;
         for _ in 0..frames {
-            probability = update_cloud_probability(trends, stars, background, true, true);
+            probability = update_cloud_probability(trends, stars, Some(background), true, true);
         }
         probability
+    }
+
+    #[test]
+    fn measured_zero_background_seeds_the_reference_like_any_value() {
+        // Characterization: a measured level of 0 is a measurement (for
+        // example calibrated residual frames); it seeds the floored reference.
+        let mut trends = VisionTrendState::default();
+        update_cloud_probability(&mut trends, 30, Some(0.0), true, true);
+        assert_eq!(trends.clear_background_baseline, Some(1.0));
+    }
+
+    #[test]
+    fn unavailable_background_neither_seeds_nor_moves_the_reference() {
+        let mut trends = VisionTrendState::default();
+        let probability = update_cloud_probability(&mut trends, 30, None, true, true);
+        assert!(trends.clear_background_baseline.is_none());
+        assert!(probability.is_finite());
+        feed(&mut trends, 30, 200.0, 3);
+        let reference = trends.clear_background_baseline;
+        for _ in 0..5 {
+            let probability = update_cloud_probability(&mut trends, 30, None, true, true);
+            assert!(probability.is_finite());
+        }
+        assert_eq!(trends.clear_background_baseline, reference);
+    }
+
+    #[test]
+    fn a_new_background_identity_restarts_the_references() {
+        let mut trends = VisionTrendState::default();
+        assert!(!trends.follow_background_identity("legacy_global_clip:1:abc".into()));
+        feed(&mut trends, 30, 200.0, 3);
+        assert!(!trends.follow_background_identity("legacy_global_clip:1:abc".into()));
+        assert!(trends.clear_background_baseline.is_some());
+        assert!(trends.follow_background_identity("sep_spatial_mesh:1:def".into()));
+        assert!(trends.clear_background_baseline.is_none());
+        assert!(trends.clear_star_baseline.is_none());
     }
 
     #[test]
@@ -1009,7 +1120,7 @@ mod analysis_domain_tests {
     fn darker_background_is_adopted_and_invalid_frames_do_not_move_references() {
         let mut trends = VisionTrendState::default();
         // An invalid first frame must not seed either reference.
-        update_cloud_probability(&mut trends, 20, 400.0, false, true);
+        update_cloud_probability(&mut trends, 20, Some(400.0), false, true);
         assert!(trends.clear_star_baseline.is_none());
         assert!(trends.clear_background_baseline.is_none());
 
@@ -1019,7 +1130,7 @@ mod analysis_domain_tests {
 
         let star_before = trends.clear_star_baseline;
         let background_before = trends.clear_background_baseline;
-        update_cloud_probability(&mut trends, 300, 10.0, false, true);
+        update_cloud_probability(&mut trends, 300, Some(10.0), false, true);
         assert_eq!(trends.clear_star_baseline, star_before);
         assert_eq!(trends.clear_background_baseline, background_before);
     }
@@ -1061,7 +1172,7 @@ mod analysis_domain_tests {
         feed(&mut trends, 50, 100.0, 10);
         let before = trends.clear_star_baseline;
         for _ in 0..10 {
-            update_cloud_probability(&mut trends, 150, 500.0, true, false);
+            update_cloud_probability(&mut trends, 150, Some(500.0), true, false);
         }
         assert_eq!(trends.clear_star_baseline, before);
 

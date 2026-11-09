@@ -230,6 +230,8 @@ mod tests {
             sensor_axis: Some(SensorAxis::X),
             sky: None,
             withheld: Some("no_plate_solve".into()),
+            policy: crate::vision::trailing::LEGACY_TRAILING_POLICY,
+            unavailable_reason: None,
         }
     }
 
