@@ -12,6 +12,7 @@ pub mod fqe_runner;
 pub mod observed_frame;
 pub mod preprocess;
 pub mod quality;
+pub mod sep_backend;
 pub mod shared_observation;
 pub mod ted_runner;
 pub mod trailing;
