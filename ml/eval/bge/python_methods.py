@@ -140,11 +140,19 @@ def global_scalar_config_json() -> dict:
     return dict({"method": "python_global_sigma_clip", "method_version": 1}, **GLOBAL_SCALAR_PARAMS)
 
 
-def sep_module():
-    import sep
+class MissingPrerequisite(RuntimeError):
+    """The pinned SEP wheel is absent or a different version. Tests that need
+    it ERROR with this message instead of skipping (prompt section 7)."""
 
+
+def sep_module():
+    """The pinned SEP module, imported only where SEP actually runs."""
+    try:
+        import sep
+    except ImportError as exc:
+        raise MissingPrerequisite(f"missing prerequisite: sep=={SEP_VERSION_EXPECTED} ({exc})") from exc
     if sep.__version__ != SEP_VERSION_EXPECTED:
-        raise RuntimeError(f"sep {sep.__version__} found; the reference requires {SEP_VERSION_EXPECTED}")
+        raise MissingPrerequisite(f"missing prerequisite: sep=={SEP_VERSION_EXPECTED} (found sep {sep.__version__})")
     return sep
 
 
@@ -172,6 +180,9 @@ class BackgroundEstimate:
     noise_source: str = "unavailable"
     diagnostics: dict = field(default_factory=dict)
     detail: str | None = None
+    #: SEP's RMS map as returned, kept for cross-implementation parity even
+    #: when it is not a valid noise measurement. Never scored.
+    raw_rms: object = None
 
     def back_map(self, shape):
         if self.back is None:
@@ -257,7 +268,6 @@ def rms_map_reasons(r_usable: np.ndarray) -> list:
 
 
 def python_sep_background(image: np.ndarray, masks: dict, params: dict | None = None) -> BackgroundEstimate:
-    sep = sep_module()
     config = sep_background_config_json(params)
     method = "python_sep"
     if image.ndim != 2 or image.size == 0:
@@ -285,6 +295,7 @@ def python_sep_background(image: np.ndarray, masks: dict, params: dict | None = 
         return _unavailable(method, config, ["insufficient_support"],
                             detail="no mesh has >= 50% usable pixels; SEP would return back=0, rms=1 with no error",
                             diagnostics=diag)
+    sep = sep_module()
     # SEP's histogram does not check NaN: sanitize and mask (preflight H1).
     data = np.where(bad, 0.0, image).astype(np.float32)
     mask = bad.astype(np.uint8)
@@ -314,6 +325,7 @@ def python_sep_background(image: np.ndarray, masks: dict, params: dict | None = 
         spatial=True,
         back=back,
         rms=rms if noise_ok else None,
+        raw_rms=rms,
         level_summary=float(np.median(back[usable])),
         rms_summary=float(np.median(r_usable)) if noise_ok else None,
         level_definition="median of the SEP background map over usable pixels",
@@ -372,26 +384,34 @@ def python_global_scalar(image: np.ndarray, masks: dict) -> BackgroundEstimate:
 
 
 def oracle_background(scenario) -> BackgroundEstimate:
-    config = {"method": "oracle_true_background", "source": "simulated truth B(x,y), noise_std_sky(x,y)"}
+    """Truth B and R. For digitized scenarios R is the effective digitized
+    noise and, where the analog level is not recoverable from the digitized
+    data, B is the expected digitized level (``scoring_background``)."""
+    config = {"method": "oracle_true_background",
+              "source": "simulated truth: scoring background, effective sky noise std"}
     if scenario.background is None or scenario.image.size == 0:
         return _unavailable("oracle_true_background", config, ["no_truth"])
     usable = ~unusable_mask(scenario.image, scenario.masks)
     if not usable.any():
         return _unavailable("oracle_true_background", config, ["no_usable_pixels"])
     r = scenario.noise_std_sky
-    noise_ok = r is not None and bool(np.all(r[usable] > 0))
+    scoreable = scenario.metadata.get("noise_scoreable", True)
+    noise_ok = r is not None and scoreable and bool(np.all(r[usable] > 0))
+    back = scenario.scoring_background()
+    reasons = [] if noise_ok else ["zero_empirical_scatter"] if not scoreable else ["no_truth_noise"]
     return BackgroundEstimate(
         method="oracle_true_background",
         status="completed",
         level_status="measured",
         noise_status="measured" if noise_ok else "unresolved",
-        reasons=[],
+        reasons=reasons,
         config=config,
         config_sha256=config_sha256(config),
         spatial=True,
-        back=scenario.background,
+        back=back,
         rms=r if noise_ok else None,
-        level_summary=float(np.median(scenario.background[usable])),
+        detail=None if noise_ok or scoreable else "effective digitized noise is below 0.01 ADU step",
+        level_summary=float(np.median(back[usable])),
         rms_summary=float(np.median(r[usable])) if noise_ok else None,
         level_definition="median of truth B over usable pixels",
         rms_definition="median of truth sky noise std over usable pixels",
@@ -420,8 +440,10 @@ def _catalog_rows(objects, sep) -> list:
 
 def detect_and_measure(image: np.ndarray, masks: dict, estimate: BackgroundEstimate,
                        det_params: dict | None = None, policy: dict | None = None) -> dict:
-    """SEP extraction on I - B_hat and harness acceptance/HFR. Never raises."""
-    sep = sep_module()
+    """SEP extraction on I - B_hat and harness acceptance/HFR.
+
+    Never raises on bad data; raises MissingPrerequisite only when SEP must
+    run and the pinned wheel is absent."""
     det = sep_detection_config_json(det_params)
     policy = policy or ACCEPTANCE_POLICY
     out = {
@@ -442,6 +464,7 @@ def detect_and_measure(image: np.ndarray, masks: dict, estimate: BackgroundEstim
                             "reason": f"noise {estimate.noise_status} ({','.join(r for r in estimate.reasons if r in NOISE_REASONS)}): "
                                       "a relative detection threshold is undefined"}
         return out
+    sep = sep_module()
     h, w = image.shape
     bad = unusable_mask(image, masks)
     sat = masks.get("native_saturation")
