@@ -17,8 +17,10 @@ python -m ml.eval.bge.run_benchmark --out <dir> [--rust --repo <checkout with ac
 - Without `--rust` every Rust row is `skipped: --rust not requested`.
 - `--rust` runs `cargo test --release bge_eval_bridge -- --ignored --nocapture`
   with `ACHERNAR_BGE_EVAL_MANIFEST`/`ACHERNAR_BGE_EVAL_OUT`. A missing test or a
-  failed build is reported as `skipped: rust bridge unavailable (...)`, never as
-  a pass; a revision whose SEP backend is not built is reported as
+  failed build (no test binary ran) is reported as `skipped: rust bridge
+  unavailable (...)`, never as a pass. A test that compiled and then failed
+  (panic, "test failed", a signal) is `failed` with the reason. A revision
+  whose SEP backend is not built is reported as
   `skipped: rust sep backend not integrated at <rev>`.
 - `--mesh-study` adds the SEP mesh-size / source-footprint study; `--timing`
   adds 6000x4000 host timing and peak memory.
@@ -29,7 +31,22 @@ with a `reason`), `summary.md`, `configs/` (effective configurations and
 sha256), `input_hashes.json`, `bridge_inputs/` (manifest + raw pixels/masks),
 `bridge_outputs/`, `catalogs/`, optional `maps/`, `mesh_study/`, `timing/`, `logs/`.
 
-Tests: `python -m pytest -q ml/tests/test_bge_fixtures.py`.
+**Statuses.** A row has four stages: background, noise, detection, hfr
+(width measured on at least one accepted star; `not_applicable` when the
+scenario has no stars). `completed` = every applicable stage ran and is
+scored. `unsupported` = at least one stage could not measure; if other stages
+completed, the row is `partial` (`results.json`: `partial: true`,
+`scored_stages`, `unscored_stages`, and `scored` per stage; `summary.md`:
+`partial: <reason>`). Its numbers cover only the scored stages and must not be
+aggregated with completed rows. `skipped` and `failed` rows carry no numbers.
+A focus sweep is `completed` only when the fit succeeded and every frame has
+an HFR; `partial` when the fit succeeded over a subset (frame counts given);
+`failed` otherwise.
+
+Tests: `python -m pytest -q ml/tests/test_bge_fixtures.py`. Tests that run SEP
+ERROR with "missing prerequisite: sep==1.4.1" when the pinned wheel is
+absent; the others (truth, metrics, bridge, statuses) run without it. The
+benchmark command itself requires SEP.
 
 ## Three comparisons, three interpretations
 
@@ -38,7 +55,12 @@ Tests: `python -m pytest -q ml/tests/test_bge_fixtures.py`.
    sensors and skies.
 2. **Cross-implementation agreement** (Python SEP vs Rust SEP on identical
    input bytes and configuration) — implementation consistency, not physical
-   validation. Reported against the predeclared D-006 bounds as diagnostics.
+   validation. Reported against the predeclared D-006 bounds as diagnostics:
+   B maps, raw R maps (compared whatever the noise status, e.g. the negative
+   spline of `steep_ridge_background`), globalback, globalrms (only when the
+   daemon reports a measured rms) and catalogs, for the benchmark frames and
+   every mesh-study run. Segmentation maps are not compared (the bridge does
+   not export them).
 3. **Real frames** — not run. `real_frames.py` loads a real-frame manifest for
    a future run, emits observations only, refuses accuracy or pass/fail
    without a predeclared thresholds file, and never opens hold-out frames
@@ -106,8 +128,17 @@ plausibility, not tuned to any method.
 
 **Truth.** `background` is B(x,y) (including pedestal); `noise_std` is the
 expected std of the analog noise process (sources included), `noise_std_sky`
-the same without source photons (what an RMS map estimates). Quantized
-scenarios keep the analog noise as truth and record the step. Sources are
+the same without source photons (what an RMS map estimates). In digitized
+(quantized) scenarios the primary noise truth is the effective std of the
+digitized values, computed exactly for `step*round(X/step)` with
+`X ~ N(B, sigma)` (`digitized_moments`); the analog sigma is kept as a
+labelled secondary truth (`R err analog`). Where the expected digitized level
+differs from the analog level by more than 0.01 step (`quantization_plateau`),
+the level is quantization-limited: bias is scored against the expected
+digitized level and the analog bias is shown as secondary. An effective noise
+below 0.01 step is not scoreable, and the oracle then reports the noise as
+unresolved. Source footprints and the bright-star cut use the analog sigma in
+digitized scenarios. Sources are
 pixel-integrated (Gaussian exactly via erf; Moffat/annulus by midpoint
 super-sampling). `hfr_true_px` is computed from the isolated noiseless stamp:
 the radius enclosing half of the stamp flux inside the render radius
@@ -161,9 +192,16 @@ constant maps. e = B_hat - B_true.
   frame nearest p0.
 - **honest absence** (inputs without usable pixels): true iff no level was
   reported as measured.
-- **timing**: wall ms (median, p95 of repeats after one warm-up) and peak RSS
-  (getrusage in a fresh subprocess; `/usr/bin/time -l` around the Rust test
-  binary). Available-host software timing, not a deployment target.
+- **timing**: Python: one fresh process per method, one discarded in-process
+  warm-up call, then repeats in that process (warm); wall ms median/p95 and
+  peak RSS from getrusage. Rust: one discarded warm-up process, then each
+  repeat is a fresh test-binary process (cold process) under `/usr/bin/time`;
+  `timing_ms` covers only the in-process background/quality/trailing stages,
+  while process wall time and peak RSS include process start, frame read and
+  result write. A repeat with a non-zero return code or no fresh output (output
+  directories are cleared first) fails the timing row. The host label carries
+  the CPU model; the Rust build profile ([profile.release]) is recorded.
+  Available-host software timing, not a deployment target.
 
 ## Known limitations
 

@@ -34,6 +34,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -225,21 +226,48 @@ def run_bridge(manifest_path: Path, out_dir: Path, repo_root: Path, cargo_target
     info["wall_s"] = time.perf_counter() - t0
     Path(log_path).write_text(f"$ {info['command']}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}")
     info["returncode"] = proc.returncode
-    text = proc.stdout + proc.stderr
-    if proc.returncode != 0:
-        if "could not compile" in text or re.search(r"^error(\[E\d+\])?:", text, re.M):
-            return dict(info, status="skipped", reason=f"{UNAVAILABLE}: build failed (see log)")
-        return dict(info, status="failed", reason="bridge test failed (see log)")
-    if re.search(r"running 0 tests", text) and not re.search(r"running [1-9]\d* tests?", text):
-        return dict(info, status="skipped", reason=f"{UNAVAILABLE}: no test matched bge_eval_bridge")
-    exe = re.search(r"Running unittests src/main\.rs \(([^)]+)\)", text)
+    return dict(info, **classify_cargo_test(proc.returncode, proc.stdout + proc.stderr))
+
+
+_RUNNING_BINARY = re.compile(r"Running unittests src/main\.rs \(([^)]+)\)")
+_COMPILE_ERROR = re.compile(r"^error\[E\d+\]", re.M)
+
+
+def classify_cargo_test(returncode: int, text: str) -> dict:
+    """Status of one ``cargo test`` run of the bridge.
+
+    A build failure (``skipped: rust bridge unavailable``) means no test
+    binary ran: "could not compile", an ``error[E...]`` diagnostic, or no
+    "Running unittests" line. Once the binary ran, a non-zero exit (panic,
+    "test failed, to rerun pass", a signal) is a runtime ``failed``; cargo's
+    own "error: test failed" line is not a build error.
+    """
+    exe = _RUNNING_BINARY.search(text)
+    out = {}
     if exe:
-        info["binary"] = exe.group(1)
+        out["binary"] = exe.group(1)
         try:
-            info["binary_sha256"] = _sha256_file(Path(exe.group(1)))
+            out["binary_sha256"] = _sha256_file(Path(exe.group(1)))
         except OSError:
-            info["binary_sha256"] = None
-    return dict(info, status="completed", reason=None)
+            out["binary_sha256"] = None
+    if returncode != 0:
+        if "could not compile" in text or _COMPILE_ERROR.search(text) or not exe:
+            return dict(out, status="skipped", reason=f"{UNAVAILABLE}: build failed (see log)")
+        detail = []
+        panic = re.search(r"panicked at ([^\n]+)\n?([^\n]*)", text)
+        if panic:
+            detail.append(f"panic at {panic.group(1).strip()} {panic.group(2).strip()}".strip())
+        sig = re.search(r"signal: (\d+)(?:, (SIG\w+))?", text)
+        if sig or returncode < 0:
+            detail.append(f"terminated by signal {sig.group(2) or sig.group(1) if sig else -returncode}")
+        if "test result: FAILED" in text or "test failed, to rerun pass" in text:
+            detail.append("test result FAILED")
+        return dict(out, status="failed",
+                    reason=f"bridge test ran and failed at runtime (exit {returncode}): "
+                           f"{'; '.join(detail) or 'see log'}")
+    if re.search(r"running 0 tests", text) and not re.search(r"running [1-9]\d* tests?", text):
+        return dict(out, status="skipped", reason=f"{UNAVAILABLE}: no test matched bge_eval_bridge")
+    return dict(out, status="completed", reason=None)
 
 
 def bridge_test_binary(repo_root: Path, cargo_target_dir: Path, jobs: int = 4) -> str | None:
@@ -267,12 +295,20 @@ def run_binary_timed(binary: str, manifest_path: Path, out_dir: Path, log_path: 
     """Run the test binary directly under ``/usr/bin/time -l`` (macOS) for peak RSS."""
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, ACHERNAR_BGE_EVAL_MANIFEST=str(manifest_path), ACHERNAR_BGE_EVAL_OUT=str(out_dir))
-    cmd = ["/usr/bin/time", "-l", binary, "bge_eval_bridge", "--ignored", "--nocapture", "--test-threads=1"]
+    test_args = [binary, "bge_eval_bridge", "--ignored", "--nocapture", "--test-threads=1"]
+    if sys.platform == "darwin" and os.path.exists("/usr/bin/time"):
+        cmd = ["/usr/bin/time", "-l", *test_args]  # BSD time: "maximum resident set size" in bytes
+    elif os.path.exists("/usr/bin/time"):
+        cmd = ["/usr/bin/time", "-v", *test_args]  # GNU time: "Maximum resident set size (kbytes)"
+    else:
+        cmd = test_args
     t0 = time.perf_counter()
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout_s)
     wall = time.perf_counter() - t0
     Path(log_path).write_text(f"$ {' '.join(cmd)}\n--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}")
     rss = re.search(r"(\d+)\s+maximum resident set size", proc.stderr)
+    gnu = re.search(r"Maximum resident set size \(kbytes\): (\d+)", proc.stderr)
+    peak = int(rss.group(1)) if rss else (int(gnu.group(1)) * 1024 if gnu else None)
     real = re.search(r"([\d.]+)\s+real", proc.stderr)
     return {"returncode": proc.returncode, "wall_s": wall, "time_real_s": float(real.group(1)) if real else None,
-            "peak_rss_bytes": int(rss.group(1)) if rss else None, "command": " ".join(cmd), "log": str(log_path)}
+            "peak_rss_bytes": peak, "command": " ".join(cmd), "log": str(log_path)}

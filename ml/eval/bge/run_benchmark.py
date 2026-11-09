@@ -46,16 +46,33 @@ D006_MAP_REL = 1e-5
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def host_label() -> str:
-    mem = None
+def _sysctl(name):
     try:
-        mem = int(subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True).stdout.strip())
-    except (OSError, ValueError):
-        pass
-    vendor = "Apple" if sys.platform == "darwin" else platform.system()
+        return subprocess.run(["sysctl", "-n", name], capture_output=True, text=True, timeout=10).stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def host_label() -> str:
+    try:
+        mem = int(_sysctl("hw.memsize") or "")
+    except ValueError:
+        mem = None
+    cpu = _sysctl("machdep.cpu.brand_string") or platform.processor() or platform.system()
     mem_s = f", {round(mem / 2**30)} GB" if mem else ""
-    return f"available-host software timing ({vendor} {platform.machine()}, {os.cpu_count()} CPU{mem_s}), " \
+    return f"available-host software timing ({cpu}, {platform.machine()}, {os.cpu_count()} CPU{mem_s}), " \
            f"not a deployment target"
+
+
+def rust_build_profile(repo: Path) -> dict:
+    """The daemon's [profile.release] (the bridge is built with --release)."""
+    try:
+        import tomllib
+
+        with open(Path(repo) / "achernar-daemon" / "Cargo.toml", "rb") as fh:
+            return {"profile": "release", "settings": tomllib.load(fh).get("profile", {}).get("release", {})}
+    except (OSError, ValueError) as exc:
+        return {"profile": "release", "settings": None, "error": str(exc)}
 
 
 def _json_default(o):
@@ -103,8 +120,17 @@ def git_info(repo: Path) -> dict:
 # Scoring one scenario x method
 # --------------------------------------------------------------------------
 
+#: Stages of one scenario x method row, in pipeline order, and the metric
+#: sections each one owns. A section is computed only when its stage
+#: completed; ``scored_stages`` lists the sections actually present.
+STAGES = ("background", "noise", "detection", "hfr")
+STAGE_METRICS = {"background": ("background", "background_vs_analog"), "noise": ("noise", "noise_vs_analog"),
+                 "detection": ("detection", "blends"), "hfr": ("hfr",)}
+NOT_APPLICABLE = "not_applicable"
+
 
 def overall_status(stages: dict):
+    """Row status from its stages. ``not_applicable`` stages are ignored."""
     reasons = []
     for name, st in stages.items():
         if st["status"] == "failed":
@@ -117,8 +143,23 @@ def overall_status(stages: dict):
     return "completed", None
 
 
-def score(sc, level_measured, noise_measured, b_hat, r_hat, candidates, accepted, frame_hfr) -> dict:
+def hfr_stage(sc, detection_completed, n_accepted, frame_hfr, why_none) -> dict:
+    """The width-measurement stage: completed only when an HFR was produced."""
+    has_stars = any(s.kind == "star" for s in sc.sources)
+    if not has_stars and not n_accepted:
+        return {"status": NOT_APPLICABLE, "reason": "scenario has no truth stars"}
+    if not detection_completed:
+        return {"status": "unsupported", "reason": "detection not run"}
+    if frame_hfr is not None and np.isfinite(frame_hfr) and (n_accepted or 0) > 0:
+        return {"status": "completed", "reason": None}
+    return {"status": "unsupported", "reason": f"no usable stars ({why_none})"}
+
+
+def score(sc, stages, b_hat, r_hat, candidates, accepted, frame_hfr) -> dict:
+    """Metrics for the completed stages only; marks each stage scored or not."""
     out = {}
+    done = {k: v.get("status") == "completed" for k, v in stages.items()}
+    level_measured = done.get("background", False)
     if sc.image.size == 0:
         out["honest_absence"] = not level_measured
         return out
@@ -126,50 +167,87 @@ def score(sc, level_measured, noise_measured, b_hat, r_hat, candidates, accepted
     if not usable.any():
         out["honest_absence"] = not level_measured
     truth = [s.to_json() for s in sc.sources]
+    fp_noise = sc.footprint_noise()
     if level_measured and b_hat is not None and sc.background is not None and usable.any():
-        under, far = MT.source_masks(sc.source_image, sc.noise_std_sky, usable)
+        under, far = MT.source_masks(sc.source_image, fp_noise, usable)
         star_xy = [(s.x, s.y) for s in sc.sources if s.kind == "star"]
-        out["background"] = MT.background_map_metrics(b_hat, sc.background, usable, under, far, star_xy)
-    if noise_measured and r_hat is not None and sc.noise_std_sky is not None and usable.any():
-        out["noise"] = MT.noise_map_metrics(r_hat, sc.noise_std_sky, usable)
-    if candidates is not None:
-        det = MT.detection_metrics(candidates, truth, sc.width, sc.height, sc.source_image, sc.noise_std_sky)
+        truth_b = sc.scoring_background()
+        bg = MT.background_map_metrics(b_hat, truth_b, usable, under, far, star_xy)
+        if truth_b is sc.background:
+            bg["truth"] = "analog B(x,y)"
+        else:
+            bg["truth"] = ("expected digitized level (quantization-limited: the analog level "
+                           f"{sc.metadata['params'].get('background_adu')} ADU is not recoverable from the data)")
+            out["background_vs_analog"] = {"bias_median_adu": MT.background_map_metrics(
+                b_hat, sc.background, usable)["bias_median_adu"], "truth": "analog B (secondary)"}
+        out["background"] = bg
+    if done.get("noise") and r_hat is not None and sc.noise_std_sky is not None and usable.any():
+        if not sc.metadata.get("noise_scoreable", True):
+            stages["noise"]["score_note"] = (f"not scoreable: effective digitized noise "
+                                             f"{sc.metadata.get('effective_sky_std_adu'):.2e} ADU < 0.01 step")
+        else:
+            nz = MT.noise_map_metrics(r_hat, sc.noise_std_sky, usable)
+            nz["truth"] = sc.metadata.get("noise_truth", "expected noise std of the sky")
+            out["noise"] = nz
+            if sc.noise_std_sky_analog is not None:
+                sec = MT.noise_map_metrics(r_hat, sc.noise_std_sky_analog, usable)
+                out["noise_vs_analog"] = {"rel_error_median": sec.get("rel_error_median"),
+                                          "truth": "analog sigma (secondary)"}
+    if done.get("detection") and candidates is not None:
+        det = MT.detection_metrics(candidates, truth, sc.width, sc.height, sc.source_image, fp_noise)
         if any(c > 1 for c in SC.group_sizes(sc.sources).values()):
             out["blends"] = MT.blend_metrics(candidates, truth, det["_matches"])
         out["detection"] = MT.strip_private(det)
-    if accepted is not None:
+    if done.get("hfr") and accepted is not None:
         hfr = MT.hfr_metrics(accepted, truth)
         hfr["frame_hfr_median_px"] = frame_hfr
         out["hfr"] = hfr
+    for name, st in stages.items():
+        st["scored"] = any(k in out for k in STAGE_METRICS.get(name, ()))
     return out
+
+
+def finish_record(rec: dict, stages: dict) -> dict:
+    """Status, reason and the scored/not-scored markers of a row."""
+    status, reason = overall_status(stages)
+    scored = [k for k in STAGES if stages.get(k, {}).get("scored")]
+    unscored = [k for k in STAGES if k in stages and not stages[k].get("scored")
+                and stages[k]["status"] != NOT_APPLICABLE]
+    rec.update(status=status, reason=reason, stages=stages, scored_stages=scored, unscored_stages=unscored,
+               partial=bool(status == "unsupported" and scored))
+    return rec
 
 
 def run_python(sc, method, bg_params=None) -> tuple[dict, dict]:
     t0 = time.perf_counter()
     try:
         res = PM.run_python_method(method, sc, bg_params=bg_params)
+    except PM.MissingPrerequisite:
+        raise
     except Exception as exc:  # noqa: BLE001 - recorded as a failed case, never as a pass
-        rec = {"status": "failed", "reason": f"{type(exc).__name__}: {exc}", "stages": {}, "metrics": {}}
+        rec = {"status": "failed", "reason": f"{type(exc).__name__}: {exc}", "stages": {}, "metrics": {},
+               "scored_stages": [], "unscored_stages": list(STAGES), "partial": False}
         return rec, {}
     est, meas = res["estimate"], res["measurement"]
     level_ok = est.level_status == "measured"
     stages = {
         "background": {"status": "completed" if level_ok else ("failed" if est.status == "failed" else "unsupported"),
                        "reason": None if level_ok else ",".join(est.reasons) + (f" ({est.detail})" if est.detail else "")},
-        "noise": {"status": "completed" if est.noise_status == "measured" else "unsupported",
-                  "reason": None if est.noise_status == "measured" else f"noise {est.noise_status}: {','.join(est.reasons)}"},
-        "detection": {"status": meas["detection"]["status"], "reason": meas["detection"].get("reason")},
     }
-    if not level_ok:
-        stages.pop("noise")
-    status, reason = overall_status(stages)
+    if level_ok:
+        stages["noise"] = {"status": "completed" if est.noise_status == "measured" else "unsupported",
+                           "reason": None if est.noise_status == "measured" else
+                           f"noise {est.noise_status}: {','.join(est.reasons)}"}
+    stages["detection"] = {"status": meas["detection"]["status"], "reason": meas["detection"].get("reason")}
+    if level_ok:
+        rej = {k: v for k, v in (meas.get("rejections") or {}).items() if v}
+        why = "no candidates detected" if not meas.get("candidates") else f"rejections {rej}"
+        stages["hfr"] = hfr_stage(sc, stages["detection"]["status"] == "completed", meas.get("n_accepted"),
+                                  meas.get("frame_hfr_median_px"), why)
     shape = sc.image.shape
     b_hat = est.back_map(shape) if level_ok else None
     r_hat = est.rms_map(shape) if est.noise_status == "measured" else None
     rec = {
-        "status": status,
-        "reason": reason,
-        "stages": stages,
         "background_result": est.summary(),
         "detection_config_sha256": meas.get("detection_config_sha256"),
         "acceptance_policy_sha256": meas.get("acceptance_policy_sha256"),
@@ -178,10 +256,14 @@ def run_python(sc, method, bg_params=None) -> tuple[dict, dict]:
         "n_accepted": meas.get("n_accepted"),
         "frame_hfr_median_px": meas.get("frame_hfr_median_px"),
         "wall_ms": 1e3 * (time.perf_counter() - t0),
-        "metrics": score(sc, level_ok, est.noise_status == "measured", b_hat, r_hat, meas.get("candidates"),
-                         meas.get("accepted"), meas.get("frame_hfr_median_px")),
     }
-    artifacts = {"candidates": meas.get("candidates"), "accepted": meas.get("accepted"), "back": b_hat, "rms": r_hat}
+    rec["metrics"] = score(sc, stages, b_hat, r_hat, meas.get("candidates"), meas.get("accepted"),
+                           meas.get("frame_hfr_median_px"))
+    finish_record(rec, stages)
+    raw_rms = est.raw_rms if isinstance(est.raw_rms, np.ndarray) else r_hat
+    artifacts = {"candidates": meas.get("candidates"), "accepted": meas.get("accepted"), "back": b_hat,
+                 "rms": raw_rms, "globalback": est.diagnostics.get("sep_globalback_raw"),
+                 "globalrms": est.diagnostics.get("sep_globalrms_raw")}
     return rec, artifacts
 
 
@@ -194,20 +276,22 @@ DETECTION_NOT_RUN = ("BackgroundUnavailable", "DetectionUnavailable")
 def run_rust_parse(sc, out_dir, backend, revision=None) -> tuple[dict, dict]:
     out = bridge.read_output(out_dir, sc.id, backend, sc.width, sc.height)
     if out["status"] != "completed":
-        return {"status": "failed", "reason": out["reason"], "stages": {}, "metrics": {}}, {}
+        return {"status": "failed", "reason": out["reason"], "stages": {}, "metrics": {}, "scored_stages": [],
+                "unscored_stages": list(STAGES), "partial": False}, {}
     j = out["json"]
     bge = (j.get("background") or {}).get("backend_error") or ""
     if backend == "sep" and SEP_NOT_BUILT_MARKER in bge:
         rev = (revision or "unknown revision")[:12]
         return {"status": "skipped", "reason": f"skipped: rust sep backend not integrated at {rev} ({bge})",
-                "stages": {}, "metrics": {}, "background_result": j.get("background")}, {}
+                "stages": {}, "metrics": {}, "background_result": j.get("background"), "scored_stages": [],
+                "unscored_stages": list(STAGES), "partial": False}, {}
     bgr = j.get("background") or {}
     level_ok = bgr.get("level_status") == "measured"
     noise_ok = bgr.get("noise_status") == "measured"
     spatial = bgr.get("method") == "sep_spatial_mesh"
     reasons = ",".join(bgr.get("reasons") or [])
     if spatial:
-        b_hat, r_hat = out["back"], out["rms"]
+        b_hat, r_hat = out["back"], out["rms"] if noise_ok else None
     else:
         b_hat = np.float64(bgr["level"]) if level_ok and bgr.get("level") is not None else None
         r_hat = np.float64(bgr["rms"]) if noise_ok and bgr.get("rms") is not None else None
@@ -218,29 +302,28 @@ def run_rust_parse(sc, out_dir, backend, revision=None) -> tuple[dict, dict]:
     detection_ran = j.get("detection") is not None and q_status not in DETECTION_NOT_RUN
     candidates = j.get("candidates") if detection_ran else None
     accepted = quality.get("used_stars") if detection_ran else None
-    stages = {
-        "background": {"status": "completed" if level_ok else "unsupported", "reason": None if level_ok else reasons},
-        "noise": {"status": "completed" if noise_ok else "unsupported",
-                  "reason": None if noise_ok else f"noise {bgr.get('noise_status')}: {reasons}"},
-        "detection": {"status": "completed" if detection_ran else "unsupported",
-                      "reason": None if detection_ran else
-                      f"detection not run (quality status {q_status}; catalog_error {j.get('catalog_error')})"},
-    }
+    stages = {"background": {"status": "completed" if level_ok else "unsupported",
+                             "reason": None if level_ok else reasons}}
+    if level_ok:
+        stages["noise"] = {"status": "completed" if noise_ok else "unsupported",
+                           "reason": None if noise_ok else f"noise {bgr.get('noise_status')}: {reasons}"}
+    stages["detection"] = {"status": "completed" if detection_ran else "unsupported",
+                           "reason": None if detection_ran else
+                           f"detection not run (quality status {q_status}; catalog_error {j.get('catalog_error')})"}
     if (j.get("detection") or {}).get("noise_floor_applied"):
         stages["detection"]["note"] = "ran with the legacy 1 ADU noise floor (noise_floor_applied), a labelled heuristic"
+    if level_ok:
+        rej = {k: v for k, v in (quality.get("star_rejections") or {}).items() if v}
+        why = f"quality status {q_status}; " + ("no candidates detected" if not candidates else f"rejections {rej}")
+        stages["hfr"] = hfr_stage(sc, detection_ran, None if accepted is None else len(accepted), quality.get("hfr_px"),
+                                  why)
     if level_ok and spatial and b_hat is None:
-        stages["background_map"] = {"status": "unsupported", "reason": "spatial field but no .back.f32 emitted"}
-    if not level_ok:
-        stages.pop("noise")
-    status, reason = overall_status(stages)
+        stages["background"] = {"status": "unsupported", "reason": "spatial field but no .back.f32 emitted"}
     bg_summary = {k: bgr.get(k) for k in ("method", "method_version", "requested_method", "config_sha256",
                                           "level_status", "noise_status", "reasons", "backend_error", "units",
                                           "noise_source", "level", "level_definition", "rms", "rms_definition",
                                           "mesh", "plane", "support", "library_version")}
     rec = {
-        "status": status,
-        "reason": reason,
-        "stages": stages,
         "background_result": bg_summary,
         "background_config": bgr.get("config"),
         "detection": j.get("detection"),
@@ -251,22 +334,34 @@ def run_rust_parse(sc, out_dir, backend, revision=None) -> tuple[dict, dict]:
         "n_candidates": None if candidates is None else len(candidates),
         "n_accepted": None if accepted is None else len(accepted),
         "frame_hfr_median_px": quality.get("hfr_px"),
-        "metrics": score(sc, level_ok, noise_ok, b_hat, r_hat, candidates, accepted, quality.get("hfr_px")),
     }
+    rec["metrics"] = score(sc, stages, b_hat, r_hat, candidates, accepted, quality.get("hfr_px"))
+    finish_record(rec, stages)
     return rec, {"candidates": candidates, "accepted": accepted, "catalog": j.get("catalog"), "back": out["back"],
-                 "rms": out["rms"]}
+                 "rms": out["rms"], "globalback": bgr.get("level") if level_ok else None,
+                 "globalrms": bgr.get("rms") if noise_ok else None}
 
 
 def skipped_record(reason) -> dict:
-    return {"status": "skipped", "reason": reason, "stages": {}, "metrics": {}}
+    return {"status": "skipped", "reason": reason, "stages": {}, "metrics": {}, "scored_stages": [],
+            "unscored_stages": list(STAGES), "partial": False}
 
 
 # --------------------------------------------------------------------------
 # Cross-implementation agreement
 # --------------------------------------------------------------------------
 
+PARITY_NOT_COMPARED = ("segmentation maps (the bridge does not export them); globalrms when the daemon reports "
+                       "noise unresolved (it publishes no rms then)")
+
+
+def _within(a: float, b: float) -> bool:
+    return abs(a - b) <= D006_MAP_REL * max(1.0, abs(a))
+
 
 def parity(py_art, rs_art, py_rec, rs_rec) -> dict:
+    """D-006 comparison of every item both implementations produced: B and
+    raw R maps (whatever the noise status), globalback/globalrms, catalogs."""
     out = {"python_status": py_rec["status"], "rust_status": rs_rec["status"]}
     for key in ("back", "rms"):
         a, b = py_art.get(key), rs_art.get(key)
@@ -277,6 +372,11 @@ def parity(py_art, rs_art, py_rec, rs_rec) -> dict:
             out[f"{key}_within_d006_bound"] = bool(np.all(d <= bound))
         else:
             out[f"{key}_max_abs_diff"] = None
+    for key in ("globalback", "globalrms"):
+        a, b = py_art.get(key), rs_art.get(key)
+        if a is not None and b is not None:
+            out[f"{key}_abs_diff"] = abs(float(a) - float(b))
+            out[f"{key}_within_d006_bound"] = _within(float(a), float(b))
     pl = (py_rec.get("background_result") or {})
     rl = (rs_rec.get("background_result") or {})
     out["python_level_status"], out["rust_level_status"] = pl.get("level_status"), rl.get("level_status")
@@ -285,7 +385,20 @@ def parity(py_art, rs_art, py_rec, rs_rec) -> dict:
     rc = rs_art.get("catalog") if rs_art.get("catalog") is not None else rs_art.get("candidates")
     if pc is not None and rc is not None:
         out.update(catalog_parity(pc, rc))
+    out["not_compared"] = PARITY_NOT_COMPARED
     return out
+
+
+def parity_tally(rows) -> dict:
+    def tally(key):
+        vals = [p[key] for p in rows if p.get(key) is not None]
+        return {"within": sum(bool(v) for v in vals), "compared": len(vals)}
+
+    return {"cases": len(rows),
+            "statuses_identical": sum(1 for p in rows if (p["python_level_status"], p["python_noise_status"]) ==
+                                      (p["rust_level_status"], p["rust_noise_status"])),
+            **{k: tally(f"{k}_within_d006_bound") for k in ("back", "rms", "globalback", "globalrms")},
+            "catalog": tally("catalog_within_d006")}
 
 
 def catalog_parity(pc, rc) -> dict:
@@ -438,28 +551,8 @@ def main(argv=None) -> int:
                  "params": sw.metadata, "methods": {}}
         ref_idx = int(np.argmin(np.abs(np.asarray(sw.positions) - sw.p0_true)))
         for m in list(PY_METHODS) + list(RUST_METHODS):
-            recs = [by_key[(fr.id, m)] for fr in sw.frames]
-            statuses = [r["status"] for r in recs]
-            if all(s == "skipped" for s in statuses):
-                entry["methods"][m] = {"status": "skipped", "reason": recs[0]["reason"]}
-                continue
-            vals = [r.get("frame_hfr_median_px") for r in recs]
-            curve = [float(v) if v is not None else float("nan") for v in vals]
-            fit = MT.focus_shift(sw.positions, curve, sw.p0_true)
-            sets = [(r.get("metrics", {}).get("hfr") or {}).get("matched_truth_ids") or [] for r in recs]
-            jac = [MT.jaccard(s, sets[ref_idx]) for s in sets]
-            hyper_ok = fit["hyperbola"]["status"] == "completed"
-            entry["methods"][m] = {
-                "status": "completed" if hyper_ok else "failed",
-                "reason": None if hyper_ok else f"sweep fit failed: {fit['hyperbola'].get('reason')}",
-                "frame_statuses": statuses,
-                "median_hfr_px": curve,
-                "n_accepted": [r.get("n_accepted") for r in recs],
-                "fit": fit,
-                "accepted_set_jaccard_vs_frame_nearest_p0": jac,
-                "frame_hfr_rel_error_vs_truth_median": [
-                    (c / t - 1.0) if np.isfinite(c) else None for c, t in zip(curve, truth_curve)],
-            }
+            entry["methods"][m] = summarize_sweep_method([by_key[(fr.id, m)] for fr in sw.frames], sw.positions,
+                                                         sw.p0_true, ref_idx, truth_curve)
         sweep_results.append(entry)
 
     # ---- mesh study
@@ -475,6 +568,7 @@ def main(argv=None) -> int:
     # ---- cross-implementation
     parity_rows = {}
     parity_reason = rust_info["reason"]
+    mesh_parity = mesh.get("parity") or {}
     if rust_info["status"] == "completed":
         for sc in cases:
             rs = by_key[(sc.id, "rust_sep")]
@@ -486,8 +580,14 @@ def main(argv=None) -> int:
     cross = {"status": "completed" if parity_rows else "skipped",
              "reason": None if parity_rows else parity_reason,
              "interpretation": SECTION_PARITY,
-             "bound": "D-006 (decisions.md): maps |delta| <= 1e-5*max(1,|ref|) per pixel; reported as diagnostic here",
-             "cases": parity_rows}
+             "bound": ("D-006 (decisions.md): maps and globalback/globalrms |delta| <= 1e-5*max(1,|ref|); catalogs: "
+                       "identical count, npix, bbox, flags; x, y <= 1e-4 px; flux, a, b relative <= 1e-5; "
+                       "theta <= 1e-5 rad. Reported as diagnostics."),
+             "not_compared": PARITY_NOT_COMPARED,
+             "cases": parity_rows,
+             "tally": parity_tally(list(parity_rows.values())) if parity_rows else None,
+             "mesh_study_cases": mesh_parity,
+             "mesh_study_tally": parity_tally(list(mesh_parity.values())) if mesh_parity else None}
 
     real = {"status": "not_run", "reason": SECTION_REAL,
             "adapter": "ml/eval/bge/real_frames.py (refuses accuracy/pass-fail without a predeclared thresholds file)"}
@@ -533,6 +633,48 @@ def main(argv=None) -> int:
     return 0
 
 
+def summarize_sweep_method(recs, positions, p0_true, ref_idx, truth_curve) -> dict:
+    """One method's focus sweep: fit, frame counts and status (completed only
+    when the fit succeeded and every frame produced an HFR)."""
+    statuses = [r["status"] for r in recs]
+    if all(s == "skipped" for s in statuses):
+        return {"status": "skipped", "reason": recs[0]["reason"]}
+    vals = [r.get("frame_hfr_median_px") for r in recs]
+    curve = [float(v) if v is not None else float("nan") for v in vals]
+    fit = MT.focus_shift(positions, curve, p0_true)
+    sets = [(r.get("metrics", {}).get("hfr") or {}).get("matched_truth_ids") or [] for r in recs]
+    jac = [MT.jaccard(s, sets[ref_idx]) for s in sets]
+    hyper_ok = fit["hyperbola"]["status"] == "completed"
+    hfr_status = [(r.get("stages", {}).get("hfr") or {}).get("status", r["status"]) for r in recs]
+    counts = {"frames": len(recs), "frames_with_hfr": sum(1 for h in hfr_status if h == "completed"),
+              "frames_failed": sum(1 for r in recs if r["status"] == "failed"),
+              "frames_without_hfr": sum(1 for h in hfr_status if h != "completed")}
+    # A sweep is completed only if every frame produced an HFR and the
+    # fit succeeded; a successful fit over missing frames is partial.
+    if not hyper_ok:
+        sweep_status = "failed"
+        sweep_reason = f"sweep fit failed: {fit['hyperbola'].get('reason')}"
+    elif counts["frames_without_hfr"] or counts["frames_failed"]:
+        sweep_status = "partial"
+        sweep_reason = (f"fit over {counts['frames_with_hfr']}/{counts['frames']} frames; "
+                        f"{counts['frames_without_hfr']} without HFR, {counts['frames_failed']} failed")
+    else:
+        sweep_status, sweep_reason = "completed", None
+    return {
+        "status": sweep_status,
+        "reason": sweep_reason,
+        "frame_counts": counts,
+        "frame_statuses": statuses,
+        "frame_hfr_stage_statuses": hfr_status,
+        "median_hfr_px": curve,
+        "n_accepted": [r.get("n_accepted") for r in recs],
+        "fit": fit,
+        "accepted_set_jaccard_vs_frame_nearest_p0": jac,
+        "frame_hfr_rel_error_vs_truth_median": [
+            (c / t - 1.0) if np.isfinite(c) else None for c, t in zip(curve, truth_curve)],
+    }
+
+
 def run_mesh_study(args, out, cargo_target, note) -> dict:
     fields = SC.mesh_study_fields()
     rows = []
@@ -548,16 +690,19 @@ def run_mesh_study(args, out, cargo_target, note) -> dict:
                                               out / "logs" / f"bridge_mesh_bw{bw}.log", jobs=args.jobs)
         else:
             rust_runs[bw] = {"status": "skipped", "reason": "skipped: --rust not requested"}
+    mesh_parity = {}
     for sc in fields:
         for m in ("python_global_scalar", "oracle_true_background"):
             rec, _ = run_python(sc, m)
             rows.append(dict(_mesh_row(rec), field=sc.id, footprint=sc.metadata["footprint"], method=m, bw=None))
         for bw in SC.MESH_STUDY_SIZES:
-            rec, _ = run_python(sc, "python_sep", bg_params={"bw": bw, "bh": bw})
+            rec, art = run_python(sc, "python_sep", bg_params={"bw": bw, "bh": bw})
             rows.append(dict(_mesh_row(rec), field=sc.id, footprint=sc.metadata["footprint"], method="python_sep", bw=bw))
             rr = rust_runs[bw]
             if rr["status"] == "completed":
-                rrec, _ = run_rust_parse(sc, mesh_dir / f"out_bw{bw}", "sep", (rr.get("revision") or {}).get("commit"))
+                rrec, rart = run_rust_parse(sc, mesh_dir / f"out_bw{bw}", "sep", (rr.get("revision") or {}).get("commit"))
+                if rrec["status"] != "skipped":
+                    mesh_parity[f"{sc.id}@bw{bw}"] = parity(art, rart, rec, rrec)
             else:
                 rrec = {"status": rr["status"], "reason": rr["reason"], "metrics": {}}
             rows.append(dict(_mesh_row(rrec), field=sc.id, footprint=sc.metadata["footprint"], method="rust_sep", bw=bw))
@@ -565,14 +710,15 @@ def run_mesh_study(args, out, cargo_target, note) -> dict:
     return {"status": "completed", "sizes": list(SC.MESH_STUDY_SIZES), "footprints": SC.MESH_STUDY_FOOTPRINTS,
             "fields": {sc.id: {"truth_hfr_median_px": float(np.median([s.hfr_true_px for s in sc.sources])),
                                "input_sha256": sc.input_hashes(), "metadata": sc.metadata} for sc in fields},
-            "rust_runs": rust_runs, "rows": rows}
+            "rust_runs": rust_runs, "rows": rows, "parity": mesh_parity}
 
 
 def _mesh_row(rec) -> dict:
     m = rec.get("metrics", {})
     bg, hfr, det = m.get("background") or {}, m.get("hfr") or {}, m.get("detection") or {}
     return {
-        "status": rec["status"], "reason": rec.get("reason"),
+        "status": rec["status"], "reason": rec.get("reason"), "partial": rec.get("partial", False),
+        "scored_stages": rec.get("scored_stages", []), "unscored_stages": rec.get("unscored_stages", []),
         "bias_median_adu": bg.get("bias_median_adu"), "rmse_adu": bg.get("rmse_adu"),
         "bias_median_under_sources_adu": bg.get("bias_median_under_sources_adu"),
         "bias_median_far_from_sources_adu": bg.get("bias_median_far_from_sources_adu"),
@@ -591,7 +737,8 @@ def run_timing(args, out, cargo_target, rust_info, note) -> dict:
     frame = SC.timing_frame()
     entries = bridge.write_inputs([frame], tdir)
     rel = entries[0]["pixels"]
-    result = {"status": "completed", "label": host_label(), "frame": {"id": frame.id, "width": frame.width,
+    result = {"status": "completed", "label": host_label(), "python_repeat_semantics": PY_REPEAT_SEMANTICS,
+              "frame": {"id": frame.id, "width": frame.width,
               "height": frame.height, "input_sha256": entries[0]["extras"]["sha256"], "metadata": frame.metadata},
               "python": {}, "rust": {}}
     for m in ("python_sep", "python_global_scalar"):
@@ -611,35 +758,70 @@ def run_timing(args, out, cargo_target, rust_info, note) -> dict:
     if binary is None:
         result["rust"] = {"status": "skipped", "reason": f"{bridge.UNAVAILABLE}: test binary not found"}
         return result
+    result["rust_build"] = rust_build_profile(args.repo)
     for backend in bridge.RUST_BACKENDS:
         mpath = bridge.write_manifest(entries, tdir, name=f"manifest_{backend}.json", backends=(backend,),
                                       write_maps=False)
-        rows = []
-        for rep in range(args.timing_repeats):
-            odir = tdir / f"out_{backend}_{rep}"
-            run = bridge.run_binary_timed(binary, mpath, odir, out / "logs" / f"timing_{backend}_{rep}.log")
-            o = bridge.read_output(odir, frame.id, backend, frame.width, frame.height)
-            run["timing_ms"] = (o.get("json") or {}).get("timing_ms")
-            run["output_status"] = o["status"]
-            run["backend_error"] = ((o.get("json") or {}).get("background") or {}).get("backend_error")
-            rows.append(run)
-        if any(SEP_NOT_BUILT_MARKER in (r.get("backend_error") or "") for r in rows):
+        runs = rust_timing_runs(binary, mpath, tdir, backend, frame, args.timing_repeats, out / "logs")
+        if any(SEP_NOT_BUILT_MARKER in (r.get("backend_error") or "") for r in runs):
             rev = ((rust_info.get("revision") or {}).get("commit") or "unknown")[:12]
-            result["rust"][backend] = {"status": "skipped", "runs": rows,
+            result["rust"][backend] = {"status": "skipped", "runs": runs,
                                        "reason": f"skipped: rust sep backend not integrated at {rev}"}
             continue
-        tm = [sum((r["timing_ms"] or {}).values()) for r in rows if r.get("timing_ms")]
-        bg_ms = [r["timing_ms"]["background"] for r in rows if r.get("timing_ms")]
-        result["rust"][backend] = {
-            "status": "completed" if tm else "failed", "binary": binary, "runs": rows,
-            "bridge_total_ms_median": float(np.median(tm)) if tm else None,
-            "bridge_total_ms_p95": float(np.percentile(tm, 95)) if tm else None,
-            "bridge_background_ms_median": float(np.median(bg_ms)) if bg_ms else None,
-            "process_peak_rss_bytes_max": max((r["peak_rss_bytes"] or 0) for r in rows) or None,
-            "note": "peak RSS of the whole test process (frame load + one backend), from /usr/bin/time -l",
-        }
+        result["rust"][backend] = dict(summarize_rust_timing(runs), binary=binary)
         note(f"timing rust {backend}: {result['rust'][backend].get('bridge_total_ms_median')} ms")
     return result
+
+
+PY_REPEAT_SEMANTICS = ("one fresh Python process per method; one discarded in-process warm-up call, then the "
+                       "repeats in the same process (warm); peak RSS from getrusage covers the whole process")
+RUST_REPEAT_SEMANTICS = ("each repeat is a fresh test-binary process (cold process): /usr/bin/time wall time and peak "
+                         "RSS include process start, manifest and frame read and result write; bridge timing_ms "
+                         "covers only the in-process background, quality and trailing stages of that one call; one "
+                         "discarded warm-up process runs first (file cache)")
+
+
+def rust_timing_runs(binary, manifest, tdir, backend, frame, repeats, log_dir) -> list:
+    """One discarded warm-up process, then ``repeats`` timed processes. Each
+    output directory is cleared first so a stale result is never read."""
+    import shutil
+
+    runs = []
+    for rep in ["warmup", *range(repeats)]:
+        odir = Path(tdir) / f"out_{backend}_{rep}"
+        if odir.exists():
+            shutil.rmtree(odir)
+        run = bridge.run_binary_timed(binary, manifest, odir, Path(log_dir) / f"timing_{backend}_{rep}.log")
+        o = bridge.read_output(odir, frame.id, backend, frame.width, frame.height)
+        payload = o.get("json") or {}
+        run.update(repeat=rep, warmup=rep == "warmup", output_status=o["status"],
+                   timing_ms=payload.get("timing_ms"),
+                   backend_error=(payload.get("background") or {}).get("backend_error"))
+        run["ok"] = run["returncode"] == 0 and o["status"] == "completed" and bool(run["timing_ms"])
+        runs.append(run)
+    return runs
+
+
+def summarize_rust_timing(runs) -> dict:
+    measured = [r for r in runs if not r["warmup"]]
+    ok = [r for r in measured if r["ok"]]
+    tm = [sum(r["timing_ms"].values()) for r in ok]
+    bg_ms = [r["timing_ms"]["background"] for r in ok]
+    rss = [r["peak_rss_bytes"] for r in ok if r.get("peak_rss_bytes")]
+    failed = len(measured) - len(ok)
+    return {
+        "status": "completed" if measured and not failed else "failed",
+        "reason": None if measured and not failed else
+        f"{failed}/{len(measured)} timed repeats failed (non-zero return code or no output); see runs",
+        "runs": runs,
+        "repeats_ok": len(ok),
+        "repeat_semantics": RUST_REPEAT_SEMANTICS,
+        "bridge_total_ms_median": float(np.median(tm)) if tm else None,
+        "bridge_total_ms_p95": float(np.percentile(tm, 95)) if tm else None,
+        "bridge_background_ms_median": float(np.median(bg_ms)) if bg_ms else None,
+        "process_wall_s_median": float(np.median([r["wall_s"] for r in ok])) if ok else None,
+        "process_peak_rss_bytes_max": max(rss) if rss else None,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -653,6 +835,20 @@ def _status(status, reason) -> str:
         return status
     reason = reason or ""
     return reason if reason.startswith(f"{status}:") else f"{status}: {reason}"
+
+
+def _row_status(r) -> str:
+    """Status cell. A row with some scored stages but an unsupported stage is
+    labelled ``partial: <reason>`` and names the stages its numbers cover."""
+    if r["status"] == "unsupported" and r.get("partial"):
+        text = (f"partial: {r.get('reason')} [scored: {', '.join(r.get('scored_stages') or [])}; "
+                f"not scored: {', '.join(r.get('unscored_stages') or [])}]")
+    else:
+        text = _status(r["status"], r.get("reason"))
+    for name, st in (r.get("stages") or {}).items():
+        if st.get("score_note"):
+            text += f" [{name} {st['score_note']}]"
+    return text
 
 
 def _fmt(v, nd=2):
@@ -694,8 +890,13 @@ def render_summary(doc, core, sweeps) -> str:
          f"(matches daemon default: {_fmt(doc['contract_check']['background_hash_matches_daemon_default'])}), "
          f"SEP detection `{doc['configs']['python_sep_detection']['sha256'][:12]}...` "
          f"(matches: {_fmt(doc['contract_check']['detection_hash_matches_daemon_default'])})",
-         "- Metric definitions and units: `ml/eval/bge/README.md`. Every row has an explicit status; "
-         "`unsupported` means the method reported that it could not measure (no number was scored).", "",
+         "- Metric definitions and units: `ml/eval/bge/README.md`. Every scenario x method row has a status: "
+         "`completed` = every applicable stage (background, noise, detection, hfr) ran and is scored; "
+         "`unsupported` = at least one stage reported that it could not measure. An unsupported row whose other "
+         "stages completed is shown as `partial: <reason>` with the stages it scored; its numbers cover only those "
+         "stages and must not be aggregated with completed rows. `skipped` / `failed` rows carry no numbers. "
+         "results.json marks each row with `partial`, `scored_stages`, `unscored_stages` and a `scored` flag per stage.",
+         "",
          "Methods:", ""]
     for m in methods:
         L.append(f"- `{m}` ({METHOD_INFO[m]['kind']}): {METHOD_INFO[m]['label']}")
@@ -705,12 +906,16 @@ def render_summary(doc, core, sweeps) -> str:
     for r in doc["results"]:
         counts.setdefault(r["method"], {}).setdefault(r["status"], 0)
         counts[r["method"]][r["status"]] += 1
-    L.append(_table(["method", "completed", "unsupported", "skipped", "failed"],
-                    [[m] + [counts.get(m, {}).get(s, 0) for s in ("completed", "unsupported", "skipped", "failed")]
-                     for m in methods]))
+        if r.get("partial"):
+            counts[r["method"]]["partial"] = counts[r["method"]].get("partial", 0) + 1
+    L.append(_table(["method", "completed", "unsupported", "of which partial", "skipped", "failed"],
+                    [[m] + [counts.get(m, {}).get(s, 0) for s in ("completed", "unsupported", "partial", "skipped",
+                                                                   "failed")] for m in methods]))
     L += ["", "### Per-scenario tables", "",
           "Columns: background bias = median(B_hat - B_true) [ADU]; RMSE [ADU]; LS = large-scale residual RMS "
-          "(32 px blocks) [ADU]; under-src = median error under source footprints [ADU]; R err = median(R_hat/R_true - 1); "
+          "(32 px blocks) [ADU]; under-src = median error under source footprints [ADU]; R err = median(R_hat/R_true - 1) "
+          "against the expected sky noise (for digitized scenarios the effective std of the digitized values); "
+          "R err analog = the same against the analog sigma (digitized scenarios only, secondary); "
           "compl = completeness of bright truth stars (all stars in parentheses); false = unmatched detections off "
           "every source footprint; frag = unmatched detections on source footprints; acc = accepted stars; "
           "HFR bias = median signed (HFR - HFR_true) of clean matched accepted stars [px] (relative in parentheses); "
@@ -722,7 +927,7 @@ def render_summary(doc, core, sweeps) -> str:
             r = by[(sc.id, m)]
             mt = r.get("metrics", {})
             bg, nz, det, hf, bl = (mt.get(k) or {} for k in ("background", "noise", "detection", "hfr", "blends"))
-            status = _status(r["status"], r.get("reason"))
+            status = _row_status(r)
             if (r.get("stages", {}).get("detection") or {}).get("note"):
                 status += f" [detection {r['stages']['detection']['note']}]"
             if "honest_absence" in mt:
@@ -731,18 +936,31 @@ def render_summary(doc, core, sweeps) -> str:
             hfr = "-" if hf.get("clean_bias_median_px") is None else \
                 f"{_fmt(hf.get('clean_bias_median_px'), 3)} ({_fmt(hf.get('clean_rel_bias_median'), 3)})"
             blend = "" if not bl else f"; merged {bl.get('merged_groups')}/{bl.get('n_multi_member_groups')}, split {bl.get('split_sources')}"
+            nz_an = mt.get("noise_vs_analog") or {}
             rows.append([f"`{m}`", status, _fmt(bg.get("bias_median_adu")), _fmt(bg.get("rmse_adu")),
                          _fmt(bg.get("large_scale_rms_adu")), _fmt(bg.get("bias_median_under_sources_adu")),
-                         _fmt(nz.get("rel_error_median"), 3), compl,
+                         _fmt(nz.get("rel_error_median"), 3), _fmt(nz_an.get("rel_error_median"), 3), compl,
                          f"{_fmt(det.get('false_detections'))} / {_fmt(det.get('fragments_on_sources'))}{blend}",
-                         _fmt(hf.get("n_accepted")), hfr, _fmt(hf.get("saturated_leakage"))])
-        L.append(_table(["method", "status", "bias", "RMSE", "LS", "under-src", "R err", "compl", "false / frag",
-                         "acc", "HFR bias", "sat leak"], rows))
+                         _fmt(r.get("n_accepted")), hfr, _fmt(hf.get("saturated_leakage"))])
+        L.append(_table(["method", "status", "bias", "RMSE", "LS", "under-src", "R err", "R err analog", "compl",
+                         "false / frag", "acc", "HFR bias", "sat leak"], rows))
+        meta = doc["scenarios"].get(sc.id, {}).get("metadata", {}) if isinstance(doc.get("scenarios"), dict) else {}
+        if meta.get("quantization_step_adu"):
+            L.append("")
+            L.append(f"Digitized scenario: analog sigma {meta.get('analog_sigma_adu')} ADU, effective digitized sky "
+                     f"std {_fmt(meta.get('effective_sky_std_adu'), 5)} ADU (primary R truth), expected digitized "
+                     f"level {_fmt(meta.get('expected_digitized_level_adu'), 4)} ADU. "
+                     + ("Level is quantization-limited: bias is scored against the expected digitized level (the "
+                        "analog level is not recoverable). " if meta.get("quantization_limited_level") else "")
+                     + ("" if meta.get("noise_scoreable", True) else
+                        "Noise is not scoreable: the ADC has swallowed it (effective std < 0.01 step)."))
         L.append("")
     L += ["### Focus sweeps (BGE-14)", "",
           "Per-frame median HFR of accepted stars vs focuser position; hyperbola a*sqrt(1+((p-p0)/b)^2) and "
           "parabola fitted with numpy. Shift = fitted p0 - true p0 (focuser steps; sweep step 100). "
-          "Jaccard = mean over frames of the accepted-truth-star set overlap with the frame nearest p0.", ""]
+          "Jaccard = mean over frames of the accepted-truth-star set overlap with the frame nearest p0. "
+          "A sweep is `completed` only if the fit succeeded and every frame produced an HFR; `partial` when the fit "
+          "succeeded over a subset (frame counts given); `failed` when the fit failed.", ""]
     for sw in doc["focus_sweeps"]:
         tf = sw["truth_fit"]
         L += [f"#### `{sw['sweep']}`", "", f"{sw['description']} True p0 = {sw['p0_true']}; noiseless truth-curve "
@@ -760,7 +978,8 @@ def render_summary(doc, core, sweeps) -> str:
             pstat = _fmt(f["parabola"].get("p0_shift"), 1) if f["parabola"]["status"] == "completed" else \
                 f"failed: {f['parabola'].get('reason')}"
             rel = [x for x in e["frame_hfr_rel_error_vs_truth_median"] if x is not None]
-            rows.append([f"`{m}`", _status(e["status"], e["reason"]),
+            rows.append([f"`{m}`", _status(e["status"], e["reason"]) if e["status"] != "partial" else
+                         f"partial: {e['reason']}",
                          f"{f['n_frames_valid']}/{f['n_frames']}", hstat, pstat,
                          _fmt(float(np.mean(jac)) if jac else None, 3),
                          _fmt(float(np.median(rel)) if rel else None, 3)])
@@ -780,7 +999,7 @@ def render_summary(doc, core, sweeps) -> str:
         rows = []
         for r in mesh["rows"]:
             rows.append([r["footprint"], f"`{r['method']}`", _fmt(r["bw"]),
-                         _status(r["status"], r["reason"]),
+                         _row_status(r),
                          _fmt(r["bias_median_adu"]), _fmt(r["bias_median_under_sources_adu"]),
                          _fmt(r["bias_median_at_star_centres_adu"]), _fmt(r["max_abs_error_at_star_centres_adu"]),
                          _fmt(r["bias_median_far_from_sources_adu"]), _fmt(r["rmse_adu"]),
@@ -793,31 +1012,31 @@ def render_summary(doc, core, sweeps) -> str:
     if cross["status"] != "completed":
         L.append(_status(cross["status"], cross["reason"]))
     else:
-        L.append(f"Bound: {cross['bound']}.")
-        L.append("")
+        L += [f"Bound: {cross['bound']}", "", f"Not compared: {cross.get('not_compared')}.", ""]
+
+        def tally_text(t):
+            parts = [f"{k} {t[k]['within']}/{t[k]['compared']}" for k in ("back", "rms", "globalback", "globalrms",
+                                                                            "catalog")]
+            return (f"{t['cases']} cases; level/noise statuses identical in {t['statuses_identical']}/{t['cases']}. "
+                    f"Within D-006 / compared (only items both sides produced; R maps compared as raw arrays "
+                    f"whatever the noise status): {', '.join(parts)}.")
+
+        L += [f"Benchmark frames: {tally_text(cross['tally'])}", ""]
+        if cross.get("mesh_study_tally"):
+            L += [f"Mesh-study runs (bw 16/32/64/128): {tally_text(cross['mesh_study_tally'])}", ""]
         rows = []
-        for cid, p in cross["cases"].items():
+        for cid, p in list(cross["cases"].items()) + list((cross.get("mesh_study_cases") or {}).items()):
             rows.append([cid, f"{p['python_level_status']}/{p['rust_level_status']}",
                          f"{p['python_noise_status']}/{p['rust_noise_status']}", _fmt(p.get("back_max_abs_diff"), 6),
                          _fmt(p.get("back_within_d006_bound")), _fmt(p.get("rms_max_abs_diff"), 6),
-                         _fmt(p.get("rms_within_d006_bound")),
+                         _fmt(p.get("rms_within_d006_bound")), _fmt(p.get("globalback_abs_diff"), 6),
+                         _fmt(p.get("globalrms_abs_diff"), 6),
                          f"{_fmt(p.get('n_candidates_python'))}/{_fmt(p.get('n_candidates_rust'))}",
                          _fmt(p.get("n_matched_within_0p5px")), _fmt(p.get("max_centroid_diff_px"), 6),
                          _fmt(p.get("catalog_within_d006"))])
-        L.append(_table(["case", "level py/rs", "noise py/rs", "max |dB|", "B in bound", "max |dR|", "R in bound",
-                         "objects py/rs", "matched <=0.5 px", "max centroid diff", "catalog in bound"], rows))
-        cases = list(cross["cases"].values())
-
-        def tally(key):
-            vals = [p[key] for p in cases if p.get(key) is not None]
-            return f"{sum(bool(v) for v in vals)}/{len(vals)}"
-
-        statuses_equal = sum(1 for p in cases if (p["python_level_status"], p["python_noise_status"]) ==
-                             (p["rust_level_status"], p["rust_noise_status"]))
-        L.insert(len(L) - 1, f"{len(cases)} cases. Level/noise statuses identical in {statuses_equal}/{len(cases)}. "
-                             f"Within D-006 where both sides produced the item: B maps {tally('back_within_d006_bound')}, "
-                             f"R maps {tally('rms_within_d006_bound')}, catalogs {tally('catalog_within_d006')}.")
-        L.insert(len(L) - 1, "")
+        L.append(_table(["case", "level py/rs", "noise py/rs", "max |dB|", "B in bound", "max |dR| (raw)",
+                         "R in bound", "|d globalback|", "|d globalrms|", "objects py/rs", "matched <=0.5 px",
+                         "max centroid diff", "catalog in bound"], rows))
     L += ["", f"## 3. {SECTION_REAL}", "",
           "`ml/eval/bge/real_frames.py` can load a real-frame manifest for a future run; it refuses accuracy or "
           "pass/fail output without a predeclared thresholds file and never reads hold-out frames in this run.", ""]
@@ -828,9 +1047,10 @@ def render_summary(doc, core, sweeps) -> str:
     else:
         L += [f"**{t['label']}.** Workload: {t['frame']['width']}x{t['frame']['height']} float32 frame, "
               f"{t['frame']['metadata']['params']['n_stars']} Gaussian stars, gradient sky; no masks. "
-              "Python: background + extraction + harness acceptance/HFR, one subprocess per method, median of repeats "
-              "after one warm-up, peak RSS from getrusage. Rust: bridge timing_ms (background + quality + trailing) and "
-              "/usr/bin/time -l around the test binary.", ""]
+              "Python: background + extraction + harness acceptance/HFR; " + t.get("python_repeat_semantics", "") +
+              ". Rust: " + ((t.get("rust") or {}).get("sep", {}) or {}).get("repeat_semantics", RUST_REPEAT_SEMANTICS) +
+              (f". Rust build: {json.dumps(t.get('rust_build'))}" if t.get("rust_build") else "") +
+              ". Python and Rust columns are therefore warm-call vs cold-process numbers.", ""]
         rows = []
         for m, r in t["python"].items():
             rows.append([f"`{m}`", r.get("status"), _fmt(r.get("total_ms_median"), 1), _fmt(r.get("total_ms_p95"), 1),
