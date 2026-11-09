@@ -808,6 +808,23 @@ def steep_ridge_background(seed=120, width=512, height=512):
         seed, bg, np.full_like(bg, 5.0), [], params)
 
 
+def steep_ridge_amp600(seed=122, width=512, height=512):
+    """D-018 fixture: a 600 ADU ridge whose RMS spline undershoots while
+    staying positive (review B: min R 0.549 against a 4.865 minimum mesh
+    sigma, ~100 false detections on this starless frame). An honest reference
+    reports ``invalid_rms_map`` and runs no extraction."""
+    xx, _ = _grid(width, height)
+    bg = 1000.0 + 600.0 * np.exp(-(((xx - 256.0) / 60.0) ** 2))
+    params = {"model": "1000 + 600 exp(-((x-256)/60)^2) ADU", "sigma_adu": 5.0, "n_stars": 0,
+              "provenance": "review B1 / decision D-018 (positive RMS-spline undershoot)",
+              "designed_outcome": "python_sep and rust_sep: noise unresolved, invalid_rms_map, no extraction"}
+    return _gaussian_scene(
+        "steep_ridge_amp600",
+        "Steep vertical sky ridge (+600 ADU, 60 px) on 1000 ADU, 5 ADU noise, 512x512, no sources "
+        "(positive RMS-spline undershoot).",
+        seed, bg, np.full_like(bg, 5.0), [], params)
+
+
 def curved_bowl(seed=121, width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT):
     """Strongly curved background 1000 + 0.02 r^2 ADU (r from the frame centre).
 
@@ -1050,6 +1067,7 @@ SCENARIOS = {
         vignetting_radial,
         curved_bowl,
         steep_ridge_background,
+        steep_ridge_amp600,
         amp_glow_corner,
         heteroscedastic_noise,
         sparse_gaussian_stars,

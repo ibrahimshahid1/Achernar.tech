@@ -30,7 +30,9 @@ SEP fabricates values in two cases (preflight notes, SEP 1.4.1
 back = 0, sigma = 1 with ``RETURN_OK``; with every mesh sigma <= 0
 ``globalrms`` becomes 1.0. Both are detected here from the mask (the 50%
 rule is re-applied on SEP's own mesh grid) and from ``R(x,y) <= 0``, and are
-reported as unsupported/unresolved instead of being scored.
+reported as unsupported/unresolved instead of being scored. The R(x,y)
+validity rules (including D-018's positive-undershoot bound) come from
+``ml.labels.psf_measure.rms_map_validity``, shared with the labeler.
 """
 
 from __future__ import annotations
@@ -253,18 +255,20 @@ def sep_mesh_support(usable: np.ndarray, bw: int, bh: int):
     return nx, ny, frac
 
 
-def rms_map_reasons(r_usable: np.ndarray) -> list:
-    """Contract rule for an RMS map over usable pixels (daemon and W1 agree):
-    any R == 0 -> ``zero_empirical_scatter``; any R < 0 or non-finite ->
-    ``invalid_rms_map`` (SEP's bicubic spline can undershoot below zero where
-    mesh sigmas change sharply). Either makes the noise unresolved."""
-    reasons = []
-    finite = np.isfinite(r_usable)
-    if np.any(finite & (r_usable == 0)):
-        reasons.append("zero_empirical_scatter")
-    if np.any(~finite) or np.any(r_usable[finite] < 0):
-        reasons.append("invalid_rms_map")
-    return reasons
+def rms_map_validity(rms: np.ndarray, usable: np.ndarray, bw: int, bh: int):
+    """Noise validity of SEP's R(x,y) on usable pixels: ``(reasons, diagnostics)``.
+
+    Delegates to W1's ``ml.labels.psf_measure.rms_map_validity`` so the Python
+    reference, the labeler and the daemon apply one rule set (contract and
+    D-018): any usable R == 0 -> ``zero_empirical_scatter``; R < 0, non-finite,
+    or below 0.5 x the smallest positive filtered mesh sigma (the spline
+    undershooting while still positive) -> ``invalid_rms_map``. Either makes
+    the noise unresolved and no extraction runs.
+    """
+    from ml.labels.psf_measure import rms_map_validity as _validity
+
+    reasons, diagnostics = _validity(rms, usable, (bw, bh))
+    return list(reasons), dict(diagnostics)
 
 
 def python_sep_background(image: np.ndarray, masks: dict, params: dict | None = None) -> BackgroundEstimate:
@@ -312,7 +316,8 @@ def python_sep_background(image: np.ndarray, masks: dict, params: dict | None = 
         return est
     reasons = ["meshes_interpolated"] if diag["meshes_below_support"] else []
     r_usable = rms[usable]
-    noise_reasons = rms_map_reasons(r_usable)
+    noise_reasons, validity = rms_map_validity(rms, usable, bw, bh)
+    diag["rms_map_validity"] = validity
     noise_ok = not noise_reasons
     est = BackgroundEstimate(
         method=method,
@@ -334,10 +339,6 @@ def python_sep_background(image: np.ndarray, masks: dict, params: dict | None = 
         diagnostics=diag,
     )
     if not noise_ok:
-        finite = np.isfinite(r_usable)
-        est.diagnostics["rms_zero_fraction"] = float(np.mean(finite & (r_usable == 0)))
-        est.diagnostics["rms_negative_or_nonfinite_fraction"] = float(np.mean(~finite | (r_usable < 0)))
-        est.diagnostics["rms_min_usable"] = float(np.nanmin(r_usable)) if finite.any() else None
         est.diagnostics["sep_globalrms_note"] = "not scored: SEP substitutes 1.0 or a positive-mesh median"
     return est
 
