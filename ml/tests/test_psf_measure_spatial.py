@@ -177,6 +177,7 @@ class TestSpatialBackgroundStatus(SepTestCase):
         self.assertIn("zero_empirical_scatter", label.reasons)
         self.assertIsNone(label.sky_rms_adu)
         self.assertIsNone(label.hfr_px_median)
+        self.assertIsNone(label.saturated_star_fraction)  # no detection ran: not 0
 
     def test_frame_smaller_than_mesh_grid_is_unavailable(self):
         rng = np.random.default_rng(1)

@@ -654,7 +654,7 @@ class FrameLabel:
     star_count_used: int
     sky_median_adu: Optional[float]
     sky_rms_adu: Optional[float]
-    saturated_star_fraction: float
+    saturated_star_fraction: Optional[float]  # None when no source was detected
     label_schema_version: str = LABEL_SCHEMA_VERSION
     label_method: str = ""
     status: str = STATUS_MEASURED
@@ -1287,7 +1287,7 @@ def aggregate_frame(
         star_count_used=len(used),
         sky_median_adu=None if sky_median is None else float(sky_median),
         sky_rms_adu=None if sky_rms is None else float(sky_rms),
-        saturated_star_fraction=(saturated / len(measurements)) if measurements else 0.0,
+        saturated_star_fraction=(saturated / len(measurements)) if measurements else None,
         label_method=f"{BACKGROUND_METHOD_CROP}+{HFR_METHOD_CROP}",
         status=STATUS_MEASURED if hfr_med is not None else STATUS_UNAVAILABLE,
         reasons=[] if hfr_med is not None else ["no_valid_sources"],
@@ -1451,7 +1451,7 @@ def _empty_frame_label(background: SpatialBackground, detection: dict, reasons, 
         star_count_used=0,
         sky_median_adu=background.global_background,
         sky_rms_adu=background.global_rms,
-        saturated_star_fraction=0.0,
+        saturated_star_fraction=None,
         label_method=label_method,
         status=STATUS_UNAVAILABLE,
         reasons=list(reasons),
@@ -1766,7 +1766,7 @@ def measure_frame_sep(
         star_count_used=len(used),
         sky_median_adu=background.global_background,
         sky_rms_adu=background.global_rms,
-        saturated_star_fraction=(saturated / len(sources)) if sources else 0.0,
+        saturated_star_fraction=(saturated / len(sources)) if sources else None,
         label_method=label_method,
         status=STATUS_MEASURED if hfr_med is not None else STATUS_UNAVAILABLE,
         reasons=list(background.reasons) + ([] if hfr_med is not None else ["no_valid_sources"]),

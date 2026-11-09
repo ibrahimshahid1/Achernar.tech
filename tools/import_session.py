@@ -97,7 +97,7 @@ SATURATION_SOURCE_CONTAINER_8BIT = "container_ceiling_8bit"
 # importer's meaning under an unambiguous name.
 SATURATED_STAR_FRACTION_DEFINITION = (
     "fraction of SEP-detected sources (measure_frame_sep) rejected as saturated: native-mask "
-    "footprint or raw footprint peak >= the applied threshold; 0 when no source was detected"
+    "footprint or raw footprint peak >= the applied threshold (written only when sources were measured)"
 )
 SATURATION_FRACTION_LEGACY_NOTE = (
     "legacy key: importer value = saturated_star_fraction (a STAR fraction); the daemon writes a "
