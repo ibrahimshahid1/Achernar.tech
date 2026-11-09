@@ -22,8 +22,9 @@
 //! * `-ffp-contract=on`: contraction of `a*b+c` into one fused multiply-add
 //!   *within a single expression* (ISO C `FP_CONTRACT` semantics). This is
 //!   clang's default, and the PyPI sep 1.4.1 macOS arm64 wheel (the parity
-//!   reference) was built with it: its disassembly has 316 FMA instructions,
-//!   and the per-function counts match a local `-O3` clang build of these
+//!   reference) was built with it: its disassembly has 316 FMA-family
+//!   instructions (312 outside the Cython wrapper; 305 in a local build), and
+//!   the per-function counts match a local `-O3` clang build of these
 //!   files exactly for `backstat`, `backguess`, `filterback`,
 //!   `bkg_line_flt_internal`, `convolve`, `deblend`, `clean` (differences only
 //!   in `analyse` 23/17 and `makebackspline` 4/3, consistent with different
@@ -32,8 +33,10 @@
 //!   GCC's GNU-mode default `fast` would contract *across* statements, which
 //!   neither the reference nor ISO C does. Passing `on` explicitly pins the
 //!   clang behaviour and makes GCC >= 14 match it (older GCC treats `on` as
-//!   `off`). `tests/parity.rs` is the evidence that this choice reproduces the
-//!   reference within decisions.md D-006.
+//!   `off`). Evidence (`tests/parity.rs`, macOS arm64, Apple clang 17): with
+//!   `on` the wheel's maps, globals, catalog and segmentation map are
+//!   reproduced bit for bit; with `off` 27-30% of map pixels differ (by at
+//!   most 3.6e-7 relative, inside decisions.md D-006).
 //! * No `-ffast-math` (or any value-unsafe flag): SEP's histogram mode and
 //!   clipping are order- and NaN-sensitive.
 use std::env;
