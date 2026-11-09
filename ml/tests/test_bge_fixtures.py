@@ -356,10 +356,34 @@ def test_zero_scatter_plateau_leaves_noise_unresolved_and_detection_unrun(sep_re
 def test_negative_rms_spline_is_reported_as_invalid_rms_map(sep_required):
     est = PM.python_sep_background(*(lambda s: (s.image, s.masks))(SC.build_scenario("steep_ridge_background")))
     assert est.noise_status == "unresolved" and "invalid_rms_map" in est.reasons
-    assert est.diagnostics["rms_min_usable"] < 0
-    assert PM.rms_map_reasons(np.array([1.0, 0.0])) == ["zero_empirical_scatter"]
-    assert PM.rms_map_reasons(np.array([1.0, -0.1, np.nan])) == ["invalid_rms_map"]
-    assert PM.rms_map_reasons(np.array([1.0, 2.0])) == []
+    assert est.diagnostics["rms_map_validity"]["min_rms"] < 0
+
+
+def test_positive_rms_undershoot_is_invalid_rms_map_d018(sep_required):
+    sc = SC.build_scenario("steep_ridge_amp600")
+    assert not sc.sources
+    res = PM.run_python_method("python_sep", sc)
+    est = res["estimate"]
+    v = est.diagnostics["rms_map_validity"]
+    assert est.noise_status == "unresolved" and "invalid_rms_map" in est.reasons
+    assert v["min_rms"] > 0 and v["count_below_bound"] > 0  # positive, yet below 0.5 x min mesh sigma
+    assert v["bound"] == pytest.approx(0.5 * v["min_positive_mesh_sigma"])
+    assert res["measurement"]["detection"]["status"] == "unsupported" and res["measurement"]["candidates"] is None
+
+
+def test_rms_validity_rules_are_the_shared_labeler_rules():
+    bw = bh = 64
+    usable = np.ones((128, 128), bool)
+    flat = np.full((128, 128), 5.0, np.float32)
+    assert PM.rms_map_validity(flat, usable, bw, bh)[0] == []
+    plateau = np.zeros((128, 128), np.float32)  # every mesh sigma 0: no positive bound exists
+    assert PM.rms_map_validity(plateau, usable, bw, bh)[0] == ["zero_empirical_scatter"]
+    zero = flat.copy()
+    zero[3, 3] = 0.0  # zero scatter, and also below 0.5 x the 5 ADU mesh sigma (D-018)
+    assert PM.rms_map_validity(zero, usable, bw, bh)[0] == ["zero_empirical_scatter", "invalid_rms_map"]
+    bad = flat.copy()
+    bad[5, 5], bad[6, 6] = -0.1, np.nan
+    assert PM.rms_map_validity(bad, usable, bw, bh)[0] == ["invalid_rms_map"]
 
 
 def test_python_sep_recovers_a_flat_sky_and_finds_every_bright_star(sep_required):

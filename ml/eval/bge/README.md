@@ -89,9 +89,13 @@ SEP fabricates numbers in some cases; the Python reference detects them and
 reports instead of scoring: no mesh with >= 50% usable pixels (SEP returns
 back 0, rms 1 without error) -> `insufficient_support`; frame below
 `min_meshes_per_axis * bw` -> `frame_smaller_than_mesh_grid`; any usable
-`R == 0` -> `zero_empirical_scatter`; any usable `R < 0` or non-finite (SEP's
-bicubic RMS spline can undershoot) -> `invalid_rms_map`. Unresolved noise
-means detection does not run.
+`R == 0` -> `zero_empirical_scatter`; any usable `R < 0`, non-finite, or (D-018)
+below 0.5 x the smallest positive filtered mesh sigma (SEP's bicubic RMS spline
+undershooting, possibly while still positive) -> `invalid_rms_map`. These
+rules come from `ml.labels.psf_measure.rms_map_validity`, shared with the
+labeler and matching the daemon; its diagnostics are recorded under
+`background_result.diagnostics.rms_map_validity`. Unresolved noise means
+detection does not run.
 
 ## Scenarios (`scenarios.py`, generator `bge-fixtures-v1`)
 
@@ -110,6 +114,7 @@ plausibility, not tuned to any method.
 | `vignetting_radial` | 1000(1 - 0.25 rho^2 - 0.05 rho^4) |
 | `curved_bowl` | stress: 1000 + 0.02 r^2 |
 | `steep_ridge_background` | 512x512, 1000 + 800 exp(-((x-256)/60)^2), sigma 5 (negative-RMS-spline reproduction) |
+| `steep_ridge_amp600` | as above with a 600 ADU ridge: the RMS spline undershoots while staying positive (D-018; expects `invalid_rms_map`) |
 | `amp_glow_corner` | +600 e- exponential corner glow, Poisson + read noise |
 | `heteroscedastic_noise` | R(x,y) = 6 + 12 x/(W-1) + 4 sin(pi y/(H-1)) |
 | `sparse_gaussian_stars`, `moffat_stars` | 40 isolated stars (Gaussian sigma 2; Moffat FWHM 5, beta 3) |
