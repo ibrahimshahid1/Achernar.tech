@@ -44,8 +44,11 @@ def aperture_hfr(signal: np.ndarray, center: tuple[float, float], radius: float)
     residuals are retained; clipping them would introduce a positive noise
     pedestal.  This finite-aperture reference is not an infinite analytic HFR
     or a physical best-focus label. ``None`` means an invalid measurement.
+    Requires the pinned SEP (MissingPrerequisite otherwise).
     """
-    import sep
+    from ml.labels.psf_measure import require_sep
+
+    sep = require_sep()
 
     y, x = np.indices(signal.shape, dtype=np.float64)
     r = np.hypot(x - center[0], y - center[1])
@@ -64,6 +67,12 @@ def aperture_hfr(signal: np.ndarray, center: tuple[float, float], radius: float)
     if flags[0] or not np.isfinite(result[0]) or result[0] <= 0:
         return None
     return float(result[0])
+
+
+def _pinned_sep_version() -> str:
+    from ml.labels.psf_measure import require_sep
+
+    return require_sep().__version__
 
 
 def moment_shape(signal: np.ndarray, *, angle_threshold: float = 0.02) -> tuple[float, float | None]:
@@ -365,6 +374,7 @@ def prepare_synthetic(root: Path, seed=42, families=800, variants=3, scene_count
         "dataset_id": "stellar_sim_v1", "generator": SIM_VERSION, "seed": seed,
         "generator_source_sha256": sha256_file(output/'generator_source.py'),
         "normalization_source_sha256":sha256_file(output/'normalization_source.py'), "numpy_version": np.__version__,
+        "sep_version": _pinned_sep_version(),
         "families": families, "variants_per_family": variants, "observations": len(rows),
         "fqe_accepted": len(accepted_rows), "fqe_split_counts": registry["counts"],
         "fqe_rejections": dict(Counter(reason for r in rows for reason in r["fqe_rejections"])),
