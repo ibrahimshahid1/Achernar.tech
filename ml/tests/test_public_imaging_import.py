@@ -39,7 +39,28 @@ def test_fits_intake_preserves_quality_arrays_and_rejects_masked_cores(tmp_path)
     with np.load(output/'frame.npz',allow_pickle=False) as data:
         np.testing.assert_array_equal(data['science_electrons'],image)
         np.testing.assert_array_equal(data['dq'],dq)
+        background = data['sep_background_estimate_electrons']
     assert manifest['fqe_quality_accepted']==2
+    # SEP provenance (BGE-20). The background is the same SEP call as before
+    # (library-default mesh, DQ/finite/ERR mask); noise stays the pipeline ERR.
+    import sep
+    from ml.labels.psf_measure import config_sha256
+    mask=(dq!=0)|~np.isfinite(image)
+    cleaned=image.copy();cleaned[mask]=float(np.median(image[~mask]))
+    np.testing.assert_array_equal(background,sep.Background(cleaned,mask=mask).back())
+    assert manifest['sep_version']=='1.4.1'
+    assert manifest['noise_source']=='pipeline_error'
+    assert manifest['background_config']['method']=='sep_spatial_mesh'
+    assert (manifest['background_config']['bw'],manifest['background_config']['fw'])==(64,3)
+    assert manifest['background_config_sha256']==config_sha256(manifest['background_config'])
+    detection=manifest['detection_config']
+    assert (detection['thresh_sigma'],detection['filter_type'],detection['noise'])==(6.0,'matched','pipeline_error_map')
+    assert detection['pixstack']>=image.size
+    assert manifest['detection_config_sha256']==config_sha256(detection)
+    assert manifest['background_provenance']['units']=='electrons'
+    assert all(r['noise_source']=='pipeline_error' and r['detection_config_sha256']==manifest['detection_config_sha256'] for r in rows)
+    assert not manifest['training_eligible'] and manifest['split']=='test'
+    assert any('do not calibrate Canon' in item for item in manifest['limitations'])
 
 
 def _gaussian(**changes):
