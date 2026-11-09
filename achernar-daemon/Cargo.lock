@@ -6,6 +6,7 @@ version = 4
 name = "achernar-daemon"
 version = "0.1.0"
 dependencies = [
+ "achernar-sep",
  "anyhow",
  "ascom-alpaca",
  "axum",
@@ -37,6 +38,13 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "achernar-sep"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
