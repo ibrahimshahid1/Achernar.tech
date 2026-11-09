@@ -25,6 +25,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from labels import psf_measure as pm  # noqa: E402
 from labels.psf_measure import (  # noqa: E402
     MissingPrerequisite,
+    filtered_mesh_sigmas,
+    rms_map_validity,
     Rejection,
     SepBackgroundParams,
     SepDetectionParams,
@@ -265,6 +267,69 @@ class TestSpatialBackgroundStatus(SepTestCase):
         _, label = measure_frame_sep(np.ones((256, 256)), native_saturation_mask=np.zeros((10, 10), bool))
         self.assertEqual(label.reasons, ["malformed_geometry"])
 
+    def test_filtered_mesh_sigmas_are_recovered_exactly(self):
+        # bw odd and bh even put every spline node exactly on a pixel (x node at
+        # (k+0.5)*bw-0.5, y node at (j+0.5)*bh), so R there IS the node value:
+        # an independent check of the spline transcription and inversion.
+        rng = np.random.default_rng(31)
+        ys, xs = np.mgrid[0:320, 0:315]
+        image = (300.0 + rng.normal(0.0, 1.0, xs.shape) * (3.0 + 0.02 * xs + 0.01 * ys)).astype(np.float32)
+        rms = self.sep.Background(image, bw=63, bh=64).rms()
+        grid, diagnostics = filtered_mesh_sigmas(rms, (63, 64))
+        nodes = rms[np.ix_(32 + 64 * np.arange(5), 31 + 63 * np.arange(5))]
+        self.assertEqual(diagnostics["mesh_sigma_method"], "spline_inversion")
+        self.assertLess(diagnostics["reconstruction_max_rel_error"], 1e-6)
+        # Tolerance: float32 storage of the map (~6e-8 relative) and the
+        # float32 dx accumulation inside SEP; 1e-6 relative leaves margin.
+        np.testing.assert_allclose(grid, nodes, rtol=1e-6)
+
+    def test_positive_spline_undershoot_is_invalid_and_not_extracted(self):
+        """D-018 fixture (review B1): amp-600 ridge, starless. The map stays
+        positive, yet dips far below every mesh sigma; extraction on it finds
+        stars that do not exist. The labeler must stop before sep.extract."""
+        rng = np.random.default_rng(5)
+        ys, xs = np.mgrid[0:512, 0:512]
+        image = 1000.0 + 600.0 * np.exp(-(((xs - 256) / 60.0) ** 2)) + rng.normal(0, 5.0, xs.shape)
+        raw = self.sep.Background(image.astype(np.float32))
+        rms = raw.rms()
+        self.assertGreater(float(rms.min()), 0.0)
+        false = self.sep.extract((image - raw.back()).astype(np.float32), 5.0, err=rms, filter_type="conv", minarea=5)
+        self.assertGreater(len(false), 20)  # the defect: a starless frame "has" stars
+
+        reasons, diagnostics = rms_map_validity(rms, np.ones(rms.shape, bool), SepBackgroundParams())
+        self.assertEqual(reasons, ["invalid_rms_map"])
+        self.assertEqual(diagnostics["mesh_sigma_method"], "spline_inversion")
+        self.assertLess(diagnostics["min_rms"], diagnostics["bound"])
+        self.assertAlmostEqual(diagnostics["bound"], 0.5 * diagnostics["min_positive_mesh_sigma"])
+        self.assertGreater(diagnostics["count_below_bound"], 0)
+
+        calls = []
+        original = self.sep.extract
+
+        def recording(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(self.sep, "extract", recording):
+            sources, label = measure_frame_sep(image, fit_fwhm=False)
+        self.assertEqual(calls, [])
+        self.assertEqual(sources, [])
+        self.assertEqual(label.status, "unavailable")
+        self.assertIn("invalid_rms_map", label.reasons)
+        self.assertEqual(label.background["rms_validity"]["count_below_bound"], diagnostics["count_below_bound"])
+
+    def test_smooth_heteroscedastic_field_stays_measured(self):
+        # Flat-fielded vignetting: sigma 5 -> 59 smoothly. No undershoot.
+        rng = np.random.default_rng(21)
+        ys, xs = np.mgrid[0:512, 0:512]
+        sigma = 5.0 + 27.0 * ((xs - 255.5) ** 2 + (ys - 255.5) ** 2) / (255.5**2)
+        image = 800.0 + rng.normal(0.0, 1.0, xs.shape) * sigma
+        bg = estimate_spatial_background(image)
+        self.assertEqual((bg.level_status, bg.noise_status, bg.reasons), ("measured", "measured", ()))
+        self.assertEqual(bg.rms_validity["count_below_bound"], 0)
+        self.assertGreaterEqual(bg.rms_validity["min_rms"], bg.rms_validity["bound"])
+        self.assertEqual(bg.rms_validity["mesh_sigma_method"], "spline_inversion")
+
     def test_negative_spline_rms_is_invalid_not_consumed(self):
         # A narrow bright ridge inflates the clipped sigma of a few meshes; SEP's
         # bicubic RMS spline then undershoots below zero between meshes.
@@ -304,20 +369,43 @@ class TestLocalNoiseDetection(SepTestCase):
                                        detection_params=SepDetectionParams(filter_type="matched"))
         self.assertGreater(len(_matched([(s.x, s.y) for s in matched], positions)), len(found_local) + 5)
 
-    def test_heteroscedastic_halves_equal_significance(self):
-        """Noisy region (sigma 40) on 5/8 of the frame, quiet (sigma 5) on 3/8.
-        Every star has the same peak significance, 20 x its local sigma."""
+    def test_sharp_noise_step_undershoots_and_is_invalid(self):
+        """An 8x noise step (sigma 40 | 5) between neighbouring meshes. SEP's
+        natural-cubic RMS spline undershoots into the quiet side to ~1.6, a
+        third of the true sigma 5 there, while staying positive: a 5-sigma
+        threshold on that map would really be ~1.6 sigma. Decision D-018 makes
+        this invalid_rms_map (this fixture was, before D-018, the
+        equal-significance test, which now uses a 3x step)."""
         rng = np.random.default_rng(11)
         ys, xs = np.mgrid[0:512, 0:512]
         sigma = np.where(xs < 320, 40.0, 5.0)
         image = 1000.0 + rng.normal(0.0, 1.0, xs.shape) * sigma
+        raw = self.sep.Background(image.astype(np.float32)).rms()
+        quiet = xs >= 320
+        self.assertGreater(float(raw[quiet].min()), 0.0)   # the old zero/negative rules do not fire
+        self.assertLess(float(raw[quiet].min()), 0.5 * 5.0)  # but R is < half the true sigma
+        bg = estimate_spatial_background(image)
+        self.assertEqual((bg.level_status, bg.noise_status), ("measured", "unresolved"))
+        self.assertEqual(bg.reasons, ("invalid_rms_map",))
+        self.assertGreater(bg.rms_validity["count_below_bound"], 0)
+
+    def test_heteroscedastic_halves_equal_significance(self):
+        """Noisy region (sigma 15) on 5/8 of the frame, quiet (sigma 5) on 3/8.
+        Every star has the same peak significance, 12 x its local sigma. A 3x
+        step keeps SEP's RMS spline above the D-018 bound (the 8x step of the
+        pre-D-018 version undershoots: test_sharp_noise_step_undershoots...)."""
+        rng = np.random.default_rng(11)
+        ys, xs = np.mgrid[0:512, 0:512]
+        sigma = np.where(xs < 320, 15.0, 5.0)
+        image = 1000.0 + rng.normal(0.0, 1.0, xs.shape) * sigma
         noisy = [(x, y) for y in (64, 160, 256, 352, 448) for x in (64, 160, 256)]
         quiet = [(x, y) for y in (64, 160, 256, 352, 448) for x in (416, 464)]
         for cx, cy in noisy:
-            image += _gaussian(xs, ys, cx, cy, 20.0 * 40.0, 1.5)
+            image += _gaussian(xs, ys, cx, cy, 12.0 * 15.0, 1.5)
         for cx, cy in quiet:
-            image += _gaussian(xs, ys, cx, cy, 20.0 * 5.0, 1.5)
+            image += _gaussian(xs, ys, cx, cy, 12.0 * 5.0, 1.5)
 
+        self.assertEqual(estimate_spatial_background(image).noise_status, "measured")
         sources, label = measure_frame_sep(image, fit_fwhm=False)
         xy = [(s.x, s.y) for s in sources]
         self.assertEqual(len(_matched(xy, noisy)), len(noisy))
@@ -326,8 +414,8 @@ class TestLocalNoiseDetection(SepTestCase):
             np.hypot(p[0] - tx, p[1] - ty) for tx, ty in noisy + quiet) > 3.0]
         self.assertLessEqual(len(false_local), 2)
 
-        # Pre-v2 scalar err: globalrms is the median mesh sigma (~40 here), so
-        # the quiet region's threshold is 8x too high and its stars vanish.
+        # Pre-v2 scalar err: globalrms is the median mesh sigma (~15 here), so
+        # the quiet region's threshold is 3x too high and its stars vanish.
         legacy = _legacy_scalar_extract(self.sep, image)
         legacy_xy = np.column_stack([legacy["x"], legacy["y"]])
         self.assertEqual(len(_matched(legacy_xy, noisy)), len(noisy))
@@ -622,6 +710,19 @@ class TestGainAndMetadata(SepTestCase):
         self.assertEqual(len(seen), 2)
         for received in seen:
             self.assertFalse(received.any())  # detector mask only: nothing is bad here
+
+
+class TestRmsValidityFallback(unittest.TestCase):
+    def test_map_that_is_not_a_sep_spline_uses_the_node_sample_approximation(self):
+        rng = np.random.default_rng(0)
+        rms = (5.0 + rng.random((256, 256))).astype(np.float32)
+        reasons, diagnostics = rms_map_validity(rms, np.ones(rms.shape, bool), (64, 64))
+        self.assertEqual(diagnostics["mesh_sigma_method"], "node_pixel_sample")
+        self.assertGreater(diagnostics["reconstruction_max_rel_error"], 1e-4)
+        self.assertEqual(reasons, [])  # every value lies in [5, 6): above half of any node
+        rms[100, 100] = 2.0  # below 0.5 x min node (>= 5)
+        reasons, diagnostics = rms_map_validity(rms, np.ones(rms.shape, bool), {"bw": 64, "bh": 64})
+        self.assertEqual((reasons, diagnostics["count_below_bound"]), (["invalid_rms_map"], 1))
 
 
 class TestFwhmPooling(unittest.TestCase):
