@@ -183,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_plate_solver(plate_solver)
     .with_auto_solve(&config.plate_solve)
+    .with_background_settings(config.vision.background.clone())
     .with_equipment(&equipment_configs, site, Some(equipment_store));
     // Sequence numbers continue from the journal (§4.3).
     match storage::equipment_events_repo::max_seq(app_state.local_store.pool()).await {

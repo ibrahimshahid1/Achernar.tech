@@ -28,7 +28,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use super::background::BackgroundStats;
+use super::background_model::{BackgroundAnalysis, BackgroundField, SourceCatalog};
 use super::quality::LumaFrame;
 use crate::equipment::types::{AlignmentMode, PierSide};
 
@@ -105,7 +105,23 @@ pub struct TrailingEstimate {
     pub sky: Option<SkyAttribution>,
     /// Why `sky` is `None` when there is a trail to attribute.
     pub withheld: Option<String>,
+    /// Source-selection policy that produced the ellipses.
+    pub policy: &'static str,
+    /// Set when trailing could not be measured (no background, or no
+    /// detection on the spatial path). `severity` is then not a measurement.
+    pub unavailable_reason: Option<String>,
 }
+
+/// Legacy trailing selection: 8-connected components above the global
+/// `max(B + 3*max(sigma,1), B + 6)`, 5..=5000 pixels, no masked or clipped
+/// neighbour, moments of `max(I-B,0)`.
+pub const LEGACY_TRAILING_POLICY: &str = "legacy_components_3sigma_v1";
+/// SEP-path trailing selection: the shared SEP catalog's detection
+/// footprints (the focus detection threshold, not a separate 3-sigma pass),
+/// 5..=5000 pixels, no masked or clipped neighbour, moments of the
+/// *unfiltered* residual `max(I-B(x,y),0)` (SEP's own a/b/theta are moments
+/// of the filtered image). Focus-star gates are not applied.
+pub const SEP_TRAILING_POLICY: &str = "sep_footprint_unfiltered_moments_v1";
 
 impl TrailingEstimate {
     /// The bus's `trailing_axis`: the sky axis when attributed, else the
@@ -163,8 +179,24 @@ struct Ellipse {
 }
 
 /// Measure the trail on the sensor. No sky axis is claimed: see [`attribute`].
-pub fn estimate_trailing(frame: &LumaFrame, background: &BackgroundStats) -> TrailingEstimate {
-    let mut ellipses = source_ellipses(frame, background);
+pub fn estimate_trailing(frame: &LumaFrame, background: &BackgroundAnalysis) -> TrailingEstimate {
+    let (mut ellipses, policy) = match (&background.catalog, background.field.as_ref()) {
+        (_, None) => return unavailable(LEGACY_TRAILING_POLICY, "background_unavailable"),
+        (Some(catalog), Some(field)) => {
+            (catalog_ellipses(frame, field, catalog), SEP_TRAILING_POLICY)
+        }
+        (None, Some(BackgroundField::Uniform { level, sigma })) => (
+            source_ellipses(frame, *level, *sigma),
+            LEGACY_TRAILING_POLICY,
+        ),
+        (None, Some(BackgroundField::Map { .. })) => {
+            let reason = background
+                .catalog_error
+                .clone()
+                .unwrap_or_else(|| "detection_unavailable".to_string());
+            return unavailable(SEP_TRAILING_POLICY, &reason);
+        }
+    };
     if ellipses.is_empty() {
         return TrailingEstimate {
             severity: 0.0,
@@ -172,6 +204,8 @@ pub fn estimate_trailing(frame: &LumaFrame, background: &BackgroundStats) -> Tra
             sensor_axis: None,
             sky: None,
             withheld: None,
+            policy,
+            unavailable_reason: None,
         };
     }
 
@@ -191,6 +225,20 @@ pub fn estimate_trailing(frame: &LumaFrame, background: &BackgroundStats) -> Tra
         sensor_axis,
         sky: None,
         withheld: sensor_axis.map(|_| "no_plate_solve".to_string()),
+        policy,
+        unavailable_reason: None,
+    }
+}
+
+fn unavailable(policy: &'static str, reason: &str) -> TrailingEstimate {
+    TrailingEstimate {
+        severity: 0.0,
+        sensor_pa_deg: None,
+        sensor_axis: None,
+        sky: None,
+        withheld: None,
+        policy,
+        unavailable_reason: Some(reason.to_string()),
     }
 }
 
@@ -300,9 +348,9 @@ pub fn attribute(
     estimate
 }
 
-fn source_ellipses(frame: &LumaFrame, background: &BackgroundStats) -> Vec<Ellipse> {
-    let sigma = background.background_sigma.max(1.0);
-    let threshold = (background.background_adu + sigma * 3.0).max(background.background_adu + 6.0);
+fn source_ellipses(frame: &LumaFrame, level: f32, measured_sigma: f32) -> Vec<Ellipse> {
+    let sigma = measured_sigma.max(1.0);
+    let threshold = (level + sigma * 3.0).max(level + 6.0);
     let mut visited = vec![false; frame.pixels.len()];
     let mut ellipses = Vec::new();
 
@@ -327,7 +375,7 @@ fn source_ellipses(frame: &LumaFrame, background: &BackgroundStats) -> Vec<Ellip
 
         while let Some(current) = stack.pop() {
             let current_value = frame.pixels[current];
-            let signal = (current_value - background.background_adu).max(0.0);
+            let signal = (current_value - level).max(0.0);
             let x = current % frame.width;
             let y = current / frame.width;
 
@@ -364,50 +412,108 @@ fn source_ellipses(frame: &LumaFrame, background: &BackgroundStats) -> Vec<Ellip
             }
         }
 
-        if touches_masked_support
-            || points.len() < 5
-            || points.len() > 5_000
-            || flux <= f32::EPSILON
-        {
+        if touches_masked_support || points.len() < 5 || points.len() > 5_000 {
             continue;
         }
-
-        let cx = weighted_x / flux;
-        let cy = weighted_y / flux;
-        let mut mxx = 0.0_f32;
-        let mut myy = 0.0_f32;
-        let mut mxy = 0.0_f32;
-
-        for (x, y, signal) in points {
-            let dx = x - cx;
-            let dy = y - cy;
-            mxx += signal * dx * dx;
-            myy += signal * dy * dy;
-            mxy += signal * dx * dy;
+        if let Some(ellipse) = ellipse_of(&points, flux, weighted_x, weighted_y) {
+            ellipses.push(ellipse);
         }
-
-        mxx /= flux;
-        myy /= flux;
-        mxy /= flux;
-
-        let trace = mxx + myy;
-        let det_term = ((mxx - myy).powi(2) + 4.0 * mxy * mxy).sqrt();
-        let major = ((trace + det_term) * 0.5).max(0.0).sqrt();
-        let minor = ((trace - det_term) * 0.5).max(0.0).sqrt();
-        if major <= f32::EPSILON {
-            continue;
-        }
-
-        let ellipticity = (1.0 - minor / major).clamp(0.0, 1.0);
-        let pa_deg = normalize_pa(0.5 * (2.0 * mxy).atan2(mxx - myy).to_degrees());
-        ellipses.push(Ellipse {
-            ellipticity,
-            pa_deg,
-            flux,
-        });
     }
 
     ellipses
+}
+
+/// Shape of each shared-catalog footprint from the unfiltered residual.
+fn catalog_ellipses(
+    frame: &LumaFrame,
+    field: &BackgroundField,
+    catalog: &SourceCatalog,
+) -> Vec<Ellipse> {
+    let mut ellipses = Vec::new();
+    for object in &catalog.objects {
+        let n = object.pixels.len();
+        if !(5..=5_000).contains(&n) {
+            continue;
+        }
+        // Same veto as the legacy policy: no footprint pixel may touch
+        // masked or clipped support in its 8-neighbourhood.
+        let touches_masked_support = object.pixels.iter().any(|&index| {
+            let index = index as usize;
+            let x = index % frame.width;
+            let y = index / frame.width;
+            (y.saturating_sub(1)..=(y + 1).min(frame.height - 1)).any(|ny| {
+                (x.saturating_sub(1)..=(x + 1).min(frame.width - 1)).any(|nx| {
+                    let neighbor = ny * frame.width + nx;
+                    !frame.measurement_pixel_valid(neighbor) || frame.native_saturation_at(neighbor)
+                })
+            })
+        });
+        if touches_masked_support {
+            continue;
+        }
+        let mut points = Vec::with_capacity(n);
+        let mut flux = 0.0_f32;
+        let mut weighted_x = 0.0_f32;
+        let mut weighted_y = 0.0_f32;
+        for &index in &object.pixels {
+            let index = index as usize;
+            let (x, y) = ((index % frame.width) as f32, (index / frame.width) as f32);
+            let signal = (frame.pixels[index] - field.level_at(index)).max(0.0);
+            points.push((x, y, signal));
+            flux += signal;
+            weighted_x += x * signal;
+            weighted_y += y * signal;
+        }
+        if let Some(ellipse) = ellipse_of(&points, flux, weighted_x, weighted_y) {
+            ellipses.push(ellipse);
+        }
+    }
+    ellipses
+}
+
+/// Flux-weighted second moments of `(x, y, signal)` points (SExtractor A/B).
+fn ellipse_of(
+    points: &[(f32, f32, f32)],
+    flux: f32,
+    weighted_x: f32,
+    weighted_y: f32,
+) -> Option<Ellipse> {
+    if flux <= f32::EPSILON {
+        return None;
+    }
+    let cx = weighted_x / flux;
+    let cy = weighted_y / flux;
+    let mut mxx = 0.0_f32;
+    let mut myy = 0.0_f32;
+    let mut mxy = 0.0_f32;
+
+    for &(x, y, signal) in points {
+        let dx = x - cx;
+        let dy = y - cy;
+        mxx += signal * dx * dx;
+        myy += signal * dy * dy;
+        mxy += signal * dx * dy;
+    }
+
+    mxx /= flux;
+    myy /= flux;
+    mxy /= flux;
+
+    let trace = mxx + myy;
+    let det_term = ((mxx - myy).powi(2) + 4.0 * mxy * mxy).sqrt();
+    let major = ((trace + det_term) * 0.5).max(0.0).sqrt();
+    let minor = ((trace - det_term) * 0.5).max(0.0).sqrt();
+    if major <= f32::EPSILON {
+        return None;
+    }
+
+    let ellipticity = (1.0 - minor / major).clamp(0.0, 1.0);
+    let pa_deg = normalize_pa(0.5 * (2.0 * mxy).atan2(mxx - myy).to_degrees());
+    Some(Ellipse {
+        ellipticity,
+        pa_deg,
+        flux,
+    })
 }
 
 fn trimmed_mean_ellipticity(ellipses: &[Ellipse], trim_fraction: f32) -> f32 {
@@ -476,7 +582,7 @@ fn normalize_pa(pa_deg: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vision::background::estimate_background;
+    use crate::vision::quality::background_from_luma;
 
     /// One star trailed along the sensor's x axis.
     fn trailed_along_x() -> LumaFrame {
@@ -503,7 +609,7 @@ mod tests {
 
     fn measured() -> TrailingEstimate {
         let frame = trailed_along_x();
-        let background = estimate_background(&frame.pixels, frame.saturation_adu);
+        let background = background_from_luma(&frame);
         estimate_trailing(&frame, &background)
     }
 
@@ -735,5 +841,81 @@ mod tests {
         let attributed = attribute(round, None, &frame(Some(PierSide::East)));
         assert!(attributed.sky.is_none() && attributed.withheld.is_none());
         assert_eq!(attributed.axis_label(), None);
+    }
+
+    #[test]
+    fn shared_sep_catalog_trails_use_unfiltered_footprint_moments() {
+        use crate::vision::background_model::{
+            BackgroundField, CatalogSource, CropSkySource, DetectionMethod, DetectionProvenance,
+            SourceCatalog,
+        };
+        let frame = trailed_along_x();
+        let mut analysis = background_from_luma(&frame);
+        let pixels: Vec<u32> = frame
+            .pixels
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| **v > 100.0)
+            .map(|(i, _)| i as u32)
+            .collect();
+        analysis.field = Some(BackgroundField::Map {
+            level: vec![100.0; frame.pixels.len()],
+            rms: vec![1.0; frame.pixels.len()],
+            width: frame.width,
+            height: frame.height,
+        });
+        analysis.catalog = Some(SourceCatalog {
+            provenance: DetectionProvenance {
+                method: DetectionMethod::SepExtract,
+                config_sha256: "test".into(),
+                crop_sky_source: CropSkySource::ParentBackgroundMap,
+                noise_floor_applied: false,
+                objects_detected: 1,
+                objects_deblended: 0,
+                objects_truncated: 0,
+            },
+            objects: vec![CatalogSource {
+                x: 31.5,
+                y: 32.0,
+                xmin: 24,
+                xmax: 39,
+                ymin: 31,
+                ymax: 33,
+                npix: pixels.len() as u32,
+                flux: 1.0e4,
+                peak_residual: 500.0,
+                peak_raw: 600.0,
+                // SEP's own (filtered-image) shape is deliberately round here:
+                // the policy must not use it.
+                a: 3.0,
+                b: 3.0,
+                theta: 0.0,
+                flags: 0,
+                deblended: false,
+                truncated: false,
+                pixels,
+            }],
+            segmentation: None,
+        });
+        let sep = estimate_trailing(&frame, &analysis);
+        let legacy = measured();
+        assert_eq!(sep.policy, SEP_TRAILING_POLICY);
+        assert_eq!(legacy.policy, LEGACY_TRAILING_POLICY);
+        assert!(sep.unavailable_reason.is_none());
+        assert!((sep.severity - legacy.severity).abs() < 1e-5);
+        assert_eq!(sep.sensor_axis, Some(SensorAxis::X));
+    }
+
+    #[test]
+    fn trailing_without_a_background_is_unavailable_not_round() {
+        let frame = trailed_along_x();
+        let mut analysis = background_from_luma(&frame);
+        analysis.field = None;
+        let estimate = estimate_trailing(&frame, &analysis);
+        assert_eq!(
+            estimate.unavailable_reason.as_deref(),
+            Some("background_unavailable")
+        );
+        assert!(estimate.sensor_axis.is_none());
     }
 }

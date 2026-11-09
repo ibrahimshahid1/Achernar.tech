@@ -112,6 +112,11 @@ pub enum BackgroundReason {
     FrameSmallerThanMeshGrid,
     /// Usable pixels exist but their empirical scatter is zero.
     ZeroEmpiricalScatter,
+    /// The interpolated RMS map is negative or non-finite on usable pixels.
+    /// SEP's bicubic spline overshoots between meshes whose clipped sigmas
+    /// differ sharply (for example a steep background ridge inflating some
+    /// meshes' sigma), so the map cannot serve as a detection noise.
+    InvalidRmsMap,
     /// The SEP library returned an error (see `backend_error`).
     BackendFailure,
     /// The selected backend failed and the configured fallback ran instead.

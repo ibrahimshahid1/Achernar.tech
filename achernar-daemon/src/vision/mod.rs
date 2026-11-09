@@ -2,6 +2,7 @@
 //! Shared observation pipeline, vision loop, and inference runners.
 
 pub mod background;
+pub mod background_dispatch;
 pub mod background_estimator;
 pub mod background_model;
 pub mod coc_runner;

@@ -37,6 +37,21 @@ pub struct AchernarConfig {
     pub safety: SafetyConfig,
     #[serde(default)]
     pub weather: WeatherConfig,
+    /// `[vision]`: image-analysis settings of the vision loop.
+    #[serde(default)]
+    pub vision: VisionConfig,
+}
+
+/// `[vision]` in `achernar.toml`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct VisionConfig {
+    /// `[vision.background]`: `backend = "legacy_global_clip" | "sep"`,
+    /// `fallback = "unavailable" | "legacy_global_clip"`, `[vision.background.sep]`
+    /// mesh parameters and `[vision.background.detection]` extraction
+    /// parameters. `sep` is an opt-in diagnostic backend, not a qualified
+    /// default.
+    #[serde(default)]
+    pub background: crate::vision::background_model::BackgroundSettings,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1570,6 +1585,7 @@ impl Default for AchernarConfig {
             guider: GuiderConfig::default(),
             safety: SafetyConfig::default(),
             weather: WeatherConfig::default(),
+            vision: VisionConfig::default(),
         }
     }
 }

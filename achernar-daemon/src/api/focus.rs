@@ -2024,8 +2024,10 @@ async fn record_sample(
             fqe_hfr_px: f64_of(observation.fqe_hfr_px),
             fqe_sigma_log_hfr: f64_of(observation.fqe_sigma_log_hfr),
             quality_uncertainty: f64_of(observation.quality_uncertainty),
-            background_adu: f64_of(Some(observation.background_adu)),
-            saturation_fraction: f64_of(Some(observation.saturation_fraction)),
+            // Absent unless measured: FOP masks it as `background_unavailable`
+            // instead of training on a stand-in 0.
+            background_adu: f64_of(observation.background_adu),
+            saturation_fraction: f64_of(observation.saturation_fraction),
             saturation_gate_applied: observation.saturation_gate.was_applied(),
             sensor_temperature_c: sensor_measured,
             ambient: &ambient,
@@ -3285,9 +3287,15 @@ fn autofocus_quality_json(
             "status": observation.status,
             "quality_uncertainty": observation.quality_uncertainty,
             "hfr_log_sigma": observation.hfr_log_sigma,
+            // Deprecated top-level mirrors (the FOP contract names them);
+            // `null` when not measured. `background` is authoritative: method,
+            // configuration hash, level/noise validity, units and support.
+            // Rows without it are legacy-unverified.
             "background_adu": observation.background_adu,
             "background_sigma": observation.background_sigma,
             "saturation_fraction": observation.saturation_fraction,
+            "background": observation.background,
+            "detection": observation.detection,
             // The FQE's own reading of this frame — the Quality(3) group of the
             // Focus Offset Predictor's input (ml/contracts/fop_features.py).
             //
