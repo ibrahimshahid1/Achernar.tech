@@ -13,7 +13,10 @@ Safe Rust API over the vendored SEP 1.4.1 C library: spatial background
   numerical effect.
 - Built by `build.rs` with the `cc` crate; no network, works with
   `cargo build --offline`. Flags and their reasons are documented in
-  `build.rs` and recorded in `achernar_sep::BUILD_FLAGS`.
+  `build.rs` and recorded in `achernar_sep::BUILD_FLAGS`, including any
+  `CFLAGS`-family environment variables `cc` appends and the compiler path.
+  A value-unsafe flag in them (`-ffast-math`, `-Ofast`,
+  `-ffp-contract=fast`, ...) fails the build.
 - Changing the SEP version or the compile flags changes measurements. Re-run
   the parity test and regenerate the fixture with the reference wheel when
   doing so.
