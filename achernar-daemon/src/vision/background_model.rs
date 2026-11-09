@@ -197,7 +197,13 @@ pub struct SepDetectionParams {
     pub thresh_sigma: f32,
     #[serde(default = "default_minarea")]
     pub minarea: u32,
-    /// `matched` (uses the noise array) or `conv`.
+    /// `conv` or `matched`. SEP 1.4.1 compares a CONV-filtered residual with
+    /// `thresh_sigma * R(x,y)`, but a MATCHED-filtered unit-variance S/N with
+    /// `thresh_sigma` itself; for the 3x3 default kernel MATCHED is ~2.67x more
+    /// sensitive at the same number (sqrt(sum k^2)/sum|k| = 6/16). SEP also
+    /// silently downgrades MATCHED to CONV when the noise is scalar, which is
+    /// what the Python labeler effectively ran with `err=globalrms`. `conv`
+    /// keeps that detection semantics while the noise becomes the local map.
     #[serde(default = "default_filter_type")]
     pub filter_type: String,
     /// Row-major kernel. SEP Python default 3x3 `[[1,2,1],[2,4,2],[1,2,1]]`.
@@ -228,7 +234,7 @@ fn default_minarea() -> u32 {
     5
 }
 fn default_filter_type() -> String {
-    "matched".to_string()
+    "conv".to_string()
 }
 fn default_kernel() -> Vec<Vec<f32>> {
     vec![
@@ -606,9 +612,13 @@ impl BackgroundField {
 }
 
 /// One SEP-extracted source in analysis-pixel coordinates.
+///
+/// SEP 1.4.1 computes `x`, `y`, `a`, `b`, `theta` from moments weighted by
+/// the *filtered* (convolved) residual, so they describe the smoothed image.
+/// Consumers that need unfiltered shape (trailing) use `pixels`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogSource {
-    /// Barycentre of the residual over the detection footprint (0-based).
+    /// Barycentre of the filtered residual over the footprint (0-based).
     pub x: f32,
     pub y: f32,
     pub xmin: usize,
@@ -616,9 +626,9 @@ pub struct CatalogSource {
     pub ymin: usize,
     pub ymax: usize,
     pub npix: u32,
-    /// Isophotal residual flux `sum(I-B)` over the footprint.
+    /// Unfiltered residual flux `sum(I-B)` over the footprint (SEP `flux`).
     pub flux: f32,
-    /// Peak residual `max(I-B)`.
+    /// Unfiltered peak residual `max(I-B)` (SEP `peak`).
     pub peak_residual: f32,
     /// Raw input value at the peak pixel (for legacy peak saturation gates).
     pub peak_raw: f32,
@@ -632,6 +642,9 @@ pub struct CatalogSource {
     pub deblended: bool,
     /// `SEP_OBJ_TRUNC`: the footprint touches the image border.
     pub truncated: bool,
+    /// Row-major analysis-pixel indices of the object's detection footprint
+    /// (SEP's per-object pixel list, after deblending).
+    pub pixels: Vec<u32>,
 }
 
 /// Sources from one SEP extraction, shared by focus and trailing.
@@ -685,6 +698,19 @@ mod tests {
         assert_eq!(
             config_sha256(&config),
             "80eab0fbae4abf9f60f348adb7de3004067a3873cca29f996289e9dc14040b84"
+        );
+    }
+
+    #[test]
+    fn default_sep_detection_config_hash_matches_the_python_reference() {
+        let config = sep_detection_config_json(&SepDetectionParams::default());
+        assert_eq!(
+            canonical_json(&config),
+            r#"{"accept_deblended_for_focus":false,"clean":true,"clean_param":1.0,"deblend_cont":0.005,"deblend_nthresh":32,"filter_kernel":[[1.0,2.0,1.0],[2.0,4.0,2.0],[1.0,2.0,1.0]],"filter_type":"conv","library":"sep","library_version":"1.4.1","method":"sep_extract","minarea":5,"noise":"background_rms_map","pixstack":300000,"thresh_sigma":5.0}"#
+        );
+        assert_eq!(
+            config_sha256(&config),
+            "4f4499cda7067107c0fe6d64319684c13d1ec62f590b4bee4b346c1459dc99df"
         );
     }
 
