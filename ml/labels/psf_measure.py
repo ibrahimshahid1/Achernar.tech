@@ -110,6 +110,10 @@ REASON_MESHES_INTERPOLATED = "meshes_interpolated"
 # sigmas). A negative or non-finite R(x,y) on usable support cannot serve as
 # a detection noise map (a negative per-pixel threshold detects everything).
 REASON_INVALID_RMS_MAP = "invalid_rms_map"
+# Decision D-018 (mirrors the Rust rule): the natural-cubic RMS spline can also
+# undershoot while staying positive. A usable R(x,y) below this fraction of the
+# smallest positive filtered mesh sigma is invalid_rms_map too.
+RMS_UNDERSHOOT_FRACTION = 0.5
 
 # SEP background.c: a mesh with fewer than this fraction of usable pixels is
 # discarded and replaced by the mean of its nearest valid meshes
@@ -363,6 +367,7 @@ class SpatialBackground:
     source_mask_applied: bool = False
     source_masked_fraction: Optional[float] = None
     backend_error: Optional[str] = None
+    rms_validity: Optional[dict] = None  # rms_map_validity diagnostics
     method: str = BACKGROUND_METHOD_SEP
 
     @property
@@ -404,6 +409,7 @@ class SpatialBackground:
             "source_mask_applied": self.source_mask_applied,
             "source_masked_fraction": self.source_masked_fraction,
             "backend_error": self.backend_error,
+            "rms_validity": None if self.rms_validity is None else dict(self.rms_validity),
         }
 
 
@@ -460,6 +466,198 @@ def _mesh_support(excluded: np.ndarray, bw: int, bh: int) -> tuple[int, int, int
     return nx, ny, supported, nx * ny
 
 
+def _sep_spline_d2_operator(n: int) -> np.ndarray:
+    """Linear operator of SEP's spline "second derivative" pass over ``n`` nodes.
+
+    A literal transcription of the recurrence in SEP 1.4.1 background.c
+    (``makebackspline`` along y; the same code inline in
+    ``bkg_line_flt_internal`` along x), applied to the identity so that
+    ``d = D @ values``. SEP divides by 6 inside the back-substitution, which is
+    not the textbook natural spline; transcribing it keeps the result linear in
+    the node values and identical to what SEP evaluates.
+    """
+    eye = np.eye(n)
+    d = np.zeros((n, n))
+    if n < 3:
+        return d  # both natural boundary conditions; no interior nodes
+    u = np.zeros((n, n))
+    coef = np.zeros(n)
+    for i in range(1, n - 1):
+        temp = -1.0 / (coef[i - 1] + 4.0)
+        coef[i] = temp
+        u[i] = temp * (u[i - 1] - 6.0 * (eye[i + 1] + eye[i - 1] - 2.0 * eye[i]))
+    for i in range(n - 2, 0, -1):
+        d[i] = (coef[i] * d[i + 1] + u[i]) / 6.0
+    return d
+
+
+def _sep_spline_basis_y(h: int, bh: int, ny: int) -> np.ndarray:
+    """``Phi`` (h x ny): row y of SEP's y-interpolation of a node column.
+
+    Node j sits at pixel row ``(j + 0.5) * bh`` (non-centred, as in SEP).
+    """
+    if ny < 2:
+        return np.ones((h, 1))
+    d = _sep_spline_d2_operator(ny)
+    eye = np.eye(ny)
+    phi = np.zeros((h, ny))
+    for y in range(h):
+        dy = float(np.float32(np.float32(y) / np.float32(bh)) - np.float32(0.5))
+        yl = int(dy)  # C truncation toward zero
+        dy -= yl
+        if yl >= ny - 1:
+            yl = ny - 2
+            dy += 1.0
+        cdy = 1.0 - dy
+        phi[y] = (cdy * eye[yl] + dy * eye[yl + 1]
+                  + (cdy ** 3 - cdy) * d[yl] + (dy ** 3 - dy) * d[yl + 1])
+    return phi
+
+
+def _sep_spline_basis_x(w: int, bw: int, nx: int) -> np.ndarray:
+    """``Psi`` (w x nx): pixel x of SEP's x-interpolation of a node row.
+
+    Node k sits at pixel ``(k + 0.5) * bw - 0.5`` (pixel-centred); the segment
+    switches at mid-mesh, exactly as in ``bkg_line_flt_internal``.
+    """
+    if nx < 2:
+        return np.ones((w, 1))
+    d = _sep_spline_d2_operator(nx)
+    eye = np.eye(nx)
+    psi = np.zeros((w, nx))
+    xstep = np.float32(1.0) / np.float32(bw)
+    changepoint = bw // 2
+    dx = (xstep - np.float32(1.0)) / np.float32(2.0)
+    dx0 = np.float32(((bw + 1) % 2)) * xstep / np.float32(2.0)
+    lo, mesh, i = 0, 0, 0
+    for col in range(w):
+        if i == changepoint and 0 < mesh < nx - 1:
+            lo += 1
+            dx = dx0
+        fdx = float(dx)
+        cdx = 1.0 - fdx
+        psi[col] = (cdx * eye[lo] + fdx * eye[lo + 1]
+                    + (cdx ** 3 - cdx) * d[lo] + (fdx ** 3 - fdx) * d[lo + 1])
+        if i == bw:
+            mesh += 1
+            i = 0
+        i += 1
+        dx = np.float32(dx + xstep)
+    return psi
+
+
+def _mesh_size(mesh_grid) -> tuple[int, int]:
+    if isinstance(mesh_grid, SepBackgroundParams):
+        return int(mesh_grid.bw), int(mesh_grid.bh)
+    if isinstance(mesh_grid, dict):
+        return int(mesh_grid["bw"]), int(mesh_grid["bh"])
+    bw, bh = mesh_grid
+    return int(bw), int(bh)
+
+
+def filtered_mesh_sigmas(rms_map: np.ndarray, mesh_grid) -> tuple[Optional[np.ndarray], dict]:
+    """Recover SEP's filtered per-mesh sigma grid (ny x nx) from its RMS map.
+
+    The Python wrapper does not expose ``sep_bkg.sigma`` (sep.pyx keeps the
+    struct pointer private; only ``globalrms``/``rms()`` are public). The map is
+    linear in the grid, ``R = Phi @ S @ Psi.T``, with ``Phi``/``Psi`` the exact
+    transcription of SEP's spline evaluation, so ``S`` is recovered by least
+    squares on a strided subset of rows/columns. The fit is verified by
+    reconstruction: if the residual exceeds 1e-4 of max|R| (float32 round-off
+    is ~1e-7) the grid is not trusted and ``None`` is returned with
+    ``method="node_pixel_sample"`` diagnostics from :func:`rms_map_validity`.
+    """
+    bw, bh = _mesh_size(mesh_grid)
+    rms = np.asarray(rms_map, dtype=np.float64)
+    h, w = rms.shape
+    nx, ny = (w - 1) // bw + 1, (h - 1) // bh + 1
+    rows = np.unique(np.r_[np.arange(0, h, max(1, bh // 8)), h - 1])
+    cols = np.unique(np.r_[np.arange(0, w, max(1, bw // 8)), w - 1])
+    phi = _sep_spline_basis_y(h, bh, ny)[rows]
+    psi = _sep_spline_basis_x(w, bw, nx)[cols]
+    sample = rms[np.ix_(rows, cols)]
+    diagnostics = {"mesh_sigma_method": "spline_inversion", "mesh_grid": [nx, ny],
+                   "reconstruction_max_rel_error": None}
+    if not np.isfinite(sample).all():
+        return None, diagnostics
+    left = np.linalg.lstsq(phi, sample, rcond=None)[0]             # ny x len(cols)
+    grid = np.linalg.lstsq(psi, left.T, rcond=None)[0].T            # ny x nx
+    scale = max(float(np.abs(sample).max()), 1e-30)
+    error = float(np.abs(phi @ grid @ psi.T - sample).max()) / scale
+    diagnostics["reconstruction_max_rel_error"] = error
+    if not np.isfinite(error) or error > 1e-4:
+        return None, diagnostics
+    return grid, diagnostics
+
+
+def rms_map_validity(rms_map: np.ndarray, usable_mask: np.ndarray, mesh_grid) -> tuple[list, dict]:
+    """Validity of SEP's R(x,y) on usable support: ``(reasons, diagnostics)``.
+
+    ``mesh_grid`` is the mesh size: a :class:`SepBackgroundParams`, a dict with
+    ``bw``/``bh``, or a ``(bw, bh)`` tuple (nx, ny follow SEP's grid rule).
+
+    Rules (reason codes as in the Rust contract):
+
+    * ``zero_empirical_scatter``: R is exactly 0 on a usable pixel;
+    * ``invalid_rms_map``: R is negative or non-finite on a usable pixel, or
+      (D-018) below ``RMS_UNDERSHOOT_FRACTION`` (0.5) x the smallest positive
+      filtered mesh sigma — the natural-cubic spline undershooting while still
+      positive (amp-600 ridge: map minimum 0.549 against a 4.865 mesh minimum,
+      103 false detections on a starless frame).
+
+    Exactness relative to the Rust rule: Rust reads ``sep_bkg.sigma`` directly.
+    Here the filtered mesh sigmas come from :func:`filtered_mesh_sigmas`, an
+    exact (to float32 round-off) inversion of SEP's spline, verified by
+    reconstruction; ``diagnostics["mesh_sigma_method"]`` is then
+    ``"spline_inversion"``. Only if that verification fails does it fall back
+    to the documented approximation ``"node_pixel_sample"``: R at the pixel
+    nearest each spline node (row ``(j+0.5)*bh``, column ``(k+0.5)*bw - 0.5``,
+    clamped into the frame), minimum over meshes — approximate.
+
+    Diagnostics: ``min_rms`` (over usable pixels), ``min_positive_mesh_sigma``,
+    ``bound``, ``count_below_bound``, plus the counts per rule and the method.
+    """
+    rms = np.asarray(rms_map)
+    usable = np.asarray(usable_mask, dtype=bool)
+    values = rms[usable].astype(np.float64)
+    finite = np.isfinite(values)
+    reasons = []
+    zero = int((finite & (values == 0)).sum())
+    negative = int((finite & (values < 0)).sum())
+    nonfinite = int((~finite).sum())
+    if zero:
+        reasons.append(REASON_ZERO_EMPIRICAL_SCATTER)
+    if negative or nonfinite:
+        reasons.append(REASON_INVALID_RMS_MAP)
+
+    grid, diagnostics = filtered_mesh_sigmas(rms, mesh_grid)
+    if grid is None:
+        bw, bh = _mesh_size(mesh_grid)
+        h, w = rms.shape
+        nx, ny = (w - 1) // bw + 1, (h - 1) // bh + 1
+        ys = np.clip(np.floor((np.arange(ny) + 0.5) * bh + 0.5).astype(int), 0, h - 1)
+        xs = np.clip(np.floor((np.arange(nx) + 0.5) * bw - 0.5 + 0.5).astype(int), 0, w - 1)
+        grid = rms[np.ix_(ys, xs)].astype(np.float64)
+        diagnostics["mesh_sigma_method"] = "node_pixel_sample"
+    positive = grid[np.isfinite(grid) & (grid > 0)]
+    min_positive = float(positive.min()) if positive.size else None
+    bound = None if min_positive is None else RMS_UNDERSHOOT_FRACTION * min_positive
+    below = int((finite & (values < bound)).sum()) if bound is not None else 0
+    if below and REASON_INVALID_RMS_MAP not in reasons:
+        reasons.append(REASON_INVALID_RMS_MAP)
+    diagnostics.update({
+        "min_rms": float(values[finite].min()) if finite.any() else None,
+        "min_positive_mesh_sigma": min_positive,
+        "bound": bound,
+        "bound_fraction": RMS_UNDERSHOOT_FRACTION,
+        "count_below_bound": below,
+        "count_zero": zero,
+        "count_negative": negative,
+        "count_nonfinite": nonfinite,
+    })
+    return reasons, diagnostics
+
+
 def estimate_spatial_background(
     image: np.ndarray,
     *,
@@ -495,8 +693,10 @@ def estimate_spatial_background(
       by the median positive mesh sigma or by 1.0 (background.c L645-653);
       neither value is consumed here;
     * ``invalid_rms_map`` (noise ``unresolved``): R(x,y) is negative or
-      non-finite on a usable pixel — SEP's bicubic spline undershooting between
-      meshes of very different sigma.
+      non-finite on a usable pixel, or below 0.5 x the smallest positive
+      filtered mesh sigma (D-018) — SEP's bicubic spline undershooting between
+      meshes of very different sigma. See :func:`rms_map_validity`; its
+      diagnostics are kept in ``rms_validity``.
 
     ``meshes_interpolated`` is informational: some meshes lacked support and
     SEP filled them from their nearest valid neighbours.
@@ -578,12 +778,10 @@ def estimate_spatial_background(
             params, version, units, shape, [REASON_BACKEND_FAILURE], backend_error="non-finite background map",
             **common, **mesh,
         )
-    rms_usable = rms[usable]
-    finite_rms = np.isfinite(rms_usable)
-    if (finite_rms & (rms_usable == 0)).any() or not (np.isfinite(globalrms) and globalrms > 0):
+    rms_reasons, rms_diagnostics = rms_map_validity(rms, usable, params)
+    reasons.extend(rms_reasons)
+    if not (np.isfinite(globalrms) and globalrms > 0) and REASON_ZERO_EMPIRICAL_SCATTER not in reasons:
         reasons.append(REASON_ZERO_EMPIRICAL_SCATTER)
-    if (~finite_rms).any() or (finite_rms & (rms_usable < 0)).any():
-        reasons.append(REASON_INVALID_RMS_MAP)
     noise_ok = REASON_ZERO_EMPIRICAL_SCATTER not in reasons and REASON_INVALID_RMS_MAP not in reasons
     return SpatialBackground(
         background_map=back,
@@ -600,6 +798,7 @@ def estimate_spatial_background(
         noise_source=NOISE_EMPIRICAL_MESH_RMS if noise_ok else NOISE_UNAVAILABLE,
         units=units,
         shape=shape,
+        rms_validity=rms_diagnostics,
         **common,
         **mesh,
     )
