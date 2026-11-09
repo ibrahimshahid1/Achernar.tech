@@ -4,10 +4,19 @@ These are correctness checks of the evaluation harness itself under its own
 simulated assumptions. They do not establish real-camera accuracy.
 
 Run: ``python -m pytest -q ml/tests/test_bge_fixtures.py`` from the repo root.
+
+Tests that run SEP take the ``sep_required`` fixture: without the pinned
+``sep==1.4.1`` they ERROR with "missing prerequisite: sep==1.4.1" instead of
+being skipped. Every other test (truth, metrics, bridge, statuses) runs
+without SEP.
 """
 
 import json
 import math
+import os
+import stat
+import sys
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -19,7 +28,25 @@ from ml.eval.bge import real_frames as RF
 from ml.eval.bge import run_benchmark as RB
 from ml.eval.bge import scenarios as SC
 
-sep = pytest.importorskip("sep", reason="SEP 1.4.1 is a required prerequisite of the Python reference")
+
+@pytest.fixture
+def sep_required():
+    """The pinned SEP module; raises MissingPrerequisite (test ERROR) if absent."""
+    return PM.sep_module()
+
+
+def test_missing_sep_is_a_hard_prerequisite_error_not_a_skip():
+    with mock.patch.dict(sys.modules, {"sep": None}):
+        with pytest.raises(PM.MissingPrerequisite, match=r"missing prerequisite: sep==1\.4\.1"):
+            PM.sep_module()
+        sc = SC.build_scenario("sparse_gaussian_stars")
+        with pytest.raises(PM.MissingPrerequisite):
+            PM.python_sep_background(sc.image, sc.masks)
+        with pytest.raises(PM.MissingPrerequisite):
+            RB.run_python(sc, "python_sep")  # never recorded as a failed or skipped row
+        # Refusals that need no SEP still work without it.
+        est = PM.python_sep_background(*(lambda t: (t.image, t.masks))(SC.build_scenario("tiny_frame")))
+        assert "frame_smaller_than_mesh_grid" in est.reasons
 
 
 def _hashes(sc):
@@ -279,7 +306,8 @@ def test_focus_fits_report_failures_instead_of_numbers():
 # --------------------------------------------------------------------------
 
 
-def test_python_sep_configuration_hashes_equal_the_daemon_contract():
+def test_python_sep_configuration_hashes_equal_the_daemon_contract(sep_required):
+    sep = sep_required
     assert config_sha256(PM.sep_background_config_json()) == PM.EXPECTED_BACKGROUND_CONFIG_SHA256
     assert config_sha256(PM.sep_detection_config_json()) == PM.EXPECTED_DETECTION_CONFIG_SHA256
     assert config_sha256(PM.sep_background_config_json()) == \
@@ -316,7 +344,7 @@ def test_sep_insufficient_mesh_support_is_detected_before_sep_fabricates_values(
     assert est.diagnostics["meshes_below_support"] == est.diagnostics["mesh_nx"] * est.diagnostics["mesh_ny"]
 
 
-def test_zero_scatter_plateau_leaves_noise_unresolved_and_detection_unrun():
+def test_zero_scatter_plateau_leaves_noise_unresolved_and_detection_unrun(sep_required):
     for method in ("python_sep", "python_global_scalar"):
         res = PM.run_python_method(method, SC.build_scenario("quantization_plateau"))
         est = res["estimate"]
@@ -325,7 +353,7 @@ def test_zero_scatter_plateau_leaves_noise_unresolved_and_detection_unrun():
         assert res["measurement"]["detection"]["status"] == "unsupported"
 
 
-def test_negative_rms_spline_is_reported_as_invalid_rms_map():
+def test_negative_rms_spline_is_reported_as_invalid_rms_map(sep_required):
     est = PM.python_sep_background(*(lambda s: (s.image, s.masks))(SC.build_scenario("steep_ridge_background")))
     assert est.noise_status == "unresolved" and "invalid_rms_map" in est.reasons
     assert est.diagnostics["rms_min_usable"] < 0
@@ -334,7 +362,7 @@ def test_negative_rms_spline_is_reported_as_invalid_rms_map():
     assert PM.rms_map_reasons(np.array([1.0, 2.0])) == []
 
 
-def test_python_sep_recovers_a_flat_sky_and_finds_every_bright_star():
+def test_python_sep_recovers_a_flat_sky_and_finds_every_bright_star(sep_required):
     sc = SC.build_scenario("sparse_gaussian_stars")
     rec, _ = RB.run_python(sc, "python_sep")
     assert rec["status"] == "completed"
@@ -482,13 +510,17 @@ def test_missing_rust_bridge_is_reported_as_skipped_not_passed(tmp_path):
     assert res["status"] == "skipped" and res["reason"].startswith(bridge.UNAVAILABLE)
 
 
-def test_benchmark_command_writes_explicit_statuses(tmp_path):
+def test_benchmark_command_writes_explicit_statuses(tmp_path, sep_required):
     out = tmp_path / "run"
     assert RB.main(["--out", str(out), "--scenarios", "uniform_gaussian_sky", "tiny_frame", "zero_size",
-                    "all_masked"]) == 0
+                    "all_masked", "quantization_plateau"]) == 0
     doc = json.loads((out / "results.json").read_text())
     rows = {(r["scenario"], r["method"]): r for r in doc["results"]}
-    assert len(rows) == 4 * 5
+    assert len(rows) == 5 * 5
+    plateau = rows[("quantization_plateau", "python_sep")]
+    assert plateau["status"] == "unsupported" and plateau["partial"] and plateau["scored_stages"] == ["background"]
+    assert rows[("uniform_gaussian_sky", "python_sep")]["status"] == "completed"
+    assert all(not r["partial"] for r in rows.values() if r["status"] in ("completed", "skipped", "failed"))
     assert all(r["status"] in ("completed", "unsupported", "skipped", "failed") and
                (r["status"] == "completed" or r["reason"]) for r in rows.values())
     assert rows[("tiny_frame", "python_sep")]["status"] == "unsupported"
@@ -498,6 +530,7 @@ def test_benchmark_command_writes_explicit_statuses(tmp_path):
     summary = (out / "summary.md").read_text()
     for heading in (RB.SECTION_TRUTH, RB.SECTION_PARITY, RB.SECTION_REAL):
         assert heading in summary
+    assert "no number was scored" not in summary and "| `python_sep` | partial: " in summary
 
 
 # --------------------------------------------------------------------------
@@ -518,7 +551,7 @@ def _real_manifest(tmp_path):
     return path
 
 
-def test_real_frames_emit_observations_only_and_never_open_holdout(tmp_path):
+def test_real_frames_emit_observations_only_and_never_open_holdout(tmp_path, sep_required):
     path = _real_manifest(tmp_path)
     res = RF.evaluate(path)  # the hold-out file does not exist: opening it would raise
     assert res["status"] == "observations_only" and res["pass_fail"] is None and res["accuracy"] is None
@@ -527,7 +560,7 @@ def test_real_frames_emit_observations_only_and_never_open_holdout(tmp_path):
         RF.evaluate(path, include_holdout=True)
 
 
-def test_real_frame_thresholds_must_be_predeclared_for_this_manifest(tmp_path):
+def test_real_frame_thresholds_must_be_predeclared_for_this_manifest(tmp_path, sep_required):
     path = _real_manifest(tmp_path)
     sha = RF._sha256(path)
     future = {"schema": RF.THRESHOLDS_SCHEMA, "predeclared_utc": "2999-01-01T00:00:00+00:00",
@@ -543,3 +576,218 @@ def test_real_frame_thresholds_must_be_predeclared_for_this_manifest(tmp_path):
     (tmp_path / "t.json").write_text(json.dumps(ok))
     res = RF.evaluate(path, tmp_path / "t.json")
     assert res["pass_fail"]["status_failure_rate"]["status"] == "pass" and res["accuracy"] is None
+
+
+# --------------------------------------------------------------------------
+# Review fixes: partial rows (F1), cargo classification (F2), digitized truth
+# (F3), hfr stage and sweep status (F4), parity coverage (F5), timing (F6)
+# --------------------------------------------------------------------------
+
+
+def test_partial_rows_are_marked_and_name_their_scored_stages():
+    sc = SC.build_scenario("quantization_plateau")
+    stages = {"background": {"status": "completed", "reason": None},
+              "noise": {"status": "unsupported", "reason": "noise unresolved"},
+              "detection": {"status": "unsupported", "reason": "noise unresolved"},
+              "hfr": {"status": "unsupported", "reason": "detection not run"}}
+    rec = {"metrics": RB.score(sc, stages, np.float64(200.0), None, None, None, None)}
+    RB.finish_record(rec, stages)
+    assert rec["status"] == "unsupported" and rec["partial"] is True
+    assert rec["scored_stages"] == ["background"] and rec["unscored_stages"] == ["noise", "detection", "hfr"]
+    assert stages["background"]["scored"] and not stages["noise"]["scored"]
+    assert RB._row_status(rec).startswith("partial: ") and "scored: background" in RB._row_status(rec)
+    # Quantization-limited level: scored against the expected digitized level; analog bias is secondary.
+    assert "quantization-limited" in rec["metrics"]["background"]["truth"]
+    assert rec["metrics"]["background"]["bias_median_adu"] == pytest.approx(0.0, abs=1e-6)
+    assert rec["metrics"]["background_vs_analog"]["bias_median_adu"] == pytest.approx(-0.2, abs=1e-4)
+    full = {k: {"status": "completed", "reason": None} for k in ("background", "noise", "detection")}
+    full["hfr"] = {"status": RB.NOT_APPLICABLE, "reason": "scenario has no truth stars"}
+    uni = SC.build_scenario("uniform_gaussian_sky")
+    rec2 = {"metrics": RB.score(uni, full, np.float64(1000.0), np.float64(10.0), [], None, None)}
+    RB.finish_record(rec2, full)
+    assert rec2["status"] == "completed" and rec2["partial"] is False and "hfr" not in rec2["unscored_stages"]
+
+
+def test_digitized_moments_are_exact():
+    from scipy import special
+
+    mean, std = SC.digitized_moments(np.array([3.2]), 0.0, 1.0)
+    assert mean[0] == 3.0 and std[0] == 0.0
+    mean, std = SC.digitized_moments(np.array([0.3]), 3.0, 1.0)  # sigma >> step: Sheppard holds
+    assert std[0] == pytest.approx(math.sqrt(9.0 + 1.0 / 12.0), rel=1e-6) and mean[0] == pytest.approx(0.3, abs=1e-6)
+    k = np.arange(-20, 21, dtype=float)  # direct definition for mu = 200.3 (shifted), sigma = 0.5
+    p = special.ndtr((k + 0.5 - 0.3) / 0.5) - special.ndtr((k - 0.5 - 0.3) / 0.5)
+    ref_mean = np.sum(p * k)
+    ref_std = math.sqrt(np.sum(p * (k - ref_mean) ** 2))
+    mean, std = SC.digitized_moments(np.array([200.3]), 0.5, 1.0)
+    assert mean[0] - 200.0 == pytest.approx(ref_mean, abs=1e-9) and std[0] == pytest.approx(ref_std, rel=1e-9)
+
+
+def test_quantized_scenarios_use_the_effective_digitized_noise_as_truth():
+    coarse = SC.build_scenario("quantization_coarse")
+    off = coarse.source_image < 1e-3
+    observed = float(np.std(coarse.image[off]))
+    eff = coarse.metadata["effective_sky_std_adu"]
+    # ~1.9e5 off-source pixels: the std's standard error is ~0.16%; allow 1%.
+    assert observed == pytest.approx(eff, rel=0.01) and eff / 0.5 > 1.1
+    assert np.allclose(coarse.noise_std_sky, eff) and np.allclose(coarse.noise_std_sky_analog, 0.5)
+    assert not coarse.metadata["quantization_limited_level"] and coarse.metadata["noise_scoreable"]
+    assert coarse.scoring_background() is coarse.background
+    plateau = SC.build_scenario("quantization_plateau")
+    assert plateau.metadata["quantization_limited_level"] and not plateau.metadata["noise_scoreable"]
+    assert np.allclose(plateau.scoring_background(), 200.0) and np.all(plateau.image[plateau.source_image < 1e-3] == 200)
+
+
+def test_oracle_detects_with_the_effective_noise_and_refuses_a_swallowed_one():
+    coarse = SC.build_scenario("quantization_coarse")
+    est = PM.oracle_background(coarse)
+    assert est.noise_status == "measured" and np.allclose(est.rms, coarse.metadata["effective_sky_std_adu"])
+    plateau = SC.build_scenario("quantization_plateau")
+    est = PM.oracle_background(plateau)
+    assert est.noise_status == "unresolved" and np.allclose(est.back, 200.0)
+    meas = PM.detect_and_measure(plateau.image, plateau.masks, est)  # returns before SEP is needed
+    assert meas["detection"]["status"] == "unsupported"
+
+
+def test_hfr_stage_distinguishes_no_usable_stars_from_not_applicable():
+    stars, empty = SC.build_scenario("sparse_gaussian_stars"), SC.build_scenario("uniform_gaussian_sky")
+    no_stars = RB.hfr_stage(stars, True, 0, None, "rejections {'blended': 3}")
+    assert no_stars["status"] == "unsupported" and no_stars["reason"].startswith("no usable stars")
+    assert RB.hfr_stage(empty, True, 0, None, "x")["status"] == RB.NOT_APPLICABLE
+    assert RB.hfr_stage(stars, True, 3, 2.4, "x")["status"] == "completed"
+    assert RB.hfr_stage(stars, False, None, None, "x")["status"] == "unsupported"
+    assert RB.overall_status({"background": {"status": "completed"},
+                              "hfr": {"status": RB.NOT_APPLICABLE}}) == ("completed", None)
+
+
+def _sweep_rec(hfr, hfr_status="completed", status="completed"):
+    return {"status": status, "reason": None, "frame_hfr_median_px": hfr, "n_accepted": 1, "metrics": {},
+            "stages": {"hfr": {"status": hfr_status}}}
+
+
+def test_sweep_with_frames_without_hfr_is_partial_not_completed():
+    p = np.arange(4000, 5201, 100, dtype=float)
+    y = list(MT.hyperbola(p, 2.5, 4630.0, 80.0))
+    full = RB.summarize_sweep_method([_sweep_rec(v) for v in y], p, 4630.0, 6, y)
+    assert full["status"] == "completed" and full["frame_counts"]["frames_with_hfr"] == 13
+    recs = [_sweep_rec(v) for v in y]
+    recs[0] = _sweep_rec(None, hfr_status="unsupported", status="unsupported")
+    recs[12] = _sweep_rec(None, hfr_status="failed", status="failed")
+    part = RB.summarize_sweep_method(recs, p, 4630.0, 6, y)
+    assert part["status"] == "partial" and "11/13" in part["reason"]
+    assert part["frame_counts"] == {"frames": 13, "frames_with_hfr": 11, "frames_failed": 1, "frames_without_hfr": 2}
+    assert part["fit"]["hyperbola"]["p0_shift"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_parity_compares_raw_rms_maps_and_globals_whatever_the_noise_status():
+    back = np.full((4, 4), 1000.0, np.float32)
+    rms = np.full((4, 4), 5.0, np.float32)
+    rms[0, 0] = -0.95  # a negative spline undershoot: not a noise measurement, still compared
+    rec = {"status": "unsupported", "background_result": {"level_status": "measured", "noise_status": "unresolved"}}
+    py = {"back": back, "rms": rms, "globalback": 1000.0, "globalrms": 37.6, "candidates": None}
+    rs = {"back": back.copy(), "rms": rms.copy(), "globalback": 1000.004, "globalrms": None, "candidates": None}
+    p = RB.parity(py, rs, rec, rec)
+    assert p["rms_max_abs_diff"] == 0.0 and p["rms_within_d006_bound"] is True
+    assert p["globalback_within_d006_bound"] is True and "globalrms_abs_diff" not in p
+    assert "segmentation" in p["not_compared"]
+    off = RB.parity(py, dict(rs, globalback=1000.5), rec, rec)
+    assert off["globalback_within_d006_bound"] is False
+    t = RB.parity_tally([p, off])
+    assert t["rms"] == {"within": 2, "compared": 2} and t["globalback"] == {"within": 1, "compared": 2}
+    assert t["globalrms"]["compared"] == 0
+
+
+def test_python_sep_keeps_the_raw_rms_map_for_parity_when_noise_is_unresolved(sep_required):
+    rec, art = RB.run_python(SC.build_scenario("steep_ridge_background"), "python_sep")
+    assert rec["partial"] and "noise" not in rec["metrics"]
+    assert isinstance(art["rms"], np.ndarray) and float(art["rms"].min()) < 0
+    assert art["globalrms"] == pytest.approx(37.6, rel=0.01)
+
+
+RUNTIME_PANIC = """   Compiling achernar-daemon v0.1.0
+    Finished `release` profile [optimized] target(s) in 1.0s
+     Running unittests src/main.rs (/nonexistent/achernar_daemon-abc)
+
+running 1 test
+thread 'vision::bge_eval::bge_eval_bridge' panicked at src/vision/bge_eval.rs:199:5:
+unsupported manifest schema
+test vision::bge_eval::bge_eval_bridge ... FAILED
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored
+
+error: test failed, to rerun pass `--bin achernar-daemon`
+"""
+COMPILE_ERROR = """error[E0308]: mismatched types
+   --> src/vision/vision_loop.rs:993:23
+error: could not compile `achernar-daemon` (bin "achernar-daemon" test) due to 2 previous errors
+"""
+SIGNAL_EXIT = """     Running unittests src/main.rs (/nonexistent/achernar_daemon-abc)
+error: test failed, to rerun pass `--bin achernar-daemon`
+
+Caused by:
+  process didn't exit successfully: `/nonexistent/achernar_daemon-abc bge_eval_bridge` (signal: 11, SIGSEGV: invalid memory reference)
+"""
+
+
+def test_cargo_runtime_failures_are_failed_and_only_unbuilt_tests_are_skipped():
+    r = bridge.classify_cargo_test(101, RUNTIME_PANIC)
+    assert r["status"] == "failed" and "panic at src/vision/bge_eval.rs:199:5" in r["reason"]
+    assert r["binary"] == "/nonexistent/achernar_daemon-abc"
+    s = bridge.classify_cargo_test(101, SIGNAL_EXIT)
+    assert s["status"] == "failed" and "SIGSEGV" in s["reason"]
+    c = bridge.classify_cargo_test(101, COMPILE_ERROR)
+    assert c["status"] == "skipped" and c["reason"] == f"{bridge.UNAVAILABLE}: build failed (see log)"
+    n = bridge.classify_cargo_test(101, "error: could not find `Cargo.toml`\n")  # no binary ran
+    assert n["status"] == "skipped"
+    ok = bridge.classify_cargo_test(0, "     Running unittests src/main.rs (/x)\nrunning 1 test\ntest result: ok.\n")
+    assert ok["status"] == "completed" and ok["binary"] == "/x"
+
+
+def _fake_executable(path, stderr_text, exit_code, write_json=None):
+    body = "#!/bin/sh\n"
+    if write_json:
+        body += f"printf '%s' '{write_json}' > \"$ACHERNAR_BGE_EVAL_OUT/{{name}}\"\n"
+    body += f"cat <<'TXT' 1>&2\n{stderr_text}TXT\nexit {exit_code}\n"
+    path.write_text(body)
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def test_run_bridge_with_fake_cargo_separates_runtime_and_build_failures(tmp_path, monkeypatch):
+    daemon = tmp_path / "repo" / "achernar-daemon"
+    (daemon / "src").mkdir(parents=True)
+    (daemon / "Cargo.toml").write_text("[package]\nname = 'achernar-daemon'\n")
+    (daemon / "src" / "bge_eval.rs").write_text("#[test] #[ignore] fn bge_eval_bridge() {}\n")
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+    args = (tmp_path / "m.json", tmp_path / "out", tmp_path / "repo", tmp_path / "target", tmp_path / "log.txt")
+    _fake_executable(bindir / "cargo", RUNTIME_PANIC, 101)
+    res = bridge.run_bridge(*args)
+    assert res["status"] == "failed" and res["returncode"] == 101 and "runtime" in res["reason"]
+    _fake_executable(bindir / "cargo", COMPILE_ERROR, 101)
+    res = bridge.run_bridge(*args)
+    assert res["status"] == "skipped" and "build failed" in res["reason"]
+
+
+def test_rust_timing_clears_stale_outputs_and_checks_the_return_code(tmp_path):
+    frame = SC.build_scenario("tiny_frame")
+    payload = json.dumps({"case": frame.id, "backend": "sep", "error": None, "background": {"backend_error": None},
+                          "timing_ms": {"background": 5.0, "quality": 1.0, "trailing": 0.5}})
+    stale = tmp_path / "timing" / "out_sep_0"
+    stale.mkdir(parents=True)
+    (stale / f"{frame.id}__sep.json").write_text(payload)  # left over from an earlier run
+    (tmp_path / "logs").mkdir()
+    failing = _fake_executable(tmp_path / "fail.sh", "boom\n", 101)
+    runs = RB.rust_timing_runs(str(failing), tmp_path / "m.json", tmp_path / "timing", "sep", frame, 2,
+                               tmp_path / "logs")
+    assert [r["repeat"] for r in runs] == ["warmup", 0, 1] and not any(r["ok"] for r in runs)
+    summary = RB.summarize_rust_timing(runs)
+    assert summary["status"] == "failed" and summary["bridge_total_ms_median"] is None and "2/2" in summary["reason"]
+    good = tmp_path / "good.sh"
+    _fake_executable(good, "", 0, write_json=payload)
+    good.write_text(good.read_text().replace("{name}", f"{frame.id}__sep.json"))
+    summary = RB.summarize_rust_timing(RB.rust_timing_runs(str(good), tmp_path / "m.json", tmp_path / "timing", "sep",
+                                                           frame, 2, tmp_path / "logs"))
+    assert summary["status"] == "completed" and summary["repeats_ok"] == 2
+    assert summary["bridge_total_ms_median"] == pytest.approx(6.5) and "cold process" in summary["repeat_semantics"]
