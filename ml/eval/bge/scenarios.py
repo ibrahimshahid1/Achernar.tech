@@ -102,6 +102,24 @@ class Scenario:
     masks: dict = field(default_factory=dict)
     sources: list = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
+    #: Digitized scenarios: the analog sky sigma (secondary truth; the primary
+    #: ``noise_std_sky`` is the effective std of the digitized values).
+    noise_std_sky_analog: np.ndarray | None = None
+    #: Digitized scenarios: expected digitized level E[step*round(X/step)].
+    background_digitized: np.ndarray | None = None
+
+    def scoring_background(self):
+        """Truth B used for scoring: the analog B(x,y), or the expected
+        digitized level where quantization makes the analog level
+        unrecoverable (``metadata['quantization_limited_level']``)."""
+        if self.metadata.get("quantization_limited_level") and self.background_digitized is not None:
+            return self.background_digitized
+        return self.background
+
+    def footprint_noise(self):
+        """Noise scale for source footprints and the bright-star cut: the
+        analog sigma where the digitized std is degenerate, else the sky std."""
+        return self.noise_std_sky_analog if self.noise_std_sky_analog is not None else self.noise_std_sky
 
     @property
     def height(self) -> int:
@@ -546,6 +564,8 @@ def _finish(
     sources,
     metadata,
     masks=None,
+    noise_std_sky_analog=None,
+    background_digitized=None,
 ):
     sat = metadata.get("saturation_adu")
     if sat is not None and source_image is not None and background is not None:
@@ -568,6 +588,8 @@ def _finish(
         masks={k: np.ascontiguousarray(v, dtype=np.uint8) for k, v in (masks or {}).items()},
         sources=sources,
         metadata=metadata,
+        noise_std_sky_analog=as32(noise_std_sky_analog),
+        background_digitized=as32(background_digitized),
     )
 
 
@@ -649,9 +671,57 @@ def _quantized(scenario_id, description, seed, level, analog_sigma, step, n_star
     sig = np.full((height, width), analog_sigma)
     analog = bg + src + gaussian_noise(rngs[2], sig)
     image = step * np.round(analog / step)
+    # Truth for an estimator of the digitized frame: the exact mean and std of
+    # step*round(X/step), X ~ N(mu, sigma), per pixel (sources included in
+    # noise_std; sky only in noise_std_sky). The analog sigma stays secondary.
+    level_dig, sky_std = digitized_moments(np.array(level), analog_sigma, step)
+    _, total_std = digitized_moments(bg + src, analog_sigma, step)
+    limited = bool(abs(float(level_dig) - level) > QUANT_LEVEL_LIMIT_STEPS * step)
+    scoreable = bool(float(sky_std) >= QUANT_NOISE_MIN_STEPS * step)
     meta = _base_metadata(scenario_id, seed, params, noise_model="gaussian+adc_rounding",
                           quantization_step_adu=step)
-    return _finish(scenario_id, description, image, bg, sig, sig, src, sources, meta)
+    meta.update({
+        "noise_truth": "effective digitized std: exact std of step*round(X/step), X ~ N(B, analog sigma)",
+        "analog_sigma_adu": analog_sigma,
+        "effective_sky_std_adu": float(sky_std),
+        "sheppard_sky_std_adu": math.sqrt(analog_sigma**2 + step**2 / 12.0),
+        "expected_digitized_level_adu": float(level_dig),
+        "quantization_limited_level": limited,
+        "noise_scoreable": scoreable,
+        "quantization_rules": f"level quantization-limited if |E_dig - B| > {QUANT_LEVEL_LIMIT_STEPS} step; "
+                              f"noise not scoreable if effective std < {QUANT_NOISE_MIN_STEPS} step",
+    })
+    return _finish(scenario_id, description, image, bg, total_std, np.full_like(bg, float(sky_std)), src, sources,
+                   meta, noise_std_sky_analog=sig, background_digitized=np.full_like(bg, float(level_dig)))
+
+
+#: The analog level is "quantization-limited" when the expected digitized
+#: level differs from it by more than this fraction of a step.
+QUANT_LEVEL_LIMIT_STEPS = 0.01
+#: An effective digitized noise below this fraction of a step is not a
+#: scoreable noise truth (the ADC has swallowed the noise).
+QUANT_NOISE_MIN_STEPS = 0.01
+
+
+def digitized_moments(mu, sigma: float, step: float):
+    """Exact mean and std of ``step*round(X/step)`` for ``X ~ N(mu, sigma)``.
+
+    Vectorised over ``mu``; sums the bin probabilities within 8 sigma (the
+    neglected tail mass is < 1e-15). Ties of ``round`` have probability 0.
+    """
+    mu = np.asarray(mu, dtype=np.float64)
+    if sigma <= 0:
+        mean = step * np.round(mu / step)
+        return mean, np.zeros_like(mu)
+    half = int(math.ceil(8.0 * sigma / step)) + 1
+    k0 = np.round(mu / step)
+    offsets = np.arange(-half, half + 1).reshape((-1,) + (1,) * mu.ndim)
+    k = k0[None, ...] + offsets
+    p = special.ndtr(((k + 0.5) * step - mu) / sigma) - special.ndtr(((k - 0.5) * step - mu) / sigma)
+    values = k * step
+    mean = np.sum(p * values, axis=0) / np.sum(p, axis=0)
+    var = np.sum(p * (values - mean) ** 2, axis=0) / np.sum(p, axis=0)
+    return mean, np.sqrt(var)
 
 
 def quantization_coarse(seed=103, width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT):
