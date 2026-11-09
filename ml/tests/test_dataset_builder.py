@@ -27,9 +27,13 @@ from data_pipeline.build_focus_quality_dataset import (  # noqa: E402
 from data_pipeline.synthetic_psf import render_star  # noqa: E402
 
 
-def _write_frame_png(path, hfr, rng):
+def _write_frame_png(path, hfr, rng, size=192):
     # A frame with a single centered star; the builder detects + crops it.
-    img = render_star(hfr, size=96, amp=12000.0, sky=200.0, rng=rng).astype(np.uint16)
+    # 192 px holds a 3x3 grid of the labeler's 64-px SEP meshes. The former
+    # 96-px fixture holds fewer than the required 2 meshes per axis, so its
+    # "mesh" background was one global estimate in disguise and is now
+    # reported unavailable (test_psf_measure_spatial: frame_smaller_than_mesh_grid).
+    img = render_star(hfr, size=size, amp=12000.0, sky=200.0, rng=rng).astype(np.uint16)
     Image.fromarray(img).save(path)
 
 
