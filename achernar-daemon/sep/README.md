@@ -13,7 +13,10 @@ Safe Rust API over the vendored SEP 1.4.1 C library: spatial background
   numerical effect.
 - Built by `build.rs` with the `cc` crate; no network, works with
   `cargo build --offline`. Flags and their reasons are documented in
-  `build.rs` and recorded in `achernar_sep::BUILD_FLAGS`.
+  `build.rs` and recorded in `achernar_sep::BUILD_FLAGS`, including any
+  `CFLAGS`-family environment variables `cc` appends and the compiler path.
+  A value-unsafe flag in them (`-ffast-math`, `-Ofast`,
+  `-ffp-contract=fast`, ...) fails the build.
 - Changing the SEP version or the compile flags changes measurements. Re-run
   the parity test and regenerate the fixture with the reference wheel when
   doing so.
@@ -48,6 +51,17 @@ are bit-identical to the wheel with `-ffp-contract=on`. With
 by up to 3.6e-7 relative and theta by up to 4e-6 rad, still within D-006.
 Other platforms and compilers have not been measured.
 
+Deblended children (`SEP_OBJ_MERGED`) depend on the C library's `rand_r`
+(`deblend.c:gatherup`; MSVC maps it to `rand()` with per-thread state). The
+fixture records its platform and C library (`meta.json`); on any other
+platform the test keeps every exact check except per-child npix/flux/shape of
+deblended children, checks a source-derived family rule instead (same family
+pixel set, total npix and total flux within D-006, flag union, child
+barycentres), and prints that the per-child values are not verifiable there.
+Compiling glibc's `rand_r` or an MSVC `rand()` emulation into a scratch copy
+makes the exact checks fail (npix 30/65 and 32/63 instead of 31/64) while the
+family rule holds (family npix 95, flux 38913.397461 in all three).
+
 ## Licensing (owner review required)
 
 The C core is LGPL-3.0-or-later (`src/overlap.h` BSD-3-Clause). This crate
@@ -69,11 +83,18 @@ This is not legal advice.
   x86-64, and such bins are discarded). Masked non-finite values are replaced
   by 0 before the call; unmasked ones are rejected.
 - Deblending assigns faint pixels with `rand_r` (`deblend.c`); POSIX does not
-  fix its algorithm and MSVC builds map it to `rand()`, so deblended
-  footprints are bit-reproducible only per C library.
+  fix its algorithm and MSVC builds map it to `rand()` (seed ignored,
+  per-thread state kept between calls), so deblended children are
+  reproducible only per C library, and on MSVC not even between calls.
 - `globalrms` falls back to 1.0 when no mesh RMS is positive, and a frame with
   no supported mesh returns level 0 / RMS 1 with success. Callers check mesh
   support and RMS themselves (the daemon adapter does).
-- The RMS map is a natural cubic spline of the mesh RMS values and can go
-  negative between meshes whose RMS changes sharply; callers must check it
-  before using it as a noise map.
+- The RMS map is a natural cubic spline of the mesh RMS values and can
+  undershoot far below every mesh RMS between meshes whose RMS changes
+  sharply (to 0.58 against mesh values >= 4.8 on a 600 ADU ridge, below zero
+  on an 800 ADU one); callers must check it before using it as a noise map
+  (the daemon adapter rejects R below half the smallest positive mesh RMS,
+  run decision D-018).
+- `filterback`'s bad-mesh search is O(bad meshes x meshes); `Background::
+  estimate` refuses frames above `MAX_BAD_MESH_WORK` (1.5e9, about 0.8 s on
+  the development host).

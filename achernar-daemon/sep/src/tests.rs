@@ -610,3 +610,114 @@ fn concurrent_calls_are_serialized_and_deterministic() {
         }
     });
 }
+
+/// Host timing of `filterback`'s bad-mesh search (O(bad x meshes)); the
+/// measurement behind `MAX_BAD_MESH_WORK`. Run with
+/// `cargo test --release -p achernar-sep -- --ignored bad_mesh_work --nocapture`.
+#[test]
+#[ignore]
+fn bad_mesh_work_host_timing() {
+    for (width, height, mesh) in [
+        (2000, 1000, 8),
+        (2000, 2000, 8),
+        (2800, 2800, 8),
+        (4000, 2000, 8),
+        (6000, 4000, 16),
+    ] {
+        let data = noisy_sky(width, height, 100.0, 3.0, 31);
+        // Left half masked: every mesh there is below support.
+        let mask: Vec<u8> = (0..width * height)
+            .map(|i| u8::from(i % width < width / 2))
+            .collect();
+        let grid = MeshGrid::for_frame(width, height, mesh, mesh);
+        let meshes = grid.nx * grid.ny;
+        let bad = mesh_support(Some(&mask), width, height, grid)
+            .iter()
+            .filter(|ok| !**ok)
+            .count();
+        let params = BackgroundParams {
+            bw: mesh,
+            bh: mesh,
+            ..Default::default()
+        };
+        let work = bad as u64 * meshes as u64;
+        let start = std::time::Instant::now();
+        let result = Background::estimate_unbounded(&data, width, height, Some(&mask), &params);
+        let elapsed = start.elapsed().as_secs_f64();
+        assert!(result.is_ok());
+        println!(
+            "{width}x{height} mesh {mesh}: {meshes} meshes, {bad} bad, work {work:.3e}: {elapsed:.3} s ({:.3} ns per unit)",
+            elapsed * 1e9 / work as f64
+        );
+    }
+}
+
+#[test]
+fn bad_mesh_search_above_the_work_bound_is_refused_before_sep() {
+    // 2000x2000 with 8 px meshes, left half masked: 31,250 of 62,500 meshes
+    // bad, 1.95e9 search units (about 1 s on the development host).
+    let (width, height) = (2000, 2000);
+    let data = vec![100.0f32; width * height];
+    let mask: Vec<u8> = (0..width * height)
+        .map(|i| u8::from(i % width < width / 2))
+        .collect();
+    let params = BackgroundParams {
+        bw: 8,
+        bh: 8,
+        ..Default::default()
+    };
+    let error = Background::estimate(&data, width, height, Some(&mask), &params).unwrap_err();
+    assert_eq!(
+        error,
+        SepError::WorkBound {
+            bad_meshes: 31_250,
+            meshes: 62_500,
+            limit: MAX_BAD_MESH_WORK
+        }
+    );
+    assert!(error.to_string().starts_with("work bound:"), "{error}");
+    // Without bad meshes the same grid is linear work and allowed.
+    Background::estimate(&data, width, height, None, &params).unwrap();
+}
+
+#[test]
+fn mesh_support_counts_actual_partial_mesh_sizes() {
+    // 20x10 with 8 px meshes: columns 0..8, 8..16, 16..20 (4 px wide);
+    // rows 0..8, 8..10 (2 px high).
+    let (width, height) = (20, 10);
+    let grid = MeshGrid::for_frame(width, height, 8, 8);
+    assert_eq!((grid.nx, grid.ny), (3, 2));
+    let mut mask = vec![0u8; width * height];
+    // Mesh (2,0) is 4x8 = 32 px: 16 masked is exactly half -> supported.
+    for y in 0..8 {
+        for x in 16..18 {
+            mask[y * width + x] = 1;
+        }
+    }
+    // Mesh (0,1) is 8x2 = 16 px: 9 masked -> 7 < 8 -> bad.
+    for i in 0..9 {
+        mask[8 * width + (i % 8) + (i / 8) * width] = 1;
+    }
+    assert_eq!(
+        mesh_support(Some(&mask), width, height, grid),
+        vec![true, true, true, false, true, true]
+    );
+    assert!(mesh_support(None, width, height, grid).iter().all(|&ok| ok));
+    assert!(usable_data_value(9.9e29) && !usable_data_value(-1e30));
+    assert!(!usable_data_value(f32::NAN) && !usable_data_value(f32::INFINITY));
+}
+
+#[test]
+fn deblend_families_group_touching_children_only() {
+    // 6x3 image: objects 0 and 1 touch diagonally, 2 is separate, 3 is not a
+    // child even though it touches 2.
+    let width = 6;
+    let footprints: [(Vec<u32>, bool); 4] = [
+        (vec![0, 1], true),
+        (vec![8], true),
+        (vec![4, 5], true),
+        (vec![11, 17], false),
+    ];
+    let families = deblend_families(footprints.iter().map(|(p, m)| (p.as_slice(), *m)), width, 3);
+    assert_eq!(families, vec![vec![0, 1], vec![2]]);
+}

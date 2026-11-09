@@ -36,18 +36,35 @@
 //! This crate therefore runs every FFI call sequence — configuring the pixel
 //! stack and sub-object limit, the call itself, and reading the error message
 //! and detail on the same thread — under one process-wide [`Mutex`]. Calls
-//! are serialized; results are deterministic per call (`sep_extract` reseeds
-//! `randseed = 1`). No other code in the process may call SEP directly; the
+//! are serialized. No other code in the process may call SEP directly; the
 //! `links = "sep"` key in `Cargo.toml` keeps a second copy of the library out
 //! of the binary.
 //!
-//! # Allocation bounds
+//! # Determinism
+//!
+//! Background estimation and everything about non-deblended objects is
+//! deterministic. Deblended children (`SEP_OBJ_MERGED`) are not fully
+//! portable: `deblend.c:gatherup` hands each parent pixel outside the
+//! children's cores to one child drawn with `rand_r(&randseed)`.
+//! `sep_extract` reseeds `randseed = 1`, so with a POSIX `rand_r` a call is
+//! repeatable on one C library, but the generator differs between C
+//! libraries (macOS libSystem and glibc give different children for the
+//! parity fixture). On MSVC `sepcore.h` maps `rand_r(SEED)` to `rand()`,
+//! which ignores the seed and keeps per-thread state between calls, so even
+//! the same frame processed twice on one thread can deblend differently.
+//! What does not depend on the generator: each child's barycentre
+//! (`analyse.c` robust branch keeps the pre-assignment centre), and the
+//! union of a parent's children, their total `npix` and their total flux.
+//!
+//! # Allocation and work bounds
 //!
 //! The C code misbehaves on some allocation-failure paths (for example
 //! `sep_extract` frees an uninitialised `arraybuffer` if an early allocation
 //! fails), so the inputs that size SEP's allocations are bounded here:
 //! [`MAX_PIXELS`], [`MAX_PIXSTACK`], [`MAX_DEBLEND_NTHRESH`],
-//! [`MAX_FILTER_MESHES`], [`MAX_MESHES`] and [`MAX_KERNEL_DIM`].
+//! [`MAX_FILTER_MESHES`], [`MAX_MESHES`] and [`MAX_KERNEL_DIM`]. The one
+//! super-linear step of `sep_background`, the bad-mesh search, is bounded by
+//! [`MAX_BAD_MESH_WORK`].
 
 mod ffi;
 
@@ -103,6 +120,21 @@ pub const MAX_FILTER_MESHES: usize = 63;
 
 /// Largest accepted mesh grid (`nx * ny`); SEP keeps four `float` grids.
 pub const MAX_MESHES: usize = 1 << 20;
+
+/// Largest accepted `bad_meshes * total_meshes` for one `sep_background`.
+///
+/// `filterback` replaces every mesh below support by scanning all meshes for
+/// the nearest supported ones (`background.c`, nested loop), so its cost is
+/// proportional to that product; everything else in `sep_background` is
+/// linear in pixels or meshes. Measured on the development host (Apple M3
+/// Pro, release build, `tests::bad_mesh_work_host_timing`, half of each frame
+/// masked): 0.50-0.54 ns per unit, and 1.95e9 units took 1.00 s for the whole
+/// call. 1.5e9 therefore keeps one call near 0.8 s on that host while the
+/// process-wide SEP lock is held (an available-host figure, not a deployment
+/// budget). Typical frames are far below it: 64 px meshes on 6000x4000 are
+/// 5,952 meshes, at most 3.5e7 units even with every mesh bad. Frames above
+/// the bound fail with [`SepError::WorkBound`] before SEP is called.
+pub const MAX_BAD_MESH_WORK: u64 = 1_500_000_000;
 
 /// Largest accepted convolution kernel width/height.
 pub const MAX_KERNEL_DIM: usize = 63;
@@ -197,6 +229,13 @@ pub enum SepError {
     InconsistentOutput {
         reason: String,
     },
+    /// The frame would make `filterback`'s bad-mesh search exceed
+    /// [`MAX_BAD_MESH_WORK`]; refused before calling SEP.
+    WorkBound {
+        bad_meshes: usize,
+        meshes: usize,
+        limit: u64,
+    },
     /// SEP returned a non-zero status: `code` (see [`status`]), the
     /// `sep_get_errmsg` text, and the `sep_get_errdetail` text (may be empty).
     Library {
@@ -237,6 +276,16 @@ impl fmt::Display for SepError {
             SepError::InvalidParameter { name, reason } => {
                 write!(f, "invalid parameter {name}: {reason}")
             }
+            SepError::WorkBound {
+                bad_meshes,
+                meshes,
+                limit,
+            } => write!(
+                f,
+                "work bound: {bad_meshes} of {meshes} meshes below support would cost \
+                 {} > {limit} bad-mesh search units",
+                *bad_meshes as u64 * *meshes as u64
+            ),
             SepError::InconsistentOutput { reason } => {
                 write!(f, "inconsistent SEP output: {reason}")
             }
@@ -357,8 +406,47 @@ fn is_masked(mask: Option<&[u8]>, index: usize) -> bool {
     mask.is_some_and(|mask| mask[index] != 0)
 }
 
-fn usable_value(value: f32) -> bool {
+/// Whether SEP can use `value` as data: finite and below its `BIG` sentinel
+/// (1e30) in magnitude. Callers building a detector mask should exclude every
+/// pixel for which this is false; unmasked ones are rejected.
+pub fn usable_data_value(value: f32) -> bool {
     value.is_finite() && value.abs() < SEP_BIG
+}
+
+fn usable_value(value: f32) -> bool {
+    usable_data_value(value)
+}
+
+/// SEP's mesh-support rule (`background.c:backstat`, `BACK_MINGOODFRAC =
+/// 0.5`): mesh `(i, j)` spans its *actual* pixels (the last column and row of
+/// meshes are partial) and is "bad" iff
+/// `(float)npix < (float)(bw_i * h_j * 0.5)`, where `npix` counts pixels with
+/// `mask <= 0` and `pix > -BIG`. For data this crate accepts (unmasked pixels
+/// are usable) that is the unmasked count. One flag per mesh, row-major,
+/// `true` = supported.
+pub fn mesh_support(mask: Option<&[u8]>, width: usize, height: usize, grid: MeshGrid) -> Vec<bool> {
+    let Some(mask) = mask else {
+        return vec![true; grid.nx * grid.ny];
+    };
+    let mut usable = vec![0u64; grid.nx * grid.ny];
+    for (y, row) in mask.chunks_exact(width).take(height).enumerate() {
+        let mesh_row = (y / grid.bh) * grid.nx;
+        for (x, &m) in row.iter().enumerate() {
+            if m == 0 {
+                usable[mesh_row + x / grid.bw] += 1;
+            }
+        }
+    }
+    usable
+        .iter()
+        .enumerate()
+        .map(|(index, &npix)| {
+            let (i, j) = (index % grid.nx, index / grid.nx);
+            let mesh_w = (width - i * grid.bw).min(grid.bw);
+            let mesh_h = (height - j * grid.bh).min(grid.bh);
+            !((npix as f32) < ((mesh_w * mesh_h) as f64 * 0.5) as f32)
+        })
+        .collect()
 }
 
 fn first_unusable_unmasked(
@@ -526,10 +614,48 @@ impl Background {
         mask: Option<&[u8]>,
         params: &BackgroundParams,
     ) -> Result<Self, SepError> {
+        Self::estimate_checked(data, width, height, mask, params, true)
+    }
+
+    /// [`Background::estimate`] without [`MAX_BAD_MESH_WORK`], to measure it.
+    #[cfg(test)]
+    fn estimate_unbounded(
+        data: &[f32],
+        width: usize,
+        height: usize,
+        mask: Option<&[u8]>,
+        params: &BackgroundParams,
+    ) -> Result<Self, SepError> {
+        Self::estimate_checked(data, width, height, mask, params, false)
+    }
+
+    fn estimate_checked(
+        data: &[f32],
+        width: usize,
+        height: usize,
+        mask: Option<&[u8]>,
+        params: &BackgroundParams,
+        bound_work: bool,
+    ) -> Result<Self, SepError> {
         let pixels = check_geometry(data.len(), width, height)?;
         check_mask(mask, pixels)?;
         params.validate(width, height)?;
         first_unusable_unmasked(data, mask, width)?;
+        if bound_work {
+            let grid = MeshGrid::for_frame(width, height, params.bw, params.bh);
+            let meshes = grid.nx * grid.ny;
+            let bad_meshes = mesh_support(mask, width, height, grid)
+                .iter()
+                .filter(|ok| !**ok)
+                .count();
+            if bad_meshes as u64 * meshes as u64 > MAX_BAD_MESH_WORK {
+                return Err(SepError::WorkBound {
+                    bad_meshes,
+                    meshes,
+                    limit: MAX_BAD_MESH_WORK,
+                });
+            }
+        }
 
         // `backhisto` computes `(int64_t)(pix / qscale + cste)` for every
         // pixel before testing its mask, which is undefined behaviour in C for
@@ -1049,6 +1175,80 @@ pub struct Catalog {
     pub filter_applied: Option<FilterType>,
     /// Whether `thresh` was relative to the noise.
     pub thresh_relative: bool,
+}
+
+/// Groups deblended children (`SEP_OBJ_MERGED`) into families: objects whose
+/// footprints are 8-connected through other children, i.e. the children of
+/// one detected parent. A detection footprint is an 8-connected component
+/// (`lutz.c`), and two separate detections cannot touch, so the families are
+/// the parents.
+///
+/// `objects` yields each object's footprint (linear indices `x + width*y`)
+/// and whether it is a deblended child, in catalog order; the result lists
+/// catalog indices per family, ascending, families ordered by first member.
+///
+/// Within a family, which child receives a faint pixel depends on the C
+/// library's `rand_r` (see the crate docs), while the family's pixel set,
+/// total `npix` and total flux do not.
+pub fn deblend_families<'a>(
+    objects: impl IntoIterator<Item = (&'a [u32], bool)>,
+    width: usize,
+    height: usize,
+) -> Vec<Vec<usize>> {
+    const NONE: usize = usize::MAX;
+    let mut owner = vec![NONE; width * height];
+    let mut merged = Vec::new();
+    for (index, (pixels, is_child)) in objects.into_iter().enumerate() {
+        if is_child {
+            merged.push(index);
+            for &p in pixels {
+                if let Some(slot) = owner.get_mut(p as usize) {
+                    *slot = index;
+                }
+            }
+        }
+    }
+    let count = merged.iter().max().map_or(0, |&m| m + 1);
+    let mut parent: Vec<usize> = (0..count).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for y in 0..height {
+        for x in 0..width {
+            let a = owner[y * width + x];
+            if a == NONE {
+                continue;
+            }
+            // Right, below-left, below and below-right cover all 8 neighbours
+            // once per pair.
+            for (dx, dy) in [(1isize, 0isize), (-1, 1), (0, 1), (1, 1)] {
+                let (nx, ny) = (x as isize + dx, y as isize + dy);
+                if nx < 0 || nx >= width as isize || ny >= height as isize {
+                    continue;
+                }
+                let b = owner[ny as usize * width + nx as usize];
+                if b != NONE && b != a {
+                    let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+                    parent[ra.max(rb)] = ra.min(rb);
+                }
+            }
+        }
+    }
+    let mut families: Vec<Vec<usize>> = Vec::new();
+    let mut family_of_root = vec![NONE; count];
+    for &index in &merged {
+        let r = root(&mut parent, index);
+        if family_of_root[r] == NONE {
+            family_of_root[r] = families.len();
+            families.push(Vec::new());
+        }
+        families[family_of_root[r]].push(index);
+    }
+    families
 }
 
 /// Frees a `sep_catalog` on every exit path.

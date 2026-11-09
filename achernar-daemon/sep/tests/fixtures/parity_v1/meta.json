@@ -7,6 +7,8 @@
   "fw": 3,
   "maskthresh": 0.0
  },
+ "c_library": "Apple libSystem (macOS 15.8)",
+ "deblend_rng": "C library rand_r(&randseed), randseed = 1 per sep_extract (deblend.c gatherup)",
  "extract": {
   "clean": true,
   "clean_param": 1.0,
@@ -38,7 +40,7 @@
  },
  "fixture": "parity_v1",
  "generator": "achernar-daemon/sep/tests/fixtures/make_parity_fixture.py",
- "generator_sha256": "3c8339afc3bbc8b1c8e1baf19f66adb93441a3df6b228ca99d507179d493da2e",
+ "generator_sha256": "f091cdb631ff44abac9c8d3f2a637b472449280935899200bb413a9c0a6e29de",
  "globalback": 1052.110595703125,
  "globalrms": 12.484267234802246,
  "height": 160,
@@ -67,6 +69,7 @@
  "objects": 10,
  "platform": "Darwin arm64",
  "python_version": "3.12.14",
+ "rust_target_os": "macos",
  "seed": 20261108,
  "sep_c_version_string": null,
  "sep_version": "1.4.1",

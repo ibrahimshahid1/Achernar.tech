@@ -38,9 +38,37 @@
 //!   reproduced bit for bit; with `off` 27-30% of map pixels differ (by at
 //!   most 3.6e-7 relative, inside decisions.md D-006).
 //! * No `-ffast-math` (or any value-unsafe flag): SEP's histogram mode and
-//!   clipping are order- and NaN-sensitive.
+//!   clipping are order- and NaN-sensitive. `cc` appends `CFLAGS` from the
+//!   environment after these flags (`CFLAGS_<target>`,
+//!   `CFLAGS_<target_with_underscores>`, `HOST_CFLAGS` or `TARGET_CFLAGS`,
+//!   `CFLAGS`; all that are set apply), so the build fails if any of them
+//!   carries a value-unsafe flag ([`VALUE_UNSAFE_FLAGS`]), and every set one
+//!   is recorded in `BUILD_FLAGS` together with the compiler path and
+//!   `CRATE_CC_NO_DEFAULTS` (which drops cc's default flags, `-O3` included).
 use std::env;
 use std::path::PathBuf;
+
+/// Flags that let the compiler change floating-point results (reassociation,
+/// reciprocal approximations, ignoring NaN/inf/signed zero, contraction
+/// across statements). Compared token by token with the environment CFLAGS;
+/// `-ffp-contract=fast` also matches clang's `-ffp-contract=fast-honor-pragmas`.
+const VALUE_UNSAFE_FLAGS: [&str; 15] = [
+    "-ffast-math",
+    "-Ofast",
+    "-funsafe-math-optimizations",
+    "-ffp-contract=fast",
+    "-fassociative-math",
+    "-freciprocal-math",
+    "-fno-signed-zeros",
+    "-ffinite-math-only",
+    "-ffp-model=fast",
+    "-ffp-model=aggressive",
+    "-fno-honor-nans",
+    "-fno-honor-infinities",
+    "-fapprox-func",
+    "/fp:fast",
+    "-fp:fast",
+];
 
 const SEP_SOURCES: [&str; 8] = [
     "analyse.c",
@@ -66,14 +94,17 @@ fn main() {
         .define("SEP_VERSION_STRING", "\"1.4.1\"")
         .define("_USE_MATH_DEFINES", "1");
 
-    let msvc = build.get_compiler().is_like_msvc();
+    let compiler = build.get_compiler();
+    let msvc = compiler.is_like_msvc();
     // Recorded into the crate (`achernar_sep::BUILD_FLAGS`) for provenance;
     // the machine-specific prefix-map path is summarised.
-    let mut recorded = vec![
+    let mut recorded: Vec<String> = [
         "-O3",
         "-DSEP_VERSION_STRING=\"1.4.1\"",
         "-D_USE_MATH_DEFINES=1",
-    ];
+    ]
+    .map(String::from)
+    .to_vec();
     if !msvc {
         let contract = fp_contract_flag();
         build.flag("-std=gnu11");
@@ -82,12 +113,33 @@ fn main() {
         prefix_map.push(vendor.as_os_str());
         prefix_map.push("/=");
         build.flag(prefix_map);
-        recorded.extend([
-            "-std=gnu11",
-            contract,
-            "-fmacro-prefix-map=<vendor/sep-1.4.1>/=",
-        ]);
+        recorded.extend(
+            [
+                "-std=gnu11",
+                contract,
+                "-fmacro-prefix-map=<vendor/sep-1.4.1>/=",
+            ]
+            .map(String::from),
+        );
     }
+    for (name, value) in environment_cflags() {
+        if let Some(flag) = value
+            .split_ascii_whitespace()
+            .map(|token| token.trim_matches(|c| c == '"' || c == '\''))
+            .find(|token| is_value_unsafe(token))
+        {
+            panic!(
+                "achernar-sep: {name} contains the value-unsafe flag `{flag}`, which would \
+                 change SEP's floating-point results (cc appends it after this crate's flags). \
+                 Unset it for this build."
+            );
+        }
+        recorded.push(format!("env:{name}={value}"));
+    }
+    if let Ok(value) = env::var("CRATE_CC_NO_DEFAULTS") {
+        recorded.push(format!("env:CRATE_CC_NO_DEFAULTS={value}"));
+    }
+    recorded.push(format!("compiler={}", compiler.path().display()));
     println!(
         "cargo:rustc-env=ACHERNAR_SEP_BUILD_FLAGS={}",
         recorded.join(" ")
@@ -103,6 +155,10 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=csrc/layout_probe.c");
     println!("cargo:rerun-if-env-changed=ACHERNAR_SEP_FP_CONTRACT");
+    for name in cflags_variables() {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    println!("cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS");
     for entry in std::fs::read_dir(&src).expect("vendored SEP sources are present") {
         let path = entry.expect("readable vendor dir").path();
         println!("cargo:rerun-if-changed={}", path.display());
@@ -112,6 +168,34 @@ fn main() {
         // macOS, glibc needs it named.
         println!("cargo:rustc-link-lib=m");
     }
+}
+
+fn is_value_unsafe(token: &str) -> bool {
+    VALUE_UNSAFE_FLAGS.contains(&token) || token.starts_with("-ffp-contract=fast")
+}
+
+/// The CFLAGS variables cc 1.2 reads for this target (`Build::envflags`
+/// with `target_envs`), in cc's application order: `CFLAGS`, then
+/// `HOST_CFLAGS` (native build) or `TARGET_CFLAGS` (cross build), then the
+/// target-suffixed forms.
+fn cflags_variables() -> [String; 4] {
+    let target = env::var("TARGET").expect("Cargo sets TARGET");
+    let host = env::var("HOST").expect("Cargo sets HOST");
+    let kind = if target == host { "HOST" } else { "TARGET" };
+    let target_u = target.replace(['-', '.'], "_");
+    [
+        "CFLAGS".to_string(),
+        format!("{kind}_CFLAGS"),
+        format!("CFLAGS_{target_u}"),
+        format!("CFLAGS_{target}"),
+    ]
+}
+
+fn environment_cflags() -> Vec<(String, String)> {
+    cflags_variables()
+        .into_iter()
+        .filter_map(|name| env::var(&name).ok().map(|value| (name, value)))
+        .collect()
 }
 
 /// `-ffp-contract=on` (see the module docs). `ACHERNAR_SEP_FP_CONTRACT=off`
