@@ -3,6 +3,7 @@
 
 pub mod background;
 pub mod background_estimator;
+pub mod background_model;
 pub mod coc_runner;
 pub mod coc_shadow_runner;
 pub mod coc_shadow;
