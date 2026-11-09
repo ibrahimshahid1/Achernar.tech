@@ -972,6 +972,97 @@ mod analysis_domain_tests {
         }
     }
 
+    /// A 256x192 Mono8 frame: sky ramp 40..91 ADU, +-3 ADU quantized noise and
+    /// four 1.8 px-sigma stars well inside the frame.
+    fn ramp_star_frame() -> FrameData {
+        let (w, h) = (256usize, 192usize);
+        let mut data = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let noise = ((i as u64).wrapping_mul(2_654_435_761) % 7) as f32 - 3.0;
+                let mut value = 40.0 + 0.2 * x as f32 + noise;
+                for (cx, cy) in [(64.0, 48.0), (190.0, 60.0), (128.0, 140.0), (60.0, 150.0)] {
+                    let r2: f32 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
+                    value += 150.0 * (-r2 / (2.0 * 1.8 * 1.8)).exp();
+                }
+                data[i] = value.round().clamp(0.0, 254.0) as u8;
+            }
+        }
+        let mut frame = mono_frame();
+        frame.width = w as i32;
+        frame.height = h as i32;
+        frame.data = data;
+        let descriptor = frame.sensor_descriptor.as_mut().unwrap();
+        descriptor.width = w;
+        descriptor.height = h;
+        descriptor.row_stride_bytes = w;
+        frame
+    }
+
+    #[test]
+    fn opt_in_sep_backend_reaches_detection_gates_hfr_and_trailing() {
+        use crate::vision::background_model::{
+            BackgroundBackend, BackgroundMethod, CropSkySource, DetectionMethod, LevelStatus,
+        };
+        let frame = ramp_star_frame();
+        let context = ObservationContext {
+            background_settings: BackgroundSettings {
+                backend: BackgroundBackend::Sep,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let observation = observation_with_context(
+            &frame,
+            &mut VisionTrendState::default(),
+            None,
+            None,
+            &context,
+        )
+        .unwrap();
+        let background = observation.background.as_ref().unwrap();
+        assert_eq!(background.method, BackgroundMethod::SepSpatialMesh);
+        assert_eq!(background.library_version.as_deref(), Some("1.4.1"));
+        assert_eq!(background.level_status, LevelStatus::Measured);
+        assert_eq!(background.units, "adu");
+        assert!(background.mesh.is_some());
+        let detection = observation.detection.as_ref().unwrap();
+        assert_eq!(detection.method, DetectionMethod::SepExtract);
+        assert_eq!(
+            detection.crop_sky_source,
+            CropSkySource::ParentBackgroundMap
+        );
+        assert!(observation.star_count >= 3, "{}", observation.star_count);
+        assert_eq!(observation.status, quality::QualityStatus::Valid);
+        let hfr = observation.hfr_px.unwrap();
+        assert!((1.5..3.0).contains(&hfr), "HFR {hfr}");
+        assert_eq!(
+            observation.trailing_policy.as_deref(),
+            Some(trailing::SEP_TRAILING_POLICY)
+        );
+        assert!(observation.trailing_unavailable_reason.is_none());
+        assert_eq!(observation.background_adu, background.level());
+
+        // Without configuration the same frame runs the legacy path.
+        let legacy = observation_with_context(
+            &frame,
+            &mut VisionTrendState::default(),
+            None,
+            None,
+            &ObservationContext::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.background.unwrap().method,
+            BackgroundMethod::LegacyGlobalClip
+        );
+        assert_eq!(
+            legacy.detection.unwrap().method,
+            DetectionMethod::LegacyConnectedComponents
+        );
+    }
+
     #[test]
     fn observation_identifies_transform_and_disables_unqualified_shadow() {
         let observation = observation_from_frame(&mono_frame()).unwrap();

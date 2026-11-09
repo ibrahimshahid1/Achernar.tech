@@ -599,7 +599,9 @@ pub enum BackgroundField {
     /// is the measured scale, possibly 0 when unresolved.
     Uniform { level: f32, sigma: f32 },
     /// Full-resolution maps from SEP's spline array evaluators, row-major on
-    /// the analysis grid.
+    /// the analysis grid. Values at detector-masked pixels are interpolated
+    /// from the mesh model, not measurements there; consumers that need
+    /// evidence at a pixel must also check its mask.
     Map {
         level: Vec<f32>,
         rms: Vec<f32>,

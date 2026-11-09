@@ -25,14 +25,15 @@ pub fn analyze_background(frame: &LumaFrame, settings: &BackgroundSettings) -> B
     }
 }
 
+/// The vendored SEP 1.4.1 backend (`sep_backend::analyze_sep`). Blocking
+/// native work serialized by the binding's process-wide mutex; the vision
+/// loop calls it from the blocking pool.
 fn sep_backend(
-    _frame: &LumaFrame,
-    _settings: &BackgroundSettings,
+    frame: &LumaFrame,
+    settings: &BackgroundSettings,
 ) -> Result<BackgroundAnalysis, BackendFailure> {
-    Err((
-        BackgroundReason::BackendFailure,
-        "the SEP backend is not built into this revision".to_string(),
-    ))
+    super::sep_backend::analyze_sep(frame, settings)
+        .map_err(|failure| (failure.reason, failure.detail))
 }
 
 /// Apply the fallback policy around a SEP backend call.
