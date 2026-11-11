@@ -361,6 +361,20 @@ fw = 3                              # median filter of the mesh grid, meshes
 fh = 3
 fthresh = 0.0
 min_meshes_per_axis = 2             # smaller frames: frame_smaller_than_mesh_grid
+# How R(x,y) becomes the detection noise (docs/bge-v2-spec.md section 3):
+# "masked_local_v2" (default): a second background with sources masked, and
+# an RMS pixel is invalid only against its own spline cell; up to
+# rms_max_invalid_fraction of invalid pixels are masked out of detection and
+# star support (reason rms_map_locally_invalid) instead of withholding the
+# catalog. "frame_wide_v1": decision D-018, one bad RMS pixel makes the
+# noise unresolved for the whole frame (configuration hash unchanged).
+noise_policy = "masked_local_v2"
+mask_thresh_sigma = 2.0             # source-mask extraction, x max(R1, cell floor)
+mask_minarea = 5
+mask_ellipse_scale = 3.0            # each mask object's SEP ellipse, scaled
+mask_max_fraction = 0.5             # larger source mask: pass 2 skipped
+rms_local_fraction = 0.5            # invalid: 0 < R < this x cell floor
+rms_max_invalid_fraction = 0.25     # above: noise unresolved (invalid_rms_map)
 
 [vision.background.detection]       # sep_extract on I - B(x,y)
 thresh_sigma = 5.0                  # in units of the local RMS R(x,y)
@@ -373,3 +387,13 @@ clean = true
 clean_param = 1.0
 pixstack = 300000
 accept_deblended_for_focus = false  # deblending is SEP's; accepting children is a focus policy
+
+[vision.star_gates]                 # focus-star gates, every background backend
+# "dip_annulus_v2" (default): two peaks blend only across a significant
+# saddle, and a spider-vane/obstructed donut that is one annulus is accepted.
+# "peak_count_v1": any two core peaks above 5 sigma reject the star.
+blend_test = "dip_annulus_v2"
+# Re-merge SEP deblended children into their parent and judge it with the
+# blend test (a failed family is tallied "deblended"). No effect when
+# accept_deblended_for_focus = true.
+regroup_deblended = true

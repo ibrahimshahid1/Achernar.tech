@@ -25,6 +25,16 @@ export interface StarRejectionTallies {
     invalid_hfr: number;
     masked_support: number;
     deblended: number;
+    /** masked_local_v2: the star's crop touched locally invalid RMS pixels. */
+    invalid_noise_support: number;
+}
+
+/** Accepted stars that needed a v2 gate rule (diagnostics, not rejections). */
+export interface GateDiagnostics {
+    /** Blend-flagged by the saddle test, accepted as one annulus (donut). */
+    annulus_exempt: number;
+    /** Regrouped SEP deblend families that were accepted. */
+    regrouped_accepted: number;
 }
 
 const EMPTY_TALLIES: StarRejectionTallies = {
@@ -37,6 +47,7 @@ const EMPTY_TALLIES: StarRejectionTallies = {
     invalid_hfr: 0,
     masked_support: 0,
     deblended: 0,
+    invalid_noise_support: 0,
 };
 
 export type BackgroundProvenance = "current" | "legacy_unverified" | "absent";
@@ -91,6 +102,9 @@ export interface SharedObservation {
     starCountUsed: number;
     /** Why detected stars were not used ("14 detected / 5 used" explained). */
     starRejections: StarRejectionTallies;
+    /** `null` on payloads from before the v2 star gates. */
+    gateDiagnostics: GateDiagnostics | null;
+    starGatesConfigSha256: string | null;
     /** FQE shadow prediction (px) — informational; classical hfrPx is authority. */
     fqeHfrPx: number | null;
     /** FQE frame log-HFR sigma, comparable to hfrLogSigma. */
@@ -103,6 +117,8 @@ export interface SharedObservation {
     fqeCalibrated: boolean | null;
     cloudProbability: number | null;
     cloudEvent: string;
+    /** Why a measured frame gave no cloud evidence (`partial_detection_area`). */
+    cloudUnavailableReason: string | null;
     /** Not a measurement when `trailingUnavailableReason` is set. */
     trailingSeverity: number | null;
     trailingUnavailableReason: string | null;
@@ -164,6 +180,15 @@ export function mapBackground(raw: unknown): BackgroundSummary | null {
     };
 }
 
+function mapGateDiagnostics(raw: unknown): GateDiagnostics | null {
+    const diag = record(raw);
+    if (!diag) return null;
+    return {
+        annulus_exempt: num(diag.annulus_exempt) ?? 0,
+        regrouped_accepted: num(diag.regrouped_accepted) ?? 0,
+    };
+}
+
 /** Map a raw VISION_UPDATE `observation` object. */
 export function mapSharedObservation(raw: unknown): SharedObservation | null {
     const obs = record(raw);
@@ -189,6 +214,8 @@ export function mapSharedObservation(raw: unknown): SharedObservation | null {
         starCount: background && !detection ? null : (num(obs.star_count) ?? 0),
         starCountUsed: num(obs.star_count_used) ?? 0,
         starRejections: { ...EMPTY_TALLIES, ...(record(obs.star_rejections) ?? {}) },
+        gateDiagnostics: mapGateDiagnostics(obs.gate_diagnostics),
+        starGatesConfigSha256: str(obs.star_gates_config_sha256),
         fqeHfrPx: num(obs.fqe_hfr_px),
         fqeSigmaLogHfr: num(obs.fqe_sigma_log_hfr),
         fqeStarCount: num(obs.fqe_star_count),
@@ -196,6 +223,7 @@ export function mapSharedObservation(raw: unknown): SharedObservation | null {
         fqeCalibrated: typeof obs.fqe_calibrated === "boolean" ? obs.fqe_calibrated : null,
         cloudProbability: num(obs.cloud_probability),
         cloudEvent: str(obs.cloud_event) ?? "None",
+        cloudUnavailableReason: str(obs.cloud_unavailable_reason),
         trailingSeverity: str(obs.trailing_unavailable_reason) ? null : num(obs.trailing_severity),
         trailingUnavailableReason: str(obs.trailing_unavailable_reason),
         trailingPolicy: str(obs.trailing_policy),

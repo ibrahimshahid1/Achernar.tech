@@ -151,6 +151,31 @@ extern "C" {
     pub fn sep_set_sub_object_limit(val: c_int);
     pub fn sep_catalog_free(catalog: *mut sep_catalog);
 
+    /// `aperture.c`: pure arithmetic on its arguments, no global state.
+    pub fn sep_ellipse_coeffs(
+        a: f64,
+        b: f64,
+        theta: f64,
+        cxx: *mut f64,
+        cyy: *mut f64,
+        cxy: *mut f64,
+    );
+    /// `aperture.c`: writes `val` into `arr[yi*w + xi]` for every pixel of
+    /// the clamped bounding box of the ellipse that satisfies the ellipse
+    /// inequality; no global state.
+    pub fn sep_set_ellipse(
+        arr: *mut u8,
+        w: i64,
+        h: i64,
+        x: f64,
+        y: f64,
+        cxx: f64,
+        cyy: f64,
+        cxy: f64,
+        r: f64,
+        val: u8,
+    );
+
     pub static sep_version_string: *const c_char;
     pub fn sep_get_errmsg(status: c_int, errtext: *mut c_char);
     pub fn sep_get_errdetail(errtext: *mut c_char);

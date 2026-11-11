@@ -201,6 +201,7 @@ pub fn legacy_result(frame: &LumaFrame, stats: Option<&LegacyGlobalStats>) -> Ba
         plane_unavailable_reason: Some(BackgroundReason::NoSpatialModel),
         bright_pixel_significance: stats.and_then(|stats| stats.bright_pixel_significance),
         saturation_fraction,
+        refinement: None,
     };
     let field = stats.map(|stats| BackgroundField::Uniform {
         level: stats.level,

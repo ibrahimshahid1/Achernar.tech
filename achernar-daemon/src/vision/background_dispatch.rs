@@ -126,6 +126,7 @@ fn sep_unavailable(
             plane_unavailable_reason: Some(reason),
             bright_pixel_significance: None,
             saturation_fraction: None,
+            refinement: None,
         },
         field: None,
         catalog: None,

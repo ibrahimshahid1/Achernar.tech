@@ -3310,6 +3310,17 @@ fn autofocus_quality_json(
             "saturation_fraction": observation.saturation_fraction,
             "background": observation.background,
             "detection": observation.detection,
+            // BGE v2: accepted stars that needed the annulus exemption or a
+            // regrouped deblend family (diagnostics, not rejections), the
+            // star-gate configuration they ran under, and masked_local_v2's
+            // noise-map refinement (also inside `background`; null for
+            // frame_wide_v1 and legacy).
+            "gate_diagnostics": observation.gate_diagnostics,
+            "star_gates_config_sha256": observation.star_gates_config_sha256,
+            "refinement": observation
+                .background
+                .as_ref()
+                .and_then(|background| background.refinement.as_ref()),
             // The FQE's own reading of this frame — the Quality(3) group of the
             // Focus Offset Predictor's input (ml/contracts/fop_features.py).
             //
@@ -3967,6 +3978,48 @@ mod tests {
             json["background_adu"].as_f64().map(|v| v as f32),
             analysis.result.level()
         );
+    }
+
+    /// BGE v2 provenance reaches the frame record: gate diagnostics, the
+    /// star-gate configuration hash and the noise refinement (null when the
+    /// frame did not produce them).
+    #[test]
+    fn quality_json_records_gate_diagnostics_and_refinement() {
+        let empty = quality_json_for(&SharedObservation::empty_for_test());
+        for key in ["gate_diagnostics", "star_gates_config_sha256", "refinement"] {
+            assert!(empty[key].is_null(), "{key} should be null when unmeasured");
+        }
+        let analysis = crate::vision::quality::background_from_luma(&luma());
+        let quality = crate::vision::quality::estimate_quality(&luma(), &analysis);
+        let mut observation = SharedObservation::empty_for_test();
+        observation.gate_diagnostics = Some(crate::vision::quality::GateDiagnostics {
+            annulus_exempt: 2,
+            regrouped_accepted: 1,
+        });
+        observation.star_gates_config_sha256 = Some(quality.star_gates_config_sha256.clone());
+        let mut result = analysis.result.clone();
+        result.refinement = Some(crate::vision::background_model::NoiseRefinement {
+            noise_policy: crate::vision::background_model::NoisePolicy::MaskedLocalV2,
+            pass2_used: true,
+            pass2_skipped_reason: None,
+            source_mask_objects: Some(3),
+            source_mask_pixels: Some(120),
+            source_mask_fraction: Some(0.01),
+            invalid_rms_pixels: Some(0),
+            invalid_rms_fraction: Some(0.0),
+            detection_area_fraction: Some(1.0),
+        });
+        observation.set_background(result, quality.detection);
+        let json = quality_json_for(&observation);
+        assert_eq!(json["gate_diagnostics"]["annulus_exempt"], 2);
+        assert_eq!(json["gate_diagnostics"]["regrouped_accepted"], 1);
+        assert_eq!(
+            json["star_gates_config_sha256"],
+            "77034b3d3e0fc0dc9661a822a8ae7baa0ef644eeaa2273ddd2fcf8ec60f93c6b"
+        );
+        assert_eq!(json["refinement"]["noise_policy"], "masked_local_v2");
+        assert_eq!(json["refinement"]["source_mask_objects"], 3);
+        assert_eq!(json["background"]["refinement"], json["refinement"]);
     }
 
     /// FOP #35 is defined on the legacy estimator: a SEP level is masked, and

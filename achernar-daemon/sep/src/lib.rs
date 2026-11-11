@@ -2,8 +2,10 @@
 //! (`vendor/sep-1.4.1`, see `vendor/sep-1.4.1/SOURCE.md`).
 //!
 //! Scope: spatial background estimation (`sep_background` and its spline
-//! evaluators) and source extraction (`sep_extract`). Aperture photometry is
-//! compiled (it is part of the library) but not exposed.
+//! evaluators), source extraction (`sep_extract`), and the ellipse masking
+//! helpers `sep_ellipse_coeffs` / `sep_set_ellipse` (Python
+//! `sep.mask_ellipse`). Aperture photometry is compiled (it is part of the
+//! library) but not exposed.
 //!
 //! Every `unsafe` block of the Achernar SEP integration lives in this crate.
 //! Callers get owned Rust values, typed errors, and validated inputs:
@@ -1190,20 +1192,27 @@ pub struct Catalog {
 /// Within a family, which child receives a faint pixel depends on the C
 /// library's `rand_r` (see the crate docs), while the family's pixel set,
 /// total `npix` and total flux do not.
+///
+/// Memory is proportional to the children's pixels, not to the frame: a
+/// 6000x4000 frame would otherwise need a 192 MB owner plane per call.
 pub fn deblend_families<'a>(
     objects: impl IntoIterator<Item = (&'a [u32], bool)>,
     width: usize,
     height: usize,
 ) -> Vec<Vec<usize>> {
+    use std::collections::HashMap;
     const NONE: usize = usize::MAX;
-    let mut owner = vec![NONE; width * height];
+    let pixels_total = width.saturating_mul(height);
+    // Pixel -> owning child; a later child overwrites an earlier one on a
+    // shared pixel (SEP footprints are disjoint, so this never happens).
+    let mut owner: HashMap<u32, usize> = HashMap::new();
     let mut merged = Vec::new();
     for (index, (pixels, is_child)) in objects.into_iter().enumerate() {
         if is_child {
             merged.push(index);
             for &p in pixels {
-                if let Some(slot) = owner.get_mut(p as usize) {
-                    *slot = index;
+                if (p as usize) < pixels_total {
+                    owner.insert(p, index);
                 }
             }
         }
@@ -1217,26 +1226,29 @@ pub fn deblend_families<'a>(
         }
         i
     }
-    for y in 0..height {
-        for x in 0..width {
-            let a = owner[y * width + x];
-            if a == NONE {
-                continue;
-            }
+    // Connectivity does not depend on visiting order, so the map's iteration
+    // order cannot change the families.
+    let pairs: Vec<(usize, usize)> = owner
+        .iter()
+        .flat_map(|(&p, &a)| {
+            let (x, y) = ((p as usize % width) as isize, (p as usize / width) as isize);
             // Right, below-left, below and below-right cover all 8 neighbours
             // once per pair.
-            for (dx, dy) in [(1isize, 0isize), (-1, 1), (0, 1), (1, 1)] {
-                let (nx, ny) = (x as isize + dx, y as isize + dy);
-                if nx < 0 || nx >= width as isize || ny >= height as isize {
-                    continue;
-                }
-                let b = owner[ny as usize * width + nx as usize];
-                if b != NONE && b != a {
-                    let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
-                    parent[ra.max(rb)] = ra.min(rb);
-                }
-            }
-        }
+            [(1isize, 0isize), (-1, 1), (0, 1), (1, 1)]
+                .into_iter()
+                .filter_map(move |(dx, dy)| {
+                    let (nx, ny) = (x + dx, y + dy);
+                    (nx >= 0 && nx < width as isize && ny < height as isize)
+                        .then(|| (ny as usize * width + nx as usize) as u32)
+                })
+                .map(move |q| (a, q))
+        })
+        .filter_map(|(a, q)| owner.get(&q).map(|&b| (a, b)))
+        .filter(|(a, b)| a != b)
+        .collect();
+    for (a, b) in pairs {
+        let (ra, rb) = (root(&mut parent, a), root(&mut parent, b));
+        parent[ra.max(rb)] = ra.min(rb);
     }
     let mut families: Vec<Vec<usize>> = Vec::new();
     let mut family_of_root = vec![NONE; count];
@@ -1249,6 +1261,145 @@ pub fn deblend_families<'a>(
         families[family_of_root[r]].push(index);
     }
     families
+}
+
+/// `sep_ellipse_coeffs`: the coefficient form `(cxx, cyy, cxy)` of the
+/// ellipse with semi-axes `a`, `b` and position angle `theta` (radians,
+/// counter-clockwise from +x), i.e.
+/// `cxx*dx^2 + cyy*dy^2 + cxy*dx*dy = 1` on its boundary (`aperture.c`).
+/// Non-positive axes give infinite or NaN coefficients, as in C.
+pub fn ellipse_coeffs(a: f64, b: f64, theta: f64) -> (f64, f64, f64) {
+    let (mut cxx, mut cyy, mut cxy) = (0.0f64, 0.0f64, 0.0f64);
+    // SAFETY: pure arithmetic on its arguments writing three valid
+    // out-pointers; no global state, so no lock is needed.
+    unsafe { ffi::sep_ellipse_coeffs(a, b, theta, &mut cxx, &mut cyy, &mut cxy) };
+    (cxx, cyy, cxy)
+}
+
+/// An ellipse in axis form, frame coordinates (0-based pixel centres).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ellipse {
+    pub x: f64,
+    pub y: f64,
+    pub a: f64,
+    pub b: f64,
+    pub theta: f64,
+}
+
+/// The pixel box `sep_set_ellipse` loops over, `[xmin, xmax) x [ymin, ymax)`
+/// after clamping to the image, or `None` when it is empty. Mirrors
+/// `aperture.c:boxextent_ellipse` + `boxextent` and refuses inputs whose
+/// unclamped bounds would make C's `(int64_t)` casts undefined (NaN or out
+/// of range).
+fn set_ellipse_box(
+    width: usize,
+    height: usize,
+    x: f64,
+    y: f64,
+    cxx: f64,
+    cyy: f64,
+    cxy: f64,
+    r: f64,
+) -> Result<Option<(i64, i64, i64, i64)>, SepError> {
+    if !x.is_finite() || !y.is_finite() {
+        return Err(parameter("x/y", format!("({x}, {y}) is not finite")));
+    }
+    if !r.is_finite() || r < 0.0 {
+        return Err(parameter("r", format!("{r} is not finite and >= 0")));
+    }
+    // The same double expressions as boxextent_ellipse (no product feeds an
+    // addition directly, so FP contraction cannot change them).
+    let dxlim = cxx - cxy * cxy / (4.0 * cyy);
+    let dxlim = if dxlim > 0.0 { r / dxlim.sqrt() } else { 0.0 };
+    let dylim = cyy - cxy * cxy / (4.0 * cxx);
+    let dylim = if dylim > 0.0 { r / dylim.sqrt() } else { 0.0 };
+    // A margin far inside i64 so a rounding difference cannot matter.
+    const LIMIT: f64 = (1u64 << 60) as f64;
+    let bounds = [
+        x - dxlim + 0.5,
+        x + dxlim + 1.4999999,
+        y - dylim + 0.5,
+        y + dylim + 1.4999999,
+    ];
+    if bounds.iter().any(|b| !b.is_finite() || b.abs() >= LIMIT) {
+        return Err(parameter(
+            "ellipse",
+            format!("bounding box {bounds:?} is not finite or out of range"),
+        ));
+    }
+    let (w, h) = (width as i64, height as i64);
+    let xmin = (bounds[0] as i64).max(0);
+    let xmax = (bounds[1] as i64).min(w);
+    let ymin = (bounds[2] as i64).max(0);
+    let ymax = (bounds[3] as i64).min(h);
+    Ok((xmin < xmax && ymin < ymax).then_some((xmin, xmax, ymin, ymax)))
+}
+
+/// `sep_set_ellipse`: sets `arr[y*width + x] = val` on every pixel of the
+/// ellipse `cxx*(x'-x)^2 + cyy*(y'-y)^2 + cxy*(x'-x)*(y'-y) <= r^2`
+/// (`aperture.c`; integer pixel centres). An ellipse wholly off the image
+/// sets nothing, as in C.
+#[allow(clippy::too_many_arguments)]
+pub fn set_ellipse(
+    arr: &mut [u8],
+    width: usize,
+    height: usize,
+    x: f64,
+    y: f64,
+    cxx: f64,
+    cyy: f64,
+    cxy: f64,
+    r: f64,
+    val: u8,
+) -> Result<(), SepError> {
+    check_geometry(arr.len(), width, height)?;
+    if set_ellipse_box(width, height, x, y, cxx, cyy, cxy, r)?.is_none() {
+        return Ok(());
+    }
+    // SAFETY: `arr` holds width*height bytes. The clamped box is non-empty,
+    // so every pointer `arr + yi*w + xmin` (ymin <= yi < ymax <= h, 0 <=
+    // xmin < xmax <= w) stays inside the buffer and the writes stay below
+    // `arr + yi*w + xmax`; the unclamped bounds were checked to be finite
+    // and in range for C's integer casts. No global state, no lock needed.
+    unsafe {
+        ffi::sep_set_ellipse(
+            arr.as_mut_ptr(),
+            width as i64,
+            height as i64,
+            x,
+            y,
+            cxx,
+            cyy,
+            cxy,
+            r,
+            val,
+        )
+    };
+    Ok(())
+}
+
+/// Python `sep.mask_ellipse(arr, x, y, a, b, theta, r)`: for each ellipse,
+/// `sep_ellipse_coeffs(a, b, theta)` then `sep_set_ellipse(..., r, 1)`.
+/// Every ellipse is validated before the mask is touched.
+pub fn mask_ellipses(
+    mask: &mut [u8],
+    width: usize,
+    height: usize,
+    ellipses: &[Ellipse],
+    r: f64,
+) -> Result<(), SepError> {
+    check_geometry(mask.len(), width, height)?;
+    let coeffs: Vec<(Ellipse, (f64, f64, f64))> = ellipses
+        .iter()
+        .map(|e| (*e, ellipse_coeffs(e.a, e.b, e.theta)))
+        .collect();
+    for (e, (cxx, cyy, cxy)) in &coeffs {
+        set_ellipse_box(width, height, e.x, e.y, *cxx, *cyy, *cxy, r)?;
+    }
+    for (e, (cxx, cyy, cxy)) in coeffs {
+        set_ellipse(mask, width, height, e.x, e.y, cxx, cyy, cxy, r, 1)?;
+    }
+    Ok(())
 }
 
 /// Frees a `sep_catalog` on every exit path.

@@ -52,6 +52,11 @@ pub struct VisionConfig {
     /// default.
     #[serde(default)]
     pub background: crate::vision::background_model::BackgroundSettings,
+    /// `[vision.star_gates]`: `blend_test = "dip_annulus_v2" |
+    /// "peak_count_v1"` and `regroup_deblended` (docs/bge-v2-spec.md §1-2).
+    /// Applies to every background backend.
+    #[serde(default)]
+    pub star_gates: crate::vision::quality::StarGateSettings,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1721,6 +1726,50 @@ mod example_config_tests {
         );
         assert_eq!(sep.vision.background.sep.bw, 32);
         assert_eq!(sep.vision.background.sep.bh, 64);
+    }
+
+    /// `[vision.star_gates]` and the v2 `[vision.background.sep]` keys: the
+    /// example documents the defaults, a missing section is the default, and
+    /// each key parses on its own.
+    #[test]
+    fn the_star_gate_and_noise_policy_keys_default_and_parse() {
+        use super::*;
+        use crate::vision::background_model::NoisePolicy;
+        use crate::vision::quality::{BlendTest, StarGateSettings};
+        let example: AchernarConfig = toml::from_str(include_str!("../achernar.example.toml"))
+            .expect("achernar.example.toml must parse");
+        assert_eq!(example.vision.star_gates, StarGateSettings::default());
+        let empty: AchernarConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.vision.star_gates.blend_test, BlendTest::DipAnnulusV2);
+        assert!(empty.vision.star_gates.regroup_deblended);
+        assert_eq!(
+            empty.vision.background.sep.noise_policy,
+            NoisePolicy::MaskedLocalV2
+        );
+        let set: AchernarConfig = toml::from_str(
+            "[vision.star_gates]\nblend_test = \"peak_count_v1\"\nregroup_deblended = false\n\
+             [vision.background.sep]\nnoise_policy = \"frame_wide_v1\"\n\
+             rms_max_invalid_fraction = 0.1\nmask_minarea = 9\n",
+        )
+        .unwrap();
+        assert_eq!(set.vision.star_gates.blend_test, BlendTest::PeakCountV1);
+        assert!(!set.vision.star_gates.regroup_deblended);
+        assert_eq!(
+            set.vision.background.sep.noise_policy,
+            NoisePolicy::FrameWideV1
+        );
+        assert_eq!(set.vision.background.sep.rms_max_invalid_fraction, 0.1);
+        assert_eq!(set.vision.background.sep.mask_minarea, 9);
+        assert_eq!(set.vision.background.sep.mask_thresh_sigma, 2.0);
+        let only_regroup: AchernarConfig =
+            toml::from_str("[vision.star_gates]\nregroup_deblended = false\n").unwrap();
+        assert_eq!(
+            only_regroup.vision.star_gates.blend_test,
+            BlendTest::DipAnnulusV2
+        );
+        assert!(
+            toml::from_str::<AchernarConfig>("[vision.star_gates]\nblend_test = \"v3\"\n").is_err()
+        );
     }
 
     /// The example documents the equipment defaults, so a copied example

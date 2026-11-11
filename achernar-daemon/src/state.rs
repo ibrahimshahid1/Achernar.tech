@@ -291,6 +291,10 @@ pub struct AppState {
     /// for the vision loop. Defaults to the legacy estimator; `sep` is an
     /// opt-in diagnostic path.
     pub background_settings: Arc<crate::vision::background_model::BackgroundSettings>,
+    /// `[vision.star_gates]`: the star blend test and SEP deblend
+    /// regrouping for the vision loop (`dip_annulus_v2` with regrouping by
+    /// default).
+    pub star_gate_settings: crate::vision::quality::StarGateSettings,
     /// Rendered-preview research diagnostics; never supplies control observations.
     pub coc_shadow: Arc<crate::vision::coc_shadow::CocShadowService>,
 
@@ -409,6 +413,7 @@ impl AppState {
             rig_id,
             fqe_runner,
             background_settings: Arc::new(Default::default()),
+            star_gate_settings: Default::default(),
             coc_shadow,
             plate_solver: Arc::new(crate::processing::plate_solver::PlateSolver::disabled(
                 "No plate solver was configured for this daemon instance",
@@ -485,6 +490,15 @@ impl AppState {
         settings: crate::vision::background_model::BackgroundSettings,
     ) -> Self {
         self.background_settings = Arc::new(settings);
+        self
+    }
+
+    /// `[vision.star_gates]` for the vision loop.
+    pub fn with_star_gate_settings(
+        mut self,
+        settings: crate::vision::quality::StarGateSettings,
+    ) -> Self {
+        self.star_gate_settings = settings;
         self
     }
 

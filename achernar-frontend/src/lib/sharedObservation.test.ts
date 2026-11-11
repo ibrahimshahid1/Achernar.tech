@@ -147,6 +147,30 @@ describe("mapSharedObservation background contract", () => {
         expect(displayBackgroundLevel(obs)).toEqual({ text: "—", note: "no background estimate" });
     });
 
+    it("maps the v2 star-gate fields and defaults the new tally on older payloads", () => {
+        const old = mapSharedObservation(observation({ star_rejections: { blended: 2 } }))!;
+        expect(old.starRejections.blended).toBe(2);
+        expect(old.starRejections.invalid_noise_support).toBe(0);
+        expect(old.gateDiagnostics).toBeNull();
+        expect(old.starGatesConfigSha256).toBeNull();
+        expect(old.cloudUnavailableReason).toBeNull();
+
+        const v2 = mapSharedObservation(
+            observation({
+                star_rejections: { invalid_noise_support: 3 },
+                gate_diagnostics: { annulus_exempt: 2, regrouped_accepted: 1 },
+                star_gates_config_sha256: "77034b3d",
+                cloud_probability: null,
+                cloud_unavailable_reason: "partial_detection_area",
+            }),
+        )!;
+        expect(v2.starRejections.invalid_noise_support).toBe(3);
+        expect(v2.gateDiagnostics).toEqual({ annulus_exempt: 2, regrouped_accepted: 1 });
+        expect(v2.starGatesConfigSha256).toBe("77034b3d");
+        expect(v2.cloudProbability).toBeNull();
+        expect(v2.cloudUnavailableReason).toBe("partial_detection_area");
+    });
+
     it("rejects non-objects", () => {
         expect(mapSharedObservation(null)).toBeNull();
         expect(mapSharedObservation("x")).toBeNull();

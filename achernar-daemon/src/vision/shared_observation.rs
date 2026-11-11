@@ -119,6 +119,14 @@ pub struct SharedObservation {
     /// observations persisted before this field deserialize cleanly.
     #[serde(default)]
     pub star_rejections: StarRejectionTallies,
+    /// Accepted stars that needed a v2 gate rule (annulus exemption,
+    /// regrouped deblend family); diagnostics, not rejections. `None` on
+    /// observations from before the v2 gates and when no frame was analysed.
+    #[serde(default)]
+    pub gate_diagnostics: Option<crate::vision::quality::GateDiagnostics>,
+    /// sha256 of the star-gate configuration record the gates ran under.
+    #[serde(default)]
+    pub star_gates_config_sha256: Option<String>,
 
     // --- FQE shadow predictions (Section 7.6.1, published alongside — never
     // replacing — the classical measurement until the promotion gate passes) ---
@@ -150,6 +158,11 @@ pub struct SharedObservation {
     #[serde(default)]
     pub cloud_probability: Option<f32>,
     pub cloud_event: CloudEvent,
+    /// Why the frame gave no cloud evidence although detection ran:
+    /// `partial_detection_area` (masked_local_v2 searched less than 95% of
+    /// the usable pixels, so its star count is not comparable).
+    #[serde(default)]
+    pub cloud_unavailable_reason: Option<String>,
 
     // --- From TrailingElongationDetector ---
     /// `None` when trailing was not measured (`trailing_unavailable_reason`).
@@ -308,6 +321,8 @@ impl SharedObservation {
             star_count: 0,
             star_count_used: 0,
             star_rejections: StarRejectionTallies::default(),
+            gate_diagnostics: None,
+            star_gates_config_sha256: None,
             fqe_hfr_px: None,
             fqe_sigma_log_hfr: None,
             fqe_star_count: None,
@@ -315,6 +330,7 @@ impl SharedObservation {
             fqe_calibrated: None,
             cloud_probability: None,
             cloud_event: CloudEvent::None,
+            cloud_unavailable_reason: None,
             trailing_severity: None,
             trailing_axis: None,
             trailing_direction_pa: None,

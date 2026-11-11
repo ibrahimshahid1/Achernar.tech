@@ -361,6 +361,8 @@ pub struct ObservationContext {
     /// `[vision.background]`: which background backend runs, its fallback
     /// and parameters. Defaults to the legacy estimator.
     pub background_settings: BackgroundSettings,
+    /// `[vision.star_gates]`: the blend test and SEP deblend regrouping.
+    pub star_gates: quality::StarGateSettings,
 }
 
 impl ObservationContext {
@@ -437,6 +439,7 @@ impl ObservationContext {
             solve_on_this_connection,
             mount_repointed_since_solve,
             background_settings: state.background_settings.as_ref().clone(),
+            star_gates: state.star_gate_settings,
         }
     }
 
@@ -645,9 +648,10 @@ fn observation_with_context(
     let quality = quality::estimate_quality_with_policy(
         &luma,
         &background,
-        quality::FocusSourcePolicy {
-            accept_deblended: settings.detection.accept_deblended_for_focus,
-        },
+        quality::FocusSourcePolicy::new(
+            &context.star_gates,
+            settings.detection.accept_deblended_for_focus,
+        ),
     );
 
     // H15: the trail on the sensor; on the sky only with a WCS that still
@@ -734,23 +738,27 @@ fn observation_with_context(
     // Detection that did not run (no background, unresolved noise, failed
     // extraction, malformed frame) is no evidence about cloud: no star count,
     // no reference update, and the event counters neither advance nor reset.
-    let (cloud_probability, cloud_event) = if quality.detection.is_some() {
-        let probability = update_cloud_probability(
-            trends,
-            quality.star_count_detected,
-            background.result.level(),
-            quality.observation_valid(),
-            counts,
-        );
-        let event = if counts {
-            update_cloud_event(trends, probability)
+    // Neither is a count from a partial search area (masked_local_v2 masked
+    // locally invalid RMS pixels): it is not comparable with other frames.
+    let cloud_unavailable_reason = partial_detection_area(&background.result);
+    let (cloud_probability, cloud_event) =
+        if quality.detection.is_some() && cloud_unavailable_reason.is_none() {
+            let probability = update_cloud_probability(
+                trends,
+                quality.star_count_detected,
+                background.result.level(),
+                quality.observation_valid(),
+                counts,
+            );
+            let event = if counts {
+                update_cloud_event(trends, probability)
+            } else {
+                CloudEvent::None
+            };
+            (Some(probability), event)
         } else {
-            CloudEvent::None
+            (None, CloudEvent::None)
         };
-        (Some(probability), event)
-    } else {
-        (None, CloudEvent::None)
-    };
 
     let observation_valid = quality.observation_valid();
     let detection = quality.detection.clone();
@@ -772,6 +780,8 @@ fn observation_with_context(
         star_count: quality.star_count_detected,
         star_count_used: quality.star_count_used,
         star_rejections: quality.star_rejections,
+        gate_diagnostics: Some(quality.gate_diagnostics),
+        star_gates_config_sha256: Some(quality.star_gates_config_sha256),
         fqe_hfr_px,
         fqe_sigma_log_hfr,
         fqe_star_count,
@@ -779,6 +789,7 @@ fn observation_with_context(
         fqe_calibrated,
         cloud_probability,
         cloud_event,
+        cloud_unavailable_reason: cloud_unavailable_reason.map(str::to_string),
         trailing_severity: trailing
             .unavailable_reason
             .is_none()
@@ -810,6 +821,24 @@ fn observation_with_context(
     };
     observation.set_background(background.result, detection);
     Ok(context.apply(observation))
+}
+
+/// Below this share of the usable frame searched by detection, a star count
+/// is not comparable with other frames (`docs/bge-v2-spec.md` §3.9).
+pub const MIN_DETECTION_AREA_FRACTION: f64 = 0.95;
+
+/// `partial_detection_area` when `masked_local_v2` excluded more than 5% of
+/// the usable pixels from detection; the cloud update skips such a frame
+/// and keeps its references and identity.
+fn partial_detection_area(
+    result: &crate::vision::background_model::BackgroundResult,
+) -> Option<&'static str> {
+    result
+        .refinement
+        .as_ref()
+        .and_then(|refinement| refinement.detection_area_fraction)
+        .filter(|fraction| *fraction < MIN_DETECTION_AREA_FRACTION)
+        .map(|_| "partial_detection_area")
 }
 
 fn update_cloud_probability(
@@ -1077,6 +1106,121 @@ mod analysis_domain_tests {
         // clear-sky star reference.
         assert_eq!(trends.consecutive_cloudy, 0);
         assert_eq!(trends.clear_star_baseline, stars);
+    }
+
+    /// A 512x512 Mono16 frame: 1000 ADU sky, sigma ~5 ADU, and a smooth
+    /// 800 ADU ridge whose mesh sigmas make the RMS spline undershoot on
+    /// ~18% of the pixels (`sep_backend` ridge fixture), plus a few stars.
+    /// `ridge = 0` gives the same geometry and stars on a flat sky.
+    fn ridge_frame(ridge: f64) -> FrameData {
+        let (w, h) = (512usize, 512usize);
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut normal = || {
+            let mut uniform = || {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                ((state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 11) as f64 + 0.5)
+                    / (1u64 << 53) as f64
+            };
+            let (u1, u2) = (uniform(), uniform());
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        };
+        let mut data = Vec::with_capacity(w * h * 2);
+        for y in 0..h {
+            for x in 0..w {
+                let mut value =
+                    1000.0 + ridge * (-((x as f64 - 256.0) / 60.0).powi(2)).exp() + 5.0 * normal();
+                for (cx, cy) in [(140.0, 100.0), (380.0, 300.0), (150.0, 420.0)] {
+                    let r2 = (x as f64 - cx).powi(2) + (y as f64 - cy).powi(2);
+                    value += 2000.0 * (-r2 / (2.0 * 1.8 * 1.8)).exp();
+                }
+                data.extend_from_slice(&(value.round().clamp(0.0, 65535.0) as u16).to_le_bytes());
+            }
+        }
+        let mut frame = mono_frame();
+        frame.format = OlsStreamType::Mono16;
+        frame.width = w as i32;
+        frame.height = h as i32;
+        frame.data = data;
+        let descriptor = frame.sensor_descriptor.as_mut().unwrap();
+        descriptor.width = w;
+        descriptor.height = h;
+        descriptor.row_stride_bytes = w * 2;
+        descriptor.sample_type = SampleType::U16;
+        frame
+    }
+
+    #[test]
+    fn a_partial_detection_area_is_no_cloud_evidence_and_keeps_the_references() {
+        let v2 = sep_context(|_| {});
+        let (mut trends, mut previous) = (VisionTrendState::default(), None);
+        // References from good frames of the same camera mode first.
+        let mut good = ridge_frame(0.0);
+        for counter in 0..3 {
+            good.frame_counter = 500 + counter;
+            analyse_in_sequence(&good, &mut trends, &mut previous, &v2);
+        }
+        let (stars, sky) = (trends.clear_star_baseline, trends.clear_background_baseline);
+        assert!(stars.is_some() && sky.is_some());
+
+        let mut ridge = ridge_frame(800.0);
+        ridge.frame_counter = 600;
+        let observation = analyse_in_sequence(&ridge, &mut trends, &mut previous, &v2);
+        let refinement = observation
+            .background
+            .as_ref()
+            .and_then(|b| b.refinement.as_ref())
+            .expect("masked_local_v2 refinement");
+        let area = refinement.detection_area_fraction.unwrap();
+        assert!(area < MIN_DETECTION_AREA_FRACTION, "detection area {area}");
+        assert!(
+            observation.detection.is_some(),
+            "detection ran on the valid area"
+        );
+        assert_eq!(observation.cloud_probability, None);
+        assert_eq!(observation.cloud_event, CloudEvent::None);
+        assert_eq!(
+            observation.cloud_unavailable_reason.as_deref(),
+            Some("partial_detection_area")
+        );
+        assert_eq!(trends.clear_star_baseline, stars);
+        assert_eq!(trends.clear_background_baseline, sky);
+        assert_eq!(trends.consecutive_cloudy, 0);
+        assert!(observation.gate_diagnostics.is_some());
+        assert_eq!(
+            observation.star_gates_config_sha256.as_deref(),
+            Some("77034b3d3e0fc0dc9661a822a8ae7baa0ef644eeaa2273ddd2fcf8ec60f93c6b")
+        );
+
+        // The same frame under frame_wide_v1 withholds detection entirely.
+        let v1 = sep_context(|settings| {
+            settings.sep.noise_policy = crate::vision::background_model::NoisePolicy::FrameWideV1
+        });
+        let observation =
+            observation_with_context(&ridge, &mut VisionTrendState::default(), None, None, &v1)
+                .unwrap();
+        assert!(observation.detection.is_none());
+        assert_eq!(observation.cloud_unavailable_reason, None);
+    }
+
+    #[test]
+    fn star_gate_settings_reach_the_quality_measurement() {
+        let mut context = ObservationContext::default();
+        context.star_gates.blend_test = quality::BlendTest::PeakCountV1;
+        context.star_gates.regroup_deblended = false;
+        let observation = observation_with_context(
+            &ramp_star_frame(),
+            &mut VisionTrendState::default(),
+            None,
+            None,
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            observation.star_gates_config_sha256.as_deref(),
+            Some("b517dd32a276a9e645c00d584cf9386bef2817584db91bf2087322d8e39e4460")
+        );
     }
 
     #[test]

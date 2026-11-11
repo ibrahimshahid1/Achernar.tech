@@ -15,24 +15,33 @@
 //!   interpolates (even below zero); neither is a measured noise, so
 //!   detection does not run on them (see [`RMS_MAP_LOWER_BOUND_FRACTION`]).
 //!
-//! Noise validity is decided for the whole frame: one bad pixel of the RMS
-//! map withholds the catalog everywhere (a documented limitation).
+//! Two noise policies (`[vision.background.sep] noise_policy`):
+//! * `frame_wide_v1` (decision D-018): noise validity is decided for the
+//!   whole frame; one bad pixel of the RMS map withholds the catalog
+//!   everywhere.
+//! * `masked_local_v2` (default, `docs/bge-v2-spec.md` §3): a source mask
+//!   from a low-threshold extraction on pass 1 feeds a second SEP background;
+//!   the RMS map is then judged per pixel against the smallest positive mesh
+//!   sigma of the pixel's own spline cell. Up to `rms_max_invalid_fraction`
+//!   of locally invalid pixels are masked out of detection and star support
+//!   instead of withholding the catalog.
 //!
 //! Everything numeric comes from SEP's own evaluators (`sep_bkg_array`,
 //! `sep_bkg_rmsarray`, `sep_bkg_global(rms)`, `sep_extract`), the same calls
 //! the Python reference makes (`sep.Background.back()/rms()`, `sep.extract`).
 
 use achernar_sep::{
-    extract, flags, mesh_support, usable_data_value, Background, BackgroundParams, ExtractParams,
-    FilterType, Kernel, MeshGrid, Noise, SepError,
+    extract, flags, mask_ellipses, mesh_support, usable_data_value, Background, BackgroundParams,
+    Ellipse, ExtractParams, FilterType, Kernel, MeshGrid, Noise, SepError,
 };
 
 use super::background_model::{
     config_sha256, sep_background_config_json, sep_detection_config_json, BackgroundAnalysis,
     BackgroundField, BackgroundMethod, BackgroundReason, BackgroundResult, BackgroundSettings,
     BackgroundSupport, CatalogSource, CropSkySource, DetectionMethod, DetectionProvenance,
-    LevelStatus, MeshSummary, NoiseSource, NoiseStatus, PlaneFit, SepDetectionParams,
-    SourceCatalog, BACKGROUND_SCHEMA_VERSION, SEP_LIBRARY_VERSION,
+    LevelStatus, MeshSummary, NoisePolicy, NoiseRefinement, NoiseSource, NoiseStatus,
+    Pass2SkipReason, PlaneFit, SepDetectionParams, SourceCatalog, BACKGROUND_SCHEMA_VERSION,
+    MASK_DEBLEND_CONT, SEP_LIBRARY_VERSION,
 };
 use super::quality::{frame_geometry_valid, LumaFrame};
 
@@ -110,6 +119,22 @@ const RMS_DEFINITION: &str = "SEP 1.4.1 sep_bkg_globalrms: median of the nx*ny m
      zero R is zero scatter, negative, non-finite or lower R an invalid RMS map); SEP's \
      substitutes for a non-positive median (median of positive sigmas, or 1.0) are never \
      reported.";
+
+const LEVEL_DEFINITION_V2_SUFFIX: &str = " masked_local_v2: when refinement.pass2_used, the \
+     meshes are those of a second sep_background whose mask adds a source mask (a pass-1 \
+     extraction at mask_thresh_sigma against max(R1, cell floor), its footprints and its \
+     objects' SEP ellipses scaled by mask_ellipse_scale).";
+
+const RMS_DEFINITION_V2: &str = "SEP 1.4.1 sep_bkg_globalrms: median of the nx*ny mesh sigmas \
+     after bad-mesh replacement and the median filter (of the second, source-masked pass when \
+     refinement.pass2_used); a mesh sigma is the standard deviation of its clipped histogram (no \
+     truncation correction). masked_local_v2 (docs/bge-v2-spec.md 3.5): reported unless a mesh \
+     sigma or the global value is zero or not finite and positive, a usable pixel has R = 0 \
+     (zero scatter), or more than rms_max_invalid_fraction of the usable pixels are locally \
+     invalid: R not finite, R < 0, or 0 < R < rms_local_fraction x the smallest finite positive \
+     mesh sigma among the (up to four) spline nodes of the pixel's cell (the frame's smallest \
+     positive mesh sigma when the cell has none). Locally invalid pixels are excluded from \
+     detection and from star measurement support.";
 
 /// Runs the SEP background and, when the noise is measured, SEP extraction
 /// on `frame` with `settings.sep` / `settings.detection`.
@@ -201,40 +226,66 @@ pub fn analyze_sep(
 
     // Frames whose bad-mesh search would exceed achernar_sep's
     // MAX_BAD_MESH_WORK fail here with "work bound: ..." before SEP runs.
-    let background = Background::estimate(&frame.pixels, width, height, Some(&mask), &params)
+    let pass1 = Background::estimate(&frame.pixels, width, height, Some(&mask), &params)
         .map_err(|e| backend_failure(&e))?;
-    let level_map = background.back_array().map_err(|e| backend_failure(&e))?;
-    let rms_map = background.rms_array().map_err(|e| backend_failure(&e))?;
+    let level1 = pass1.back_array().map_err(|e| backend_failure(&e))?;
+    let rms1 = pass1.rms_array().map_err(|e| backend_failure(&e))?;
+
+    let maps = match sep_params.noise_policy {
+        NoisePolicy::FrameWideV1 => {
+            frame_wide_v1(pass1, level1, rms1, &mask, supported, meshes_below_support)
+        }
+        NoisePolicy::MaskedLocalV2 => masked_local_v2(
+            frame,
+            settings,
+            &mask,
+            usable_pixels,
+            &params,
+            grid,
+            Pass {
+                background: pass1,
+                level: level1,
+                rms: rms1,
+                supported,
+                meshes_below_support,
+            },
+        )?,
+    };
+    let NoiseMaps {
+        pass:
+            Pass {
+                background,
+                level: level_map,
+                rms: rms_map,
+                supported,
+                meshes_below_support,
+            },
+        skip_reason,
+        noise,
+        invalid,
+        floor,
+        refinement,
+    } = maps;
 
     let mut reasons = Vec::new();
     if meshes_below_support > 0 {
         reasons.push(BackgroundReason::MeshesInterpolated);
     }
-    let (noise, check) = noise_validity(
-        background.global_rms(),
-        background.mesh_rms(),
-        &rms_map,
-        &mask,
-    );
-    if noise.contains(&BackgroundReason::InvalidRmsMap) {
-        tracing::warn!(
-            usable_min = ?check.usable_min,
-            mesh_sigma_min_positive = ?check.mesh_sigma_min_positive,
-            lower_bound = ?check.lower_bound,
-            below_bound = check.below_bound,
-            zero = check.zero,
-            negative_or_non_finite = check.negative_or_non_finite,
-            "SEP RMS map rejected (invalid_rms_map); detection not run"
-        );
-    }
+    reasons.extend(skip_reason);
     reasons.extend(noise.iter().copied());
-    let noise_measured = noise.is_empty();
+    let noise_measured = !noise.iter().any(|reason| {
+        matches!(
+            reason,
+            BackgroundReason::ZeroEmpiricalScatter | BackgroundReason::InvalidRmsMap
+        )
+    });
 
     let (plane, plane_unavailable_reason) =
         match fit_plane(background.mesh_level(), &supported, grid, width, height) {
             Some(plane) => (Some(plane), None),
             None => (None, Some(BackgroundReason::InsufficientMeshesForPlane)),
         };
+    let v2 = sep_params.noise_policy == NoisePolicy::MaskedLocalV2;
 
     let config = sep_background_config_json(sep_params);
     let result = BackgroundResult {
@@ -271,19 +322,47 @@ pub fn analyze_sep(
             saturation_evidence: frame.saturation_evidence().to_string(),
         },
         level: Some(background.global_level()),
-        level_definition: LEVEL_DEFINITION.to_string(),
+        level_definition: if v2 {
+            format!("{LEVEL_DEFINITION}{LEVEL_DEFINITION_V2_SUFFIX}")
+        } else {
+            LEVEL_DEFINITION.to_string()
+        },
         rms: noise_measured.then(|| background.global_rms()),
-        rms_definition: RMS_DEFINITION.to_string(),
+        rms_definition: if v2 {
+            RMS_DEFINITION_V2
+        } else {
+            RMS_DEFINITION
+        }
+        .to_string(),
         mesh: Some(mesh_summary(&background, grid, meshes_below_support)),
         plane,
         plane_unavailable_reason,
         // Legacy-only heuristic; the SEP path has per-source significance.
         bright_pixel_significance: None,
         saturation_fraction: saturation_fraction(frame, &mask),
+        refinement,
     };
 
     let (catalog, catalog_error) = if noise_measured {
-        match sep_catalog(frame, settings, &mask, &level_map, &rms_map) {
+        // M_det, plus the locally invalid pixels under masked_local_v2
+        // (never the source mask: sources must be detected).
+        let detection_mask: std::borrow::Cow<[u8]> = match &invalid {
+            Some(invalid) => mask
+                .iter()
+                .zip(invalid)
+                .map(|(&m, &i)| m | i)
+                .collect::<Vec<u8>>()
+                .into(),
+            None => (&mask[..]).into(),
+        };
+        match sep_catalog(
+            frame,
+            settings,
+            &detection_mask,
+            &level_map,
+            &rms_map,
+            floor.as_ref(),
+        ) {
             Ok(catalog) => (Some(catalog), None),
             Err(error) => (None, Some(error)),
         }
@@ -298,10 +377,500 @@ pub fn analyze_sep(
             rms: rms_map,
             width,
             height,
+            invalid_noise: invalid,
         }),
         catalog,
         catalog_error,
     })
+}
+
+/// The noise array of the final masked_local_v2 extraction (amendment A-1,
+/// `docs/bge-v2-spec.md` §3.6): `R`, with every masked pixel (`M_det ∪
+/// M_inv`) set to its cell floor. The reported `R` map is not changed.
+///
+/// SEP's `apply_mask_line` gives every masked pixel the noise `BIG` except
+/// those of the first `convh/2` rows: `arraybuffer_init` reads them before
+/// the main loop, so the mask is never applied there (`extract.c`). Under
+/// frame_wide_v1 every masked `R` was a positive spline value; under
+/// masked_local_v2 a masked pixel can carry a negative `R`, its threshold
+/// `thresh * R` turns negative, and row 0 yields zero-flux "objects" made
+/// only of masked pixels (x = y = NaN, `OBJ_TRUNC`; seen on the 800 ADU ridge
+/// fixture). The floor is positive, so that cannot happen.
+fn noise_for_masked_extraction(
+    rms: &[f32],
+    mask: &[u8],
+    floor: &CellFloor,
+    width: usize,
+) -> Vec<f32> {
+    rms.iter()
+        .zip(mask)
+        .enumerate()
+        .map(|(i, (&r, &m))| {
+            if m != 0 {
+                floor.at(i % width, i / width)
+            } else {
+                r
+            }
+        })
+        .collect()
+}
+
+/// One SEP background pass and the maps evaluated from it.
+struct Pass {
+    background: Background,
+    level: Vec<f32>,
+    rms: Vec<f32>,
+    /// SEP's mesh-support flags under the mask this pass ran with.
+    supported: Vec<bool>,
+    meshes_below_support: usize,
+}
+
+/// The maps a frame reports and detects with, and what the noise policy
+/// concluded about them.
+struct NoiseMaps {
+    pass: Pass,
+    /// `masked_local_v2`: why pass 2 was skipped, as a result reason.
+    skip_reason: Option<BackgroundReason>,
+    /// Noise reasons; the noise is measured unless one of them is
+    /// `zero_empirical_scatter` or `invalid_rms_map`.
+    noise: Vec<BackgroundReason>,
+    /// `M_inv` (1 = locally invalid usable pixel), when any exists.
+    invalid: Option<Vec<u8>>,
+    /// masked_local_v2: the cell floor of the maps used (A-1 extraction
+    /// noise on masked pixels).
+    floor: Option<CellFloor>,
+    refinement: Option<NoiseRefinement>,
+}
+
+fn log_rejected_map(noise: &[BackgroundReason], check: &RmsMapCheck) {
+    if noise.contains(&BackgroundReason::InvalidRmsMap) {
+        tracing::warn!(
+            usable_min = ?check.usable_min,
+            mesh_sigma_min_positive = ?check.mesh_sigma_min_positive,
+            lower_bound = ?check.lower_bound,
+            below_bound = check.below_bound,
+            zero = check.zero,
+            negative_or_non_finite = check.negative_or_non_finite,
+            "SEP RMS map rejected (invalid_rms_map); detection not run"
+        );
+    }
+}
+
+/// Decision D-018 unchanged: the pass-1 maps and the frame-wide validity.
+fn frame_wide_v1(
+    background: Background,
+    level: Vec<f32>,
+    rms: Vec<f32>,
+    mask: &[u8],
+    supported: Vec<bool>,
+    meshes_below_support: usize,
+) -> NoiseMaps {
+    let (noise, check) = noise_validity(background.global_rms(), background.mesh_rms(), &rms, mask);
+    log_rejected_map(&noise, &check);
+    NoiseMaps {
+        pass: Pass {
+            background,
+            level,
+            rms,
+            supported,
+            meshes_below_support,
+        },
+        skip_reason: None,
+        noise,
+        invalid: None,
+        floor: None,
+        refinement: None,
+    }
+}
+
+/// The local reference of `masked_local_v2` (`docs/bge-v2-spec.md` §3.2):
+/// for each pixel, the smallest finite strictly positive filtered mesh sigma
+/// among the spline nodes of its cell, or the frame's smallest one when the
+/// cell has none.
+///
+/// SEP's spline nodes sit at `(j + 0.5) * bw` (`bkg_line_flt_internal`), so
+/// pixel `x` lies between nodes `xl = (2x - bw) div 2bw` and `xl + 1` (0 for
+/// `2x < bw`), clamped to `[0, max(nx - 2, 0)]`; a single-node axis has
+/// one node.
+#[derive(Debug, Clone)]
+pub struct CellFloor {
+    col: Vec<u32>,
+    row: Vec<u32>,
+    cells_x: usize,
+    cells: Vec<f32>,
+}
+
+/// The lower node of the spline cell holding `coord` along one axis.
+pub fn cell_index(coord: usize, size: usize, nodes: usize) -> usize {
+    let lower = if 2 * coord < size {
+        0
+    } else {
+        (2 * coord - size) / (2 * size)
+    };
+    lower.min(nodes.saturating_sub(2))
+}
+
+impl CellFloor {
+    /// `None` when no mesh sigma is finite and strictly positive: the floor
+    /// is undefined and the noise unresolved.
+    pub fn new(mesh_rms: &[f32], grid: MeshGrid, width: usize, height: usize) -> Option<Self> {
+        let positive = |s: &f32| s.is_finite() && *s > 0.0;
+        let global = mesh_rms.iter().copied().filter(positive).reduce(f32::min)?;
+        let (cells_x, cells_y) = (
+            grid.nx.saturating_sub(1).max(1),
+            grid.ny.saturating_sub(1).max(1),
+        );
+        let axis = |lower: usize, nodes: usize| -> Vec<usize> {
+            if nodes > 1 {
+                vec![lower, lower + 1]
+            } else {
+                vec![0]
+            }
+        };
+        let mut cells = Vec::with_capacity(cells_x * cells_y);
+        for cy in 0..cells_y {
+            for cx in 0..cells_x {
+                let floor = axis(cy, grid.ny)
+                    .into_iter()
+                    .flat_map(|j| axis(cx, grid.nx).into_iter().map(move |i| (i, j)))
+                    .map(|(i, j)| mesh_rms[j * grid.nx + i])
+                    .filter(positive)
+                    .reduce(f32::min)
+                    .unwrap_or(global);
+                cells.push(floor);
+            }
+        }
+        Some(Self {
+            col: (0..width)
+                .map(|x| cell_index(x, grid.bw, grid.nx) as u32)
+                .collect(),
+            row: (0..height)
+                .map(|y| cell_index(y, grid.bh, grid.ny) as u32)
+                .collect(),
+            cells_x,
+            cells,
+        })
+    }
+
+    #[inline]
+    pub fn at(&self, x: usize, y: usize) -> f32 {
+        self.cells[self.row[y] as usize * self.cells_x + self.col[x] as usize]
+    }
+}
+
+/// §3.5 on the maps actually used.
+struct LocalValidity {
+    noise: Vec<BackgroundReason>,
+    invalid: Option<Vec<u8>>,
+    invalid_pixels: Option<u64>,
+    floor: Option<CellFloor>,
+    check: RmsMapCheck,
+}
+
+/// `masked_local_v2` noise validity (§3.5). The zero rule and the mesh-level
+/// checks are v1's; the per-pixel rule compares `R` with its cell floor, and
+/// only more than `max_invalid_fraction` invalid usable pixels make the
+/// noise unresolved for the frame.
+fn local_noise_validity(
+    background: &Background,
+    rms_map: &[f32],
+    mask: &[u8],
+    usable_pixels: usize,
+    fraction: f64,
+    max_invalid_fraction: f64,
+) -> LocalValidity {
+    let (width, height) = (background.width(), background.height());
+    let Some(floor) = CellFloor::new(background.mesh_rms(), background.mesh_grid(), width, height)
+    else {
+        // No finite positive mesh sigma: unresolved exactly as v1 says.
+        let (noise, check) = noise_validity(
+            background.global_rms(),
+            background.mesh_rms(),
+            rms_map,
+            mask,
+        );
+        return LocalValidity {
+            noise,
+            invalid: None,
+            invalid_pixels: None,
+            floor: None,
+            check,
+        };
+    };
+    let (mut zero, mut mesh_invalid) = (false, false);
+    for value in
+        std::iter::once(background.global_rms()).chain(background.mesh_rms().iter().copied())
+    {
+        if !value.is_finite() || value < 0.0 {
+            mesh_invalid = true;
+        } else if value == 0.0 {
+            zero = true;
+        }
+    }
+    let mut check = RmsMapCheck {
+        usable_min: None,
+        mesh_sigma_min_positive: background
+            .mesh_rms()
+            .iter()
+            .copied()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .reduce(f32::min),
+        lower_bound: None,
+        below_bound: 0,
+        zero: 0,
+        negative_or_non_finite: 0,
+    };
+    let mut invalid = vec![0u8; width * height];
+    for y in 0..height {
+        let row = y * width;
+        for x in 0..width {
+            let i = row + x;
+            if mask[i] != 0 {
+                continue;
+            }
+            let r = rms_map[i];
+            if !r.is_finite() || r < 0.0 {
+                check.negative_or_non_finite += 1;
+                invalid[i] = 1;
+            } else if r == 0.0 {
+                check.zero += 1;
+            } else if (r as f64) < fraction * floor.at(x, y) as f64 {
+                check.below_bound += 1;
+                invalid[i] = 1;
+            }
+            if r.is_finite() {
+                check.usable_min = Some(check.usable_min.map_or(r, |m: f32| m.min(r)));
+            }
+        }
+    }
+    let invalid_pixels = check.negative_or_non_finite + check.below_bound;
+    zero |= check.zero > 0;
+    let frame_wide = invalid_pixels as f64 / usable_pixels.max(1) as f64 > max_invalid_fraction;
+    let mut noise = Vec::new();
+    if zero {
+        noise.push(BackgroundReason::ZeroEmpiricalScatter);
+    }
+    if mesh_invalid || frame_wide {
+        noise.push(BackgroundReason::InvalidRmsMap);
+    }
+    if invalid_pixels > 0 && noise.is_empty() {
+        noise.push(BackgroundReason::RmsMapLocallyInvalid);
+    }
+    LocalValidity {
+        noise,
+        invalid: (invalid_pixels > 0).then_some(invalid),
+        invalid_pixels: Some(invalid_pixels),
+        floor: Some(floor),
+        check,
+    }
+}
+
+/// The source mask of §3.3: footprints of a low-threshold, non-deblended
+/// extraction on `I - B1` against `max(R1, floor)`, plus each object's SEP
+/// ellipse scaled by `mask_ellipse_scale` (`sep.mask_ellipse`). Returns the
+/// mask (1 = source) and the object count.
+fn source_mask(
+    frame: &LumaFrame,
+    settings: &BackgroundSettings,
+    mask: &[u8],
+    pass1: &Pass,
+    floor: &CellFloor,
+) -> Result<(Vec<u8>, u32), String> {
+    let (width, height) = (frame.width, frame.height);
+    let sep = &settings.sep;
+    // The mask is built from the objects' footprints, which is exactly
+    // SEP's segmentation map (seg > 0) without allocating it.
+    let mut params = extract_params(&settings.detection, false)?;
+    params.thresh = sep.mask_thresh_sigma as f32;
+    params.minarea = sep.mask_minarea as usize;
+    params.deblend_cont = MASK_DEBLEND_CONT;
+    params.clean = false;
+    let residual: Vec<f32> = frame
+        .pixels
+        .iter()
+        .zip(&pass1.level)
+        .zip(mask)
+        .map(|((&value, &background), &m)| if m != 0 { 0.0 } else { value - background })
+        .collect();
+    let mut masking_noise = pass1.rms.clone();
+    for y in 0..height {
+        for (x, r) in masking_noise[y * width..(y + 1) * width]
+            .iter_mut()
+            .enumerate()
+        {
+            // NaN-ignoring max, as np.fmax.
+            *r = r.max(floor.at(x, y));
+        }
+    }
+    let catalog = extract(
+        &residual,
+        width,
+        height,
+        Some(mask),
+        Noise::Array(&masking_noise),
+        &params,
+    )
+    .map_err(|e| e.to_string())?;
+    drop((residual, masking_noise));
+    let mut source = vec![0u8; width * height];
+    for object in &catalog.objects {
+        for &p in &object.pixels {
+            source[p as usize] = 1;
+        }
+    }
+    let ellipses: Vec<Ellipse> = catalog
+        .objects
+        .iter()
+        .map(|o| Ellipse {
+            x: o.x,
+            y: o.y,
+            a: o.a as f64,
+            b: o.b as f64,
+            theta: o.theta as f64,
+        })
+        .collect();
+    mask_ellipses(
+        &mut source,
+        width,
+        height,
+        &ellipses,
+        sep.mask_ellipse_scale,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok((source, catalog.objects.len() as u32))
+}
+
+/// `masked_local_v2` (`docs/bge-v2-spec.md` §3): source mask, pass 2 and the
+/// local validity rule. `Err` only when no background can be evaluated at
+/// all (a SEP evaluator failure on pass 1's model).
+fn masked_local_v2(
+    frame: &LumaFrame,
+    settings: &BackgroundSettings,
+    mask: &[u8],
+    usable_pixels: usize,
+    params: &BackgroundParams,
+    grid: MeshGrid,
+    pass1: Pass,
+) -> Result<NoiseMaps, SepBackendFailure> {
+    let (width, height) = (frame.width, frame.height);
+    let sep = &settings.sep;
+    let mut refinement = NoiseRefinement {
+        noise_policy: NoisePolicy::MaskedLocalV2,
+        pass2_used: false,
+        pass2_skipped_reason: None,
+        source_mask_objects: None,
+        source_mask_pixels: None,
+        source_mask_fraction: None,
+        invalid_rms_pixels: None,
+        invalid_rms_fraction: None,
+        detection_area_fraction: None,
+    };
+    let mut skip_reason = None;
+
+    let pass = match CellFloor::new(pass1.background.mesh_rms(), grid, width, height) {
+        None => {
+            refinement.pass2_skipped_reason = Some(Pass2SkipReason::NoiseUnresolved);
+            pass1
+        }
+        Some(floor) => match source_mask(frame, settings, mask, &pass1, &floor) {
+            Err(error) => {
+                tracing::warn!("masked_local_v2 source mask failed ({error}); pass 1 kept");
+                refinement.pass2_skipped_reason = Some(Pass2SkipReason::SourceMaskFailed);
+                skip_reason = Some(BackgroundReason::SourceMaskFailed);
+                pass1
+            }
+            Ok((source, objects)) => {
+                let source_pixels = source
+                    .iter()
+                    .zip(mask)
+                    .filter(|(&s, &m)| s != 0 && m == 0)
+                    .count();
+                let fraction = source_pixels as f64 / usable_pixels.max(1) as f64;
+                refinement.source_mask_objects = Some(objects);
+                refinement.source_mask_pixels = Some(source_pixels as u64);
+                refinement.source_mask_fraction = Some(fraction);
+                let mut combined = source;
+                for (c, &m) in combined.iter_mut().zip(mask) {
+                    *c |= m;
+                }
+                let supported = mesh_support(Some(&combined), width, height, grid);
+                let below = supported.iter().filter(|ok| !**ok).count();
+                if fraction > sep.mask_max_fraction || below == supported.len() {
+                    refinement.pass2_skipped_reason = Some(Pass2SkipReason::SourceMaskTooLarge);
+                    skip_reason = Some(BackgroundReason::SourceMaskTooLarge);
+                    pass1
+                } else {
+                    match second_pass(frame, &combined, params) {
+                        Ok((background, level, rms)) => {
+                            refinement.pass2_used = true;
+                            Pass {
+                                background,
+                                level,
+                                rms,
+                                supported,
+                                meshes_below_support: below,
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!("masked_local_v2 pass 2 failed ({error}); pass 1 kept");
+                            refinement.pass2_skipped_reason =
+                                Some(Pass2SkipReason::Pass2BackendFailure);
+                            pass1
+                        }
+                    }
+                }
+            }
+        },
+    };
+
+    let validity = local_noise_validity(
+        &pass.background,
+        &pass.rms,
+        mask,
+        usable_pixels,
+        sep.rms_local_fraction,
+        sep.rms_max_invalid_fraction,
+    );
+    log_rejected_map(&validity.noise, &validity.check);
+    if let Some(n_inv) = validity.invalid_pixels {
+        let usable = usable_pixels.max(1) as f64;
+        refinement.invalid_rms_pixels = Some(n_inv);
+        refinement.invalid_rms_fraction = Some(n_inv as f64 / usable);
+        refinement.detection_area_fraction =
+            Some((usable_pixels as u64 - n_inv.min(usable_pixels as u64)) as f64 / usable);
+        if validity.noise == [BackgroundReason::RmsMapLocallyInvalid] {
+            tracing::debug!(
+                invalid_pixels = n_inv,
+                "masked_local_v2: locally invalid RMS pixels masked from detection"
+            );
+        }
+    }
+    Ok(NoiseMaps {
+        pass,
+        skip_reason,
+        noise: validity.noise,
+        invalid: validity.invalid,
+        floor: validity.floor,
+        refinement: Some(refinement),
+    })
+}
+
+/// SEP background with the combined detector + source mask, and its maps.
+fn second_pass(
+    frame: &LumaFrame,
+    combined: &[u8],
+    params: &BackgroundParams,
+) -> Result<(Background, Vec<f32>, Vec<f32>), SepError> {
+    let background = Background::estimate(
+        &frame.pixels,
+        frame.width,
+        frame.height,
+        Some(combined),
+        params,
+    )?;
+    let level = background.back_array()?;
+    let rms = background.rms_array()?;
+    Ok((background, level, rms))
 }
 
 fn backend_failure(error: &SepError) -> SepBackendFailure {
@@ -578,12 +1147,16 @@ fn extract_params(
 /// `BIG`) before filtering, so this changes no result; it keeps NaN and
 /// clipped values out of the array handed to the library, matching the
 /// Python reference (`resid[mask] = 0`).
+///
+/// `masked_floor` (masked_local_v2, amendment A-1): the noise handed to SEP
+/// on masked pixels is the cell floor. See [`noise_for_masked_extraction`].
 fn sep_catalog(
     frame: &LumaFrame,
     settings: &BackgroundSettings,
     mask: &[u8],
     level: &[f32],
     rms: &[f32],
+    masked_floor: Option<&CellFloor>,
 ) -> Result<SourceCatalog, String> {
     let params = extract_params(&settings.detection, settings.retain_segmentation)?;
     let residual: Vec<f32> = frame
@@ -593,12 +1166,20 @@ fn sep_catalog(
         .zip(mask)
         .map(|((&value, &background), &m)| if m != 0 { 0.0 } else { value - background })
         .collect();
+    let floored;
+    let noise = match masked_floor {
+        Some(floor) => {
+            floored = noise_for_masked_extraction(rms, mask, floor, frame.width);
+            &floored[..]
+        }
+        None => rms,
+    };
     let catalog = extract(
         &residual,
         frame.width,
         frame.height,
         Some(mask),
-        Noise::Array(rms),
+        Noise::Array(noise),
         &params,
     )
     .map_err(|e| e.to_string())?;
@@ -706,6 +1287,13 @@ mod tests {
         BackgroundSettings::default()
     }
 
+    /// The pre-v2 noise policy (decision D-018), for the tests that pin it.
+    fn v1_settings() -> BackgroundSettings {
+        let mut settings = BackgroundSettings::default();
+        settings.sep.noise_policy = NoisePolicy::FrameWideV1;
+        settings
+    }
+
     fn failure(result: Result<BackgroundAnalysis, SepBackendFailure>) -> BackgroundReason {
         result.expect_err("expected a backend failure").reason
     }
@@ -727,11 +1315,13 @@ mod tests {
 
     #[test]
     fn default_config_hash_matches_the_python_reference() {
+        // frame_wide_v1: the record and hash from before the noise policy.
         let analysis = analyze_sep(
             &frame(sky(256, 192, 5.0, 1, |_, _| 300.0), 256, 192),
-            &settings(),
+            &v1_settings(),
         )
         .unwrap();
+        assert!(analysis.result.refinement.is_none());
         assert_eq!(
             analysis.result.config_sha256,
             "80eab0fbae4abf9f60f348adb7de3004067a3873cca29f996289e9dc14040b84"
@@ -744,6 +1334,28 @@ mod tests {
             analysis.catalog.as_ref().unwrap().provenance.config_sha256,
             "4f4499cda7067107c0fe6d64319684c13d1ec62f590b4bee4b346c1459dc99df"
         );
+
+        // masked_local_v2 (the default): its own pinned record; detection
+        // configuration unchanged.
+        let v2 = analyze_sep(
+            &frame(sky(256, 192, 5.0, 1, |_, _| 300.0), 256, 192),
+            &settings(),
+        )
+        .unwrap();
+        assert_eq!(
+            v2.result.config_sha256,
+            "97bd28741f79a184aa55d8e64e8f368ffd1eb71e07b2338cc0b99ed60832a6f4"
+        );
+        assert_eq!(
+            v2.catalog.as_ref().unwrap().provenance.config_sha256,
+            "4f4499cda7067107c0fe6d64319684c13d1ec62f590b4bee4b346c1459dc99df"
+        );
+        let refinement = v2.result.refinement.as_ref().unwrap();
+        assert_eq!(refinement.noise_policy, NoisePolicy::MaskedLocalV2);
+        assert!(refinement.pass2_used);
+        assert_eq!(refinement.invalid_rms_pixels, Some(0));
+        assert_eq!(refinement.detection_area_fraction, Some(1.0));
+        assert_eq!(v2.result.noise_status, NoiseStatus::Measured);
     }
 
     #[test]
@@ -857,7 +1469,7 @@ mod tests {
         let pixels = sky(width, height, 5.0, 4, |x, _| {
             1000.0 + 800.0 * (-((x - 256.0) / 60.0).powi(2)).exp()
         });
-        let analysis = analyze_sep(&frame(pixels, width, height), &settings()).unwrap();
+        let analysis = analyze_sep(&frame(pixels.clone(), width, height), &v1_settings()).unwrap();
         let (_, rms) = map(&analysis);
         let min = rms.iter().copied().fold(f32::INFINITY, f32::min);
         let non_positive = rms.iter().filter(|&&r| r <= 0.0).count();
@@ -870,6 +1482,71 @@ mod tests {
         assert!(result.level().is_some());
         assert!(analysis.catalog.is_none());
         assert_eq!(analysis.catalog_error.as_deref(), Some(NOISE_UNRESOLVED));
+
+        // masked_local_v2: the undershoot is judged per cell; the ~18% of
+        // pixels it makes invalid are masked and the rest is searched,
+        // without a false detection on this starless frame.
+        let v2 = analyze_sep(&frame(pixels, width, height), &settings()).unwrap();
+        assert_locally_invalid_without_detections(&v2, 0.10..0.25);
+        // A-1 changes only the noise handed to SEP: the reported R map is
+        // still the spline, negative where it undershoots.
+        let (_, reported) = map(&v2);
+        assert!(reported.iter().any(|&r| r < 0.0));
+    }
+
+    #[test]
+    fn amendment_a1_gives_masked_pixels_their_cell_floor_as_extraction_noise() {
+        let grid = MeshGrid::for_frame(256, 128, 64, 64);
+        let sigma = vec![5.0, 9.0, 0.0, 7.0, 6.0, 3.0, 8.0, 4.0];
+        let floor = CellFloor::new(&sigma, grid, 256, 128).unwrap();
+        let rms: Vec<f32> = (0..256 * 128).map(|i| -1.0 + (i % 7) as f32).collect();
+        let mut mask = vec![0u8; 256 * 128];
+        for i in [0usize, 5, 255, 300, 256 * 127 + 200] {
+            mask[i] = 1;
+        }
+        let noise = noise_for_masked_extraction(&rms, &mask, &floor, 256);
+        for (i, (&n, &r)) in noise.iter().zip(&rms).enumerate() {
+            if mask[i] == 1 {
+                assert_eq!(n, floor.at(i % 256, i / 256), "pixel {i}");
+                assert!(n > 0.0);
+            } else {
+                assert_eq!(n, r);
+            }
+        }
+    }
+
+    /// The masked_local_v2 outcome on the starless ridge frames.
+    fn assert_locally_invalid_without_detections(
+        v2: &BackgroundAnalysis,
+        expected_fraction: std::ops::Range<f64>,
+    ) {
+        let result = &v2.result;
+        println!("v2: {:?} {:?}", result.reasons, result.refinement);
+        assert_eq!(result.reasons, vec![BackgroundReason::RmsMapLocallyInvalid]);
+        assert_eq!(result.noise_status, NoiseStatus::Measured);
+        assert!(result.rms().is_some());
+        let refinement = result.refinement.as_ref().unwrap();
+        assert!(refinement.pass2_used);
+        let fraction = refinement.invalid_rms_fraction.unwrap();
+        assert!(expected_fraction.contains(&fraction), "{fraction}");
+        let detection_area = refinement.detection_area_fraction.unwrap();
+        assert!((detection_area - (1.0 - fraction)).abs() < 1e-12);
+        assert!(detection_area < 0.95);
+        let catalog = v2.catalog.as_ref().expect("catalog on the valid area");
+        assert!(catalog.objects.is_empty(), "{:?}", catalog.objects);
+        let (_, rms) = map(v2);
+        let Some(BackgroundField::Map {
+            invalid_noise: Some(invalid),
+            ..
+        }) = v2.field.as_ref()
+        else {
+            panic!("the field carries M_inv");
+        };
+        assert_eq!(
+            invalid.iter().filter(|&&m| m == 1).count() as u64,
+            refinement.invalid_rms_pixels.unwrap()
+        );
+        assert!(rms.iter().zip(invalid).all(|(&r, &m)| r > 0.0 || m == 1));
     }
 
     #[test]
@@ -1140,7 +1817,7 @@ mod tests {
             1000.0 + 600.0 * (-((x - 256.0) / 60.0).powi(2)).exp()
         });
         let f = frame(pixels, width, height);
-        let analysis = analyze_sep(&f, &settings()).unwrap();
+        let analysis = analyze_sep(&f, &v1_settings()).unwrap();
         let (_, rms) = map(&analysis);
         let min = rms.iter().copied().fold(f32::INFINITY, f32::min);
         let background = Background::estimate(
@@ -1170,6 +1847,23 @@ mod tests {
         assert!(result.level().is_some());
         assert!(analysis.catalog.is_none());
         assert_eq!(analysis.catalog_error.as_deref(), Some(NOISE_UNRESOLVED));
+
+        let v2 = analyze_sep(&f, &settings()).unwrap();
+        assert_locally_invalid_without_detections(&v2, 0.10..0.25);
+
+        // Above rms_max_invalid_fraction the v1 frame-wide outcome returns.
+        let mut strict = settings();
+        strict.sep.rms_max_invalid_fraction = 0.1;
+        let fallback = analyze_sep(&f, &strict).unwrap();
+        assert_eq!(
+            fallback.result.reasons,
+            vec![BackgroundReason::InvalidRmsMap]
+        );
+        assert_eq!(fallback.result.noise_status, NoiseStatus::Unresolved);
+        assert!(fallback.catalog.is_none());
+        assert_eq!(fallback.catalog_error.as_deref(), Some(NOISE_UNRESOLVED));
+        let refinement = fallback.result.refinement.as_ref().unwrap();
+        assert!(refinement.invalid_rms_fraction.unwrap() > 0.1);
     }
 
     #[test]
@@ -1237,7 +1931,8 @@ mod tests {
         let (width, height) = (192, 160);
         let mut f = frame(f32s("input.f32"), width, height);
         f.masks.bad_pixel = read("mask.u8");
-        let mut settings = settings();
+        // The fixture was produced with the D-018 noise policy.
+        let mut settings = v1_settings();
         settings.sep.bw = 32;
         settings.sep.bh = 32;
         settings.retain_segmentation = true;
@@ -1419,6 +2114,269 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cell_floor_uses_the_pixels_spline_cell_with_edge_and_single_node_rules() {
+        // Nodes at (j + 0.5) * bw: with bw = 64, x = 0..31 lies before node 0
+        // (cell 0), x = 32..95 between nodes 0 and 1, and so on; the last
+        // cell extends past the last node.
+        assert_eq!(cell_index(0, 64, 4), 0);
+        assert_eq!(cell_index(31, 64, 4), 0);
+        assert_eq!(cell_index(32, 64, 4), 0);
+        assert_eq!(cell_index(95, 64, 4), 0);
+        assert_eq!(cell_index(96, 64, 4), 1);
+        assert_eq!(cell_index(160, 64, 4), 2);
+        assert_eq!(cell_index(255, 64, 4), 2, "clamped to nx - 2");
+        assert_eq!(cell_index(10_000, 64, 4), 2);
+        assert_eq!(cell_index(500, 64, 1), 0, "a single-node axis");
+        assert_eq!(cell_index(500, 64, 2), 0);
+
+        // 4 x 2 mesh grid of a 256 x 128 frame.
+        let grid = MeshGrid::for_frame(256, 128, 64, 64);
+        let sigma = vec![
+            5.0,
+            9.0,
+            0.0,
+            7.0, //
+            6.0,
+            3.0,
+            8.0,
+            f32::NAN,
+        ];
+        let floor = CellFloor::new(&sigma, grid, 256, 128).unwrap();
+        // Cell (0, 0): nodes (0,0) (1,0) (0,1) (1,1) -> min(5, 9, 6, 3).
+        assert_eq!(floor.at(0, 0), 3.0);
+        assert_eq!(floor.at(95, 127), 3.0);
+        // Cell (1, 0): 9, 0 (not positive), 3, 8 -> 3.
+        assert_eq!(floor.at(96, 0), 3.0);
+        // Cell (2, 0) at the right edge: 0, 7, 8, NaN -> 7.
+        assert_eq!(floor.at(255, 64), 7.0);
+        assert_eq!(floor.at(160, 0), 7.0);
+
+        // A single node per axis (one mesh column): the column's nodes only.
+        let grid = MeshGrid::for_frame(50, 200, 64, 64);
+        assert_eq!((grid.nx, grid.ny), (1, 4));
+        let floor = CellFloor::new(&[4.0, 2.0, 0.0, 6.0], grid, 50, 200).unwrap();
+        assert_eq!(floor.at(49, 0), 2.0);
+        assert_eq!(floor.at(0, 96), 2.0, "cell 1: nodes 1, 2 -> 2 (0 skipped)");
+        assert_eq!(floor.at(0, 160), 6.0, "cell 2: nodes 2, 3 -> 6");
+        // A cell with no positive node takes the frame's smallest one.
+        let floor = CellFloor::new(&[4.0, 0.0, 0.0, 2.5], grid, 50, 200).unwrap();
+        assert_eq!(floor.at(0, 96), 2.5);
+        // No positive finite sigma anywhere: undefined.
+        assert!(CellFloor::new(&[0.0, f32::NAN, -1.0, 0.0], grid, 50, 200).is_none());
+    }
+
+    fn starfield(width: usize, height: usize, seed: u64, stars: usize) -> Vec<f32> {
+        let mut pixels = sky(width, height, 5.0, seed, |x, y| 500.0 + 0.2 * x - 0.1 * y);
+        let mut rng = Rng(seed + 1000);
+        for _ in 0..stars {
+            let (x, y) = (
+                10.0 + rng.uniform() * (width - 20) as f64,
+                10.0 + rng.uniform() * (height - 20) as f64,
+            );
+            add_star(
+                &mut pixels,
+                width,
+                x,
+                y,
+                1.5 + rng.uniform(),
+                300.0 + 3000.0 * rng.uniform(),
+            );
+        }
+        pixels
+    }
+
+    #[test]
+    fn masked_local_v2_masks_sources_for_pass_2_and_keeps_v1_detection_semantics() {
+        let (width, height) = (384, 256);
+        let f = frame(starfield(width, height, 21, 25), width, height);
+        let v1 = analyze_sep(&f, &v1_settings()).unwrap();
+        let v2 = analyze_sep(&f, &settings()).unwrap();
+        let refinement = v2.result.refinement.as_ref().unwrap();
+        println!("starfield v2 refinement: {refinement:?}");
+        assert!(refinement.pass2_used);
+        assert_eq!(refinement.pass2_skipped_reason, None);
+        assert!(refinement.source_mask_objects.unwrap() >= 20);
+        let fraction = refinement.source_mask_fraction.unwrap();
+        assert!(fraction > 0.0 && fraction < 0.5, "{fraction}");
+        assert_eq!(
+            refinement.source_mask_pixels.unwrap() as f64 / (width * height) as f64,
+            fraction
+        );
+        assert_eq!(v2.result.noise_status, NoiseStatus::Measured);
+        assert_eq!(v2.result.reasons, Vec::<BackgroundReason>::new());
+        // Masking the stars lowers the level estimate under them: pass 2 is
+        // not pass 1 (whose maps v1 reports).
+        let ((level1, _), (level2, _)) = (map(&v1), map(&v2));
+        assert_ne!(level1, level2);
+        // The same stars are found.
+        let (n1, n2) = (
+            v1.catalog.as_ref().unwrap().objects.len(),
+            v2.catalog.as_ref().unwrap().objects.len(),
+        );
+        assert!((n1 as i64 - n2 as i64).abs() <= 2, "{n1} vs {n2}");
+        assert!(v1.result.refinement.is_none());
+    }
+
+    #[test]
+    fn a_giant_source_mask_skips_pass_2_and_keeps_pass_1() {
+        let (width, height) = (384, 256);
+        let f = frame(starfield(width, height, 22, 25), width, height);
+        let v1 = analyze_sep(&f, &v1_settings()).unwrap();
+
+        // More than mask_max_fraction of the usable pixels.
+        let mut tight = settings();
+        tight.sep.mask_max_fraction = 0.001;
+        let skipped = analyze_sep(&f, &tight).unwrap();
+        let refinement = skipped.result.refinement.as_ref().unwrap();
+        assert!(!refinement.pass2_used);
+        assert_eq!(
+            refinement.pass2_skipped_reason,
+            Some(Pass2SkipReason::SourceMaskTooLarge)
+        );
+        assert!(refinement.source_mask_fraction.unwrap() > 0.001);
+        assert!(skipped
+            .result
+            .reasons
+            .contains(&BackgroundReason::SourceMaskTooLarge));
+        assert_eq!(map(&skipped), map(&v1), "pass 1 is v1's background");
+        assert_eq!(skipped.result.level, v1.result.level);
+        assert_eq!(skipped.result.mesh, v1.result.mesh);
+        assert_eq!(skipped.result.noise_status, NoiseStatus::Measured);
+
+        // Ellipses that cover every mesh: no mesh keeps SEP's 50% support.
+        let mut huge = settings();
+        huge.sep.mask_ellipse_scale = 1000.0;
+        huge.sep.mask_max_fraction = 1.0;
+        let skipped = analyze_sep(&f, &huge).unwrap();
+        let refinement = skipped.result.refinement.as_ref().unwrap();
+        assert!(!refinement.pass2_used);
+        assert_eq!(
+            refinement.pass2_skipped_reason,
+            Some(Pass2SkipReason::SourceMaskTooLarge)
+        );
+        assert_eq!(refinement.source_mask_fraction, Some(1.0));
+        assert_eq!(map(&skipped), map(&v1));
+    }
+
+    #[test]
+    fn a_failed_source_mask_keeps_pass_1_and_says_so() {
+        let (width, height) = (192, 160);
+        let mut pixels = sky(width, height, 3.0, 13, |_, _| 100.0);
+        add_star(&mut pixels, width, 96.0, 80.0, 4.0, 3000.0);
+        let mut small = settings();
+        small.detection.pixstack = 10;
+        let analysis = analyze_sep(&frame(pixels.clone(), width, height), &small).unwrap();
+        let refinement = analysis.result.refinement.as_ref().unwrap();
+        assert_eq!(
+            refinement.pass2_skipped_reason,
+            Some(Pass2SkipReason::SourceMaskFailed)
+        );
+        assert!(!refinement.pass2_used);
+        assert_eq!(refinement.source_mask_objects, None);
+        assert_eq!(refinement.source_mask_pixels, None);
+        assert_eq!(
+            analysis.result.reasons,
+            vec![BackgroundReason::SourceMaskFailed]
+        );
+        // The pass-1 noise is still judged locally and measured.
+        assert_eq!(analysis.result.noise_status, NoiseStatus::Measured);
+        assert_eq!(refinement.invalid_rms_pixels, Some(0));
+        let mut v1 = v1_settings();
+        v1.detection.pixstack = 10;
+        let v1 = analyze_sep(&frame(pixels, width, height), &v1).unwrap();
+        assert_eq!(map(&analysis), map(&v1));
+    }
+
+    #[test]
+    fn masked_local_v2_keeps_the_zero_rule_and_v1_reasons_without_a_floor() {
+        let (width, height) = (192, 160);
+        let analysis = analyze_sep(
+            &frame(vec![321.0; width * height], width, height),
+            &settings(),
+        )
+        .unwrap();
+        assert_eq!(analysis.result.noise_status, NoiseStatus::Unresolved);
+        assert_eq!(
+            analysis.result.reasons,
+            vec![BackgroundReason::ZeroEmpiricalScatter]
+        );
+        let refinement = analysis.result.refinement.as_ref().unwrap();
+        assert_eq!(
+            refinement.pass2_skipped_reason,
+            Some(Pass2SkipReason::NoiseUnresolved)
+        );
+        assert_eq!(refinement.invalid_rms_pixels, None);
+        assert_eq!(refinement.detection_area_fraction, None);
+        assert_eq!(analysis.catalog_error.as_deref(), Some(NOISE_UNRESOLVED));
+    }
+
+    #[test]
+    fn locally_invalid_pixels_are_excluded_from_detection_and_star_support() {
+        // The 600 ADU ridge (invalid columns either side of the ridge) with
+        // stars: one inside the invalid band, one well clear of it.
+        let (width, height) = (512, 512);
+        let base = sky(width, height, 5.0, 4, |x, _| {
+            1000.0 + 600.0 * (-((x - 256.0) / 60.0).powi(2)).exp()
+        });
+        let starless = analyze_sep(&frame(base.clone(), width, height), &settings()).unwrap();
+        let Some(BackgroundField::Map {
+            invalid_noise: Some(invalid),
+            ..
+        }) = starless.field.as_ref()
+        else {
+            panic!("expected M_inv");
+        };
+        let column_invalid =
+            |x: usize| (0..height).filter(|&y| invalid[y * width + x] == 1).count();
+        let inside = (0..width)
+            .find(|&x| column_invalid(x) == height && column_invalid(x + 20) == height)
+            .expect("a fully invalid band");
+        let clear = (64..width - 64)
+            .find(|&x| (x - 40..x + 40).all(|c| column_invalid(c) == 0))
+            .expect("a clear band");
+        println!("invalid band from x = {inside}, clear star at x = {clear}");
+        let mut pixels = base;
+        add_star(&mut pixels, width, (inside + 10) as f64, 256.0, 1.8, 2000.0);
+        add_star(&mut pixels, width, clear as f64, 256.0, 1.8, 2000.0);
+        let analysis = analyze_sep(&frame(pixels.clone(), width, height), &settings()).unwrap();
+        assert!(analysis
+            .result
+            .reasons
+            .contains(&BackgroundReason::RmsMapLocallyInvalid));
+        let Some(BackgroundField::Map {
+            invalid_noise: Some(invalid),
+            ..
+        }) = analysis.field.as_ref()
+        else {
+            panic!("expected M_inv");
+        };
+        let catalog = analysis.catalog.as_ref().unwrap();
+        // No footprint pixel lies in M_inv.
+        assert!(catalog
+            .objects
+            .iter()
+            .all(|o| o.pixels.iter().all(|&p| invalid[p as usize] == 0)));
+        assert!(catalog
+            .objects
+            .iter()
+            .any(|o| (o.x - clear as f32).abs() < 1.0 && (o.y - 256.0).abs() < 1.0));
+        let quality =
+            crate::vision::quality::estimate_quality(&frame(pixels, width, height), &analysis);
+        println!(
+            "ridge+stars quality: {:?} {:?}",
+            quality.star_rejections, quality.used_stars
+        );
+        assert!(quality
+            .used_stars
+            .iter()
+            .any(|s| (s.x - clear as f32).abs() < 1.0));
+        assert!(quality
+            .used_stars
+            .iter()
+            .all(|s| (s.x - (inside + 10) as f32).abs() > 30.0));
+    }
+
     /// Available-host software timing, not a deployment target. Run with
     /// `cargo test --release -- --ignored sep_backend_host_timing --nocapture`
     /// (peak RSS from the OS, e.g. `/usr/bin/time -l` on macOS).
@@ -1442,21 +2400,36 @@ mod tests {
             }
         }
         let frame = frame(pixels, width, height);
-        let settings = settings();
-        let _ = analyze_sep(&frame, &settings).unwrap();
-        let runs = 3;
-        let start = std::time::Instant::now();
-        let mut objects = 0;
-        for _ in 0..runs {
-            let analysis = analyze_sep(&frame, &settings).unwrap();
-            objects = analysis.catalog.map_or(0, |c| c.objects.len());
+        // Spec A10: median of 5, frame_wide_v1 against masked_local_v2.
+        let runs = 5;
+        let mut medians = Vec::new();
+        for (name, settings) in [
+            ("frame_wide_v1", v1_settings()),
+            ("masked_local_v2", settings()),
+        ] {
+            let _ = analyze_sep(&frame, &settings).unwrap();
+            let mut times = Vec::new();
+            let mut objects = 0;
+            let mut refinement = None;
+            for _ in 0..runs {
+                let start = std::time::Instant::now();
+                let analysis = analyze_sep(&frame, &settings).unwrap();
+                times.push(start.elapsed().as_secs_f64() * 1e3);
+                objects = analysis.catalog.map_or(0, |c| c.objects.len());
+                refinement = analysis.result.refinement;
+            }
+            times.sort_by(f64::total_cmp);
+            let median = times[runs / 2];
+            medians.push(median);
+            println!(
+                "available host software timing (not a deployment target): analyze_sep {name} \
+                 on {width}x{height} f32, {objects} objects: median {median:.1} ms of {runs} \
+                 (runs {times:.1?}); refinement {refinement:?}"
+            );
         }
-        let per_run = start.elapsed().as_secs_f64() / runs as f64;
         println!(
-            "available host software timing (not a deployment target): analyze_sep on \
-             {width}x{height} f32, default settings, {objects} objects: {:.1} ms per frame \
-             (mean of {runs})",
-            per_run * 1e3
+            "masked_local_v2 / frame_wide_v1 median ratio: {:.2}",
+            medians[1] / medians[0]
         );
     }
 }

@@ -130,6 +130,61 @@ pub enum BackgroundReason {
     /// Some meshes had less usable support than SEP requires and were
     /// replaced by SEP's interpolation from neighbours.
     MeshesInterpolated,
+    /// `masked_local_v2`: some usable pixels (at most
+    /// `rms_max_invalid_fraction` of them) have an RMS value that is not a
+    /// valid noise against their own spline cell. They are excluded from
+    /// detection and from star measurement support; the noise elsewhere is
+    /// measured.
+    RmsMapLocallyInvalid,
+    /// `masked_local_v2`: the source-mask extraction failed (for example a
+    /// pixel-stack overflow), so the pass-1 maps were used.
+    SourceMaskFailed,
+    /// `masked_local_v2`: the source mask covered more than
+    /// `mask_max_fraction` of the usable pixels, or left no mesh with SEP's
+    /// 50% support, so the pass-1 maps were used.
+    SourceMaskTooLarge,
+}
+
+/// Why `masked_local_v2` did not use its second background pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pass2SkipReason {
+    /// The source-mask extraction failed.
+    SourceMaskFailed,
+    /// The source mask was too large (fraction, or no supported mesh).
+    SourceMaskTooLarge,
+    /// No finite positive pass-1 mesh sigma exists, so no cell floor and no
+    /// masking noise; the noise is unresolved as in v1.
+    NoiseUnresolved,
+    /// The second `sep_background` call failed (for example at the binding's
+    /// bad-mesh work bound); the pass-1 maps were used.
+    Pass2BackendFailure,
+}
+
+/// What `masked_local_v2` did on one frame (`docs/bge-v2-spec.md` §3.7).
+/// Counts are over usable pixels (outside the detector mask). `None` where
+/// the quantity does not exist on the frame: no source mask was built, or
+/// no cell floor exists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoiseRefinement {
+    pub noise_policy: NoisePolicy,
+    /// The reported `B`, `R`, mesh summary and plane come from pass 2.
+    pub pass2_used: bool,
+    pub pass2_skipped_reason: Option<Pass2SkipReason>,
+    /// Objects of the source-mask extraction.
+    pub source_mask_objects: Option<u32>,
+    /// `|M_src \ M_det|`: source-mask pixels that were usable.
+    pub source_mask_pixels: Option<u64>,
+    /// `source_mask_pixels / usable_pixels`.
+    pub source_mask_fraction: Option<f64>,
+    /// Usable pixels whose RMS is locally invalid (`n_inv`).
+    pub invalid_rms_pixels: Option<u64>,
+    /// `n_inv / usable_pixels`.
+    pub invalid_rms_fraction: Option<f64>,
+    /// `(usable_pixels - n_inv) / usable_pixels`: the share of the usable
+    /// frame that detection could search. Below 0.95 star counts are not
+    /// comparable between frames (the cloud trend skips the frame).
+    pub detection_area_fraction: Option<f64>,
 }
 
 /// Effective configuration of the legacy global estimator.
@@ -174,6 +229,92 @@ pub struct SepBackgroundParams {
     /// that a "mesh" model is a global estimate wearing a spatial label.
     #[serde(default = "default_min_meshes_per_axis")]
     pub min_meshes_per_axis: u32,
+    /// How the RMS map becomes a detection noise (`docs/bge-v2-spec.md` §3).
+    /// `frame_wide_v1` is decision D-018 (one bad pixel withholds the
+    /// catalog); `masked_local_v2` re-estimates the background with sources
+    /// masked and judges the RMS map per pixel against its spline cell.
+    #[serde(default)]
+    pub noise_policy: NoisePolicy,
+    /// `masked_local_v2` source-mask extraction threshold, in units of the
+    /// masking noise `max(R1, floor)` (relative threshold).
+    #[serde(default = "default_mask_thresh_sigma")]
+    pub mask_thresh_sigma: f64,
+    /// `masked_local_v2` source-mask extraction minimum area (pixels).
+    #[serde(default = "default_mask_minarea")]
+    pub mask_minarea: u32,
+    /// `masked_local_v2`: each mask object's SEP ellipse is scaled by this
+    /// (`sep_set_ellipse` `r`).
+    #[serde(default = "default_mask_ellipse_scale")]
+    pub mask_ellipse_scale: f64,
+    /// `masked_local_v2`: pass 2 is skipped when the source mask covers more
+    /// than this fraction of the usable pixels.
+    #[serde(default = "default_mask_max_fraction")]
+    pub mask_max_fraction: f64,
+    /// `masked_local_v2`: a usable pixel with `0 < R < fraction * floor(x,y)`
+    /// is locally invalid.
+    #[serde(default = "default_rms_local_fraction")]
+    pub rms_local_fraction: f64,
+    /// `masked_local_v2`: above this fraction of locally invalid usable
+    /// pixels the noise is unresolved for the whole frame.
+    #[serde(default = "default_rms_max_invalid_fraction")]
+    pub rms_max_invalid_fraction: f64,
+}
+
+/// Noise-map policy of the SEP backend (`[vision.background.sep]
+/// noise_policy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum NoisePolicy {
+    /// Decision D-018: the RMS map is judged against the smallest positive
+    /// filtered mesh sigma of the whole frame, and any bad usable pixel
+    /// makes the noise unresolved for the frame. The configuration record
+    /// (and hash) is byte-identical to the one before v2 existed.
+    FrameWideV1,
+    /// `docs/bge-v2-spec.md` §3: a second SEP background with sources
+    /// masked, and a per-pixel validity rule against the pixel's own spline
+    /// cell, with a frame-wide fallback above `rms_max_invalid_fraction`.
+    #[default]
+    MaskedLocalV2,
+}
+
+impl NoisePolicy {
+    pub fn id(self) -> &'static str {
+        match self {
+            NoisePolicy::FrameWideV1 => "frame_wide_v1",
+            NoisePolicy::MaskedLocalV2 => "masked_local_v2",
+        }
+    }
+}
+
+// Provisional `masked_local_v2` parameters (docs/bge-v2-spec.md §3.8):
+// engineering choices from preliminary simulations, versioned through the
+// configuration hash.
+pub const MASK_THRESH_SIGMA: f64 = 2.0;
+pub const MASK_MINAREA: u32 = 5;
+pub const MASK_ELLIPSE_SCALE: f64 = 3.0;
+pub const MASK_MAX_FRACTION: f64 = 0.5;
+pub const RMS_LOCAL_FRACTION: f64 = 0.5;
+pub const RMS_MAX_INVALID_FRACTION: f64 = 0.25;
+/// `masked_local_v2` mask extraction: no deblending (`deblend_cont = 1`).
+pub const MASK_DEBLEND_CONT: f64 = 1.0;
+
+fn default_mask_thresh_sigma() -> f64 {
+    MASK_THRESH_SIGMA
+}
+fn default_mask_minarea() -> u32 {
+    MASK_MINAREA
+}
+fn default_mask_ellipse_scale() -> f64 {
+    MASK_ELLIPSE_SCALE
+}
+fn default_mask_max_fraction() -> f64 {
+    MASK_MAX_FRACTION
+}
+fn default_rms_local_fraction() -> f64 {
+    RMS_LOCAL_FRACTION
+}
+fn default_rms_max_invalid_fraction() -> f64 {
+    RMS_MAX_INVALID_FRACTION
 }
 
 fn default_mesh() -> u32 {
@@ -195,6 +336,13 @@ impl Default for SepBackgroundParams {
             fh: default_filter(),
             fthresh: 0.0,
             min_meshes_per_axis: default_min_meshes_per_axis(),
+            noise_policy: NoisePolicy::default(),
+            mask_thresh_sigma: MASK_THRESH_SIGMA,
+            mask_minarea: MASK_MINAREA,
+            mask_ellipse_scale: MASK_ELLIPSE_SCALE,
+            mask_max_fraction: MASK_MAX_FRACTION,
+            rms_local_fraction: RMS_LOCAL_FRACTION,
+            rms_max_invalid_fraction: RMS_MAX_INVALID_FRACTION,
         }
     }
 }
@@ -440,6 +588,10 @@ pub struct BackgroundResult {
     /// evidence (`support.saturation_evidence == "unknown"`) or no finite
     /// pixel: 0.0 would otherwise read as "nothing clipped".
     pub saturation_fraction: Option<f32>,
+    /// `masked_local_v2` diagnostics; `null` for `frame_wide_v1`, the
+    /// legacy method and unavailable results.
+    #[serde(default)]
+    pub refinement: Option<NoiseRefinement>,
 }
 
 impl BackgroundResult {
@@ -644,8 +796,13 @@ pub fn legacy_config_json(config: &LegacyGlobalClipConfig) -> serde_json::Value 
 
 /// Canonical configuration object of the SEP background. The Python
 /// reference builds the same object for the same parameters.
+///
+/// `frame_wide_v1` is the record from before the noise policy existed, byte
+/// for byte (its default hash is pinned); `masked_local_v2` adds
+/// `noise_policy`, `source_mask` and `rms_validity` (`docs/bge-v2-spec.md`
+/// §3.8). `method_version` stays 1: the hash distinguishes the policies.
 pub fn sep_background_config_json(params: &SepBackgroundParams) -> serde_json::Value {
-    serde_json::json!({
+    let mut config = serde_json::json!({
         "method": BackgroundMethod::SepSpatialMesh.id(),
         "method_version": BackgroundMethod::SepSpatialMesh.method_version(),
         "library": "sep",
@@ -657,7 +814,32 @@ pub fn sep_background_config_json(params: &SepBackgroundParams) -> serde_json::V
         "fthresh": params.fthresh,
         "maskthresh": 0.0,
         "min_meshes_per_axis": params.min_meshes_per_axis,
-    })
+    });
+    if params.noise_policy == NoisePolicy::MaskedLocalV2 {
+        let object = config.as_object_mut().expect("a JSON object");
+        object.insert(
+            "noise_policy".into(),
+            serde_json::json!(NoisePolicy::MaskedLocalV2.id()),
+        );
+        object.insert(
+            "source_mask".into(),
+            serde_json::json!({
+                "thresh_sigma": params.mask_thresh_sigma,
+                "minarea": params.mask_minarea,
+                "ellipse_scale": params.mask_ellipse_scale,
+                "max_fraction": params.mask_max_fraction,
+            }),
+        );
+        object.insert(
+            "rms_validity".into(),
+            serde_json::json!({
+                "rule": "local_cell_min",
+                "fraction": params.rms_local_fraction,
+                "max_invalid_fraction": params.rms_max_invalid_fraction,
+            }),
+        );
+    }
+    config
 }
 
 /// Canonical configuration object of SEP extraction.
@@ -743,6 +925,11 @@ pub enum BackgroundField {
         rms: Vec<f32>,
         width: usize,
         height: usize,
+        /// `masked_local_v2`: 1 on usable pixels whose RMS is locally
+        /// invalid (`M_inv`). They were excluded from detection, and a star
+        /// whose measurement crop touches one is rejected
+        /// (`invalid_noise_support`). `None` when there is none.
+        invalid_noise: Option<Vec<u8>>,
     },
 }
 
@@ -845,7 +1032,8 @@ mod tests {
 
     #[test]
     fn default_sep_background_config_hash_matches_the_python_reference() {
-        let config = sep_background_config_json(&SepBackgroundParams::default());
+        // frame_wide_v1: the record and hash from before the noise policy.
+        let config = sep_background_config_json(&frame_wide_v1());
         assert_eq!(
             canonical_json(&config),
             r#"{"bh":64,"bw":64,"fh":3,"fthresh":0.0,"fw":3,"library":"sep","library_version":"1.4.1","maskthresh":0.0,"method":"sep_spatial_mesh","method_version":1,"min_meshes_per_axis":2}"#
@@ -867,6 +1055,55 @@ mod tests {
             config_sha256(&config),
             "4f4499cda7067107c0fe6d64319684c13d1ec62f590b4bee4b346c1459dc99df"
         );
+    }
+
+    fn frame_wide_v1() -> SepBackgroundParams {
+        SepBackgroundParams {
+            noise_policy: NoisePolicy::FrameWideV1,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn frame_wide_v1_ignores_the_v2_parameters_in_its_record() {
+        let tuned = SepBackgroundParams {
+            mask_thresh_sigma: 3.0,
+            rms_local_fraction: 0.4,
+            ..frame_wide_v1()
+        };
+        assert_eq!(
+            config_sha256(&sep_background_config_json(&tuned)),
+            "80eab0fbae4abf9f60f348adb7de3004067a3873cca29f996289e9dc14040b84"
+        );
+    }
+
+    #[test]
+    fn default_masked_local_v2_config_record_and_hash_are_pinned() {
+        assert_eq!(
+            SepBackgroundParams::default().noise_policy,
+            NoisePolicy::MaskedLocalV2
+        );
+        let config = sep_background_config_json(&SepBackgroundParams::default());
+        assert_eq!(
+            canonical_json(&config),
+            r#"{"bh":64,"bw":64,"fh":3,"fthresh":0.0,"fw":3,"library":"sep","library_version":"1.4.1","maskthresh":0.0,"method":"sep_spatial_mesh","method_version":1,"min_meshes_per_axis":2,"noise_policy":"masked_local_v2","rms_validity":{"fraction":0.5,"max_invalid_fraction":0.25,"rule":"local_cell_min"},"source_mask":{"ellipse_scale":3.0,"max_fraction":0.5,"minarea":5,"thresh_sigma":2.0}}"#
+        );
+        assert_eq!(
+            config_sha256(&config),
+            "97bd28741f79a184aa55d8e64e8f368ffd1eb71e07b2338cc0b99ed60832a6f4"
+        );
+    }
+
+    #[test]
+    fn noise_policy_and_v2_parameters_parse_with_defaults() {
+        let parsed: SepBackgroundParams =
+            serde_json::from_value(serde_json::json!({"noise_policy": "frame_wide_v1"})).unwrap();
+        assert_eq!(parsed, frame_wide_v1());
+        let parsed: SepBackgroundParams =
+            serde_json::from_value(serde_json::json!({"mask_minarea": 9})).unwrap();
+        assert_eq!(parsed.noise_policy, NoisePolicy::MaskedLocalV2);
+        assert_eq!(parsed.mask_minarea, 9);
+        assert_eq!(parsed.rms_max_invalid_fraction, 0.25);
     }
 
     #[test]
@@ -924,7 +1161,7 @@ mod tests {
         );
         let background = SepBackgroundParams {
             fthresh: 0.1,
-            ..Default::default()
+            ..frame_wide_v1()
         };
         assert_eq!(
             config_sha256(&sep_background_config_json(&background)),
@@ -968,6 +1205,7 @@ mod tests {
             plane_unavailable_reason: Some(BackgroundReason::NoSpatialModel),
             bright_pixel_significance: None,
             saturation_fraction: Some(0.0),
+            refinement: None,
         };
         // A measured zero level is a value; unresolved noise is absent.
         assert_eq!(result.level(), Some(0.0));

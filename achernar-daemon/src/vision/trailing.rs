@@ -871,6 +871,7 @@ mod tests {
             rms: vec![1.0; frame.pixels.len()],
             width: frame.width,
             height: frame.height,
+            invalid_noise: None,
         });
         analysis.catalog = Some(SourceCatalog {
             provenance: DetectionProvenance {

@@ -721,3 +721,225 @@ fn deblend_families_group_touching_children_only() {
     let families = deblend_families(footprints.iter().map(|(p, m)| (p.as_slice(), *m)), width, 3);
     assert_eq!(families, vec![vec![0, 1], vec![2]]);
 }
+
+/// The sparse family grouping equals the dense owner-plane definition on a
+/// random field of touching and separate children.
+#[test]
+fn deblend_families_match_a_dense_reference() {
+    let (width, height) = (40usize, 30usize);
+    let mut rng = Rng(77);
+    let mut footprints: Vec<(Vec<u32>, bool)> = Vec::new();
+    let mut taken = vec![false; width * height];
+    for _ in 0..60 {
+        let (x0, y0) = (
+            (rng.uniform() * width as f64) as usize,
+            (rng.uniform() * height as f64) as usize,
+        );
+        let mut pixels = Vec::new();
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let (x, y) = (x0 + dx, y0 + dy);
+                if x < width && y < height && !taken[y * width + x] {
+                    taken[y * width + x] = true;
+                    pixels.push((y * width + x) as u32);
+                }
+            }
+        }
+        if !pixels.is_empty() {
+            footprints.push((pixels, rng.uniform() < 0.7));
+        }
+    }
+    // Dense reference: union children whose pixels are 8-neighbours.
+    let mut owner = vec![usize::MAX; width * height];
+    for (i, (pixels, child)) in footprints.iter().enumerate() {
+        if *child {
+            for &p in pixels {
+                owner[p as usize] = i;
+            }
+        }
+    }
+    let mut label: Vec<usize> = (0..footprints.len()).collect();
+    loop {
+        let mut changed = false;
+        for y in 0..height {
+            for x in 0..width {
+                let a = owner[y * width + x];
+                if a == usize::MAX {
+                    continue;
+                }
+                for ny in y.saturating_sub(1)..=(y + 1).min(height - 1) {
+                    for nx in x.saturating_sub(1)..=(x + 1).min(width - 1) {
+                        let b = owner[ny * width + nx];
+                        if b != usize::MAX && label[b] != label[a] {
+                            let m = label[a].min(label[b]);
+                            label[a] = m;
+                            label[b] = m;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut reference: Vec<Vec<usize>> = Vec::new();
+    let mut seen: Vec<usize> = Vec::new();
+    for (i, (_, child)) in footprints.iter().enumerate() {
+        if !*child {
+            continue;
+        }
+        match seen.iter().position(|&l| l == label[i]) {
+            Some(f) => reference[f].push(i),
+            None => {
+                seen.push(label[i]);
+                reference.push(vec![i]);
+            }
+        }
+    }
+    let families = deblend_families(
+        footprints.iter().map(|(p, m)| (p.as_slice(), *m)),
+        width,
+        height,
+    );
+    assert_eq!(families, reference);
+    assert!(families.iter().any(|f| f.len() > 1), "fixture has a family");
+}
+
+#[test]
+fn ellipse_coefficients_follow_seps_formula() {
+    let (cxx, cyy, cxy) = ellipse_coeffs(2.0, 1.0, 0.0);
+    assert!((cxx - 0.25).abs() < 1e-15 && (cyy - 1.0).abs() < 1e-15 && cxy.abs() < 1e-15);
+    let (cxx, cyy, cxy) = ellipse_coeffs(2.0, 1.0, std::f64::consts::FRAC_PI_2);
+    assert!((cxx - 1.0).abs() < 1e-12 && (cyy - 0.25).abs() < 1e-12 && cxy.abs() < 1e-12);
+    let theta = 0.3f64;
+    let (cxx, cyy, cxy) = ellipse_coeffs(3.0, 1.5, theta);
+    let (c, s) = (theta.cos(), theta.sin());
+    assert!((cxx - (c * c / 9.0 + s * s / 2.25)).abs() < 1e-12);
+    assert!((cyy - (s * s / 9.0 + c * c / 2.25)).abs() < 1e-12);
+    assert!((cxy - 2.0 * c * s * (1.0 / 9.0 - 1.0 / 2.25)).abs() < 1e-12);
+}
+
+/// `sep_set_ellipse` against a direct evaluation of the ellipse inequality,
+/// inside the image, clipped at a corner, and wholly off the image.
+#[test]
+fn set_ellipse_masks_exactly_the_ellipse_pixels() {
+    let (width, height) = (31usize, 23usize);
+    let reference = |x0: f64, y0: f64, a: f64, b: f64, theta: f64, r: f64| {
+        let (cxx, cyy, cxy) = ellipse_coeffs(a, b, theta);
+        let mut out = vec![0u8; width * height];
+        for y in 0..height {
+            for x in 0..width {
+                let (dx, dy) = (x as f64 - x0, y as f64 - y0);
+                if cxx * dx * dx + cyy * dy * dy + cxy * dx * dy <= r * r {
+                    out[y * width + x] = 1;
+                }
+            }
+        }
+        out
+    };
+    // Exact circle: 29 pixel centres with dx^2 + dy^2 <= 9.
+    let mut mask = vec![0u8; width * height];
+    let (cxx, cyy, cxy) = ellipse_coeffs(1.0, 1.0, 0.0);
+    set_ellipse(&mut mask, width, height, 10.0, 10.0, cxx, cyy, cxy, 3.0, 1).unwrap();
+    assert_eq!(mask.iter().filter(|&&m| m == 1).count(), 29);
+    assert_eq!(mask, reference(10.0, 10.0, 1.0, 1.0, 0.0, 3.0));
+
+    for (x0, y0, a, b, theta) in [
+        (15.3, 11.7, 2.2, 1.1, 0.4),
+        (1.2, 0.4, 3.0, 2.0, -1.1),
+        (29.8, 21.9, 1.7, 0.9, 2.5),
+    ] {
+        let mut mask = vec![0u8; width * height];
+        mask_ellipses(
+            &mut mask,
+            width,
+            height,
+            &[Ellipse {
+                x: x0,
+                y: y0,
+                a,
+                b,
+                theta,
+            }],
+            3.0,
+        )
+        .unwrap();
+        // SEP's box test can only drop pixels the reference keeps if they
+        // fall outside the extent; for these ellipses the two agree exactly.
+        assert_eq!(mask, reference(x0, y0, a, b, theta, 3.0), "({x0}, {y0})");
+    }
+
+    let mut off = vec![0u8; width * height];
+    mask_ellipses(
+        &mut off,
+        width,
+        height,
+        &[Ellipse {
+            x: -100.0,
+            y: 500.0,
+            a: 2.0,
+            b: 1.0,
+            theta: 0.0,
+        }],
+        3.0,
+    )
+    .unwrap();
+    assert!(off.iter().all(|&m| m == 0));
+
+    // Undefined casts in C are refused before the call.
+    for bad in [
+        Ellipse {
+            x: f64::NAN,
+            y: 1.0,
+            a: 1.0,
+            b: 1.0,
+            theta: 0.0,
+        },
+        Ellipse {
+            x: 1.0,
+            y: 1.0,
+            a: 1e150,
+            b: 1.0,
+            theta: 0.0,
+        },
+    ] {
+        assert!(matches!(
+            mask_ellipses(&mut off, width, height, &[bad], 3.0),
+            Err(SepError::InvalidParameter { .. })
+        ));
+    }
+    assert!(matches!(
+        set_ellipse(
+            &mut off[..10],
+            width,
+            height,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            0.0,
+            1.0,
+            1
+        ),
+        Err(SepError::InvalidShape { .. })
+    ));
+    // A zero-width ellipse (NaN coefficients) sets nothing, as in C.
+    let mut nan = vec![0u8; width * height];
+    mask_ellipses(
+        &mut nan,
+        width,
+        height,
+        &[Ellipse {
+            x: 5.0,
+            y: 5.0,
+            a: 1.0,
+            b: 0.0,
+            theta: 0.0,
+        }],
+        3.0,
+    )
+    .unwrap();
+    assert!(nan.iter().all(|&m| m == 0));
+}

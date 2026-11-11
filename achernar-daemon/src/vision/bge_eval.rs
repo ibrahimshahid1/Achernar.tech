@@ -9,6 +9,16 @@
 //! ACHERNAR_BGE_EVAL_MANIFEST=<dir>/manifest.json ACHERNAR_BGE_EVAL_OUT=<out> \
 //!   cargo test --release bge_eval_bridge -- --ignored --nocapture
 //! ```
+//!
+//! BGE v2 (`docs/bge-v2-spec.md` §4): an optional `"star_gates":
+//! {"blend_test", "regroup_deblended"}` beside `"settings"`, at the top level
+//! and per case, merged the same way. A backend is `legacy_global_clip` or
+//! `sep` (the merged settings as given) or a method id of §4, which forces
+//! the backend, noise policy, blend test and regrouping:
+//! `rust_legacy_global_clip` = `rust_legacy__g1`, `rust_legacy__g2`,
+//! `rust_sep` = `rust_sep__n1g1`, `rust_sep__n2g1`, `rust_sep__n1g2`,
+//! `rust_sep__n2g2`. Each record echoes the effective `star_gates` record
+//! and `background.config` so the label can be verified.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -16,8 +26,12 @@ use std::time::Instant;
 use serde_json::{json, Value};
 
 use super::background_dispatch::analyze_background;
-use super::background_model::{BackgroundBackend, BackgroundField, BackgroundSettings};
-use super::quality::{estimate_quality_with_policy, FocusSourcePolicy, LumaFrame};
+use super::background_model::{
+    BackgroundBackend, BackgroundField, BackgroundSettings, NoisePolicy,
+};
+use super::quality::{
+    estimate_quality_with_policy, BlendTest, FocusSourcePolicy, LumaFrame, StarGateSettings,
+};
 use super::trailing::estimate_trailing;
 use crate::processing::debayer::AnalysisMasks;
 
@@ -103,30 +117,114 @@ fn frame_for(case: &Value, root: &Path) -> Result<LumaFrame, String> {
     })
 }
 
-fn run_case(frame: &LumaFrame, settings: &BackgroundSettings, write_maps: Option<&Path>) -> Value {
+/// A §4 method id: the backend it runs and the variant it forces.
+struct MethodVariant {
+    backend: BackgroundBackend,
+    noise_policy: Option<NoisePolicy>,
+    star_gates: StarGateSettings,
+}
+
+fn method_variant(id: &str) -> Option<MethodVariant> {
+    let (g1, g2) = (
+        StarGateSettings {
+            blend_test: BlendTest::PeakCountV1,
+            regroup_deblended: false,
+        },
+        StarGateSettings {
+            blend_test: BlendTest::DipAnnulusV2,
+            regroup_deblended: true,
+        },
+    );
+    let (n1, n2) = (NoisePolicy::FrameWideV1, NoisePolicy::MaskedLocalV2);
+    let (backend, noise_policy, star_gates) = match id {
+        "rust_legacy_global_clip" | "rust_legacy__g1" => {
+            (BackgroundBackend::LegacyGlobalClip, None, g1)
+        }
+        "rust_legacy__g2" => (BackgroundBackend::LegacyGlobalClip, None, g2),
+        "rust_sep" | "rust_sep__n1g1" => (BackgroundBackend::Sep, Some(n1), g1),
+        "rust_sep__n2g1" => (BackgroundBackend::Sep, Some(n2), g1),
+        "rust_sep__n1g2" => (BackgroundBackend::Sep, Some(n1), g2),
+        "rust_sep__n2g2" => (BackgroundBackend::Sep, Some(n2), g2),
+        _ => return None,
+    };
+    Some(MethodVariant {
+        backend,
+        noise_policy,
+        star_gates,
+    })
+}
+
+/// Effective background settings and star gates of one case and backend.
+fn case_settings(
+    manifest: &Value,
+    case: &Value,
+    backend: &str,
+) -> Result<(BackgroundSettings, StarGateSettings), String> {
+    let mut settings = serde_json::to_value(BackgroundSettings::default()).unwrap();
+    merge(&mut settings, &manifest["settings"]);
+    merge(&mut settings, &case["settings"]);
+    let mut settings = serde_json::from_value::<BackgroundSettings>(settings)
+        .map_err(|error| format!("settings: {error}"))?;
+    let mut gates = serde_json::to_value(StarGateSettings::default()).unwrap();
+    merge(&mut gates, &manifest["star_gates"]);
+    merge(&mut gates, &case["star_gates"]);
+    let mut gates = serde_json::from_value::<StarGateSettings>(gates)
+        .map_err(|error| format!("star_gates: {error}"))?;
+    match backend {
+        "legacy_global_clip" => settings.backend = BackgroundBackend::LegacyGlobalClip,
+        "sep" => settings.backend = BackgroundBackend::Sep,
+        other => {
+            let variant =
+                method_variant(other).ok_or_else(|| format!("unknown backend {other}"))?;
+            settings.backend = variant.backend;
+            if let Some(policy) = variant.noise_policy {
+                settings.sep.noise_policy = policy;
+            }
+            gates = variant.star_gates;
+        }
+    }
+    Ok((settings, gates))
+}
+
+fn write_u8(path: &Path, values: &[u8]) -> std::io::Result<()> {
+    std::fs::write(path, values)
+}
+
+fn run_case(
+    frame: &LumaFrame,
+    settings: &BackgroundSettings,
+    star_gates: &StarGateSettings,
+    write_maps: Option<&Path>,
+) -> Value {
     let started = Instant::now();
     let background = analyze_background(frame, settings);
     let background_ms = started.elapsed().as_secs_f64() * 1e3;
 
+    let policy = FocusSourcePolicy::new(star_gates, settings.detection.accept_deblended_for_focus);
     let started = Instant::now();
-    let quality = estimate_quality_with_policy(
-        frame,
-        &background,
-        FocusSourcePolicy {
-            accept_deblended: settings.detection.accept_deblended_for_focus,
-        },
-    );
+    let quality = estimate_quality_with_policy(frame, &background, policy);
     let quality_ms = started.elapsed().as_secs_f64() * 1e3;
 
     let started = Instant::now();
     let trailing = estimate_trailing(frame, &background);
     let trailing_ms = started.elapsed().as_secs_f64() * 1e3;
 
-    if let (Some(stem), Some(BackgroundField::Map { level, rms, .. })) =
-        (write_maps, background.field.as_ref())
+    if let (
+        Some(stem),
+        Some(BackgroundField::Map {
+            level,
+            rms,
+            invalid_noise,
+            ..
+        }),
+    ) = (write_maps, background.field.as_ref())
     {
         let _ = write_f32(&with_suffix(stem, ".back.f32"), level);
         let _ = write_f32(&with_suffix(stem, ".rms.f32"), rms);
+        // masked_local_v2's M_inv, when any pixel is locally invalid.
+        if let Some(invalid) = invalid_noise {
+            let _ = write_u8(&with_suffix(stem, ".invalid.u8"), invalid);
+        }
     }
 
     let candidates: Vec<Value> = quality
@@ -135,7 +233,7 @@ fn run_case(frame: &LumaFrame, settings: &BackgroundSettings, write_maps: Option
         .map(|c| {
             json!({"x": c.x, "y": c.y, "xmin": c.min_x, "xmax": c.max_x, "ymin": c.min_y,
                    "ymax": c.max_y, "npix": c.area, "flux": c.flux, "peak": c.peak,
-                   "deblended": c.deblended})
+                   "deblended": c.deblended, "family_size": c.family_size})
         })
         .collect();
     let catalog = background.catalog.as_ref().map(|catalog| {
@@ -151,7 +249,17 @@ fn run_case(frame: &LumaFrame, settings: &BackgroundSettings, write_maps: Option
             })
             .collect::<Vec<_>>()
     });
+    let accepted_stars: Vec<Value> = quality
+        .used_stars
+        .iter()
+        .map(|s| json!({"x": s.x, "y": s.y, "hfr_px": s.hfr_px}))
+        .collect();
     json!({
+        "refinement": background.result.refinement,
+        "star_gates": policy.config_json(),
+        "star_gates_config_sha256": quality.star_gates_config_sha256,
+        "gate_diagnostics": quality.gate_diagnostics,
+        "accepted_stars": accepted_stars,
         "background": background.result,
         "catalog_error": background.catalog_error,
         "detection": quality.detection,
@@ -166,6 +274,8 @@ fn run_case(frame: &LumaFrame, settings: &BackgroundSettings, write_maps: Option
             "star_count_detected": quality.star_count_detected,
             "star_count_used": quality.star_count_used,
             "star_rejections": quality.star_rejections,
+            "gate_diagnostics": quality.gate_diagnostics,
+            "star_gates_config_sha256": quality.star_gates_config_sha256,
             "saturation_gate": quality.saturation_gate,
             "used_stars": quality.used_stars.iter()
                 .map(|s| json!({"x": s.x, "y": s.y, "hfr_px": s.hfr_px}))
@@ -214,28 +324,22 @@ fn bge_eval_bridge() {
         let frame = frame_for(case, &root);
         for backend in &backends {
             let stem = out.join(format!("{id}__{backend}"));
-            let result = match (&frame, backend.as_str()) {
-                (Err(error), _) => Err(error.clone()),
-                (Ok(frame), "legacy_global_clip" | "sep") => {
-                    let mut settings = serde_json::to_value(BackgroundSettings::default()).unwrap();
-                    merge(&mut settings, &manifest["settings"]);
-                    merge(&mut settings, &case["settings"]);
-                    match serde_json::from_value::<BackgroundSettings>(settings) {
-                        Ok(mut settings) => {
-                            settings.backend = if backend == "sep" {
-                                BackgroundBackend::Sep
-                            } else {
-                                BackgroundBackend::LegacyGlobalClip
-                            };
-                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                run_case(frame, &settings, write_maps.then_some(stem.as_path()))
-                            }))
-                            .map_err(|_| "panic during analysis".to_string())
-                        }
-                        Err(error) => Err(format!("settings: {error}")),
+            let result = match &frame {
+                Err(error) => Err(error.clone()),
+                Ok(frame) => match case_settings(&manifest, case, backend) {
+                    Ok((settings, gates)) => {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_case(
+                                frame,
+                                &settings,
+                                &gates,
+                                write_maps.then_some(stem.as_path()),
+                            )
+                        }))
+                        .map_err(|_| "panic during analysis".to_string())
                     }
-                }
-                (Ok(_), other) => Err(format!("unknown backend {other}")),
+                    Err(error) => Err(error),
+                },
             };
             let mut record = json!({"case": id, "backend": backend, "error": Value::Null});
             match result {
@@ -256,4 +360,101 @@ fn bge_eval_bridge() {
         "bge_eval_bridge: wrote results to {} ({failures} case errors)",
         out.display()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_ids_force_the_spec_variants_over_the_manifest() {
+        let manifest = json!({
+            "settings": {"sep": {"noise_policy": "frame_wide_v1", "bw": 32}},
+            "star_gates": {"blend_test": "peak_count_v1"},
+        });
+        let case = json!({"star_gates": {"regroup_deblended": false}});
+        let (settings, gates) = case_settings(&manifest, &case, "sep").unwrap();
+        assert_eq!(settings.backend, BackgroundBackend::Sep);
+        assert_eq!(settings.sep.noise_policy, NoisePolicy::FrameWideV1);
+        assert_eq!(settings.sep.bw, 32);
+        assert_eq!(
+            gates,
+            StarGateSettings {
+                blend_test: BlendTest::PeakCountV1,
+                regroup_deblended: false
+            }
+        );
+        // Without overlays a plain backend runs the v2 defaults.
+        let (settings, gates) = case_settings(&json!({}), &json!({}), "sep").unwrap();
+        assert_eq!(settings.sep.noise_policy, NoisePolicy::MaskedLocalV2);
+        assert_eq!(gates, StarGateSettings::default());
+
+        for (id, backend, policy, blend, regroup) in [
+            (
+                "rust_sep",
+                BackgroundBackend::Sep,
+                NoisePolicy::FrameWideV1,
+                BlendTest::PeakCountV1,
+                false,
+            ),
+            (
+                "rust_sep__n1g1",
+                BackgroundBackend::Sep,
+                NoisePolicy::FrameWideV1,
+                BlendTest::PeakCountV1,
+                false,
+            ),
+            (
+                "rust_sep__n2g1",
+                BackgroundBackend::Sep,
+                NoisePolicy::MaskedLocalV2,
+                BlendTest::PeakCountV1,
+                false,
+            ),
+            (
+                "rust_sep__n1g2",
+                BackgroundBackend::Sep,
+                NoisePolicy::FrameWideV1,
+                BlendTest::DipAnnulusV2,
+                true,
+            ),
+            (
+                "rust_sep__n2g2",
+                BackgroundBackend::Sep,
+                NoisePolicy::MaskedLocalV2,
+                BlendTest::DipAnnulusV2,
+                true,
+            ),
+        ] {
+            let (settings, gates) = case_settings(&manifest, &case, id).unwrap();
+            assert_eq!(settings.backend, backend, "{id}");
+            assert_eq!(settings.sep.noise_policy, policy, "{id}");
+            assert_eq!(settings.sep.bw, 32, "{id}: other settings still merge");
+            assert_eq!(
+                (gates.blend_test, gates.regroup_deblended),
+                (blend, regroup),
+                "{id}"
+            );
+        }
+        for (id, blend) in [
+            ("rust_legacy_global_clip", BlendTest::PeakCountV1),
+            ("rust_legacy__g1", BlendTest::PeakCountV1),
+            ("rust_legacy__g2", BlendTest::DipAnnulusV2),
+        ] {
+            let (settings, gates) = case_settings(&json!({}), &json!({}), id).unwrap();
+            assert_eq!(
+                settings.backend,
+                BackgroundBackend::LegacyGlobalClip,
+                "{id}"
+            );
+            assert_eq!(gates.blend_test, blend, "{id}");
+        }
+        assert!(case_settings(&json!({}), &json!({}), "rust_sep__n3g1").is_err());
+        assert!(case_settings(
+            &json!({"star_gates": {"blend_test": "nope"}}),
+            &json!({}),
+            "sep"
+        )
+        .is_err());
+    }
 }
