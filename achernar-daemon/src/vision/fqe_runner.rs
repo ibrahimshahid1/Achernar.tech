@@ -923,6 +923,20 @@ mod tests {
         assert!(out.sigma_log_hfr.is_finite() && out.sigma_log_hfr > 0.0);
     }
 
+    // Acceptance check of an installed prototype bundle. Set
+    // FQE_PROTOTYPE_BUNDLE_DIR to e.g. <repo>/models/focus_quality/1.1.0; skips
+    // when unset so CI stays hermetic.
+    #[test]
+    fn verifies_installed_prototype_bundle_when_available() {
+        let Ok(dir) = std::env::var("FQE_PROTOTYPE_BUNDLE_DIR") else {
+            eprintln!("FQE_PROTOTYPE_BUNDLE_DIR unset; skipping installed-bundle verification");
+            return;
+        };
+        let prototype = verify_prototype_bundle(Path::new(&dir))
+            .unwrap_or_else(|reason| panic!("installed bundle refused: {reason}"));
+        eprintln!("PROTOTYPE_BUNDLE_OK {prototype:?}");
+    }
+
     fn scratch_root(tag: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!("fqe_{tag}_{}", std::process::id()));
         std::fs::remove_dir_all(&root).ok();
