@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { achernarApi } from "../../api/achernar";
 import { useFocusRun, type FocusRunState, type FocusSample } from "../../hooks/useFocusRun";
+import { useSharedObs } from "../../hooks/useSharedObs";
+import type { SharedObservation } from "../../lib/sharedObservation";
 import {
     evaluateRb2,
     ABORT_STARS_AT_CENTRE,
@@ -178,6 +180,38 @@ export function FocusStatus({ focus }: { focus: FocusRunState }) {
     );
 }
 
+/**
+ * Live HFR readout: the classical HFR beside the FQE prototype's frame HFR.
+ *
+ * The prototype only produces values when the daemon runs with
+ * `[vision.fqe] prototype = true` and a verified prototype bundle; it was
+ * trained on public archive data (simulated stars + HST) and is not qualified
+ * for the R50/Z114, so it is labelled as such and the classical value stays
+ * first. Renders nothing when there is no prototype reading.
+ */
+export function FqePrototypeReadout({ observation }: { observation: SharedObservation | null }) {
+    if (!observation || !observation.fqePrototype || observation.fqeHfrPx == null) return null;
+    const classical = observation.hfrPx;
+    const fqe = observation.fqeHfrPx;
+    const sigma = observation.fqeSigmaLogHfr;
+    // sigma is in ln-HFR units: a multiplicative band, shown as a percentage.
+    const band = sigma != null ? ` (±${((Math.exp(sigma) - 1) * 100).toFixed(0)}% raw)` : "";
+    return (
+        <div className="focus-status" title="FQE prototype: public-data model, not qualified for R50/Z114">
+            <span className="focus-status-meta">
+                live HFR classical {classical != null ? `${classical.toFixed(2)} px` : "—"}
+            </span>
+            <span className="focus-status-meta">
+                · FQE prototype {fqe.toFixed(2)} px{band}
+                {observation.fqeStarCount != null && ` from ${observation.fqeStarCount} stars`}
+            </span>
+            <span className="focus-status-meta">
+                · {observation.fqeModelVersion ?? "unversioned"}, uncalibrated, not qualified for R50/Z114
+            </span>
+        </div>
+    );
+}
+
 /** Card showing details of a single focus run. */
 export function FocusRunCard({ runId }: { runId: string }) {
     return (
@@ -248,6 +282,7 @@ export function FocusActions({ running }: { running: boolean }) {
 /** The whole focus panel: status, curve, acceptance, controls. */
 export default function FocusPanel() {
     const focus = useFocusRun();
+    const observation = useSharedObs();
     const running = focus.state === "running";
 
     return (
@@ -257,6 +292,7 @@ export default function FocusPanel() {
                 <div className="cam-transport">Direct daemon</div>
             </div>
             <FocusStatus focus={focus} />
+            <FqePrototypeReadout observation={observation} />
             <FocusChart samples={focus.samples} runState={focus.state} />
             <FocusAcceptance samples={focus.samples} runState={focus.state} />
             <FocusActions running={running} />
