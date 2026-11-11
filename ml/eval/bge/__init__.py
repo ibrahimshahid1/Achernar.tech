@@ -13,8 +13,12 @@ import json
 
 #: Version of the fixture generators. Bump when any rendered pixel can change.
 GENERATOR_VERSION = "bge-fixtures-v1"
-#: Version of the metric definitions and result layout.
-HARNESS_VERSION = "bge-eval-harness-v1"
+#: Version of the metric definitions and result layout. v2 (BGE v2): the
+#: method matrix, set metrics and v2 parity were added, and the detection
+#: metrics of Rust SEP rows score the bridge catalog instead of the gate
+#: candidates (which hold regrouped families under v2). Pre-existing fixture
+#: pixels are unchanged, so GENERATOR_VERSION stays.
+HARNESS_VERSION = "bge-eval-harness-v2"
 RESULTS_SCHEMA = "bge-eval-results-v1"
 BRIDGE_SCHEMA = "bge-eval-bridge-v1"
 

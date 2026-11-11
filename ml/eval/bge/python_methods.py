@@ -23,7 +23,20 @@ Detection, acceptance and HFR are identical for all three, so differences
 between them come from the background and noise maps alone. The acceptance
 policy (``ACCEPTANCE_POLICY``) is an evaluation-harness policy modelled on
 the daemon's star gates; it is not the daemon's policy, which is measured
-through the bridge.
+through the bridge. In particular its blend rule is a "neighbour" rule
+(another catalog centroid inside the HFR aperture), not the daemon's gate 5.
+
+``python_sep__n1g1``, ``__n2g1``, ``__n1g2``, ``__n2g2`` (BGE v2 matrix)
+    The Python reference of the daemon's SEP path, for Rust-Python parity
+    (docs/bge-v2-spec.md §4): the labeller's SEP background
+    (``ml.labels.psf_measure.estimate_spatial_background``) with noise policy
+    ``n1`` = ``frame_wide_v1`` or ``n2`` = ``masked_local_v2``; ``sep.extract``
+    with the daemon's settings and segmentation map; then the labeller's
+    Rust-parity focus gates (``psf_measure.focus_quality``, a port of
+    quality.rs ``measure_stars``: crop gates, 48 examined / 16 used, gate 5,
+    HFR by the daemon's curve of growth) with ``g1`` = ``peak_count_v1``
+    without regrouping or ``g2`` = ``dip_annulus_v2`` with SEP deblend
+    regrouping. Unlike ``python_sep`` these share no harness policy.
 
 SEP fabricates values in two cases (preflight notes, SEP 1.4.1
 ``background.c``): with no mesh at >= 50% valid pixels the grid becomes
@@ -94,7 +107,20 @@ ACCEPTANCE_POLICY = {
 
 HFR_CAP_PX = 63.0
 NOISE_REASONS = ("zero_empirical_scatter", "invalid_rms_map")
+#: BGE v2 Python matrix: noise policy x star gates (docs/bge-v2-spec.md §4).
+PYTHON_SEP_VARIANTS = {
+    "python_sep__n1g1": {"noise_policy": "frame_wide_v1", "blend_test": "peak_count_v1", "regroup_deblended": False},
+    "python_sep__n2g1": {"noise_policy": "masked_local_v2", "blend_test": "peak_count_v1", "regroup_deblended": False},
+    "python_sep__n1g2": {"noise_policy": "frame_wide_v1", "blend_test": "dip_annulus_v2", "regroup_deblended": True},
+    "python_sep__n2g2": {"noise_policy": "masked_local_v2", "blend_test": "dip_annulus_v2", "regroup_deblended": True},
+}
+#: SEP's BIG sentinel: the daemon also masks |value| >= 1e30 (usable_data_value).
+SEP_BIG = 1e30
 METHOD_LABELS = {
+    "python_sep__n1g1": "Python reference of the daemon SEP path: frame_wide_v1 noise, peak_count_v1, no regrouping",
+    "python_sep__n2g1": "Python reference of the daemon SEP path: masked_local_v2 noise, peak_count_v1, no regrouping",
+    "python_sep__n1g2": "Python reference of the daemon SEP path: frame_wide_v1 noise, dip_annulus_v2 + regrouping",
+    "python_sep__n2g2": "Python reference of the daemon SEP path: masked_local_v2 noise, dip_annulus_v2 + regrouping",
     "python_sep": "Python SEP 1.4.1 reference (spatial mesh background + RMS map)",
     "python_global_scalar": "Python comparator: global sigma-clipped scalar background (not the Rust legacy method)",
     "oracle_true_background": "Oracle comparator: simulated truth B and R (not a method)",
@@ -185,6 +211,11 @@ class BackgroundEstimate:
     #: SEP's RMS map as returned, kept for cross-implementation parity even
     #: when it is not a valid noise measurement. Never scored.
     raw_rms: object = None
+    #: BGE v2 variants: the labeller's SpatialBackground behind this estimate
+    #: (invalid mask, refinement record, extraction noise).
+    spatial_background: object = None
+    #: masked_local_v2 refinement record (spec §3.7); None for frame_wide_v1.
+    refinement: dict | None = None
 
     def back_map(self, shape):
         if self.back is None:
@@ -216,6 +247,7 @@ class BackgroundEstimate:
             "noise_source": self.noise_source,
             "diagnostics": self.diagnostics,
             "detail": self.detail,
+            "refinement": self.refinement,
         }
 
 
@@ -555,6 +587,13 @@ def detect_and_measure(image: np.ndarray, masks: dict, estimate: BackgroundEstim
 
 def run_python_method(method: str, scenario, bg_params: dict | None = None, det_params: dict | None = None) -> dict:
     """Run one Python method on a scenario; returns estimate and measurement."""
+    if method in PYTHON_SEP_VARIANTS:
+        variant = PYTHON_SEP_VARIANTS[method]
+        est = python_sep_variant_background(scenario.image, scenario.masks, variant["noise_policy"], bg_params,
+                                            det_params, method=method)
+        meas = detect_and_gate(scenario.image, scenario.masks, est, variant_star_gates(method), det_params,
+                               saturation_adu=scenario.metadata.get("saturation_adu"))
+        return {"estimate": est, "measurement": meas}
     if method == "python_sep":
         est = python_sep_background(scenario.image, scenario.masks, bg_params)
     elif method == "python_global_scalar":
@@ -567,3 +606,196 @@ def run_python_method(method: str, scenario, bg_params: dict | None = None, det_
         "detection": {"status": "unsupported", "reason": "malformed geometry"}, "candidates": None,
         "accepted": None, "rejections": None, "frame_hfr_median_px": None, "n_accepted": None}
     return {"estimate": est, "measurement": meas}
+
+
+# --------------------------------------------------------------------------
+# BGE v2 Python matrix (python_sep__nXgY)
+# --------------------------------------------------------------------------
+
+
+def _labeller():
+    from ml.labels import psf_measure
+
+    return psf_measure
+
+
+def variant_star_gates(method: str):
+    """The :class:`psf_measure.StarGateParams` of a ``python_sep__nXgY`` /
+    ``rust_*__*`` method id (``g1``: peak_count_v1 without regrouping;
+    ``g2``: dip_annulus_v2 with regrouping)."""
+    LM = _labeller()
+    suffix = method.rsplit("__", 1)[-1]
+    g = suffix[-2:]
+    if g == "g1":
+        return LM.StarGateParams(blend_test="peak_count_v1", regroup_deblended=False)
+    if g == "g2":
+        return LM.StarGateParams(blend_test="dip_annulus_v2", regroup_deblended=True)
+    raise KeyError(method)
+
+
+def variant_background_params(noise_policy: str, params: dict | None = None):
+    LM = _labeller()
+    p = dict(DEFAULT_BACKGROUND_PARAMS, **(params or {}))
+    return LM.SepBackgroundParams(bw=int(p["bw"]), bh=int(p["bh"]), fw=int(p["fw"]), fh=int(p["fh"]),
+                                  fthresh=float(p["fthresh"]), min_meshes_per_axis=int(p["min_meshes_per_axis"]),
+                                  noise_policy=noise_policy)
+
+
+def variant_detection_params(det_params: dict | None = None):
+    LM = _labeller()
+    p = dict(DEFAULT_DETECTION_PARAMS, **(det_params or {}))
+    return LM.SepDetectionParams(thresh_sigma=float(p["thresh_sigma"]), minarea=int(p["minarea"]),
+                                 filter_type=str(p["filter_type"]),
+                                 filter_kernel=tuple(tuple(r) for r in p["filter_kernel"]),
+                                 deblend_nthresh=int(p["deblend_nthresh"]), deblend_cont=float(p["deblend_cont"]),
+                                 clean=bool(p["clean"]), clean_param=float(p["clean_param"]),
+                                 pixstack=int(p["pixstack"]),
+                                 accept_deblended_for_focus=bool(p["accept_deblended_for_focus"]))
+
+
+def sep_background_config_for(noise_policy: str, params: dict | None = None) -> dict:
+    """Canonical background config of a noise policy (frame_wide_v1 equals
+    :func:`sep_background_config_json`, hash 80eab0fb...)."""
+    return variant_background_params(noise_policy, params).config(SEP_VERSION_EXPECTED)
+
+
+def variant_unusable_mask(image: np.ndarray, masks: dict) -> np.ndarray:
+    """The daemon SEP adapter's detector mask: :func:`unusable_mask` plus
+    |value| >= 1e30 (SEP's BIG sentinel)."""
+    bad = unusable_mask(image, masks)
+    with np.errstate(invalid="ignore"):
+        bad |= np.abs(image) >= SEP_BIG
+    return bad
+
+
+def python_sep_variant_background(image: np.ndarray, masks: dict, noise_policy: str, params: dict | None = None,
+                                  det_params: dict | None = None, method: str = "python_sep__n2g2") -> BackgroundEstimate:
+    """The labeller's SEP background under ``noise_policy`` as a BackgroundEstimate."""
+    LM = _labeller()
+    bg_params = variant_background_params(noise_policy, params)
+    config = bg_params.config(SEP_VERSION_EXPECTED)
+    image = np.asarray(image)
+    if image.ndim != 2 or image.size == 0:
+        return _unavailable(method, config, ["malformed_geometry"])
+    bad = variant_unusable_mask(image, masks)
+    sb = LM.estimate_spatial_background(image, detector_mask=bad, params=bg_params,
+                                        detection_params=variant_detection_params(det_params))
+    usable = ~bad
+    diag = {"mesh_nx": (sb.mesh_grid or (None, None))[0], "mesh_ny": (sb.mesh_grid or (None, None))[1],
+            "meshes_below_support": None if sb.meshes_total is None else sb.meshes_total - sb.meshes_supported,
+            "usable_pixels": int(usable.sum()), "total_pixels": int(image.size),
+            "rms_map_validity": sb.rms_validity, "detection_area_fraction": sb.detection_area_fraction}
+    if sb.global_background is not None:
+        diag["sep_globalback_raw"] = sb.global_background
+    if sb.global_rms is not None:
+        diag["sep_globalrms_raw"] = sb.global_rms
+    if not sb.level_measured:
+        est = _unavailable(method, config, list(sb.reasons), detail=sb.backend_error, diagnostics=diag)
+        if "backend_failure" in sb.reasons:
+            est.status = "failed"
+        est.spatial_background = sb
+        return est
+    noise_ok = sb.noise_measured
+    valid_noise = usable if sb.invalid_mask is None else usable & ~sb.invalid_mask
+    est = BackgroundEstimate(
+        method=method,
+        status="completed",
+        level_status="measured",
+        noise_status="measured" if noise_ok else "unresolved",
+        reasons=list(sb.reasons),
+        config=config,
+        config_sha256=config_sha256(config),
+        spatial=True,
+        back=sb.background_map,
+        rms=sb.rms_map if noise_ok else None,
+        raw_rms=sb.raw_rms_map,
+        level_summary=float(np.median(sb.background_map[usable])),
+        rms_summary=float(np.median(sb.rms_map[valid_noise])) if noise_ok and valid_noise.any() else None,
+        level_definition="median of the SEP background map over usable pixels",
+        rms_definition="median of the SEP RMS map over usable pixels outside the locally invalid mask",
+        noise_source="empirical_mesh_rms" if noise_ok else "unavailable",
+        diagnostics=diag,
+        spatial_background=sb,
+        refinement=sb.refinement,
+    )
+    return est
+
+
+def detect_and_gate(image: np.ndarray, masks: dict, estimate: BackgroundEstimate, gates,
+                    det_params: dict | None = None, saturation_adu=None) -> dict:
+    """SEP extraction as the daemon adapter runs it, then the labeller's
+    Rust-parity focus gates (``psf_measure.focus_quality``)."""
+    LM = _labeller()
+    det = sep_detection_config_json(det_params)
+    out = {
+        "detection_config_sha256": config_sha256(det),
+        "acceptance_policy_sha256": gates.config_sha256(),
+        "star_gates_config": gates.config(),
+        "star_gates_config_sha256": gates.config_sha256(),
+        "detection": {"status": "skipped", "reason": None},
+        "candidates": None,
+        "accepted": None,
+        "rejections": None,
+        "frame_hfr_median_px": None,
+        "n_accepted": None,
+        "gate_diagnostics": None,
+        "refinement": estimate.refinement,
+        "quality_status": None,
+    }
+    if estimate.level_status != "measured":
+        out["detection"] = {"status": "unsupported", "reason": "background level unavailable"}
+        out["quality_status"] = "BackgroundUnavailable"
+        return out
+    if estimate.noise_status != "measured":
+        out["detection"] = {"status": "unsupported",
+                            "reason": f"noise {estimate.noise_status} ({','.join(r for r in estimate.reasons if r in NOISE_REASONS)}): "
+                                      "a relative detection threshold is undefined"}
+        out["quality_status"] = "DetectionUnavailable"
+        return out
+    sep = sep_module()
+    sb = estimate.spatial_background
+    data = np.asarray(image, dtype=np.float32)
+    bad = variant_unusable_mask(image, masks)
+    invalid = None if sb is None else sb.invalid_mask
+    ext_mask = bad if invalid is None else (bad | invalid)
+    back = estimate.back_map(image.shape).astype(np.float32)
+    resid = np.ascontiguousarray(np.where(ext_mask, np.float32(0.0), data - back), dtype=np.float32)
+    err = sb.extraction_rms() if sb is not None else np.ascontiguousarray(estimate.rms, dtype=np.float32)
+    previous = sep.get_extract_pixstack()
+    try:
+        sep.set_extract_pixstack(det["pixstack"])
+        objects, segmap = sep.extract(
+            resid, det["thresh_sigma"], err=err, mask=np.ascontiguousarray(ext_mask, dtype=np.uint8),
+            maskthresh=0.0, minarea=det["minarea"],
+            filter_kernel=np.asarray(det["filter_kernel"], dtype=np.float32), filter_type=det["filter_type"],
+            deblend_nthresh=det["deblend_nthresh"], deblend_cont=det["deblend_cont"],
+            clean=det["clean"], clean_param=det["clean_param"], segmentation_map=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        out["detection"] = {"status": "failed", "reason": f"sep.extract: {type(exc).__name__}: {exc}"}
+        out["quality_status"] = "DetectionUnavailable"
+        return out
+    finally:
+        sep.set_extract_pixstack(previous)
+    rows = LM.sep_catalog_rows(objects, data, sep)
+    candidates, families = LM.focus_candidates_from_catalog(rows, segmap, gates)
+    quality = LM.focus_quality(data, candidates, gates=gates, field_kind="map", level=back,
+                               rms=np.asarray(estimate.rms, dtype=np.float32), masks=masks, invalid_mask=invalid,
+                               saturation_adu=saturation_adu)
+    out.update(
+        candidates=rows,
+        accepted=quality["used_stars"],
+        rejections=quality["star_rejections"],
+        frame_hfr_median_px=quality["hfr_px"],
+        n_accepted=quality["star_count_used"],
+        gate_diagnostics=quality["gate_diagnostics"],
+        quality_status=quality["status"],
+        focus_candidates=quality["candidates"],
+        star_count_detected=quality["star_count_detected"],
+        families={"multi_member": sum(1 for f in families if len(f) >= 2),
+                  "single_member": sum(1 for f in families if len(f) == 1)},
+        detection={"status": "completed", "reason": None, "n_objects": len(rows),
+                   "objects_deblended": sum(1 for r in rows if r["deblended"]),
+                   "objects_truncated": sum(1 for r in rows if r["truncated"])},
+    )
+    return out

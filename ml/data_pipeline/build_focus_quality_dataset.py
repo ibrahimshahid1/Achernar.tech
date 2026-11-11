@@ -80,7 +80,12 @@ SATURATION_SOURCE_UNRECOGNIZED = "unrecognized_saturation_source"
 
 # Label provenance. Bump LABEL_VERSION whenever psf_measure.LABEL_SCHEMA_VERSION,
 # the SEP pin, or the selection policy of this builder changes meaning.
-LABEL_VERSION = "fqe_sep_spatial_v2"
+# v3 (docs/bge-v2-spec.md §3.9): psf_measure's default star gates
+# (dip_annulus_v2, SEP deblend regrouping) and noise map (masked_local_v2)
+# changed; it equals psf_measure.LABEL_VERSION. v2 datasets stay readable and
+# are reported as v2 (their manifests carry their own label_version).
+LABEL_VERSION = "fqe_sep_spatial_v3"
+READABLE_LABEL_VERSIONS = ("fqe_sep_spatial_v2", LABEL_VERSION)
 LEGACY_UNVERIFIED = "legacy_unverified"
 QUALIFIED = "qualified"
 PERMISSIVE_SATURATION = "unqualified_permissive_saturation"
@@ -245,14 +250,15 @@ def label_provenance_status(manifest: dict | None) -> str:
     """Dataset-level label status: :data:`QUALIFIED`, :data:`LEGACY_UNVERIFIED`
     or :data:`PERMISSIVE_SATURATION`.
 
-    Qualified means: the current :data:`LABEL_VERSION`, the pinned SEP version,
+    Qualified means: a readable label version (:data:`READABLE_LABEL_VERSIONS`:
+    the current :data:`LABEL_VERSION`, or v2 recorded as such), the pinned SEP version,
     both SEP configuration objects present and matching their recorded sha256,
     and an enforced saturation gate. Anything missing is legacy_unverified —
     old fields are not reinterpreted.
     """
     from labels.psf_measure import SEP_PINNED_VERSION, config_sha256
 
-    if not manifest or manifest.get("label_version") != LABEL_VERSION:
+    if not manifest or manifest.get("label_version") not in READABLE_LABEL_VERSIONS:
         return LEGACY_UNVERIFIED
     if manifest.get("sep_version") != SEP_PINNED_VERSION:
         return LEGACY_UNVERIFIED
@@ -270,8 +276,8 @@ def qualified_row_mask(dataset: dict, manifest: dict | None) -> np.ndarray:
     """Per-row mask of labels a qualified evaluation may use.
 
     A row qualifies only if the dataset qualifies (:func:`label_provenance_status`)
-    and the row itself carries the current label version and the manifest's
-    configuration hashes. Rows without these columns are legacy_unverified.
+    and the row itself carries the manifest's label version and configuration
+    hashes. Rows without these columns are legacy_unverified.
     """
     n = len(dataset["hfr_px"])
     if label_provenance_status(manifest) != QUALIFIED:
@@ -283,7 +289,7 @@ def qualified_row_mask(dataset: dict, manifest: dict | None) -> np.ndarray:
     except KeyError:
         return np.zeros(n, dtype=bool)
     return (
-        (version == LABEL_VERSION)
+        (version == manifest["label_version"])
         & (background == manifest["background_config_sha256"])
         & (detection == manifest["detection_config_sha256"])
     )
@@ -309,6 +315,7 @@ def load_qualified_dataset(dataset_path: str) -> tuple[dict, dict]:
     report = {
         "dataset": str(path),
         "dataset_status": status,
+        "label_version": manifest.get("label_version") if manifest else None,
         "rows_total": int(n),
         "rows_qualified": int(mask.sum()),
         "rows_excluded": int(n - mask.sum()),
@@ -405,6 +412,7 @@ def build_dataset(
         LABEL_SCHEMA_VERSION,
         SepBackgroundParams,
         SepDetectionParams,
+        StarGateParams,
         extract_centered_crop,
         measure_frame_sep,
         require_sep,
@@ -422,6 +430,9 @@ def build_dataset(
     detection_config = detection_params.config(sep_version)
     background_sha = background_params.config_sha256(sep_version)
     detection_sha = detection_params.config_sha256(sep_version)
+    # measure_frame_sep's default star gates (provenance only; the label
+    # version already identifies them).
+    star_gates = StarGateParams(accept_deblended=detection_params.accept_deblended_for_focus)
 
     con = sqlite3.connect(db_path)
     con.row_factory = sqlite3.Row
@@ -688,6 +699,8 @@ def build_dataset(
         "background_config_sha256": background_sha,
         "detection_config": detection_config,
         "detection_config_sha256": detection_sha,
+        "star_gates_config": star_gates.config(),
+        "star_gates_config_sha256": star_gates.config_sha256(),
         "noise_source": "empirical_mesh_rms",
         "units": "adu",
         "width_definition": dict(SEP_WIDTH_DEFINITION),

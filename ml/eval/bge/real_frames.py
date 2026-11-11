@@ -25,6 +25,14 @@ Thresholds (``bge-real-thresholds-v1``)::
 Supported metrics: ``status_failure_rate`` (fraction of frames whose
 background is unavailable), ``hfr_repeatability_cv_max`` (largest coefficient
 of variation of frame HFR within a group).
+
+``bge-real-frames-v2`` manifests (nights, frame types, daemon analysis
+bundles; ``ml/eval/bge/qualification/manifest.py``) are also readable here:
+their light frames are evaluated the same way (``repeat_group`` as the group).
+The full real-frame qualification (pull, difference pull, negated residual,
+injection-recovery, dark trials, focus sweeps, paired legacy comparisons,
+thresholds R1-R17b and the one-shot hold-out ledger) is
+``python -m ml.eval.bge.qualification.run_qualification``.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ from pathlib import Path
 import numpy as np
 
 MANIFEST_SCHEMA = "bge-real-frames-v1"
+MANIFEST_SCHEMA_V2 = "bge-real-frames-v2"
 THRESHOLDS_SCHEMA = "bge-real-thresholds-v1"
 SUPPORTED_METRICS = ("status_failure_rate", "hfr_repeatability_cv_max")
 
@@ -52,8 +61,13 @@ def _sha256(path: Path) -> str:
 
 def load_manifest(path) -> dict:
     manifest = json.loads(Path(path).read_text())
+    if manifest.get("schema") == MANIFEST_SCHEMA_V2:
+        from .qualification.manifest import validate_manifest
+
+        validate_manifest(manifest)
+        return manifest
     if manifest.get("schema") != MANIFEST_SCHEMA:
-        raise ValueError(f"expected schema {MANIFEST_SCHEMA!r}")
+        raise ValueError(f"expected schema {MANIFEST_SCHEMA!r} or {MANIFEST_SCHEMA_V2!r}")
     for f in manifest.get("frames", []):
         if f.get("split") not in ("development", "holdout"):
             raise ValueError(f"frame {f.get('id')!r}: split must be 'development' or 'holdout'")
@@ -82,10 +96,15 @@ def load_thresholds(path, manifest_path, now=None) -> dict:
 
 
 def select_frames(manifest: dict, include_holdout: bool = False) -> list:
-    return [f for f in manifest["frames"] if f["split"] == "development" or include_holdout]
+    return [f for f in manifest["frames"] if (f["split"] == "development" or include_holdout)
+            and f.get("frame_type", "light") == "light"]
 
 
 def load_frame(entry: dict, base: Path):
+    if "frame_type" in entry:  # bge-real-frames-v2 entry
+        from .qualification.manifest import load_frame as load_v2
+
+        return load_v2(entry, base)
     path = base / entry["path"]
     if entry["format"] == "fits":
         from astropy.io import fits
@@ -117,7 +136,7 @@ def evaluate(manifest_path, thresholds_path=None, include_holdout: bool = False)
         image, masks = load_frame(entry, manifest_path.parent)
         est = PM.python_sep_background(image, masks)
         meas = PM.detect_and_measure(image, masks, est)
-        rows.append({"id": entry["id"], "split": entry["split"], "group": entry.get("group"),
+        rows.append({"id": entry["id"], "split": entry["split"], "group": entry.get("group", entry.get("repeat_group")),
                      "focus_position": entry.get("focus_position"), "background": est.summary(),
                      "detection_status": meas["detection"]["status"],
                      "n_candidates": None if meas["candidates"] is None else len(meas["candidates"]),

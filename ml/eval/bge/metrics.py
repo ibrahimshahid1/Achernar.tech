@@ -461,3 +461,94 @@ def strip_private(d):
     if isinstance(d, list):
         return [strip_private(v) for v in d]
     return d
+
+
+# --------------------------------------------------------------------------
+# BGE v2 acceptance metrics (docs/bge-v2-spec.md §6; definitions in README.md)
+#
+# Each takes ``frames``: a list of dicts, one per frame of a scenario set, with
+# ``truth`` (TruthSource.to_json() dicts), ``accepted`` (accepted stars with
+# x, y, hfr_px; ``None`` when detection did not run: nothing was accepted),
+# ``false_detections`` (detection metric, ``None`` when detection did not run)
+# and ``detection_ran``.
+# --------------------------------------------------------------------------
+
+
+def truth_star_matches(accepted, truth) -> dict:
+    """Truth star id -> accepted index, one-to-one greedy (the standard
+    radius ``max(2, 0.5 HFR_true)``)."""
+    if not accepted:
+        return {}
+    stars = [s for s in truth if s.get("kind") == "star"]
+    matches = match_greedy([(a["x"], a["y"]) for a in accepted], [(s["x"], s["y"]) for s in stars],
+                           [truth_match_radius(s) for s in stars])
+    return {stars[j]["id"]: i for i, j, _ in matches}
+
+
+def acceptance_rate(frames, predicate) -> dict:
+    """Fraction of truth stars in the population (``predicate(truth)``)
+    matched by an accepted star. Frames without detection count as nothing
+    accepted."""
+    n_pop = n_acc = 0
+    frames_without_detection = 0
+    for fr in frames:
+        matched = truth_star_matches(fr.get("accepted") or [], fr["truth"])
+        if not fr.get("detection_ran", fr.get("accepted") is not None):
+            frames_without_detection += 1
+        for s in fr["truth"]:
+            if s.get("kind") == "star" and predicate(s):
+                n_pop += 1
+                n_acc += int(s["id"] in matched)
+    return {"rate": (n_acc / n_pop) if n_pop else None, "n_population": n_pop, "n_accepted": n_acc,
+            "n_frames": len(frames), "frames_without_detection": frames_without_detection}
+
+
+#: A close pair counts as accepted (not rejected) when an accepted star lies
+#: within separation/2 + max(2, 0.5 HFR_true of the wider member) of its
+#: midpoint: that covers an accepted member and a merged blend centroid.
+def close_double_rejection(frames, min_separation_px: float = 5.0, min_flux_ratio: float = 0.5) -> dict:
+    """Rejection rate of truth pairs with separation >= ``min_separation_px``
+    and flux ratio >= ``min_flux_ratio``."""
+    n_pairs = n_rejected = 0
+    for fr in frames:
+        pairs = {}
+        for s in fr["truth"]:
+            if s.get("pair_id") is not None:
+                pairs.setdefault(s["pair_id"], []).append(s)
+        accepted = fr.get("accepted") or []
+        for members in pairs.values():
+            m = members[0]
+            if m["separation_px"] < min_separation_px or m["flux_ratio"] < min_flux_ratio:
+                continue
+            radius = 0.5 * m["separation_px"] + max(MATCH_MIN_PX, MATCH_HFR_FRACTION *
+                                                    max((s.get("hfr_true_px") or 0.0) for s in members))
+            hit = any(math.hypot(a["x"] - m["pair_mid_x"], a["y"] - m["pair_mid_y"]) <= radius for a in accepted)
+            n_pairs += 1
+            n_rejected += int(not hit)
+    return {"rate": (n_rejected / n_pairs) if n_pairs else None, "n_pairs": n_pairs, "n_rejected": n_rejected,
+            "population": f"separation_px >= {min_separation_px} and flux_ratio >= {min_flux_ratio}"}
+
+
+def accepted_rel_hfr_bias(frames, predicate=lambda s: True) -> dict:
+    """Median of (HFR - HFR_true) / HFR_true over accepted stars matched to
+    truth stars in the population (aperture truth: ``hfr_true_px``)."""
+    rel = []
+    for fr in frames:
+        accepted = fr.get("accepted") or []
+        by_id = {s["id"]: s for s in fr["truth"]}
+        for sid, i in truth_star_matches(accepted, fr["truth"]).items():
+            s = by_id[sid]
+            hfr = accepted[i].get("hfr_px")
+            if predicate(s) and hfr is not None and s.get("hfr_true_px"):
+                rel.append(hfr / s["hfr_true_px"] - 1.0)
+    return {"median_rel_bias": _median(rel), "abs_median_rel_bias": None if not rel else abs(_median(rel)),
+            "n_matched": len(rel)}
+
+
+def false_detections_per_frame(frames) -> dict:
+    """Mean false detections per frame; a frame whose detection did not run
+    detected nothing and contributes 0 (counted in ``frames_without_detection``)."""
+    values = [int(fr["false_detections"]) if fr.get("false_detections") is not None else 0 for fr in frames]
+    return {"per_frame": (sum(values) / len(values)) if values else None, "n_frames": len(values),
+            "frames_without_detection": sum(1 for fr in frames if not fr.get("detection_ran")),
+            "values": values}

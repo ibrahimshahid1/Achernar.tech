@@ -24,6 +24,25 @@ python -m ml.eval.bge.run_benchmark --out <dir> [--rust --repo <checkout with ac
   `skipped: rust sep backend not integrated at <rev>`.
 - `--mesh-study` adds the SEP mesh-size / source-footprint study; `--timing`
   adds 6000x4000 host timing and peak memory.
+- `--split dev` (default) runs the development set: the 22 pre-existing
+  scenarios, the 3 pre-existing sweeps and the BGE v2 development variants
+  (`dev_*`). `--split holdout` adds the held-out sets (`ho_*`) and refuses to
+  start (exit 2, before any held-out frame is rendered) unless
+  `ml/eval/bge/acceptance/synthetic-v2.json` is tracked in git
+  (`git ls-files --error-unmatch`) and unchanged versus HEAD
+  (`git diff --quiet HEAD --`); results record that file's last commit and
+  sha256 under `acceptance_criteria`. The held-out run includes the
+  development set so one `results.json` serves every criterion;
+  `--holdout-only` drops it.
+- `--methods` takes method ids or groups: `default` (the five pre-v2 rows;
+  the default for `dev`), `matrix` (every row of the BGE v2 matrix below; the
+  default for `holdout`), `python`, `python_variants`, `rust`,
+  `rust_variants`.
+- `python -m ml.eval.bge.acceptance.evaluate --results <results.json> [...]`
+  applies the predeclared criteria of `acceptance/synthetic-v2.json` (read
+  only) and prints `pass` / `fail` / `not_evaluable` per criterion and
+  implementation (`--out` writes JSON). Several results files are merged; the
+  interpretations it fixes are listed in its module docstring.
 
 Outputs in `<dir>`: `results.json` (schema `bge-eval-results-v1`; every
 scenario x method has `status` in completed | unsupported | skipped | failed
@@ -73,8 +92,32 @@ benchmark command itself requires SEP.
 | `python_sep` | reference | `sep.Background` (bw=bh=64, fw=fh=3, fthresh=0) with mask = invalid, bad_pixel, edge, native_saturation, non-finite (non-finite pixels also set to 0); `sep.extract` on `I - B(x,y)` with masked pixels 0 and the same mask passed (as the daemon adapter does), `err = R(x,y)`, thresh 5, minarea 5, 3x3 `[[1,2,1],[2,4,2],[1,2,1]]` kernel, `filter_type="conv"`, deblend 32 / 0.005, clean 1.0, pixstack 300000. Config hashes equal the daemon defaults (`80eab0fb...`, `4f4499cd...`). |
 | `python_global_scalar` | comparator | One iteratively 3-sigma-clipped median and std over usable pixels, used as constant B and R. Not the Rust legacy method. |
 | `oracle_true_background` | oracle | The truth B and sky noise R fed to the same detection/HFR path. Separates background error from detector/estimator effects. Not a method. |
-| `rust_legacy_global_clip` | Rust | Daemon default path through the bridge. |
-| `rust_sep` | Rust | Daemon opt-in SEP path through the bridge. |
+| `rust_legacy_global_clip` | Rust | Daemon legacy path through the bridge; alias of `rust_legacy__g1` (peak_count_v1 sent explicitly). |
+| `rust_sep` | Rust | Daemon opt-in SEP path through the bridge; alias of `rust_sep__n1g1` (frame_wide_v1, peak_count_v1, no regrouping sent explicitly). |
+
+### BGE v2 method matrix (`docs/bge-v2-spec.md` §4)
+
+`n1` = noise policy `frame_wide_v1` (D-018), `n2` = `masked_local_v2`;
+`g1` = blend gate `peak_count_v1` without SEP deblend regrouping, `g2` =
+`dip_annulus_v2` with regrouping.
+
+| id | what it is |
+| --- | --- |
+| `python_sep__n1g1`, `__n2g1`, `__n1g2`, `__n2g2` | The Python reference of the daemon's SEP path: the labeller's `psf_measure.estimate_spatial_background` (noise policy), `sep.extract` with the daemon settings plus segmentation map, then the labeller's Rust-parity focus gates `psf_measure.focus_quality` (a port of quality.rs `measure_stars`: 48 examined / 16 used, saturation, edge, deblending policy or regrouped family, crop masked/saturated/`invalid_noise_support`, aperture SNR, core pixels, ellipticity, gate 5, HFR by the daemon's curve of growth). |
+| `rust_legacy__g1`, `rust_legacy__g2` | Daemon legacy path through the bridge with the stated gate. |
+| `rust_sep__n1g1`, `__n2g1`, `__n1g2`, `__n2g2` | Daemon SEP path through the bridge. |
+
+Rust variants are sent to the bridge as method-id backends (one bridge run;
+each id forces its backend, noise policy, blend test and regrouping); the
+plain `legacy_global_clip` / `sep` strings would run the daemon's current
+defaults (now v2) and are never used to label a row. `python_sep` keeps its
+harness acceptance policy (`ACCEPTANCE_POLICY`) for continuity: its blend
+rule rejects any star with another catalog centroid inside its HFR aperture
+(a "neighbour" rule), not the daemon's gate 5, so `python_sep` and the
+`python_sep__*` rows are not interchangeable. Rows of every SEP variant
+record `refinement` (spec §3.7), `gate_diagnostics` (`annulus_exempt`,
+`regrouped_accepted`, counted over accepted stars), `star_gates_config_sha256`
+and `accepted_stars` (x, y, hfr).
 
 All three Python rows share one detection, acceptance and HFR path
 (`ACCEPTANCE_POLICY` in `python_methods.py`, an evaluation-harness policy
@@ -131,6 +174,32 @@ plausibility, not tuned to any method.
 | mesh study | one 20-star jittered grid (flux 3e5) on the vignetting sky, footprints Moffat FWHM 3 / 8, donuts r_out 12 / 24 / 40; SEP bw = bh in {16, 32, 64, 128} |
 | `timing_6000x4000` | 2000 Gaussian stars, gradient sky; timing only |
 
+### BGE v2 sets (`dev_*` development, `ho_*` held-out)
+
+Seeds: development 8101-8108, held-out 9101-9108, disjoint from every
+pre-existing seed (101-122, 201-203, 301, 401; checked by the tests). Frames
+of each set are `<set>_fNN` (sweeps `<sweep>_p<position>`); each frame draws
+from `SeedSequence([seed, frame])`. Donuts are geometric-defocus pupil
+shadows (`render_pupil_shadow`): a disk of radius r_out minus the obstruction
+disk minus radial vane strips of width `w_img = (vane width / D) * 2 r_out`,
+midpoint super-sampled with exact 1-D anti-aliasing of the strips, then
+convolved with Gaussian seeing; their truth HFR is taken about the stamp's
+flux centroid. Frames whose acceptance is a criterion hold at most 16
+acceptable sources (the daemon's used-star cap), so the cap never decides a
+truth source's fate. A source is `isolated` when every other source k
+satisfies d > 2 L_j + L_k (L = r_out + 3 sigma for donuts, 1.5 FWHM Moffat).
+
+| id | content |
+| --- | --- |
+| `*_newtonian_spider_donuts` | Z114-like: per frame one r_out (stratified over 6-32 px), obstruction 0.25-0.35, 4 vanes (3-vane variant on 2 of 8 frames; dev 1 of 4) of 0.5-1.5% D at one angle, seeing sigma 1.0-1.8 px; flux 5e4-1e6; 800x600 |
+| `*_refractor_disks` | unobstructed disks, r_out 6-24 px |
+| `*_comatic_donuts` | obstruction 0.25-0.35, brightness 1 + 0.4 cos(phi - phi0), obstruction offset <= 0.2 r_out, r_out 6-32 px |
+| `*_close_doubles` | Moffat beta 3, FWHM 3-6 px per frame; 10 pairs (separation 3-10 px, flux ratio 0.2-1.0, primary 2e4-3e5) + 4 singles per frame; 640x480 (6 frames held-out, 3 dev) |
+| `*_sweep_newtonian` | 13 positions 4000..5200 step 100, r_out = 0.03 abs(p - p0), obstruction 0.3, 4 vanes of 1% D, seeing 1.4 px, 20 bright stars, gradient sky (p0 4585 held-out, 4615 dev) |
+| `ho_sweep_defocused_wings` | `sweep_moffat_fixed`'s generator (D-020 class) with seed 9106 and p0 4655 |
+| `*_amp_glow_ridge` | Gaussian sky ridges +150..900 ADU (45-75 px, vertical or horizontal) on 1000 ADU, sigma 5; each amplitude once starless and once with 30 Moffat stars |
+| `*_dense_defocused_field` | 80 spider donuts r_out 8-16 px per 640x480 frame, overlaps allowed |
+
 **Truth.** `background` is B(x,y) (including pedestal); `noise_std` is the
 expected std of the analog noise process (sources included), `noise_std_sky`
 the same without source photons (what an RMS map estimates). In digitized
@@ -175,8 +244,8 @@ constant maps. e = B_hat - B_true.
   / truth (all sources; stars; bright stars with noiseless peak >= 20 x sky
   noise). **purity** = matched / candidates. **false** = unmatched candidates
   off every source footprint (per quadrant too); **fragments** = unmatched
-  candidates on a source footprint. Rust detection uses the bridge
-  `candidates` (focus detector before star gates).
+  candidates on a source footprint. Rust detection uses the bridge `catalog`
+  when the backend emits one (SEP), else `candidates` (legacy detector).
 - **blends** (multi-member truth groups): **merged** = group with a matched
   member and an unmatched member inside that detection's bounding box;
   **split** = truth star with >= 2 candidates within max(3, 1.5 HFR_true) px
@@ -197,6 +266,24 @@ constant maps. e = B_hat - B_true.
   frame nearest p0.
 - **honest absence** (inputs without usable pixels): true iff no level was
   reported as measured.
+- **BGE v2 acceptance metrics** (`metrics.py`, `v2_set_metrics` in
+  results.json, used by `acceptance/evaluate.py`): *donut acceptance* =
+  truth stars of a population (e.g. isolated with r_out >= 6 px) matched by an
+  accepted star (standard matching), pooled over the frames; a frame whose
+  detection did not run accepted nothing; skipped frames make the set not
+  evaluable. *Close-double rejection* = fraction of truth pairs (e.g.
+  separation >= 5 px and flux ratio >= 0.5) with no accepted star within
+  separation/2 + max(2, 0.5 HFR_true) of the pair midpoint. *Accepted-donut
+  HFR bias* = median (HFR - HFR_true)/HFR_true over accepted stars matched to
+  donut truth. *False detections per frame* on starless frames; a frame whose
+  detection did not run contributes 0. Sweeps add `frames_noise_measured`,
+  `valid_frames_left_right` and the hyperbola p0 shift as a fraction of the
+  sweep step.
+- **BGE v2 parity** (`cross_implementation.v2`, per SEP variant, and the
+  mesh study's `parity_v2`): statuses, reasons (as sets), refinement (exact
+  except `invalid_rms_pixels`, within 0.1% of usable pixels), catalog sizes
+  (exact and platform-aware: non-deblended objects), gate tallies, gate
+  diagnostics, accepted-star sets (positions within 0.01 px).
 - **timing**: Python: one fresh process per method, one discarded in-process
   warm-up call, then repeats in that process (warm); wall ms median/p95 and
   peak RSS from getrusage. Rust: one discarded warm-up process, then each
@@ -213,4 +300,8 @@ constant maps. e = B_hat - B_true.
 Simulations use Gaussian/Poisson noise, ideal flat fields, analytic PSFs and
 no nonlinearity; diffuse emission is declared a source by convention. The
 harness acceptance policy differs from the daemon's; compare Rust and Python
-HFR rows with that in mind. No real-camera accuracy is implied.
+HFR rows with that in mind (the `python_sep__*` rows use the daemon's gates).
+SEP 1.4.1 thresholds masked pixels of the first image row against their own
+noise value, so a negative R there is "detected" (zero flux, NaN centroid);
+under `masked_local_v2` the extraction noise of every masked pixel is the
+cell floor (spec amendment A-1). No real-camera accuracy is implied.

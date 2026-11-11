@@ -39,6 +39,11 @@ from labels.psf_measure import (  # noqa: E402
 )
 
 DEFAULT_BACKGROUND_SHA256 = "80eab0fbae4abf9f60f348adb7de3004067a3873cca29f996289e9dc14040b84"
+# BGE v2 (docs/bge-v2-spec.md): the pre-v2 behaviour stays selectable as
+# frame_wide_v1 with the unchanged hash above; masked_local_v2 is the default.
+V1_BACKGROUND = SepBackgroundParams(noise_policy="frame_wide_v1")
+V2_DEFAULT_BACKGROUND_SHA256 = "97bd28741f79a184aa55d8e64e8f368ffd1eb71e07b2338cc0b99ed60832a6f4"
+V1_LABEL_POLICY = {"background_params": V1_BACKGROUND, "blend_test": "peak_count_v1", "regroup_deblended": False}
 DEFAULT_DETECTION_SHA256 = "4f4499cda7067107c0fe6d64319684c13d1ec62f590b4bee4b346c1459dc99df"
 
 # Non-default, non-dyadic and small values (review F3). These are the exact
@@ -88,7 +93,7 @@ class SepTestCase(unittest.TestCase):
 
 class TestConfigContract(unittest.TestCase):
     def test_default_background_config_keys_and_hash(self):
-        config = SepBackgroundParams().config()
+        config = V1_BACKGROUND.config()
         self.assertEqual(
             set(config),
             {"method", "method_version", "library", "library_version", "bw", "bh", "fw", "fh",
@@ -96,7 +101,12 @@ class TestConfigContract(unittest.TestCase):
         )
         self.assertEqual(config["method"], "sep_spatial_mesh")
         self.assertEqual(config["library_version"], "1.4.1")
-        self.assertEqual(SepBackgroundParams().config_sha256(), DEFAULT_BACKGROUND_SHA256)
+        self.assertEqual(V1_BACKGROUND.config_sha256(), DEFAULT_BACKGROUND_SHA256)
+        # v2 default: the v1 object plus noise_policy, source_mask, rms_validity.
+        v2 = SepBackgroundParams().config()
+        self.assertEqual(set(v2) - set(config), {"noise_policy", "source_mask", "rms_validity"})
+        self.assertEqual({k: v2[k] for k in config}, config)
+        self.assertEqual(SepBackgroundParams().config_sha256(), V2_DEFAULT_BACKGROUND_SHA256)
 
     def test_default_detection_config_keys_and_hash(self):
         config = SepDetectionParams().config()
@@ -117,7 +127,7 @@ class TestConfigContract(unittest.TestCase):
         detection = SepDetectionParams(thresh_sigma=1.2, deblend_cont=1e-5).config()
         self.assertEqual(pm.canonical_json(detection), NONDEFAULT_DETECTION_JSON)
         self.assertEqual(pm.config_sha256(detection), NONDEFAULT_DETECTION_SHA256)
-        background = SepBackgroundParams(fthresh=0.1).config()
+        background = SepBackgroundParams(fthresh=0.1, noise_policy="frame_wide_v1").config()
         self.assertEqual(pm.canonical_json(background), NONDEFAULT_BACKGROUND_JSON)
         self.assertEqual(pm.config_sha256(background), NONDEFAULT_BACKGROUND_SHA256)
 
@@ -311,12 +321,21 @@ class TestSpatialBackgroundStatus(SepTestCase):
             return original(*args, **kwargs)
 
         with mock.patch.object(self.sep, "extract", recording):
-            sources, label = measure_frame_sep(image, fit_fwhm=False)
+            sources, label = measure_frame_sep(image, fit_fwhm=False, **V1_LABEL_POLICY)
         self.assertEqual(calls, [])
         self.assertEqual(sources, [])
         self.assertEqual(label.status, "unavailable")
         self.assertIn("invalid_rms_map", label.reasons)
         self.assertEqual(label.background["rms_validity"]["count_below_bound"], diagnostics["count_below_bound"])
+        # masked_local_v2: the undershoot is local; those pixels are masked and
+        # nothing is detected on the starless frame.
+        sources, label = measure_frame_sep(image, fit_fwhm=False)
+        self.assertEqual(label.background["noise_status"], "measured")
+        self.assertIn("rms_map_locally_invalid", label.reasons)
+        self.assertEqual(sources, [])
+        refinement = label.background["refinement"]
+        self.assertGreater(refinement["invalid_rms_pixels"], 0)
+        self.assertLessEqual(refinement["invalid_rms_fraction"], 0.25)
 
     def test_smooth_heteroscedastic_field_stays_measured(self):
         # Flat-fielded vignetting: sigma 5 -> 59 smoothly. No undershoot.
@@ -324,11 +343,15 @@ class TestSpatialBackgroundStatus(SepTestCase):
         ys, xs = np.mgrid[0:512, 0:512]
         sigma = 5.0 + 27.0 * ((xs - 255.5) ** 2 + (ys - 255.5) ** 2) / (255.5**2)
         image = 800.0 + rng.normal(0.0, 1.0, xs.shape) * sigma
-        bg = estimate_spatial_background(image)
+        bg = estimate_spatial_background(image, params=V1_BACKGROUND)
         self.assertEqual((bg.level_status, bg.noise_status, bg.reasons), ("measured", "measured", ()))
         self.assertEqual(bg.rms_validity["count_below_bound"], 0)
         self.assertGreaterEqual(bg.rms_validity["min_rms"], bg.rms_validity["bound"])
         self.assertEqual(bg.rms_validity["mesh_sigma_method"], "spline_inversion")
+        v2 = estimate_spatial_background(image)
+        self.assertEqual((v2.level_status, v2.noise_status, v2.reasons), ("measured", "measured", ()))
+        self.assertEqual((v2.refinement["invalid_rms_pixels"], v2.detection_area_fraction), (0, 1.0))
+        self.assertEqual(v2.rms_validity["mesh_sigma_method"], "spline_inversion")
 
     def test_negative_spline_rms_is_invalid_not_consumed(self):
         # A narrow bright ridge inflates the clipped sigma of a few meshes; SEP's
@@ -338,11 +361,17 @@ class TestSpatialBackgroundStatus(SepTestCase):
         image = 1000.0 + 800.0 * np.exp(-(((xs - 256) / 60.0) ** 2)) + rng.normal(0, 5.0, xs.shape)
         raw = self.sep.Background(image.astype(np.float32))
         self.assertLess(float(raw.rms().min()), 0.0)
-        bg = estimate_spatial_background(image)
+        bg = estimate_spatial_background(image, params=V1_BACKGROUND)
         self.assertEqual(bg.level_status, "measured")
         self.assertEqual(bg.noise_status, "unresolved")
         self.assertIn("invalid_rms_map", bg.reasons)
         self.assertIsNone(bg.rms_map)
+        # masked_local_v2: the negative pixels are locally invalid and masked;
+        # the map is never consumed there.
+        v2 = estimate_spatial_background(image)
+        self.assertEqual((v2.noise_status, v2.reasons), ("measured", ("rms_map_locally_invalid",)))
+        self.assertTrue(v2.invalid_mask[v2.raw_rms_map < 0].all())
+        self.assertGreater(v2.rms_validity["count_negative"], 0)
 
 
 class TestLocalNoiseDetection(SepTestCase):
@@ -384,10 +413,16 @@ class TestLocalNoiseDetection(SepTestCase):
         quiet = xs >= 320
         self.assertGreater(float(raw[quiet].min()), 0.0)   # the old zero/negative rules do not fire
         self.assertLess(float(raw[quiet].min()), 0.5 * 5.0)  # but R is < half the true sigma
-        bg = estimate_spatial_background(image)
+        bg = estimate_spatial_background(image, params=V1_BACKGROUND)
         self.assertEqual((bg.level_status, bg.noise_status), ("measured", "unresolved"))
         self.assertEqual(bg.reasons, ("invalid_rms_map",))
         self.assertGreater(bg.rms_validity["count_below_bound"], 0)
+        # masked_local_v2: the undershoot is confined to the step, judged
+        # against its own cell's sigmas; below 25% of the frame it is masked.
+        v2 = estimate_spatial_background(image)
+        self.assertEqual((v2.noise_status, v2.reasons), ("measured", ("rms_map_locally_invalid",)))
+        self.assertGreater(v2.rms_validity["count_below_local_bound"], 0)
+        self.assertLess(v2.refinement["invalid_rms_fraction"], 0.25)
 
     def test_heteroscedastic_halves_equal_significance(self):
         """Noisy region (sigma 15) on 5/8 of the frame, quiet (sigma 5) on 3/8.
@@ -479,7 +514,7 @@ class TestMaskPropagation(SepTestCase):
             return wrapped
 
         with mock.patch.multiple(sep, **{name: recorder(name) for name in originals}):
-            sources, label = measure_frame_sep(image, detector_mask=bad, fit_fwhm=False)
+            sources, label = measure_frame_sep(image, detector_mask=bad, fit_fwhm=False, **V1_LABEL_POLICY)
         self.assertEqual(set(seen), set(originals))
         for name, masks in seen.items():
             for received in masks:
@@ -487,6 +522,21 @@ class TestMaskPropagation(SepTestCase):
         self.assertEqual(label.status, "measured")
         self.assertTrue(all(np.isfinite(s.hfr_px) for s in sources if s.valid))
         self.assertTrue(np.isfinite(label.sky_median_adu) and np.isfinite(label.sky_rms_adu))
+        self.assertEqual(label.star_count_used, 4)
+
+        # masked_local_v2: pass 2 of sep.Background adds the source mask to the
+        # detector mask; every other call still receives exactly the detector
+        # mask (no locally invalid pixel on this frame).
+        seen.clear()
+        with mock.patch.multiple(sep, **{name: recorder(name) for name in originals}):
+            sources, label = measure_frame_sep(image, detector_mask=bad, fit_fwhm=False)
+        self.assertEqual(label.background["refinement"]["pass2_used"], True)
+        self.assertEqual(len(seen["Background"]), 2)
+        np.testing.assert_array_equal(seen["Background"][0], expected)
+        self.assertTrue((seen["Background"][1] >= expected).all() and seen["Background"][1].sum() > expected.sum())
+        for name in ("extract", "flux_radius", "sum_circle"):
+            for received in seen[name]:
+                np.testing.assert_array_equal(received, expected, err_msg=name)
         self.assertEqual(label.star_count_used, 4)
 
     def test_star_whose_wing_touches_a_bad_pixel_is_rejected(self):
@@ -641,8 +691,10 @@ class TestGainAndMetadata(SepTestCase):
             self.assertAlmostEqual(var_total - var_rms, a.flux / 2.0, delta=1e-3 * var_total)
 
     def test_frame_label_carries_provenance(self):
-        sources, label = measure_frame_sep(self._field())
+        sources, label = measure_frame_sep(self._field(), **V1_LABEL_POLICY)
         payload = json.loads(json.dumps(label.to_dict()))
+        self.assertEqual(payload["label_version"], "fqe_sep_spatial_v2")
+        self.assertIsNone(payload["background"]["refinement"])
         self.assertEqual(payload["label_schema_version"], pm.LABEL_SCHEMA_VERSION)
         self.assertEqual(payload["label_method"], "sep_spatial_mesh+sep_extract+sep_flux_radius")
         self.assertEqual(payload["status"], "measured")
@@ -669,12 +721,30 @@ class TestGainAndMetadata(SepTestCase):
             self.assertGreater(s.local_rms, 0.0)
             self.assertIsNotNone(s.local_background)
 
+        # Defaults (BGE v2): label version v3, the v2 background config and
+        # its hash, the star-gate record and its hash, the refinement record.
+        sources, label = measure_frame_sep(self._field())
+        payload = json.loads(json.dumps(label.to_dict()))
+        self.assertEqual(payload["label_version"], pm.LABEL_VERSION)
+        self.assertEqual(payload["label_version"], "fqe_sep_spatial_v3")
+        self.assertEqual(payload["label_schema_version"], pm.LABEL_SCHEMA_VERSION)
+        bg = payload["background"]
+        self.assertEqual(bg["config_sha256"], V2_DEFAULT_BACKGROUND_SHA256)
+        self.assertEqual(bg["noise_policy"], "masked_local_v2")
+        self.assertEqual(set(bg["refinement"]), {
+            "noise_policy", "pass2_used", "pass2_skipped_reason", "source_mask_objects", "source_mask_pixels",
+            "source_mask_fraction", "invalid_rms_pixels", "invalid_rms_fraction", "detection_area_fraction"})
+        self.assertEqual(payload["star_gates"]["blend_test"], "dip_annulus_v2")
+        self.assertEqual(payload["star_gates_config_sha256"], pm.StarGateParams().config_sha256())
+        self.assertEqual(set(payload["gate_diagnostics"]), {"annulus_exempt", "regrouped_accepted"})
+        self.assertEqual(payload["detection"]["config_sha256"], DEFAULT_DETECTION_SHA256)
+
     def test_deblending_and_acceptance_are_separate(self):
         rng = np.random.default_rng(17)
         ys, xs = np.mgrid[0:256, 0:256]
         image = 300.0 + rng.normal(0, 5.0, xs.shape)
         image += _gaussian(xs, ys, 124.0, 128.0, 3000.0, 1.6) + _gaussian(xs, ys, 132.0, 128.0, 3000.0, 1.6)
-        sources, label = measure_frame_sep(image, fit_fwhm=False)
+        sources, label = measure_frame_sep(image, fit_fwhm=False, **V1_LABEL_POLICY)
         children = [s for s in sources if s.deblended]
         self.assertEqual(len(children), 2)
         # A policy-rejected SEP child is "deblended" (Rust StarRejectionTallies
@@ -689,6 +759,24 @@ class TestGainAndMetadata(SepTestCase):
         self.assertEqual(len(children), 2)
         self.assertFalse(any(Rejection.DEBLENDED.value in s.rejections for s in children))
         self.assertEqual(label.detection["config_sha256"], accepting.config_sha256())
+        # The star-gate record carries the deblending policy actually used.
+        self.assertTrue(label.star_gates["accept_deblended"])
+        self.assertEqual(label.star_gates_config_sha256, pm.StarGateParams(accept_deblended=True).config_sha256())
+
+        # Default (v2) regrouping: the two children are one family, judged by
+        # dip_annulus_v2: a real saddle between two stars, so the detector's
+        # split is confirmed and the family is rejected as deblended.
+        sources, label = measure_frame_sep(image, fit_fwhm=False)
+        families = [s for s in sources if s.family_size >= 2]
+        self.assertEqual(len(families), 1)
+        self.assertIn(Rejection.DEBLENDED.value, families[0].rejections)  # (the pair is also elongated)
+        self.assertFalse(families[0].valid)
+        self.assertTrue(families[0].blend["blended"] and not families[0].blend["exempt"])
+        self.assertEqual(label.rejection_counts.get("deblended"), 1)
+        self.assertNotIn("blended", label.rejection_counts)
+        self.assertEqual(label.sep_flag_counts.get("obj_merged"), 2)
+        self.assertEqual(label.detection["regrouped_families"], 1)
+        self.assertEqual(label.gate_diagnostics, {"annulus_exempt": 0, "regrouped_accepted": 0})
 
     def test_source_mask_pass_is_off_by_default_and_never_enters_the_detector_mask(self):
         image = self._field()
@@ -704,12 +792,23 @@ class TestGainAndMetadata(SepTestCase):
             return original(*args, **kwargs)
 
         with mock.patch.object(self.sep, "extract", recording_extract):
-            _, label = measure_frame_sep(image, fit_fwhm=False, source_mask_background=True)
+            _, label = measure_frame_sep(image, fit_fwhm=False, source_mask_background=True, **V1_LABEL_POLICY)
         self.assertTrue(label.background["source_mask_applied"])
         self.assertGreater(label.background["source_masked_fraction"], 0.0)
         self.assertEqual(len(seen), 2)
         for received in seen:
             self.assertFalse(received.any())  # detector mask only: nothing is bad here
+
+        # masked_local_v2 adds its own source-mask extraction to each
+        # background estimate (2 + 2 calls); none of them, and neither
+        # detection call, receives anything but the (empty) detector mask.
+        seen.clear()
+        with mock.patch.object(self.sep, "extract", recording_extract):
+            _, label = measure_frame_sep(image, fit_fwhm=False, source_mask_background=True)
+        self.assertTrue(label.background["source_mask_applied"])
+        self.assertEqual(len(seen), 4)
+        for received in seen:
+            self.assertFalse(received.any())
 
 
 class TestRmsValidityFallback(unittest.TestCase):

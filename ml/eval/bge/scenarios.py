@@ -70,8 +70,18 @@ class TruthSource:
     render_radius_px: float
     blend_group: int = -1
     saturated: bool = False
+    #: Generator-specific truth (BGE v2 sets: r_out_px, vane_width_frac,
+    #: n_vanes, isolated, pair_id, separation_px, flux_ratio, ...). Emitted
+    #: at the top level of to_json() only when present, so pre-v2 scenarios
+    #: serialise exactly as before.
+    extra: dict = field(default_factory=dict)
 
     def to_json(self) -> dict:
+        out = self._base_json()
+        out.update(self.extra)
+        return out
+
+    def _base_json(self) -> dict:
         return {
             "id": self.id,
             "x": self.x,
@@ -430,6 +440,60 @@ def _paste(target: np.ndarray, stamp: Stamp) -> None:
     ]
 
 
+def pupil_shadow_coverage(x0, y0, r_out, obstruction, sigma_seeing, n_vanes=0, vane_width_frac=0.0,
+                          vane_angle_rad=0.0, modulation=0.0, modulation_angle_rad=0.0, hole_offset_px=(0.0, 0.0)):
+    """Pre-seeing pupil shadow of :func:`render_pupil_shadow`: per-pixel
+    covered area (px^2, times the brightness modulation) on the stamp grid,
+    as ``(coverage, ix0, iy0, radius)``."""
+    radius = r_out + 5.0 * sigma_seeing + 2.0
+    ix0, iy0, nx, ny = _bounds(x0, y0, radius)
+    n = int(min(32, max(8, math.ceil(8.0 / max(r_out, 1e-3)))))
+    r_in = obstruction * r_out
+    half_width = 0.5 * vane_width_frac * 2.0 * r_out
+    sub = 1.0 / n
+    hx, hy = hole_offset_px
+
+    def intensity(dx, dy):
+        r2 = dx * dx + dy * dy
+        cover = ((r2 <= r_out * r_out) & ((dx - hx) ** 2 + (dy - hy) ** 2 >= r_in * r_in)).astype(np.float64)
+        for k in range(int(n_vanes)):
+            theta = vane_angle_rad + 2.0 * math.pi * k / n_vanes
+            u = dx * math.cos(theta) + dy * math.sin(theta)
+            v = -dx * math.sin(theta) + dy * math.cos(theta)
+            frac = np.clip((np.minimum(v + 0.5 * sub, half_width) - np.maximum(v - 0.5 * sub, -half_width)) / sub,
+                           0.0, 1.0)
+            cover = cover * (1.0 - np.where(u > 0.0, frac, 0.0))
+        if modulation:
+            cover = cover * (1.0 + modulation * np.cos(np.arctan2(dy, dx) - modulation_angle_rad))
+        return cover
+
+    return _supersample(intensity, x0, y0, ix0, iy0, nx, ny, n), ix0, iy0, radius
+
+
+def render_pupil_shadow(x0, y0, r_out, obstruction, sigma_seeing, flux, n_vanes=0, vane_width_frac=0.0,
+                        vane_angle_rad=0.0, modulation=0.0, modulation_angle_rad=0.0, hole_offset_px=(0.0, 0.0)):
+    """Geometric-defocus star image: the shadow of the pupil, blurred by seeing.
+
+    The pupil image is a disk of radius ``r_out`` minus the obstruction disk
+    (radius ``obstruction * r_out``, centred at ``hole_offset_px`` from the
+    disk centre) minus ``n_vanes`` radial vane strips of width
+    ``w_img = vane_width_frac * 2 * r_out`` (the vane width as a fraction of
+    the aperture D, scaled to the pupil image of diameter ``2 r_out``) from
+    the centre to the rim, at angles ``vane_angle_rad + 2 pi k / n_vanes``.
+    ``modulation`` multiplies the brightness by
+    ``1 + modulation * cos(phi - modulation_angle_rad)`` (coma-like azimuthal
+    asymmetry). The shadow is midpoint super-sampled (vane strips
+    anti-aliased by their exact 1-D overlap with each sub-cell), normalised
+    to ``flux`` and convolved with a Gaussian of ``sigma_seeing`` px.
+    """
+    cover, ix0, iy0, radius = pupil_shadow_coverage(
+        x0, y0, r_out, obstruction, sigma_seeing, n_vanes, vane_width_frac, vane_angle_rad, modulation,
+        modulation_angle_rad, hole_offset_px)
+    total = cover.sum()
+    blurred = ndimage.gaussian_filter(cover, sigma_seeing, mode="constant", truncate=5.0)
+    return Stamp(flux * blurred / total, ix0, iy0, radius)
+
+
 def render_psf(psf: dict, x0: float, y0: float, flux: float) -> Stamp:
     model = psf["model"]
     if model == "gaussian":
@@ -438,6 +502,13 @@ def render_psf(psf: dict, x0: float, y0: float, flux: float) -> Stamp:
         return render_moffat(x0, y0, psf["fwhm_px"], psf["beta"], flux)
     if model == "annulus":
         return render_annulus(x0, y0, psf["r_out_px"], psf["r_in_px"], psf["sigma_seeing_px"], flux)
+    if model == "pupil_shadow":
+        return render_pupil_shadow(
+            x0, y0, psf["r_out_px"], psf["obstruction"], psf["sigma_seeing_px"], flux,
+            n_vanes=psf.get("n_vanes", 0), vane_width_frac=psf.get("vane_width_frac", 0.0),
+            vane_angle_rad=psf.get("vane_angle_rad", 0.0), modulation=psf.get("modulation", 0.0),
+            modulation_angle_rad=psf.get("modulation_angle_rad", 0.0),
+            hole_offset_px=tuple(psf.get("hole_offset_px", (0.0, 0.0))))
     raise ValueError(f"unknown psf model {model!r}")
 
 
@@ -449,13 +520,30 @@ def analytic_hfr(psf: dict):
     return None
 
 
+def stamp_centroid(stamp: Stamp):
+    """Flux centroid of a noiseless stamp (pixel-centre coordinates)."""
+    ny, nx = stamp.data.shape
+    total = float(stamp.data.sum())
+    xs = stamp.ix0 + np.arange(nx)
+    ys = stamp.iy0 + np.arange(ny)
+    return float((stamp.data.sum(axis=0) * xs).sum() / total), float((stamp.data.sum(axis=1) * ys).sum() / total)
+
+
 def add_stars(shape, stars, start_id=0):
-    """Render ``stars`` = [(x, y, flux, psf)] into a noiseless source image."""
+    """Render ``stars`` = [(x, y, flux, psf)] into a noiseless source image.
+
+    ``pupil_shadow`` stars take their truth HFR about the stamp's flux
+    centroid (the aperture truth a centroiding measurement can reach for an
+    asymmetric, e.g. comatic, donut); every other model about ``(x, y)``.
+    """
     image = np.zeros(shape, dtype=np.float64)
     sources = []
     for k, (x, y, flux, psf) in enumerate(stars):
         stamp = render_psf(psf, x, y, flux)
-        hfr, r_ap = numerical_hfr(stamp, x, y)
+        if psf["model"] == "pupil_shadow":
+            hfr, r_ap = numerical_hfr(stamp, *stamp_centroid(stamp))
+        else:
+            hfr, r_ap = numerical_hfr(stamp, x, y)
         _paste(image, stamp)
         sources.append(
             TruthSource(
@@ -1103,7 +1191,7 @@ def moffat_sweep_fwhm(p, p0=SWEEP_P0, w0=3.2, k=0.040):
     return math.sqrt(w0 * w0 + (k * (p - p0)) ** 2)
 
 
-def _sweep(sweep_id, description, seed, psf_for_position, n_bright, n_faint, params, min_sep):
+def _sweep(sweep_id, description, seed, psf_for_position, n_bright, n_faint, params, min_sep, p0=SWEEP_P0):
     width, height = DEFAULT_WIDTH, DEFAULT_HEIGHT
     rngs = _streams(seed)
     xy = place_uniform(rngs[0], n_bright + n_faint, width, height, margin=40, min_sep=min_sep)
@@ -1121,10 +1209,10 @@ def _sweep(sweep_id, description, seed, psf_for_position, n_bright, n_faint, par
         image = bg + src + gaussian_noise(noise_rng, sig)
         frame_id = f"{sweep_id}_p{p}"
         meta = _base_metadata(frame_id, seed, dict(params, position=p, psf=psf), noise_model="gaussian",
-                              focus_sweep=sweep_id, focus_position=p, p0_true=SWEEP_P0,
+                              focus_sweep=sweep_id, focus_position=p, p0_true=p0,
                               noise_seed=f"SeedSequence([{seed}, {idx}])")
         frames.append(_finish(frame_id, f"{description} Position {p}.", image, bg, sig, sig, src, sources, meta))
-    return FocusSweep(sweep_id, description, list(SWEEP_POSITIONS), SWEEP_P0, frames,
+    return FocusSweep(sweep_id, description, list(SWEEP_POSITIONS), p0, frames,
                       metadata={"params": params, "seed": seed, "generator_version": GENERATOR_VERSION,
                                 "n_bright": n_bright, "n_faint": n_faint})
 
@@ -1160,6 +1248,406 @@ def sweep_donut(seed=203):
 
 
 SWEEPS = {f.__name__: f for f in (sweep_moffat_fixed, sweep_moffat_changing_set, sweep_donut)}
+
+
+# --------------------------------------------------------------------------
+# BGE v2 scenario sets (docs/bge-v2-spec.md §6): development variants and the
+# held-out generators. Generator version stays bge-fixtures-v1: no pixel of
+# a pre-existing scenario changes.
+# --------------------------------------------------------------------------
+
+#: The 22 core scenarios and 3 sweeps that existed before BGE v2 (A8 compares
+#: v2 with v1 on exactly these).
+PRE_EXISTING_SCENARIOS = tuple(SCENARIOS)
+PRE_EXISTING_SWEEPS = tuple(SWEEPS)
+#: Seeds already used by any generator before BGE v2 (101-122, 201-203, 301,
+#: 401). The v2 development and held-out seeds are disjoint from these and
+#: from each other (checked by the tests).
+PRE_EXISTING_SEEDS = tuple(range(101, 123)) + (201, 202, 203, 301, 401)
+DEV_V2_SEEDS = {
+    "dev_newtonian_spider_donuts": 8101, "dev_refractor_disks": 8102, "dev_comatic_donuts": 8103,
+    "dev_close_doubles": 8104, "dev_sweep_newtonian": 8105, "dev_amp_glow_ridge": 8107,
+    "dev_dense_defocused_field": 8108,
+}
+HOLDOUT_SEEDS = {
+    "ho_newtonian_spider_donuts": 9101, "ho_refractor_disks": 9102, "ho_comatic_donuts": 9103,
+    "ho_close_doubles": 9104, "ho_sweep_newtonian": 9105, "ho_sweep_defocused_wings": 9106,
+    "ho_amp_glow_ridge": 9107, "ho_dense_defocused_field": 9108,
+}
+SPLIT_DEV = "dev"
+SPLIT_HOLDOUT = "holdout"
+#: The daemon's gates stop after 16 used stars (quality.rs MAX_STARS_USED)
+#: and examine at most 48 candidates. Frames whose acceptance is a criterion
+#: hold at most this many acceptable sources, so the cap can never decide a
+#: truth source's acceptance or rejection.
+GATE_MAX_STARS_USED = 16
+#: A truth source is "isolated" when every other source k satisfies
+#: d_jk > 2 L_j + L_k, with L the light radius (pupil shadows: r_out + 3 sigma;
+#: Moffat: 1.5 FWHM; Gaussian: 3 sigma). The measurement crop of the gates
+#: spans about 2 L about the star, so no neighbour light enters it.
+ISOLATION_RULE = "d_jk > 2 L_j + L_k; L = r_out + 3 sigma_seeing (pupil shadow), 1.5 FWHM (Moffat), 3 sigma (Gaussian)"
+
+
+@dataclass
+class ScenarioSet:
+    """A group of frames scored together (e.g. several spider-donut frames,
+    one spider orientation each)."""
+
+    id: str
+    description: str
+    frames: list
+    split: str
+    metadata: dict = field(default_factory=dict)
+
+
+def light_radius(psf: dict) -> float:
+    if psf["model"] in ("pupil_shadow", "annulus"):
+        return psf["r_out_px"] + 3.0 * psf["sigma_seeing_px"]
+    if psf["model"] == "moffat":
+        return 1.5 * psf["fwhm_px"]
+    return 3.0 * psf["sigma_px"]
+
+
+def mark_isolation(sources) -> None:
+    """Set ``extra['isolated']`` per :data:`ISOLATION_RULE`."""
+    if not sources:
+        return
+    xy = np.array([[s.x, s.y] for s in sources])
+    light = np.array([light_radius(s.psf) for s in sources])
+    for j, s in enumerate(sources):
+        d = np.hypot(xy[:, 0] - s.x, xy[:, 1] - s.y)
+        others = np.arange(len(sources)) != j
+        s.extra["isolated"] = bool(np.all(d[others] > 2.0 * light[j] + light[others]))
+
+
+def _frame_rngs(seed: int, index: int):
+    return [np.random.default_rng(s) for s in np.random.SeedSequence([seed, index]).spawn(5)]
+
+
+def _sloped_sky(width, height, gx=0.0, gy=0.0, level=SKY_ADU):
+    xx, yy = _grid(width, height)
+    return level + gx * (xx - (width - 1) / 2) + gy * (yy - (height - 1) / 2)
+
+
+def _v2_frame(frame_id, description, seed, index, split, set_id, stars, params, width, height, *, sky=None,
+              sigma_adu=SKY_SIGMA_ADU, link_px=10.0, extras=None, starless=False, rngs=None):
+    """Render one v2 frame: ``stars`` = [(x, y, flux, psf)] on ``sky`` with
+    Gaussian noise from stream 2 of ``SeedSequence([seed, index])``."""
+    rngs = rngs or _frame_rngs(seed, index)
+    bg = _sloped_sky(width, height) if sky is None else sky
+    sig = np.full_like(bg, sigma_adu)
+    src, sources = add_stars((height, width), stars)
+    assign_blend_groups(sources, link_px)
+    for s, extra in zip(sources, extras or [{}] * len(sources)):
+        s.extra.update(extra)
+        if s.psf["model"] == "pupil_shadow":
+            for key in ("r_out_px", "obstruction", "n_vanes", "vane_width_frac", "sigma_seeing_px"):
+                s.extra.setdefault(key, s.psf.get(key))
+            s.extra.setdefault("hfr_centre", "flux_centroid")
+    mark_isolation(sources)
+    image = bg + src + gaussian_noise(rngs[2], sig)
+    meta = _base_metadata(frame_id, seed, dict(params, frame_index=index), noise_model="gaussian",
+                          split=split, scenario_set=set_id, starless=bool(starless), pre_existing=False,
+                          frame_seed=f"SeedSequence([{seed}, {index}])", isolation_rule=ISOLATION_RULE)
+    return _finish(frame_id, description, image, bg, sig, sig, src, sources, meta)
+
+
+def _stratified(rng, lo, hi, n):
+    """One uniform draw in each of ``n`` equal strata of [lo, hi], shuffled."""
+    values = lo + (hi - lo) * (np.arange(n) + rng.uniform(0.0, 1.0, n)) / n
+    return values[rng.permutation(n)]
+
+
+def _pupil_psf(r_out, obstruction, seeing, n_vanes=0, vane_width_frac=0.0, vane_angle_rad=0.0, modulation=0.0,
+               modulation_angle_rad=0.0, hole_offset_px=(0.0, 0.0)) -> dict:
+    return {"model": "pupil_shadow", "r_out_px": float(r_out), "obstruction": float(obstruction),
+            "sigma_seeing_px": float(seeing), "n_vanes": int(n_vanes), "vane_width_frac": float(vane_width_frac),
+            "vane_angle_rad": float(vane_angle_rad), "modulation": float(modulation),
+            "modulation_angle_rad": float(modulation_angle_rad),
+            "hole_offset_px": [float(hole_offset_px[0]), float(hole_offset_px[1])]}
+
+
+def _donut_positions(rng, r_out, seeing, width, height, n_max=GATE_MAX_STARS_USED):
+    light = r_out + 3.0 * seeing
+    render = r_out + 5.0 * seeing + 2.0
+    min_sep = 3.2 * light
+    margin = 1.3 * render + 6.0
+    n = int(min(n_max, max(4, 0.3 * width * height / (min_sep * min_sep))))
+    return place_uniform(rng, n, width, height, margin, min_sep)
+
+
+def _donut_set(set_id, description, seed, split, n_frames, *, r_range, obstruction_range, vanes, width=800,
+               height=600, comatic=False, flux_range=(5e4, 1e6)):
+    """Frames of geometric-defocus donuts, one telescope state per frame.
+
+    ``vanes``: ``None`` (no spider) or a list of per-frame vane counts. Per
+    frame: one ``r_out`` (stratified over ``r_range``), obstruction, vane
+    width (0.5-1.5% of D), vane angle (shared by every star of the frame) and
+    seeing sigma (1.0-1.8 px). Comatic sets add, per star, a +-40%
+    brightness modulation at a random azimuth and an obstruction offset of
+    up to 0.2 r_out.
+    """
+    setup = _streams(seed)[4]
+    r_outs = _stratified(setup, r_range[0], r_range[1], n_frames)
+    frames = []
+    for idx in range(n_frames):
+        rngs = _frame_rngs(seed, idx)
+        p = rngs[4]
+        obstruction = float(p.uniform(*obstruction_range)) if obstruction_range else 0.0
+        seeing = float(p.uniform(1.0, 1.8))
+        n_vanes = int(vanes[idx]) if vanes else 0
+        vane_width = float(p.uniform(0.005, 0.015)) if n_vanes else 0.0
+        vane_angle = float(p.uniform(0.0, 2.0 * math.pi / n_vanes)) if n_vanes else 0.0
+        r_out = float(r_outs[idx])
+        xy = _donut_positions(rngs[0], r_out, seeing, width, height)
+        fluxes = log_uniform(rngs[1], flux_range[0], flux_range[1], len(xy))
+        stars, extras = [], []
+        for (x, y), f in zip(xy, fluxes):
+            if comatic:
+                offset = float(p.uniform(0.0, 0.2)) * r_out
+                direction = float(p.uniform(0.0, 2.0 * math.pi))
+                psf = _pupil_psf(r_out, obstruction, seeing, modulation=0.4,
+                                 modulation_angle_rad=float(p.uniform(0.0, 2.0 * math.pi)),
+                                 hole_offset_px=(offset * math.cos(direction), offset * math.sin(direction)))
+                extras.append({"hole_offset_frac": offset / r_out, "modulation": 0.4})
+            else:
+                psf = _pupil_psf(r_out, obstruction, seeing, n_vanes, vane_width, vane_angle)
+                extras.append({})
+            stars.append((x, y, float(f), psf))
+        params = {"r_out_px": r_out, "obstruction": obstruction, "sigma_seeing_px": seeing, "n_vanes": n_vanes,
+                  "vane_width_frac": vane_width, "vane_angle_rad": vane_angle, "comatic": comatic,
+                  "flux_adu": list(flux_range), "n_stars": len(stars), "sky_adu": SKY_ADU, "sigma_adu": SKY_SIGMA_ADU}
+        frame_id = f"{set_id}_f{idx:02d}"
+        frames.append(_v2_frame(frame_id, f"{description} Frame {idx}: r_out {r_out:.1f} px.", seed, idx, split,
+                                set_id, stars, params, width, height, extras=extras, link_px=2.0 * r_out,
+                                rngs=rngs))
+    return ScenarioSet(set_id, description, frames, split,
+                       {"seed": seed, "n_frames": n_frames, "r_range_px": list(r_range),
+                        "obstruction_range": list(obstruction_range) if obstruction_range else None,
+                        "vanes": list(vanes) if vanes else None, "comatic": comatic,
+                        "generator_version": GENERATOR_VERSION})
+
+
+def _vane_counts(seed, n_frames, n_three):
+    """Per-frame vane counts: 4 vanes, ``n_three`` frames with the 3-vane variant."""
+    counts = np.full(n_frames, 4)
+    counts[_streams(seed)[3].permutation(n_frames)[:n_three]] = 3
+    return [int(c) for c in counts]
+
+
+def newtonian_spider_donuts(set_id, seed, split, n_frames=8, n_three=2):
+    return _donut_set(set_id, "Z114-like Newtonian donuts: obstruction 0.25-0.35, spider vanes 0.5-1.5% of D "
+                      "(4 vanes; 3-vane variant), one vane angle per frame, r_out 6-32 px, seeing sigma 1.0-1.8 px, "
+                      "flux 5e4-1e6 ADU.", seed, split, n_frames, r_range=(6.0, 32.0),
+                      obstruction_range=(0.25, 0.35), vanes=_vane_counts(seed, n_frames, n_three))
+
+
+def refractor_disks(set_id, seed, split, n_frames=6):
+    return _donut_set(set_id, "Defocused unobstructed refractor disks, r_out 6-24 px, seeing sigma 1.0-1.8 px, "
+                      "flux 5e4-1e6 ADU.", seed, split, n_frames, r_range=(6.0, 24.0), obstruction_range=None,
+                      vanes=None)
+
+
+def comatic_donuts(set_id, seed, split, n_frames=6):
+    return _donut_set(set_id, "Comatic donuts: obstruction 0.25-0.35, ring brightness modulated +-40% in azimuth, "
+                      "obstruction offset up to 0.2 r_out, r_out 6-32 px.", seed, split, n_frames,
+                      r_range=(6.0, 32.0), obstruction_range=(0.25, 0.35), vanes=None, comatic=True)
+
+
+def close_doubles(set_id, seed, split, n_frames=6, n_pairs=10, n_singles=4, width=640, height=480):
+    """Moffat (beta 3) pairs: FWHM 3-6 px (one per frame), separation 3-10 px,
+    flux ratio 0.2-1.0, plus isolated singles as controls. 10 pairs + 4
+    singles per frame: at most 24 candidates and 14 acceptable sources, so the
+    gates' 48-examined / 16-used caps never bind."""
+    setup = _streams(seed)[4]
+    fwhms = _stratified(setup, 3.0, 6.0, n_frames)
+    frames = []
+    for idx in range(n_frames):
+        rngs = _frame_rngs(seed, idx)
+        fwhm = float(fwhms[idx])
+        psf = {"model": "moffat", "fwhm_px": fwhm, "beta": 3.0}
+        centres = place_uniform(rngs[0], n_pairs + n_singles, width, height, margin=24, min_sep=48.0)
+        stars, extras = [], []
+        for k, (x, y) in enumerate(centres):
+            f1 = float(log_uniform(rngs[1], 2e4, 3e5, 1)[0])
+            if k < n_pairs:
+                sep_px = float(rngs[4].uniform(3.0, 10.0))
+                ratio = float(rngs[4].uniform(0.2, 1.0))
+                angle = float(rngs[4].uniform(0.0, 2.0 * math.pi))
+                dx, dy = 0.5 * sep_px * math.cos(angle), 0.5 * sep_px * math.sin(angle)
+                pair = {"pair_id": k, "separation_px": sep_px, "flux_ratio": ratio, "pair_mid_x": x, "pair_mid_y": y}
+                stars.append((x - dx, y - dy, f1, psf))
+                extras.append(dict(pair, role="primary"))
+                stars.append((x + dx, y + dy, f1 * ratio, psf))
+                extras.append(dict(pair, role="secondary"))
+            else:
+                stars.append((x, y, f1, psf))
+                extras.append({"pair_id": None, "role": "single"})
+        params = {"psf": psf, "n_pairs": n_pairs, "n_singles": n_singles, "separation_px": [3.0, 10.0],
+                  "flux_ratio": [0.2, 1.0], "primary_flux_adu": [2e4, 3e5], "sky_adu": SKY_ADU,
+                  "sigma_adu": SKY_SIGMA_ADU}
+        frame_id = f"{set_id}_f{idx:02d}"
+        frames.append(_v2_frame(frame_id, f"Close doubles, Moffat FWHM {fwhm:.2f} px. Frame {idx}.", seed, idx,
+                                split, set_id, stars, params, width, height, extras=extras, link_px=12.0,
+                                rngs=rngs))
+    return ScenarioSet(set_id, "Close doubles: Moffat FWHM 3-6 px, separation 3-10 px, flux ratio 0.2-1.0.",
+                       frames, split, {"seed": seed, "n_frames": n_frames, "generator_version": GENERATOR_VERSION})
+
+
+def amp_glow_ridge(set_id, seed, split, n_amplitudes=6, width=512, height=512):
+    """Level ridges of 150-900 ADU (Gaussian profile, 45-75 px 1/e half-width,
+    vertical or horizontal) on 1000 ADU with 5 ADU noise; each amplitude once
+    starless and once with 30 Moffat stars."""
+    setup = _streams(seed)[4]
+    amplitudes = _stratified(setup, 150.0, 900.0, n_amplitudes)
+    frames = []
+    for idx in range(2 * n_amplitudes):
+        starless = idx < n_amplitudes
+        amplitude = float(amplitudes[idx % n_amplitudes])
+        rngs = _frame_rngs(seed, idx)
+        vertical = bool(rngs[4].integers(0, 2))
+        centre = float(rngs[4].uniform(0.35, 0.65)) * (width if vertical else height)
+        half_width = float(rngs[4].uniform(45.0, 75.0))
+        xx, yy = _grid(width, height)
+        coord = xx if vertical else yy
+        sky = 1000.0 + amplitude * np.exp(-(((coord - centre) / half_width) ** 2))
+        stars = []
+        psf = {"model": "moffat", "fwhm_px": 4.0, "beta": 3.0}
+        if not starless:
+            stars = _star_list(rngs[0], rngs[1], 30, width, height, 5e3, 2e5, psf, margin=16, min_sep=25.0)
+        params = {"ridge_amplitude_adu": amplitude, "ridge_orientation": "vertical" if vertical else "horizontal",
+                  "ridge_centre_px": centre, "ridge_half_width_px": half_width, "sky_adu": 1000.0, "sigma_adu": 5.0,
+                  "n_stars": len(stars), "psf": psf if stars else None}
+        frame_id = f"{set_id}_f{idx:02d}"
+        frames.append(_v2_frame(frame_id, f"Sky ridge +{amplitude:.0f} ADU ({'starless' if starless else '30 stars'}). "
+                                f"Frame {idx}.", seed, idx, split, set_id, stars, params, width, height, sky=sky,
+                                sigma_adu=5.0, starless=starless, rngs=rngs))
+    return ScenarioSet(set_id, "Amplifier-glow-like level ridges of 150-900 ADU on starless and starred frames.",
+                       frames, split, {"seed": seed, "n_frames": 2 * n_amplitudes,
+                                       "generator_version": GENERATOR_VERSION})
+
+
+def dense_defocused_field(set_id, seed, split, n_frames=4, n_stars=80, width=640, height=480):
+    """Many broad spider donuts (r_out 8-16 px, one per frame) close together,
+    contaminating the background meshes; overlaps allowed (10 px minimum)."""
+    setup = _streams(seed)[4]
+    r_outs = _stratified(setup, 8.0, 16.0, n_frames)
+    frames = []
+    for idx in range(n_frames):
+        rngs = _frame_rngs(seed, idx)
+        r_out = float(r_outs[idx])
+        angle = float(rngs[4].uniform(0.0, 0.5 * math.pi))
+        psf = _pupil_psf(r_out, 0.3, 1.4, 4, 0.01, angle)
+        xy = place_uniform(rngs[0], n_stars, width, height, margin=r_out + 10.0, min_sep=10.0)
+        fluxes = log_uniform(rngs[1], 2e4, 5e5, n_stars)
+        stars = [(x, y, float(f), psf) for (x, y), f in zip(xy, fluxes)]
+        params = {"r_out_px": r_out, "obstruction": 0.3, "n_vanes": 4, "vane_width_frac": 0.01,
+                  "sigma_seeing_px": 1.4, "n_stars": n_stars, "flux_adu": [2e4, 5e5], "sky_adu": SKY_ADU,
+                  "sigma_adu": SKY_SIGMA_ADU}
+        frame_id = f"{set_id}_f{idx:02d}"
+        frames.append(_v2_frame(frame_id, f"Dense defocused field, {n_stars} donuts r_out {r_out:.1f} px. "
+                                f"Frame {idx}.", seed, idx, split, set_id, stars, params, width, height,
+                                sky=_sloped_sky(width, height, 0.2, 0.1), link_px=2.0 * r_out, rngs=rngs))
+    return ScenarioSet(set_id, "Dense field of broad defocused donuts contaminating the meshes.", frames, split,
+                       {"seed": seed, "n_frames": n_frames, "generator_version": GENERATOR_VERSION})
+
+
+SWEEP_STEP = 100
+
+
+def newtonian_sweep(sweep_id, seed, split, p0=4585.0, c=0.03, n_stars=20, width=640, height=480):
+    """Focus sweep through spider donuts on both sides of focus: r_out =
+    c |p - p0| px (c = 0.03 px/step), obstruction 0.3, 4 vanes of 1% D, one
+    vane angle for the sweep, seeing sigma 1.4 px; 20 bright stars (2e5-1e6
+    ADU) >= 70 px apart on a gradient sky."""
+    rngs = _streams(seed)
+    xy = place_uniform(rngs[0], n_stars, width, height, margin=45, min_sep=70.0)
+    fluxes = log_uniform(rngs[1], 2e5, 1e6, n_stars)
+    angle = float(rngs[4].uniform(0.0, 0.5 * math.pi))
+    sky = _sloped_sky(width, height, 0.3, 0.2)
+    frames = []
+    for idx, pos in enumerate(SWEEP_POSITIONS):
+        r_out = c * abs(pos - p0)
+        psf = _pupil_psf(r_out, 0.3, 1.4, 4, 0.01, angle)
+        stars = [(x, y, float(f), psf) for (x, y), f in zip(xy, fluxes)]
+        params = {"position": pos, "p0": p0, "r_out_px": r_out, "psf": psf, "c_px_per_step": c}
+        frame_id = f"{sweep_id}_p{pos}"
+        frame = _v2_frame(frame_id, f"Newtonian spider-donut sweep. Position {pos}.", seed, idx, split, sweep_id,
+                          stars, params, width, height, sky=sky, link_px=40.0, rngs=_frame_rngs(seed, idx))
+        frame.metadata.update(focus_sweep=sweep_id, focus_position=pos, p0_true=p0)
+        frames.append(frame)
+    sweep = FocusSweep(sweep_id, "Focus sweep through Newtonian spider donuts on both sides of focus, gradient sky.",
+                       list(SWEEP_POSITIONS), p0, frames,
+                       metadata={"seed": seed, "split": split, "step": SWEEP_STEP, "p0_true": p0, "c_px_per_step": c,
+                                 "generator_version": GENERATOR_VERSION, "n_stars": n_stars})
+    return sweep
+
+
+def defocused_wings_sweep(sweep_id, seed, split, p0=4655.0):
+    """The D-020 class: sweep_moffat_fixed's generator (Moffat beta 3, broad
+    wings far from focus, 24 bright stars, gradient sky) with a new seed and
+    optimum."""
+    params = {"psf": "moffat beta=3", "fwhm_model": f"sqrt(3.2^2 + (0.040 (p-{p0}))^2) px", "p0": p0,
+              "background": "1000 + 0.3(x-xc) + 0.2(y-yc) ADU, constant over the sweep", "sigma_adu": SKY_SIGMA_ADU,
+              "stars": "24 bright, flux 2e5-1e6 ADU, >= 55 px apart", "class": "D-020 (broad Moffat wings)"}
+    sweep = _sweep(sweep_id, "Moffat focus sweep with broad wings far from focus (D-020 class).", seed,
+                   lambda p: {"model": "moffat", "fwhm_px": moffat_sweep_fwhm(p, p0=p0), "beta": 3.0}, 24, 0, params,
+                   55.0, p0=p0)
+    sweep.metadata.update(split=split, step=SWEEP_STEP, p0_true=p0)
+    for fr in sweep.frames:
+        fr.metadata.update(split=split, scenario_set=sweep_id, pre_existing=False)
+    return sweep
+
+
+def _dev(name):
+    return DEV_V2_SEEDS[name]
+
+
+def _ho(name):
+    return HOLDOUT_SEEDS[name]
+
+
+#: Development variants (split "dev"): the held-out generators with dev seeds
+#: and fewer frames. Builders take no arguments.
+DEV_V2_SETS = {
+    "dev_newtonian_spider_donuts": lambda: newtonian_spider_donuts("dev_newtonian_spider_donuts",
+                                                                   _dev("dev_newtonian_spider_donuts"), SPLIT_DEV,
+                                                                   n_frames=4, n_three=1),
+    "dev_refractor_disks": lambda: refractor_disks("dev_refractor_disks", _dev("dev_refractor_disks"), SPLIT_DEV,
+                                                   n_frames=3),
+    "dev_comatic_donuts": lambda: comatic_donuts("dev_comatic_donuts", _dev("dev_comatic_donuts"), SPLIT_DEV,
+                                                 n_frames=3),
+    "dev_close_doubles": lambda: close_doubles("dev_close_doubles", _dev("dev_close_doubles"), SPLIT_DEV, n_frames=3),
+    "dev_amp_glow_ridge": lambda: amp_glow_ridge("dev_amp_glow_ridge", _dev("dev_amp_glow_ridge"), SPLIT_DEV,
+                                                 n_amplitudes=3),
+    "dev_dense_defocused_field": lambda: dense_defocused_field("dev_dense_defocused_field",
+                                                               _dev("dev_dense_defocused_field"), SPLIT_DEV,
+                                                               n_frames=2),
+}
+DEV_V2_SWEEPS = {
+    "dev_sweep_newtonian": lambda: newtonian_sweep("dev_sweep_newtonian", _dev("dev_sweep_newtonian"), SPLIT_DEV,
+                                                   p0=4615.0),
+}
+#: Held-out sets (split "holdout"), generated and evaluated once after the
+#: acceptance criteria (ml/eval/bge/acceptance/synthetic-v2.json) were
+#: committed. run_benchmark refuses this split unless that file is tracked
+#: and unchanged.
+HOLDOUT_SETS = {
+    "ho_newtonian_spider_donuts": lambda: newtonian_spider_donuts("ho_newtonian_spider_donuts",
+                                                                  _ho("ho_newtonian_spider_donuts"), SPLIT_HOLDOUT),
+    "ho_refractor_disks": lambda: refractor_disks("ho_refractor_disks", _ho("ho_refractor_disks"), SPLIT_HOLDOUT),
+    "ho_comatic_donuts": lambda: comatic_donuts("ho_comatic_donuts", _ho("ho_comatic_donuts"), SPLIT_HOLDOUT),
+    "ho_close_doubles": lambda: close_doubles("ho_close_doubles", _ho("ho_close_doubles"), SPLIT_HOLDOUT),
+    "ho_amp_glow_ridge": lambda: amp_glow_ridge("ho_amp_glow_ridge", _ho("ho_amp_glow_ridge"), SPLIT_HOLDOUT),
+    "ho_dense_defocused_field": lambda: dense_defocused_field("ho_dense_defocused_field",
+                                                              _ho("ho_dense_defocused_field"), SPLIT_HOLDOUT),
+}
+HOLDOUT_SWEEPS = {
+    "ho_sweep_newtonian": lambda: newtonian_sweep("ho_sweep_newtonian", _ho("ho_sweep_newtonian"), SPLIT_HOLDOUT),
+    "ho_sweep_defocused_wings": lambda: defocused_wings_sweep("ho_sweep_defocused_wings",
+                                                              _ho("ho_sweep_defocused_wings"), SPLIT_HOLDOUT),
+}
+HOLDOUT_IDS = tuple(HOLDOUT_SETS) + tuple(HOLDOUT_SWEEPS)
 
 
 # --------------------------------------------------------------------------

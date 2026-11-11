@@ -11,6 +11,19 @@ Each case also carries ``extras.sha256`` (sha256 of every input file); the
 top-level ``extras.input_sha256`` repeats them by relative path. The Rust
 reader ignores unknown keys (coordinator, bridge v1).
 
+BGE v2 (docs/bge-v2-spec.md §4): ``"settings"`` is merged into the daemon's
+``BackgroundSettings`` (e.g. ``{"sep": {"noise_policy": "masked_local_v2"}}``)
+and an optional ``"star_gates": {"blend_test": ..., "regroup_deblended": ...}``
+sits beside it, at the top level and per case, merged the same way. Each
+method id of :data:`RUST_VARIANTS` (aliases included) is itself a bridge
+backend that forces its backend, noise policy, blend test and regrouping, so
+one manifest lists every variant: ``<id>__<method>.json``. The plain backend
+strings ``legacy_global_clip``/``sep`` run the daemon's *current defaults*
+(now the v2 policies) and are never used to label a v1 row. Outputs
+additionally carry ``background.refinement``,
+``quality.gate_diagnostics``, ``quality.star_gates_config_sha256`` and
+``quality.used_stars``; the readers below also accept them at the top level.
+
 Output (written by the daemon test)::
 
     <out>/<id>__<backend>.json        {"case", "backend", "background", "detection",
@@ -43,6 +56,64 @@ import numpy as np
 from . import BRIDGE_SCHEMA, GENERATOR_VERSION, HARNESS_VERSION
 
 RUST_BACKENDS = ("legacy_global_clip", "sep")
+
+_G1 = {"blend_test": "peak_count_v1", "regroup_deblended": False}
+_G2 = {"blend_test": "dip_annulus_v2", "regroup_deblended": True}
+_N1 = {"sep": {"noise_policy": "frame_wide_v1"}}
+_N2 = {"sep": {"noise_policy": "masked_local_v2"}}
+#: Rust method matrix (spec §4): backend, BackgroundSettings overlay and
+#: star_gates overlay. Every variant passes its policies explicitly, because
+#: the daemon defaults are now the v2 policies. ``rust_legacy_global_clip``
+#: and ``rust_sep`` are aliases of the v1 baselines.
+RUST_VARIANTS = {
+    "rust_legacy__g1": {"backend": "legacy_global_clip", "settings": {}, "star_gates": _G1},
+    "rust_legacy__g2": {"backend": "legacy_global_clip", "settings": {}, "star_gates": _G2},
+    "rust_sep__n1g1": {"backend": "sep", "settings": _N1, "star_gates": _G1},
+    "rust_sep__n2g1": {"backend": "sep", "settings": _N2, "star_gates": _G1},
+    "rust_sep__n1g2": {"backend": "sep", "settings": _N1, "star_gates": _G2},
+    "rust_sep__n2g2": {"backend": "sep", "settings": _N2, "star_gates": _G2},
+}
+RUST_ALIASES = {"rust_legacy_global_clip": "rust_legacy__g1", "rust_sep": "rust_sep__n1g1"}
+
+
+def rust_variant(method: str) -> tuple[str, dict]:
+    """``(canonical id, spec)`` of a Rust method id or alias."""
+    canonical = RUST_ALIASES.get(method, method)
+    return canonical, RUST_VARIANTS[canonical]
+
+
+def merge_overlay(base: dict | None, overlay: dict | None) -> dict:
+    """Recursive JSON-object merge (``overlay`` wins), as the bridge merges."""
+    out = dict(base or {})
+    for key, value in (overlay or {}).items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = merge_overlay(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _first(payload: dict, *paths):
+    for path in paths:
+        node = payload
+        for key in path:
+            node = node.get(key) if isinstance(node, dict) else None
+        if node is not None:
+            return node
+    return None
+
+
+def output_refinement(payload: dict):
+    """``refinement`` record of a bridge output (``None`` for frame_wide_v1/legacy or old revisions)."""
+    return _first(payload, ("background", "refinement"), ("refinement",))
+
+
+def output_gate_diagnostics(payload: dict):
+    return _first(payload, ("quality", "gate_diagnostics"), ("gate_diagnostics",))
+
+
+def output_star_gates_sha256(payload: dict):
+    return _first(payload, ("quality", "star_gates_config_sha256"), ("star_gates_config_sha256",))
 MASK_KEYS = ("bad_pixel", "invalid", "edge", "native_saturation")
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9_]*$")
 UNAVAILABLE = "skipped: rust bridge unavailable"
@@ -95,7 +166,8 @@ def write_inputs(scenarios, root: Path) -> list:
 
 
 def write_manifest(cases: list, root: Path, name: str = "manifest.json", backends=RUST_BACKENDS,
-                   settings: dict | None = None, write_maps: bool = True, extras: dict | None = None) -> Path:
+                   settings: dict | None = None, write_maps: bool = True, extras: dict | None = None,
+                   star_gates: dict | None = None) -> Path:
     root = Path(root)
     input_sha = {}
     for c in cases:
@@ -109,9 +181,44 @@ def write_manifest(cases: list, root: Path, name: str = "manifest.json", backend
         "extras": dict({"generator_version": GENERATOR_VERSION, "harness_version": HARNESS_VERSION,
                         "input_sha256": input_sha}, **(extras or {})),
     }
+    if star_gates is not None:
+        manifest["star_gates"] = dict(star_gates)
     path = root / name
     path.write_text(json.dumps(manifest, indent=1, sort_keys=True))
     return path
+
+
+def write_variant_manifest(cases: list, root: Path, method: str, name: str | None = None,
+                           settings: dict | None = None, write_maps: bool = True, extras: dict | None = None) -> Path:
+    """Manifest of one Rust method (alias allowed): the canonical method id as
+    the backend (it forces the variant), plus the variant's settings and
+    star_gates overlays (redundant with the id; kept so the manifest states
+    the variant explicitly)."""
+    canonical, spec = rust_variant(method)
+    return write_manifest(cases, root, name=name or f"manifest_{canonical}.json", backends=(canonical,),
+                          settings=merge_overlay(settings, spec["settings"]), write_maps=write_maps,
+                          extras=dict({"method": canonical}, **(extras or {})), star_gates=spec["star_gates"])
+
+
+def write_methods_manifest(cases: list, root: Path, methods, name: str = "manifest.json",
+                           settings: dict | None = None, write_maps: bool = True, extras: dict | None = None) -> Path:
+    """One manifest for several Rust methods: ``backends`` = their canonical
+    method ids (each forces its variant); ``settings`` (e.g. a mesh size) is
+    shared."""
+    canonical = []
+    for m in methods:
+        c, _ = rust_variant(m)
+        if c not in canonical:
+            canonical.append(c)
+    return write_manifest(cases, root, name=name, backends=canonical, settings=settings, write_maps=write_maps,
+                          extras=dict({"methods": canonical}, **(extras or {})))
+
+
+def backend_of(backend_or_method: str) -> str:
+    """``legacy_global_clip``/``sep`` of a backend string or method id."""
+    if backend_or_method in RUST_BACKENDS:
+        return backend_or_method
+    return rust_variant(backend_or_method)[1]["backend"]
 
 
 def read_manifest(path: Path) -> dict:
