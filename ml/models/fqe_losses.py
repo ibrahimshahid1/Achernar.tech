@@ -10,6 +10,8 @@ fqe_losses — training objectives + robust aggregation for the FQE (Section 7.6
     turns per-star predictions into a frame HFR and an uncertainty estimate,
     *before* any learned pooling (Bosse 2018). The resulting frame interval still
     needs its own held-out calibration scale.
+  * require_finite: the trainer's finite-loss guard. It checks a value and
+    raises; it never changes the loss math above.
 """
 from __future__ import annotations
 
@@ -20,6 +22,30 @@ try:
     import torch.nn.functional as F
 except ModuleNotFoundError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
+
+
+class NonFiniteLossError(FloatingPointError):
+    """A training objective (or a quantity derived from it) was NaN or inf.
+
+    Raised instead of letting the value reach the optimizer. One NaN step
+    poisons every weight through the gradient, so a trainer must stop the trial
+    rather than continue and save the result.
+    """
+
+
+def require_finite(value, what: str = "loss"):
+    """Return ``value`` unchanged if every element is finite, else raise
+    :class:`NonFiniteLossError`. Works on tensors (any device) and array-likes."""
+    if torch is not None and isinstance(value, torch.Tensor):
+        finite = bool(torch.isfinite(value.detach()).all().item())
+        shown = value.detach().float().cpu().flatten()[:4].tolist()
+    else:
+        array = np.asarray(value, dtype=np.float64)
+        finite = bool(np.all(np.isfinite(array)))
+        shown = array.ravel()[:4].tolist()
+    if not finite:
+        raise NonFiniteLossError(f"non-finite {what}: {shown}")
+    return value
 
 
 def heteroscedastic_nll(mu, log_var, target_log_hfr, clamp_log_var=(-8.0, 8.0)):

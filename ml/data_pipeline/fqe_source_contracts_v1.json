@@ -1,0 +1,173 @@
+{
+  "schema": "fqe-source-contracts-v1",
+  "description": "Machine-readable source/identity/partition contract for the FQE public-data development experiment, read by ml/data_pipeline/fqe_sources.py. Mirrors the frozen experiment contract (sources, identity, partitions, development_populations); hashes and rules are copied, not re-derived. Paths are relative to the public data root (ml/data/public, ACHERNAR_PUBLIC_DATA_ROOT, or an explicit data_root).",
+  "derived_from": {
+    "experiment_contract": "fqe-public-experiment-contract-v1 (run 20261111T0038, configs/contract-v1.json)",
+    "experiment_contract_sha256": "531059520bee7091d1a336aad4813c18b2560354279d1a67b639833ac0cb9fb1",
+    "frozen_utc": "2026-11-11T06:55:00Z"
+  },
+  "data_root_logical": "ml/data/public",
+  "drive_protection": {
+    "open_mode": "read-only; never import Python from the drive; never write next to an NPZ (no splits_for_dataset/create_splits on public NPZs); never run validate_public_data.py",
+    "mid_run_check": "verify_source() re-checks the mount and every pinned sha256; call it before each trial"
+  },
+  "split_column_labels": {"train": "train", "val": "validation", "test": "test"},
+  "sources": {
+    "stellar_sim_v1": {
+      "role": "synthetic_reference",
+      "directory": "stellar_sim_v1",
+      "dataset_id": "stellar_sim_v1",
+      "npz": "fqe.npz",
+      "registry": "fqe.splits.json",
+      "records": "records.jsonl",
+      "manifest": "manifest.json",
+      "files": {
+        "fqe.npz": "8b5b9fcfcc394e73871c762e3a4448220289b94502b064d479444c2c9580754d",
+        "fqe.splits.json": "d6d1fdc40bb8e5ec6f954c160f5ebc14fb7cdfe5acaee978b50ee64bc58c50c7",
+        "observations.npz": "cf04da18e8056e650b67a9a32b6acec4a0d0622a6a03e4ab5e9805612fb9715c",
+        "records.jsonl": "291c93b983b1e5b73096e74c0a97ddf1205fe0434cc13e3bb06b4f98735ba98b",
+        "manifest.json": "a94b827754769ee38e29bf825fc381e7c9ed9a49e6cff447678f1508e2e102d5",
+        "generator_source.py": "0425e89f06858cbcd370b392f8373c68ff9be9d734ee6c8f4ac40cb4401c6247",
+        "normalization_source.py": "b15ab052bac7197d27e855c3ca12a4aa24cf59ef35c6b8ce23b602477baeb3bb"
+      },
+      "manifest_bindings": {
+        "generator_source_sha256": "generator_source.py",
+        "normalization_source_sha256": "normalization_source.py"
+      },
+      "target_field": "reference_hfr_px",
+      "target_definition_id": "stellar_sim_v1:noiseless_r24_sep_flux_radius",
+      "target_equals": ["hfr_px"],
+      "log_field": "log_hfr",
+      "secondary_fields": ["measured_hfr_px"],
+      "label_definition": "sep.flux_radius frac 0.5 subpix 5 on the noiseless pixel-integrated primary, true analytic centre, fixed rmax 24 px, no background/mask (frozen generator_source.py:40-66,252; git blob 477da20a of import_public_imaging.py at 98f6a2b6)",
+      "secondary_definitions": {"measured_hfr_px": "same estimator on raw - true background - 500 bias (noisy measurement)"},
+      "units": "pixels; native electrons gain 1 bias 500",
+      "group_field": "split_group",
+      "group_semantics": "ancestor family; 3 variants per family share one target",
+      "sample_key_field": "run_key",
+      "frame_field": "frame_id",
+      "batching": "pointwise",
+      "ranking_eligible": false,
+      "run_key_semantics": "singleton_sample_not_focus_run",
+      "tier_filter": null,
+      "records_join": {
+        "index_field": "fqe_index",
+        "agree": {"frame_id": "frame_id", "split_group": "split_group", "split": "split", "source_id": "run_key"},
+        "ancestor_field": "ancestor_id"
+      },
+      "strata": {
+        "npz": ["rig_id", "camera_id", "filter_name", "night_id"],
+        "records": {"profile": "parameters.profile", "motion": "parameters.motion", "moffat_beta": "parameters.moffat_beta", "blended": "parameters.blended", "edge_case": "parameters.edge_case"}
+      },
+      "joins": {"array_index": "array_index"},
+      "calibration": {
+        "rule": "sha256_lowest_fraction",
+        "fraction": 0.15,
+        "rounding": "half_up",
+        "description": "train families whose sha256(group_uid) hex sorts in the lowest 15% (41 of 271 families), chosen from identities only",
+        "expected_groups": 41
+      },
+      "final_test": {"enabled": false, "reason": "final-test entry point disabled pending a separate owner instruction (contract-v1 partitions.test_sealed)"},
+      "expected_counts": {"rows": 1025, "train": 718, "val": 138, "test": 169, "groups": {"train": 271, "val": 52, "test": 62}},
+      "historical_counts": {"rows": 1025, "train": 718, "val": 138, "test": 169}
+    },
+    "hst_acs_corpus_v1": {
+      "role": "archive_measurement_reference",
+      "directory": "hst_acs_corpus_v1",
+      "dataset_id": "hst_acs_corpus_v1",
+      "npz": "fqe.npz",
+      "registry": "fqe.splits.json",
+      "records": "records.jsonl",
+      "manifest": "manifest.json",
+      "files": {
+        "fqe.npz": "83a81ea5b924fa7175e570ce98f314a00a5404d6905fe5e36c5a488b2c5fc40a",
+        "fqe.splits.json": "5afc8c5e6a2613e65b62802b66df82eb87debeb6b4c43898f8f1430ace59f097",
+        "records.jsonl": "e9604b5b6e8618992677ee66bdcde7116eb0daa29e68f7bb104b806c42790603",
+        "manifest.json": "da9771f8d80d796ff479d1a6501289631d78c0215809bd1aebb483149128aa7e",
+        "importer_source.py": "45713f7e61a7205cb6a86e9b0b17ea6c94f3b3f5660b1ca6ba1d9071b0ecfdee"
+      },
+      "manifest_bindings": {"importer_source_sha256": "importer_source.py"},
+      "target_field": "hfr_px",
+      "target_definition_id": "hst_acs_corpus_v1:sep_flux_radius_rmax_clip6a_6_16",
+      "target_equals": ["reference_hfr_px", "measured_hfr_px"],
+      "log_field": "log_hfr",
+      "secondary_fields": [],
+      "label_definition": "SEP chain on calibrated FLT electrons (SCI,1): DQ/non-finite/ERR<=0 masked, sep.Background 64/3 on a median-filled image, sep.extract 6 sigma with pipeline ERR, minarea 5, deblend 32/0.005, isophotal barycentre, rmax = clip(6a, 6, 16), flux_radius frac 0.5 subpix 5 with mask (frozen generator_source.py:424-516, blob 477da20a; recomputation receipt: max rel diff 5.8e-8 on dev rows)",
+      "secondary_definitions": {},
+      "units": "pixels; calibrated electrons",
+      "group_field": "split_group",
+      "group_semantics": "one exposure/date",
+      "sample_key_field": "run_key",
+      "frame_field": "frame_id",
+      "batching": "pointwise",
+      "ranking_eligible": false,
+      "run_key_semantics": "singleton_sample_not_focus_run",
+      "tier_filter": {
+        "field": "reference_quality_tier",
+        "equals": "strict_unmasked_aperture",
+        "description": "contract-v1 'reference_quality_tier == strict': unmasked at pixel centres inside the aperture; sub-pixel APER_HASMASKED allowed. The stored tier string is strict_unmasked_aperture."
+      },
+      "training_eligible_rule": "training_eligible == (split == train and tier passes)",
+      "records_join": {
+        "index_field": "fqe_index",
+        "agree": {"frame_id": "frame_id", "split_group": "split_group", "split": "split", "source_id": "run_key"},
+        "ancestor_field": "ancestor_id"
+      },
+      "strata": {
+        "npz": ["rig_id", "camera_id", "filter_name", "night_id"],
+        "records": {"hfr_aperture_radius_px": "hfr_aperture_radius_px", "masked_aperture_fraction": "masked_aperture_fraction"}
+      },
+      "joins": {"observation_index": "observation_index", "crop_origin_xy": "crop_origin_xy", "all_reference_index": "all_reference_index"},
+      "calibration": {
+        "rule": "unavailable",
+        "reason": "6 train exposures are too few independent groups; HST uncertainty is reported raw and exploratory"
+      },
+      "final_test": {"enabled": false, "reason": "final-test entry point disabled pending a separate owner instruction (contract-v1 partitions.test_sealed)"},
+      "known_label_issue": "camera_id says HST-ACS-WFC-CCD1 but every corpus science_header has CCDCHIP=2; recorded, not corrected (frozen data)",
+      "excluded_files": {
+        "fqe_all_references.npz": "13d6133b42ada94e88e572b33449840e85ba8669e30f95b95c77e38fc0a6f2ca (no registry; 763 test-era rows; not used, never opened)",
+        "exposures/*/fqe_diagnostic.npz": "split column is always 'test' (importer default); never a partition source, never opened"
+      },
+      "expected_counts": {"rows": 1059, "train": 777, "val": 159, "test": 123, "groups": {"train": 6, "val": 3, "test": 4}},
+      "historical_counts": {"rows": 1059, "train": 777, "val": 159, "test": 123}
+    },
+    "stellar_fits_pilot": {
+      "role": "diagnostic_sealed",
+      "directory": "stellar_fits_pilot",
+      "reason": "jd5702jpq (NGC104, 2017-03-07) is inside the HST test era and lies within test exposures' footprints (header WCS); same field/instrument; 3/49 strict. Not a development diagnostic and not an independent test; never loaded in development mode."
+    }
+  },
+  "identity": {
+    "sample_uid": "<source_id>:<run_key> (run_key = the importer's per-row record source_id; equals frame_id for stellar_sim_v1; for hst_acs_corpus_v1 frame_id names the exposure, so it cannot identify a sample)",
+    "group_uid": "<source_id>:<split_group>",
+    "frame_uid": "<source_id>:<frame_id>",
+    "ancestor_uid": "<source_id>:<records.ancestor_id>",
+    "integer_run_id": "never used across sources (317 sim/HST collisions); pointwise batching ignores it; not exposed by the loader",
+    "collision_check": "mixtures assert disjoint sample_uid, group_uid and frame_uid sets"
+  },
+  "partitions": {
+    "train_fit": "original train groups minus calibration groups",
+    "calibration": {
+      "stellar_sim_v1": "train families whose sha256(group_uid) hex sorts in the lowest 15% (41 of 271 families), chosen from identities only",
+      "hst_acs_corpus_v1": "unavailable: 6 train exposures are too few independent groups; HST uncertainty is reported raw and exploratory"
+    },
+    "val": "original validation groups (model/recipe selection and development reporting)",
+    "test_sealed": "original test groups: counted and hashed only; arrays never returned in development mode; final-test entry point disabled pending a separate owner instruction",
+    "policy_same_for_all_arms": true
+  },
+  "development_populations": {
+    "stellar_sim_v1": "all val rows (138 rows, 52 families); primary target reference_hfr_px; measured_hfr_px reported as a secondary comparison",
+    "hst_acs_corpus_v1": "strict val rows (159 rows, 3 exposures; 102 from one date); neighbour-contaminated rows reported as a stratum where records allow"
+  },
+  "mixtures": [
+    {
+      "id": "mixed_arm_v1",
+      "sources": ["hst_acs_corpus_v1", "stellar_sim_v1"],
+      "common_reference_policy": "HST aperture policy (half-light radius of the flux inside rmax = clip(6a,6,16) with a SEP background and isophotal centroid). The HST stored target is this quantity. For sim, the auditor measured the HST policy against the stored r24 reference on development rows only: median ratio 0.999, p5 0.981, min 0.952 (Moffat beta<3: p5 0.969). The stored sim reference is used as the proxy for the common reference, with this documented discrepancy; no derived sim targets are created.",
+      "sampling": "source-balanced: each batch draws half from each source's train_fit pool (with replacement within an epoch-free update budget)",
+      "known_confounds": ["0.5 px systematic centring offset between sources", "background-imputed DQ patches in HST crops (median 60 px/crop) absent from sim", "limited HFR-range overlap (HST median 0.81 px vs sim 2.01 px)", "HST dates/filters cluster strongly; val is 3 exposures"],
+      "interpretation": "cross-source results are reported per source; a mixed-arm gain is not evidence of transfer to Canon R50 data"
+    }
+  ],
+  "runtime_eligible": false
+}
