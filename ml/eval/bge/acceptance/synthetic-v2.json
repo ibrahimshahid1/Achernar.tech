@@ -1,0 +1,37 @@
+{
+  "schema": "bge-synthetic-acceptance-v1",
+  "name": "bge-v2 held-out synthetic acceptance",
+  "declared": "2026-11-11",
+  "declared_before": "any evaluation of a ho_* scenario",
+  "provenance": "Engineering judgement, not literature. Parameters under test are provisional (dip_annulus_v2, masked_local_v2). A failed criterion is reported as failed and is never relaxed after the run.",
+  "variants": {
+    "v2": {"sep": "__n2g2", "legacy": "__g2"},
+    "v1": {"sep": "__n1g1", "legacy": "__g1"}
+  },
+  "heldout_scenarios": [
+    "ho_newtonian_spider_donuts", "ho_refractor_disks", "ho_comatic_donuts", "ho_close_doubles",
+    "ho_sweep_newtonian", "ho_sweep_defocused_wings", "ho_amp_glow_ridge", "ho_dense_defocused_field"
+  ],
+  "criteria": [
+    {"id": "A1", "metric": "donut_acceptance_rate", "scenarios": ["ho_newtonian_spider_donuts", "ho_refractor_disks", "ho_comatic_donuts"],
+     "population": "isolated truth sources with r_out_px >= 6", "variant": "v2", "op": ">=", "value": 0.70},
+    {"id": "A2", "metric": "donut_acceptance_rate", "scenarios": ["ho_newtonian_spider_donuts"],
+     "population": "truth sources with vane_width_frac <= 0.015", "variant": "v2", "op": ">=", "value": 0.60},
+    {"id": "A3", "metric": "close_double_rejection_rate", "scenarios": ["ho_close_doubles"],
+     "population": "pairs with separation_px >= 5 and flux_ratio >= 0.5", "compare": "v2 >= v1 - 0.05"},
+    {"id": "A4", "metric": "abs_median_rel_hfr_bias_accepted_donuts", "scenarios": ["ho_newtonian_spider_donuts", "ho_refractor_disks", "ho_comatic_donuts"],
+     "variant": "v2", "op": "<=", "value": 0.03},
+    {"id": "A5", "metric": "sweep", "scenarios": ["ho_sweep_newtonian"], "variant": "v2",
+     "requires": "fit succeeded with >= 3 valid frames on each side of the minimum", "op": "abs_p0_shift_le_fraction_of_step", "value": 0.15},
+    {"id": "A6", "metric": "sweep", "scenarios": ["ho_sweep_defocused_wings"], "variant": "v2", "backend": "sep",
+     "requires": "noise measured on >= 12 of 13 frames", "op": "abs_p0_shift_le_fraction_of_step", "value": 0.15},
+    {"id": "A7", "metric": "false_detections_per_frame", "scenarios": ["ho_amp_glow_ridge"], "population": "starless frames",
+     "variant": "v2", "backend": "sep", "op": "<=", "value": 2, "compare": "v2 <= v1"},
+    {"id": "A8", "metric": "no_regression", "scenarios": "all pre-existing development scenarios",
+     "compare": ["completeness v2 >= v1 - 0.02", "false_detections_per_frame v2 <= v1 + 1", "abs_median_hfr_bias v2 <= abs_v1 + 0.005"]},
+    {"id": "A9", "metric": "background_bias_under_stars", "scenarios": ["mesh/footprint study"], "backend": "sep",
+     "compare": "abs(v2) <= abs(v1) at every footprint size"},
+    {"id": "A10", "metric": "timing_6000x4000_median_of_5_host_only", "backend": "sep", "compare": "v2 <= 2.5 * v1"},
+    {"id": "A11", "metric": "rust_python_parity", "scenarios": "all", "compare": "statuses, reasons, refinement counts (invalid_rms_pixels within 0.1% of usable), catalog sizes (platform-aware), gate tallies and accepted-star sets agree"}
+  ]
+}
