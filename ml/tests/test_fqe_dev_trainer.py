@@ -693,3 +693,38 @@ def test_tracked_contract_keeps_the_final_test_disabled():
     contract = fs.load_contract()
     for source_id in ("stellar_sim_v1", "hst_acs_corpus_v1"):
         assert contract.source(source_id)["final_test"]["enabled"] is False
+
+
+def test_bn_recalibration_makes_eval_mode_match_batch_statistics():
+    """Recipe v1.1 (F-011): after precise-BN recalibration the eval-mode
+    outputs equal a train-mode pass whose statistics are the recalibration
+    batches' cumulative average (checked on a toy BatchNorm model)."""
+    import torch
+
+    from train import fqe_dev_experiment as exp
+
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(torch.nn.Conv2d(1, 4, 3), torch.nn.BatchNorm2d(4, momentum=0.01))
+    # Corrupt the running statistics as a short training run would leave them.
+    model[1].running_mean.fill_(5.0)
+    model[1].running_var.fill_(50.0)
+    x = torch.randn(64, 1, 8, 8) * 3 + 1
+    tensors = {"src": (x, torch.zeros(64))}
+    rows = [torch.arange(i * 16, (i + 1) * 16).numpy() for i in range(4)]
+    config = {"bn_recalibration_batches": 4, "updates": 0, "batch_size": 16}
+    record = exp._recalibrate_batchnorm(model, tensors, lambda u: {"src": rows[u]}, config, "cpu")
+    assert record["batches"] == 4 and record["rows_drawn"] == {"src": 64}
+    assert model[1].momentum == 0.01 and not model.training
+    with torch.no_grad():
+        feats = model[0](x)
+    assert torch.allclose(model[1].running_mean, feats.mean(dim=(0, 2, 3)), atol=1e-5)
+
+
+def test_bn_recalibration_config_validation():
+    from train import fqe_dev_experiment as exp
+
+    base = {"schema": exp.CONFIG_SCHEMA, "arm": "synthetic_only", "seed": 0}
+    assert exp.resolve_config(dict(base))["bn_recalibration_batches"] == 64
+    assert exp.resolve_config(dict(base, bn_recalibration_batches=0))["bn_recalibration_batches"] == 0
+    with pytest.raises(exp.ExperimentRefusal):
+        exp.resolve_config(dict(base, bn_recalibration_batches=-1))

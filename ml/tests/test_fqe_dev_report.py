@@ -30,7 +30,7 @@ import train.fqe_dev_experiment as dx  # noqa: E402
 from data_pipeline.fqe_sources import SealedPartitionError  # noqa: E402
 
 BUDGET = {"batch_size": 8, "updates": 2, "warmup_updates": 1, "lambda_rank": 0.0, "lr": 1e-3,
-          "weight_decay": 1e-4, "grad_clip_norm": 1.0, "lr_schedule": "cosine"}
+          "weight_decay": 1e-4, "grad_clip_norm": 1.0, "lr_schedule": "cosine", "bn_recalibration_batches": 64}
 SIM, HST = "fixsim", "fixhst"
 RUST_G1 = "native_rust__rust_legacy__g1__sim_observation64__pixel_flags"
 

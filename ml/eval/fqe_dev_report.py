@@ -119,7 +119,7 @@ EXIT_NO_CANDIDATE = 1
 
 #: Keys of a trial config that define the matched optimizer budget/recipe.
 BUDGET_KEYS = ("batch_size", "updates", "warmup_updates", "lambda_rank", "lr", "weight_decay", "grad_clip_norm",
-               "lr_schedule")
+               "lr_schedule", "bn_recalibration_batches")
 
 #: The frozen M3 matrix (contract-v1 ``training`` + the recipe confirmed in
 #: decisions F-009). The budget of every reported trial must equal this.
@@ -127,11 +127,13 @@ FROZEN_MATRIX = {
     "arms": ["synthetic_only", "hst_only", "mixed"],
     "seeds": [0, 1, 2],
     "budget": {"batch_size": 32, "updates": 500, "warmup_updates": 50, "lambda_rank": 0.0, "lr": 1e-3,
-               "weight_decay": 1e-4, "grad_clip_norm": 1.0, "lr_schedule": "cosine"},
+               "weight_decay": 1e-4, "grad_clip_norm": 1.0, "lr_schedule": "cosine",
+               "bn_recalibration_batches": 64},
     "source": ("contract-v1 training block (batch_size 32, updates 500, mean_only_warmup_updates 50, "
                "lambda_rank 0, seeds 0/1/2, arms synthetic_only/hst_only/mixed) and the recipe confirmed in "
                "decisions F-009 before any trial (AdamW lr 1e-3, weight_decay 1e-4, grad clip 1.0, cosine "
-               "annealing over the update budget)"),
+               "annealing over the update budget), amended by F-011 (recipe v1.1: precise BatchNorm "
+               "recalibration over 64 training batches after the last update; the v1 matrix was rerun)"),
 }
 #: contract-v1 ``training`` keys -> FROZEN_MATRIX budget keys (checked with --matrix-contract).
 MATRIX_CONTRACT_KEYS = {"batch_size": "batch_size", "updates": "updates",

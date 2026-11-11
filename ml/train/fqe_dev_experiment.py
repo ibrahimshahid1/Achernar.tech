@@ -95,6 +95,9 @@ DEFAULTS = {
     "weight_decay": 1e-4,
     "grad_clip_norm": 1.0,
     "lr_schedule": "cosine",
+    # Recipe v1.1 (decision F-011): precise BatchNorm recalibration after the
+    # last update. 0 restores the v1 recipe (running statistics as trained).
+    "bn_recalibration_batches": 64,
     "checkpoint_every": 50,
     "device": "auto",
     "data_root": None,
@@ -276,6 +279,9 @@ def resolve_config(raw: dict) -> dict:
     for key in ("batch_size", "updates", "checkpoint_every"):
         if not isinstance(config[key], int) or isinstance(config[key], bool) or config[key] < 1:
             raise ExperimentRefusal(f"{key} must be a positive integer")
+    if (not isinstance(config["bn_recalibration_batches"], int) or isinstance(config["bn_recalibration_batches"], bool)
+            or config["bn_recalibration_batches"] < 0):
+        raise ExperimentRefusal("bn_recalibration_batches must be a non-negative integer (0 = v1 recipe)")
     if config["batch_size"] < 2:
         raise ExperimentRefusal("batch_size must be >= 2 (BatchNorm trains on the batch)")
     if not isinstance(config["warmup_updates"], int) or not 0 <= config["warmup_updates"] <= config["updates"]:
@@ -503,6 +509,45 @@ def _base_run_record(config: dict, config_sha: str, roles: dict, device: str) ->
         "checkpoints": [],
         "resumes": [],
         "validation_consulted_during_training": False,
+    }
+
+
+def _recalibrate_batchnorm(model, tensors, batch_rows, config, device) -> dict:
+    """Precise-BN recalibration (recipe v1.1, F-011): reset every BatchNorm's
+    running statistics and recompute them as a cumulative average
+    (``momentum=None``) over ``bn_recalibration_batches`` training batches drawn
+    by the training sampler at update indices after the budget. Training rows
+    only; weights are not updated. Returns the record kept in run.json."""
+    import torch
+
+    norms = [m for m in model.modules() if isinstance(m, torch.nn.modules.batchnorm._BatchNorm)]
+    momenta = [m.momentum for m in norms]
+    for m in norms:
+        m.reset_running_stats()
+        m.momentum = None
+    rows_seen = {}
+    model.train()
+    try:
+        with torch.no_grad():
+            for k in range(config["bn_recalibration_batches"]):
+                rows = batch_rows(config["updates"] + k)
+                xb = torch.cat([tensors[sid][0][torch.as_tensor(r, device=device)] for sid, r in rows.items()])
+                model(xb)
+                for sid, r in rows.items():
+                    rows_seen[sid] = rows_seen.get(sid, 0) + int(len(r))
+    finally:
+        for m, momentum in zip(norms, momenta):
+            m.momentum = momentum
+        model.eval()
+    return {
+        "method": "precise_bn_cumulative_average",
+        "reference": "Wu & Johnson 2021, Rethinking 'Batch' in BatchNorm (arXiv:2105.07576)",
+        "batches": int(config["bn_recalibration_batches"]),
+        "batch_size": int(config["batch_size"]),
+        "rows_drawn": rows_seen,
+        "partition": "train_fit",
+        "batchnorm_layers": len(norms),
+        "sampler_update_indices": [int(config["updates"]), int(config["updates"] + config["bn_recalibration_batches"] - 1)],
     }
 
 
@@ -738,6 +783,19 @@ def fit(config_path, out_dir, *, resume: bool = False, data_root=None, loader=No
                     record.update(updates_completed=update, updated_utc=_utc())
                     _write_json_atomic(files.run, record)
 
+        # Recipe v1.1 (F-011): torchvision's MobileNetV3 BatchNorm uses
+        # momentum 0.01, so after a short budget the running statistics still
+        # carry early-training activations and eval-mode outputs drift far from
+        # train-mode outputs (diagnosed on train_fit rows: MAE 1.0 px in eval
+        # mode vs 0.16 px with batch statistics). Precise BN (Wu & Johnson 2021,
+        # "Rethinking 'Batch' in BatchNorm", arXiv:2105.07576): reset the running
+        # statistics and recompute them as an exact average over batches drawn
+        # by the training sampler after the last update. Training rows only;
+        # no parameter is updated.
+        bn_record = None
+        if config["bn_recalibration_batches"] > 0:
+            bn_record = _recalibrate_batchnorm(model, tensors, batch_rows, config, device)
+        model.eval()
         # Final weights at the last update (no validation-based selection).
         final_state = _to_cpu(model.state_dict())
         if not state_is_finite(final_state):
@@ -754,6 +812,7 @@ def fit(config_path, out_dir, *, resume: bool = False, data_root=None, loader=No
             final_model="final/model_state.pt",
             final_model_sha256=final_sha,
             final_checkpoint_update=config["updates"],
+            bn_recalibration=bn_record,
             sample_exposure={sid: {"rows_drawn": drawn[sid], "pool_rows": int(plan.n_rows[sid]),
                                    "passes": drawn[sid] / max(1, int(plan.n_rows[sid]))}
                              for sid in plan.source_ids},
