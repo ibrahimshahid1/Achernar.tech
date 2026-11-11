@@ -1,0 +1,366 @@
+{
+ "schema": "bge-real-thresholds-v2",
+ "name": "BGE v2 real-frame qualification thresholds, v1",
+ "predeclared_utc": "2026-11-11T07:01:00+00:00",
+ "declared_before": "any real-frame qualification data for BGE v2 is analysed; values fixed by the coordinator on 2026-11-11; amended (a)-(c) by the coordinator the same day, before any real frame was seen",
+ "provenance": "Threshold values and their provenance tags (in brackets in the coordinator's table) are fixed by the coordinator. Minimum-data rules marked min_data_provenance='infrastructure default' are the qualification infrastructure's choice, fixed with this file. A failed criterion is reported as failed and is never relaxed after a hold-out run. Amended (a)-(c) on 2026-11-11 before any real frame was analysed; predeclared_utc is the time of the amendment.",
+ "analysis_input_required": "achernar-linear-bilinear-rgb-mean-v1",
+ "variants": {
+  "sep_v2": "rust_sep__n2g2",
+  "legacy_background": "rust_legacy__g2",
+  "legacy_gate": "rust_legacy__g1"
+ },
+ "variant_roles": {
+  "sep_v2": "SEP v2: masked_local_v2 noise, dip_annulus_v2 gate, regroup_deblended (spec section 4)",
+  "legacy_background": "legacy backend with the v2 gate: the comparator for gate-independent background criteria (R5-R16) and the subject of the pure gate criterion R17",
+  "legacy_gate": "legacy backend with the v1 gate: the comparator of the pure gate criterion R17"
+ },
+ "aggregation": {
+  "unit": "night",
+  "rule": "each criterion is evaluated per hold-out night; overall pass iff at least one hold-out night is evaluable and every evaluable night passes; fail if any evaluable night fails; not_evaluable when no night is evaluable",
+  "frames": "light frames of the night unless the criterion says otherwise; darks/bias calibrate s0 (development nights only) and mask hot pixels (same night)",
+  "criteria_per_night_statistics": {
+   "R5": "night-pooled detections / usable Mpx",
+   "R11": "median over dark trials, differential truth",
+   "R13": "median over repeat groups",
+   "R16": "median over sweeps",
+   "R15": "median over sweeps",
+   "R1-R3": "median over light frames",
+   "R4": "median over consecutive pairs"
+  }
+ },
+ "constants": {
+  "wavelength_nm": 550.0,
+  "cfz": "4 * lambda * N^2 (full width), N = focal_ratio of the beam the focuser moves (native f/3.95 for the Z114 also with a Barlow in the drawtube), converted to steps with focuser_stepsize_um",
+  "gaussian_tail_references": {
+   "p_abs_gt3": 0.0026998,
+   "p_abs_gt5": 5.733e-07
+  },
+  "snr_bin_edges": [
+   5,
+   10,
+   20,
+   50,
+   100,
+   300
+  ],
+  "s0_rule": "s0(method) = median over development-night dark and bias frames (same analysis input representation) of the per-frame robust std (1.4826 MAD) of the pull on the method's source-masked, hot-pixel-masked sky; s0 = 1.0 and flagged s0_uncalibrated when fewer than 2 such frames exist"
+ },
+ "criteria": [
+  {
+   "id": "R1",
+   "title": "pull mean",
+   "subject": "sep_v2",
+   "metric": "pull.median_abs_clipped_mean",
+   "statistic": "per-night median over light frames of |mean z| (z = (I - B_hat)/R_hat on the source-masked sky; mean over |z| <= 5)",
+   "op": "<=",
+   "value": 0.05,
+   "min_data": {
+    "frames": 3
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "statistics/judgement"
+  },
+  {
+   "id": "R2",
+   "title": "pull robust std",
+   "subject": "sep_v2",
+   "metric": "pull.median_robust_std",
+   "statistic": "per-night median over light frames of the pull robust std (1.4826 MAD)",
+   "op": "within",
+   "center": "s0",
+   "tolerance": 0.07,
+   "min_data": {
+    "frames": 3
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "judgement"
+  },
+  {
+   "id": "R3",
+   "title": "pull tail",
+   "subject": "sep_v2",
+   "metric": "pull.median_frac_abs_gt5",
+   "statistic": "per-night median over light frames of P(|z| > 5) after hot-pixel masking",
+   "op": "<=",
+   "value": 0.0001,
+   "min_data": {
+    "frames": 3
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "statistics 5.7e-7 + judgement margin"
+  },
+  {
+   "id": "R4",
+   "title": "difference-pull std",
+   "subject": "sep_v2",
+   "metric": "diff_pull.median_robust_std",
+   "statistic": "per-night median over consecutive pairs within repeat groups of the robust std of (I1 - I2)/sqrt(R1^2 + R2^2)",
+   "op": "within",
+   "center": "s0",
+   "tolerance": 0.1,
+   "min_data": {
+    "pairs": 3
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "judgement"
+  },
+  {
+   "id": "R5",
+   "title": "negated-residual false detections",
+   "subject": "sep_v2",
+   "comparator": "legacy_background",
+   "metric": "negated.rate_per_mpx",
+   "statistic": "night-pooled rate: (sum over the night's light frames of detections on -(I - B_hat) with the common reference detector) / (sum of usable Mpx); subject and comparator on the same frames",
+   "op": "<=",
+   "rhs": "max(floor_per_mpx, comparator)",
+   "floor_per_mpx": 1.0,
+   "min_data": {
+    "frames": 3
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "judgement",
+   "aggregation_within_night": "pooled over light frames (not a median of per-frame rates)"
+  },
+  {
+   "id": "R6",
+   "title": "injection completeness",
+   "subject": "sep_v2",
+   "comparator": "legacy_background",
+   "metric": "injection.bins",
+   "statistic": "per-night completeness per S/N bin (identical injected images for both methods)",
+   "op": ">=",
+   "rhs": "comparator - margin in every bin with lower edge >= min_bin_lower_edge",
+   "margin": 0.03,
+   "min_bin_lower_edge": 10,
+   "min_injections_per_bin": 400,
+   "min_data_provenance": "coordinator (400 per bin)",
+   "provenance": "binomial SE"
+  },
+  {
+   "id": "R7",
+   "title": "injection HFR bias",
+   "subject": "sep_v2",
+   "comparator": "legacy_background",
+   "metric": "injection.snr_ge_20.median_rel_hfr",
+   "statistic": "per-night median over accepted injected stars at S/N >= 20 of (HFR_method - HFR_truth)/HFR_truth; HFR_truth = the noiseless, isolated injected stamp measured with the daemon-equivalent crop estimator: zero sky, crop = clamp(2 x the bounding-box extent of stamp pixels above 5 x the frame sky sigma (median reference R_hat), 32, 128) px placed by ml.labels.psf_measure.rust_extract_crop, HFR by ml.labels.psf_measure.rust_compute_hfr_with_sky (Python twin of ClassicalFocusSolver::compute_hfr_with_sky) with level 0 and sigma = frame sky sigma",
+   "op": "abs<=",
+   "value": 0.05,
+   "comparator_margin": 0.01,
+   "min_snr": 20,
+   "min_data": {
+    "matched": 100
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "simulation-derived margin",
+   "truth_function": "ml.labels.psf_measure.rust_compute_hfr_with_sky",
+   "observation_not_criterion": "R7-obs (same statistic against the total-flux HFR of the injected profile)"
+  },
+  {
+   "id": "R8",
+   "title": "injection flux bias",
+   "subject": "sep_v2",
+   "metric": "injection.snr_ge_20.median_rel_flux",
+   "statistic": "per-night median relative aperture-flux error (r = max(4, 3 HFR_true)) at S/N >= 20",
+   "op": "abs<=",
+   "value": 0.02,
+   "min_snr": 20,
+   "min_data": {
+    "measured": 100
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "judgement"
+  },
+  {
+   "id": "R9",
+   "title": "injection centroid error",
+   "subject": "sep_v2",
+   "metric": "injection.snr_ge_20.median_centroid_px",
+   "statistic": "per-night median distance of the matched detection from the injected position at S/N >= 20",
+   "op": "<=",
+   "value": 0.1,
+   "min_snr": 20,
+   "min_data": {
+    "matched": 100
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "judgement"
+  },
+  {
+   "id": "R10",
+   "title": "background under injected stars",
+   "subject": "sep_v2",
+   "metric": "injection.delta_b.median_sigma",
+   "statistic": "per-night median over injected stars of mean(B_hat_inj - B_hat_orig) within max(2, 2 HFR_true) in units of R_hat_orig",
+   "op": "abs<=",
+   "value": 0.1,
+   "min_data": {
+    "stars": 100
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "aperture-bias derivation"
+  },
+  {
+   "id": "R11",
+   "title": "dark + injection",
+   "subject": "sep_v2",
+   "comparator": "legacy_background",
+   "metric": "dark_injection",
+   "statistic": "per night: median over the night's dark trials of |median over usable pixels of (B_hat(D+G+S) - B_true)| / sigma_D, with the differential truth B_true = B_hat(D) + G of the same method (the dark's own level cancels); and median over trials completed by both of the RMSE, subject <= comparator",
+   "op": "abs<=",
+   "value": 0.05,
+   "rmse_rule": "subject <= comparator",
+   "min_data": {
+    "trials": 2
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "statistics/simulation",
+   "aggregation_within_night": "median over dark trials (each dark x each simulated sky model)"
+  },
+  {
+   "id": "R12",
+   "title": "status-failure rate",
+   "subject": "sep_v2",
+   "comparator": "legacy_background",
+   "metric": "status_failure_rate",
+   "statistic": "per-night fraction of light frames whose level or noise is not measured (or the method failed)",
+   "op": "<=",
+   "value": 0.02,
+   "comparator_margin": 0.01,
+   "min_data": {
+    "frames": 10
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "judgement"
+  },
+  {
+   "id": "R13",
+   "title": "HFR repeatability",
+   "subject": "sep_v2",
+   "comparator": "legacy_background",
+   "metric": "repeatability.median_hfr_cv",
+   "statistic": "per night: median over repeat groups (>= 3 frames with an HFR, both methods) of the frame-HFR CV; subject median <= ratio x comparator median (ratio of medians, not median of ratios)",
+   "op": "<=",
+   "rhs": "ratio * comparator",
+   "ratio": 1.1,
+   "min_data": {
+    "groups": 2
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "judgement",
+   "aggregation_within_night": "median over repeat groups"
+  },
+  {
+   "id": "R14",
+   "title": "focus repeatability",
+   "subject": "sep_v2",
+   "comparator": "legacy_background",
+   "metric": "focus.p0_std",
+   "statistic": "per night with >= 4 successful sweep fits: std (ddof 1) of the hyperbola p0 over sweeps",
+   "op": "<=",
+   "rhs": "min(ratio * comparator, max_cfz_fraction * CFZ)",
+   "ratio": 1.1,
+   "max_cfz_fraction": 0.5,
+   "min_data": {
+    "sweeps": 4
+   },
+   "min_data_provenance": "coordinator (>= 4 sweeps per night)",
+   "provenance": "judgement"
+  },
+  {
+   "id": "R15",
+   "title": "focus agreement",
+   "subject": "sep_v2",
+   "comparator": "legacy_background",
+   "metric": "focus.sweeps",
+   "statistic": "per-night median over sweeps fitted by both of |p0_subject - p0_comparator|",
+   "op": "<=",
+   "rhs": "max_cfz_fraction * CFZ",
+   "max_cfz_fraction": 0.5,
+   "min_data": {
+    "sweeps": 2
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "judgement"
+  },
+  {
+   "id": "R16",
+   "title": "V-curve residual RMS",
+   "subject": "sep_v2",
+   "comparator": "legacy_background",
+   "metric": "focus.sweeps",
+   "statistic": "per night: median over sweeps fitted by both methods of the hyperbola residual RMS (px); subject median <= ratio x comparator median",
+   "op": "<=",
+   "rhs": "ratio * comparator",
+   "ratio": 1.1,
+   "min_data": {
+    "sweeps": 2
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "judgement",
+   "aggregation_within_night": "median over sweeps"
+  },
+  {
+   "id": "R17",
+   "title": "sweep coverage, pure gate change (live default backend)",
+   "subject": "legacy_background",
+   "comparator": "legacy_gate",
+   "metric": "focus.coverage.fraction",
+   "statistic": "per-night fraction of sweep frames (excluding moved_during_exposure and verification frames) with a frame HFR: rust_legacy__g2 vs rust_legacy__g1 on the same frames",
+   "op": ">=",
+   "value": 0.9,
+   "rhs": "and >= comparator",
+   "min_data": {
+    "sweep_frames": 9
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "judgement"
+  },
+  {
+   "id": "R17b",
+   "title": "sweep coverage, SEP v2",
+   "subject": "sep_v2",
+   "metric": "focus.coverage.fraction",
+   "statistic": "per-night fraction of sweep frames (excluding moved_during_exposure and verification frames) with a frame HFR for rust_sep__n2g2; no comparator",
+   "op": ">=",
+   "value": 0.9,
+   "min_data": {
+    "sweep_frames": 9
+   },
+   "min_data_provenance": "infrastructure default",
+   "provenance": "judgement"
+  }
+ ],
+ "observations": [
+  {
+   "id": "R7-obs",
+   "title": "injection HFR bias vs the total-flux truth (observation, not a criterion)",
+   "roles": [
+    "sep_v2",
+    "legacy_background"
+   ],
+   "metric": "injection.snr_ge_20.median_rel_hfr_total_flux_truth",
+   "statistic": "per-night median relative HFR error of accepted injected stars at S/N >= 20 against the total-flux half radius of the injected profile inside its render radius (ml.eval.bge.scenarios.numerical_hfr); includes the estimator's aperture definition, reported only"
+  }
+ ],
+ "amendments": [
+  {
+   "utc": "2026-11-11T07:01:00+00:00",
+   "by": "coordinator, before any real frame is seen",
+   "id": "a",
+   "change": "R7 truth = HFR of the noiseless injected stamp measured with the daemon-equivalent crop estimator (zero sky; crop = clamp(2 x extent of pixels above 5 x frame sky sigma, 32, 128); ml.labels.psf_measure.rust_compute_hfr_with_sky). The total-flux-truth bias is kept as observation R7-obs. Threshold values unchanged."
+  },
+  {
+   "utc": "2026-11-11T07:01:00+00:00",
+   "by": "coordinator, before any real frame is seen",
+   "id": "b",
+   "change": "R17 is a pure gate change on the live default backend: subject rust_legacy__g2 vs comparator rust_legacy__g1 (>= 0.90 and >= comparator). New R17b: rust_sep__n2g2 coverage >= 0.90, no comparator. The mixed SEP-v2-vs-legacy-g1 pairing is dropped."
+  },
+  {
+   "utc": "2026-11-11T07:01:00+00:00",
+   "by": "coordinator, before any real frame is seen",
+   "id": "c",
+   "change": "Accepted and stated explicitly: R5 night-pooled rate; R11 median over trials with differential truth B_true = B_hat(dark) + G; R13 median over repeat groups and R16 median over sweeps (ratio of medians)."
+  }
+ ]
+}

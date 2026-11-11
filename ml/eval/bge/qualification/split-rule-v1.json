@@ -1,0 +1,14 @@
+{
+  "schema": "bge-real-split-rule-v1",
+  "name": "bge real-frame night split v1",
+  "declared_utc": "2026-11-11T05:53:49+00:00",
+  "unit": "night_id",
+  "night_id_definition": "local date of sunset: a timestamp before local noon belongs to the previous date (achernar-daemon/src/storage/night.rs, tools/import_session.py night_id_for)",
+  "order": "nights sorted by the earliest timestamp_utc of any frame (light, dark, bias or flat) assigned to the night; nights with no timestamp sort after timestamped ones; ties and untimestamped nights by night_id",
+  "holdout_every": 2,
+  "holdout_first_position": 2,
+  "holdout_positions": "1-based positions 2, 4, 6, ... in that order are hold-out; 1, 3, 5, ... are development",
+  "calibration_frames": "darks, bias and flats belong to the split of their night",
+  "within_night": "a night is never split; every frame of a night carries the night's split",
+  "rationale": "frames within a night share seeing, transparency, sky brightness, tube temperature and focus state, so the night is the independent unit; alternating assignment keeps both splits spread over the campaign"
+}
