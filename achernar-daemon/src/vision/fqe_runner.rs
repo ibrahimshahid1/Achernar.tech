@@ -13,6 +13,16 @@
 //! The runner is SHADOW-MODE infrastructure: the classical curve-of-growth
 //! measurement remains the control authority until the FQE passes the frozen
 //! baselines in `ml/eval/baselines.py` (promotion gate, spec Section 7.10).
+//!
+//! **Prototype mode** (`[vision.fqe] prototype = true`, owner authorization
+//! F-006 of FQE run 20261111T0038): no bundle is qualified for the A03
+//! analysis domain, so the vision loop never runs the FQE. The opt-in
+//! prototype lets exactly one kind of bundle run anyway: one whose
+//! `metadata.json` carries the provenance block `ml/pipelines/rebuild_fqe.py
+//! --from-run ... --prototype-runtime-eligible` writes after the F-006
+//! evidence gate passed ([`verify_prototype_bundle`]). Its predictions are
+//! labelled prototype on the bus; classical HFR stays the authority. Without
+//! the flag nothing here changes.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -37,6 +47,27 @@ pub struct FqeOutput {
 /// Expected square crop side (px). The exported model is fixed to this.
 pub const FQE_CROP_SIZE: usize = 64;
 
+/// `training_info.prototype.gate.evidence_schema` written by
+/// `ml/pipelines/rebuild_fqe.py` (`PROTOTYPE_GATE_SCHEMA`).
+pub const PROTOTYPE_GATE_SCHEMA: &str = "fqe-prototype-gate-evidence-v1";
+
+/// What a verified prototype bundle declares about itself (from its
+/// `metadata.json`). Carried by the runner so every prediction can be
+/// labelled with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FqePrototype {
+    /// sha256 of the graph bytes the session was built from; equals the
+    /// metadata `sha256` (the gated `model.onnx`).
+    pub model_sha256: String,
+    /// sha256 of the F-006 gate evidence the export was refused without.
+    pub evidence_sha256: String,
+    /// The bundle's own domain statement (public archive data; not qualified
+    /// for R50/Z114).
+    pub domain: String,
+    /// The frozen `fqe_dev_experiment` run the weights came from.
+    pub run_name: Option<String>,
+}
+
 pub struct FqeRunner {
     // ONNX Runtime `Session::run` takes `&mut self`, so guard it with a Mutex to
     // keep the runner shareable behind an `Arc`.
@@ -48,6 +79,11 @@ pub struct FqeRunner {
     calibrated: bool,
     /// Version directory name the model was loaded from (e.g. "1.1.0").
     model_version: Option<String>,
+    /// `Some` only when prototype mode was requested AND the loaded bundle
+    /// passed [`verify_prototype_bundle`].
+    prototype: Option<FqePrototype>,
+    /// Prototype mode was requested but no verified bundle is loaded: why.
+    prototype_refusal: Option<String>,
 }
 
 impl FqeRunner {
@@ -58,21 +94,46 @@ impl FqeRunner {
     ///
     /// A `calibration.json` next to the model is read for `sigma_scale`.
     pub fn new(model_path: Option<String>) -> crate::error::Result<Self> {
+        Self::new_with_prototype(model_path, false)
+    }
+
+    /// [`FqeRunner::new`], plus `[vision.fqe] prototype`. With
+    /// `prototype_mode` false this is exactly `new`. With it true the graph
+    /// is read once, those bytes are what ONNX Runtime loads, and the same
+    /// bytes must pass [`verify_prototype_graph`] against the bundle beside
+    /// them (so a sibling such as `model.int8.onnx` cannot run under the
+    /// prototype block of `model.onnx`); otherwise the runner records why
+    /// ([`FqeRunner::prototype_refusal`]) and the vision loop keeps the FQE
+    /// disabled.
+    pub fn new_with_prototype(
+        model_path: Option<String>,
+        prototype_mode: bool,
+    ) -> crate::error::Result<Self> {
         let mut star_sigma_scale = 1.0_f64;
         let mut frame_sigma_scale = 1.0_f64;
         let mut calibrated = false;
         let mut model_version = None;
+        // Prototype mode only: the exact bytes the session was built from.
+        let mut loaded_graph: Option<Vec<u8>> = None;
 
         let session = match model_path.as_deref() {
             Some(path) if std::path::Path::new(path).exists() => {
-                let session = Session::builder()
+                let builder = Session::builder()
                     .map_err(onnx_err)?
                     .with_optimization_level(GraphOptimizationLevel::Level3)
                     .map_err(onnx_err)?
                     .with_intra_threads(1)
-                    .map_err(onnx_err)?
-                    .commit_from_file(path)
                     .map_err(onnx_err)?;
+                let session = if prototype_mode {
+                    let bytes = std::fs::read(path).map_err(|err| {
+                        InferenceError::ModelNotFound(format!("{path} unreadable: {err}"))
+                    })?;
+                    let session = builder.commit_from_memory(&bytes).map_err(onnx_err)?;
+                    loaded_graph = Some(bytes);
+                    session
+                } else {
+                    builder.commit_from_file(path).map_err(onnx_err)?
+                };
 
                 let parent = Path::new(path).parent();
                 model_version = parent
@@ -99,12 +160,48 @@ impl FqeRunner {
             }
             None => None,
         };
+        let (prototype, prototype_refusal) = match (prototype_mode, model_path.as_deref()) {
+            (false, _) => (None, None),
+            (true, Some(path)) if session.is_some() => {
+                match loaded_graph
+                    .as_deref()
+                    .map(|bytes| verify_prototype_graph(Path::new(path), bytes))
+                {
+                    Some(Ok(prototype)) => {
+                        tracing::warn!(
+                            "FQE PROTOTYPE enabled: {path} (sha256 {}, evidence {}); {}. \
+                             Predictions are labelled prototype; classical HFR stays \
+                             the authority.",
+                            prototype.model_sha256,
+                            prototype.evidence_sha256,
+                            prototype.domain
+                        );
+                        (Some(prototype), None)
+                    }
+                    Some(Err(reason)) => {
+                        tracing::warn!("FQE prototype refused for {path}: {reason}");
+                        (None, Some(format!("{path}: {reason}")))
+                    }
+                    None => (None, Some(format!("{path}: graph bytes not retained"))),
+                }
+            }
+            (true, Some(path)) => (None, Some(format!("{path}: model not loaded"))),
+            (true, None) => (
+                None,
+                Some(
+                    "no runtime-eligible shadow bundle with a verified prototype block was found"
+                        .to_string(),
+                ),
+            ),
+        };
         Ok(Self {
             session,
             star_sigma_scale,
             frame_sigma_scale,
             calibrated,
             model_version,
+            prototype,
+            prototype_refusal,
         })
     }
 
@@ -116,11 +213,34 @@ impl FqeRunner {
             frame_sigma_scale: 1.0,
             calibrated: false,
             model_version: None,
+            prototype: None,
+            prototype_refusal: None,
+        }
+    }
+
+    /// Disabled runner in prototype mode: no model, and `reason` explains
+    /// why on every observation.
+    pub fn disabled_prototype(reason: String) -> Self {
+        Self {
+            prototype_refusal: Some(reason),
+            ..Self::disabled()
         }
     }
 
     pub fn is_loaded(&self) -> bool {
         self.session.is_some()
+    }
+
+    /// The verified prototype this runner serves, when prototype mode is on
+    /// and the bundle passed [`verify_prototype_bundle`]. Only then does the
+    /// vision loop run it.
+    pub fn prototype(&self) -> Option<&FqePrototype> {
+        self.prototype.as_ref().filter(|_| self.is_loaded())
+    }
+
+    /// Prototype mode was requested, but no verified prototype is loaded.
+    pub fn prototype_refusal(&self) -> Option<&str> {
+        self.prototype_refusal.as_deref()
     }
 
     pub fn is_calibrated(&self) -> bool {
@@ -326,6 +446,166 @@ fn is_runtime_eligible(model_dir: &Path) -> bool {
         )
 }
 
+/// Prototype mode's resolver: the highest `major.minor.patch` bundle under
+/// `<models_root>/focus_quality/` that is runtime-eligible (as
+/// [`resolve_latest_model`] requires) AND passes [`verify_prototype_bundle`].
+/// Used only when `[vision.fqe] prototype = true`; a bundle without the
+/// prototype block is never selected by it.
+pub fn resolve_latest_prototype_model(models_root: &str) -> Option<PathBuf> {
+    let base = Path::new(models_root).join("focus_quality");
+    let mut best: Option<((u64, u64, u64), PathBuf)> = None;
+    for entry in std::fs::read_dir(&base).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let mut parts = name.split('.').map(|p| p.parse::<u64>());
+        let version = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(Ok(a)), Some(Ok(b)), Some(Ok(c)), None) => (a, b, c),
+            _ => continue,
+        };
+        let candidate = entry.path().join("model.onnx");
+        if !candidate.exists()
+            || !is_runtime_eligible(&entry.path())
+            || verify_prototype_bundle(&entry.path()).is_err()
+        {
+            continue;
+        }
+        if best.as_ref().map(|(v, _)| version > *v).unwrap_or(true) {
+            best = Some((version, candidate));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// [`verify_prototype_graph`] for the bundle's own `model.onnx` (the graph
+/// the prototype resolver selects).
+pub fn verify_prototype_bundle(model_dir: &Path) -> Result<FqePrototype, String> {
+    let model_path = model_dir.join("model.onnx");
+    let model_bytes =
+        std::fs::read(&model_path).map_err(|err| format!("model.onnx unreadable: {err}"))?;
+    verify_prototype_graph(&model_path, &model_bytes)
+}
+
+/// Accept the graph `model_bytes` (read from `model_path`) as an F-006
+/// prototype only when everything `rebuild_fqe.py --from-run ...
+/// --prototype-runtime-eligible` writes after a passed evidence gate is
+/// present in `model_path`'s directory and consistent:
+///
+/// * `sha256` equals the sha256 of `model_bytes`, the graph that runs. The
+///   gate's evidence (ONNX parity included) is about the FP32 `model.onnx`
+///   it hashed; any other file, e.g. the `model.int8.onnx` an export with
+///   `--quantize` writes beside it, is refused;
+/// * `training_info`: `status` "trained", `runtime_eligible` true,
+///   `promotion_status` exactly "shadow", no `prototype_refused`;
+/// * `training_info.prototype`: `runtime_eligible_override` true,
+///   `real_multi_run_data` false, `ready_for_promotion_review` false,
+///   `qualified_for` empty, a `domain` statement, and a `gate` with `status`
+///   "passed", `evidence_schema` [`PROTOTYPE_GATE_SCHEMA`], a 64-hex
+///   `evidence_sha256`, `test_partition_used` false and passed ONNX parity on
+///   fixtures and development crops;
+/// * the graph contract: `input_format.image` `[batch, 1, 64, 64]` and
+///   `mu_log_hfr`/`log_var` outputs;
+/// * `norm_params.json` declares the per-crop 1/99 percentile [0, 1]
+///   normalization this daemon implements (`preprocess::robust_normalize`).
+pub fn verify_prototype_graph(
+    model_path: &Path,
+    model_bytes: &[u8],
+) -> Result<FqePrototype, String> {
+    use serde_json::Value;
+
+    let model_dir = model_path
+        .parent()
+        .ok_or("model path has no bundle directory")?;
+    let read_json = |name: &str| -> Result<Value, String> {
+        let raw = std::fs::read_to_string(model_dir.join(name))
+            .map_err(|err| format!("{name} unreadable: {err}"))?;
+        serde_json::from_str(&raw).map_err(|err| format!("{name} is not JSON: {err}"))
+    };
+    let metadata = read_json("metadata.json")?;
+    let actual = format!("{:x}", Sha256::digest(model_bytes));
+    if metadata.get("sha256").and_then(Value::as_str) != Some(actual.as_str()) {
+        let name = model_path.file_name().map_or_else(
+            || model_path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        return Err(format!(
+            "metadata sha256 does not match {name}, the graph that would run"
+        ));
+    }
+    let training = metadata.get("training_info").ok_or("no training_info")?;
+    let text =
+        |value: &Value, key: &str| value.get(key).and_then(Value::as_str).map(str::to_string);
+    let flag = |value: &Value, key: &str| value.get(key).and_then(Value::as_bool);
+    if text(training, "status").as_deref() != Some("trained")
+        || flag(training, "runtime_eligible") != Some(true)
+        || text(training, "promotion_status").as_deref() != Some("shadow")
+    {
+        return Err(
+            "training_info is not trained / runtime_eligible / promotion_status \"shadow\"".into(),
+        );
+    }
+    if training.get("prototype_refused").is_some() {
+        return Err("training_info records a refused prototype export".into());
+    }
+    let prototype = training
+        .get("prototype")
+        .filter(|value| value.is_object())
+        .ok_or("no training_info.prototype block (rebuild_fqe --prototype-runtime-eligible)")?;
+    if flag(prototype, "runtime_eligible_override") != Some(true)
+        || flag(prototype, "real_multi_run_data") != Some(false)
+        || flag(prototype, "ready_for_promotion_review") != Some(false)
+        || prototype
+            .get("qualified_for")
+            .and_then(Value::as_array)
+            .map_or(true, |qualified| !qualified.is_empty())
+    {
+        return Err("prototype block does not declare an unqualified runtime override".into());
+    }
+    let domain = text(prototype, "domain")
+        .filter(|domain| !domain.trim().is_empty())
+        .ok_or("prototype block has no domain statement")?;
+    let gate = prototype.get("gate").ok_or("prototype block has no gate")?;
+    let evidence_sha256 = text(gate, "evidence_sha256")
+        .filter(|sha| sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()))
+        .ok_or("prototype gate has no evidence_sha256")?;
+    let parity_passed =
+        |key: &str| gate.get(key).and_then(|parity| flag(parity, "passed")) == Some(true);
+    if text(gate, "status").as_deref() != Some("passed")
+        || text(gate, "evidence_schema").as_deref() != Some(PROTOTYPE_GATE_SCHEMA)
+        || flag(gate, "test_partition_used") != Some(false)
+        || !parity_passed("onnx_parity_fixtures")
+        || !parity_passed("onnx_parity_dev_crops")
+    {
+        return Err(format!(
+            "prototype gate is not a passed {PROTOTYPE_GATE_SCHEMA} gate with ONNX parity"
+        ));
+    }
+    let input = metadata.pointer("/input_format/image").cloned();
+    if input != Some(serde_json::json!(["batch", 1, 64, 64]))
+        || metadata.pointer("/output_format/mu_log_hfr").is_none()
+        || metadata.pointer("/output_format/log_var").is_none()
+    {
+        return Err("graph contract is not image [batch,1,64,64] -> mu_log_hfr, log_var".into());
+    }
+    let norm = read_json("norm_params.json")?;
+    let number = |key: &str| norm.get(key).and_then(Value::as_f64);
+    let scale_to: Option<Vec<f64>> = norm
+        .get("scale_to")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_f64).collect());
+    if text(&norm, "scheme").as_deref() != Some("per_crop_percentile")
+        || number("p_lo") != Some(1.0)
+        || number("p_hi") != Some(99.0)
+        || scale_to.as_deref() != Some(&[0.0, 1.0][..])
+    {
+        return Err("norm_params.json is not the per-crop 1/99 percentile [0, 1] contract".into());
+    }
+    Ok(FqePrototype {
+        model_sha256: actual,
+        evidence_sha256,
+        domain,
+        run_name: text(prototype, "run_name"),
+    })
+}
+
 /// Read the per-star and post-pooling scales from `calibration.json`. Calibration
 /// is accepted only when it names the same model hash as `metadata.json`; a
 /// copied/stale file must not silently bless different weights. A valid legacy
@@ -363,6 +643,110 @@ fn load_sigma_scales(model_path: &Path) -> Option<(f64, f64, bool)> {
 
 fn onnx_err(err: ort::Error) -> crate::error::AchernarError {
     InferenceError::OnnxError(err.to_string()).into()
+}
+
+/// Test fixture: `<root>/focus_quality/<version>/` holding a copy of the
+/// checked-in random-weight `models/focus_quality/1.0.0/model.onnx` plus the
+/// files `rebuild_fqe.py --from-run ... --prototype-runtime-eligible` writes
+/// after a passed F-006 gate (metadata.json with the `training_info.prototype`
+/// block, norm_params.json, and the uncalibrated public calibration.json).
+/// `edit` changes the metadata before it is written. Returns the model path.
+/// Random weights: the predictions are finite but meaningless.
+#[cfg(test)]
+pub(crate) fn write_test_prototype_bundle(
+    root: &Path,
+    version: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> PathBuf {
+    let reference =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../models/focus_quality/1.0.0/model.onnx");
+    write_test_prototype_bundle_from(root, version, &reference, edit)
+}
+
+/// [`write_test_prototype_bundle`] with another ONNX graph as `model.onnx`.
+#[cfg(test)]
+pub(crate) fn write_test_prototype_bundle_from(
+    root: &Path,
+    version: &str,
+    reference: &Path,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> PathBuf {
+    let dir = root.join("focus_quality").join(version);
+    std::fs::create_dir_all(&dir).unwrap();
+    let model = dir.join("model.onnx");
+    std::fs::copy(reference, &model).unwrap();
+    let sha256 = format!("{:x}", Sha256::digest(std::fs::read(&model).unwrap()));
+    let domain = "public archive development data (stellar_sim_v1 synthetic reference / \
+                  hst_acs_corpus_v1 SEP measurement reference); not qualified for R50/Z114";
+    let parity = serde_json::json!({"max_abs_delta_mu": 0.0, "tolerance": 1e-4, "passed": true});
+    let gate = serde_json::json!({
+        "status": "passed",
+        "evidence_schema": PROTOTYPE_GATE_SCHEMA,
+        "evidence_name": "gate_evidence.json",
+        "evidence_sha256": "ab".repeat(32),
+        "population": {"source_id": "stellar_sim_v1", "partition": "val"},
+        "test_partition_used": false,
+        "onnx_parity_fixtures": parity,
+        "onnx_parity_dev_crops": parity,
+    });
+    let prototype = serde_json::json!({
+        "runtime_eligible_override": true,
+        "authorization": "daemon test fixture (shape of rebuild_fqe F-006 block)",
+        "note": "random weights; integration only",
+        "domain": domain,
+        "data_roles": ["synthetic_reference"],
+        "source_ids": ["stellar_sim_v1"],
+        "contract_sha256": "0".repeat(64),
+        "qualified_for": [],
+        "not_qualified_for": ["R50", "Z114", "autofocus control authority", "promotion review"],
+        "real_multi_run_data": false,
+        "ready_for_promotion_review": false,
+        "run_name": "fixture-s0",
+        "gate": gate,
+    });
+    let mut metadata = serde_json::json!({
+        "model_name": "focus_quality",
+        "version": version,
+        "task": "focus_quality",
+        "framework": "onnx",
+        "input_format": {"image": ["batch", 1, 64, 64]},
+        "output_format": {"mu_log_hfr": ["batch"], "log_var": ["batch"]},
+        "sha256": sha256,
+        "training_info": {
+            "status": "trained",
+            "promotion_status": "shadow",
+            "runtime_eligible": true,
+            "preprocessing": "per-crop robust_normalize p1/p99 -> [0,1] (norm_params.json)",
+            "domain": domain,
+            "prototype": prototype,
+        },
+    });
+    edit(&mut metadata);
+    std::fs::write(dir.join("metadata.json"), metadata.to_string()).unwrap();
+    std::fs::write(
+        dir.join("norm_params.json"),
+        serde_json::json!({
+            "scheme": "per_crop_percentile",
+            "p_lo": 1.0,
+            "p_hi": 99.0,
+            "scale_to": [0.0, 1.0],
+            "spec_section": "7.6.1"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("calibration.json"),
+        serde_json::json!({
+            "sigma_scale": null,
+            "frame_sigma_scale": null,
+            "model_sha256": sha256,
+            "model_filename": "model.onnx"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    model
 }
 
 #[cfg(test)]
@@ -537,5 +921,201 @@ mod tests {
         );
         assert!(out.hfr_px.is_finite() && out.hfr_px > 0.0);
         assert!(out.sigma_log_hfr.is_finite() && out.sigma_log_hfr > 0.0);
+    }
+
+    fn scratch_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("fqe_{tag}_{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        root
+    }
+
+    fn drop_prototype_block(metadata: &mut serde_json::Value) {
+        metadata["training_info"]
+            .as_object_mut()
+            .unwrap()
+            .remove("prototype");
+    }
+
+    /// The fixture shaped like a `rebuild_fqe --prototype-runtime-eligible`
+    /// export is accepted; every way of not being one is refused.
+    #[test]
+    fn prototype_verification_accepts_only_a_passed_f006_prototype_block() {
+        use serde_json::{json, Value};
+        let root = scratch_root("prototype_verify");
+        let model = write_test_prototype_bundle(&root, "1.1.0", |_| {});
+        let prototype = verify_prototype_bundle(model.parent().unwrap()).unwrap();
+        assert_eq!(prototype.run_name.as_deref(), Some("fixture-s0"));
+        assert_eq!(prototype.evidence_sha256, "ab".repeat(32));
+        assert!(prototype.domain.contains("not qualified for R50/Z114"));
+        assert_eq!(
+            prototype.model_sha256,
+            format!("{:x}", Sha256::digest(std::fs::read(&model).unwrap()))
+        );
+
+        let refusals: [(&str, fn(&mut Value)); 16] = [
+            (
+                "no prototype block: no training_info.prototype block",
+                drop_prototype_block,
+            ),
+            (
+                "prototype not an object: no training_info.prototype block",
+                |m| m["training_info"]["prototype"] = json!(true),
+            ),
+            ("promoted: promotion_status", |m| {
+                m["training_info"]["promotion_status"] = json!("promoted")
+            }),
+            ("not runtime eligible: runtime_eligible", |m| {
+                m["training_info"]["runtime_eligible"] = json!(false)
+            }),
+            ("reference status: not trained", |m| {
+                m["training_info"]["status"] = json!("reference")
+            }),
+            ("refused export: refused prototype export", |m| {
+                m["training_info"]["prototype_refused"] = json!({"status": "refused"})
+            }),
+            ("no override: unqualified runtime override", |m| {
+                m["training_info"]["prototype"]["runtime_eligible_override"] = json!(false)
+            }),
+            ("claims qualification: unqualified runtime override", |m| {
+                m["training_info"]["prototype"]["qualified_for"] = json!(["R50"])
+            }),
+            ("promotion evidence: unqualified runtime override", |m| {
+                m["training_info"]["prototype"]["ready_for_promotion_review"] = json!(true)
+            }),
+            ("no domain: no domain statement", |m| {
+                m["training_info"]["prototype"]["domain"] = json!(" ")
+            }),
+            (
+                "gate not passed: passed fqe-prototype-gate-evidence-v1 gate",
+                |m| m["training_info"]["prototype"]["gate"]["status"] = json!("refused"),
+            ),
+            (
+                "other evidence schema: passed fqe-prototype-gate-evidence-v1 gate",
+                |m| m["training_info"]["prototype"]["gate"]["evidence_schema"] = json!("v0"),
+            ),
+            (
+                "test partition used: passed fqe-prototype-gate-evidence-v1 gate",
+                |m| m["training_info"]["prototype"]["gate"]["test_partition_used"] = json!(true),
+            ),
+            ("dev-crop parity failed: ONNX parity", |m| {
+                m["training_info"]["prototype"]["gate"]["onnx_parity_dev_crops"]["passed"] =
+                    json!(false)
+            }),
+            ("graph contract: graph contract", |m| {
+                m["input_format"]["image"] = json!(["batch", 3, 64, 64])
+            }),
+            ("stale metadata hash: does not match model.onnx", |m| {
+                m["sha256"] = json!("0".repeat(64))
+            }),
+        ];
+        for (index, (case, edit)) in refusals.into_iter().enumerate() {
+            let (case, expected) = case.split_once(": ").unwrap();
+            let model = write_test_prototype_bundle(&root, &format!("2.0.{index}"), edit);
+            let error = verify_prototype_bundle(model.parent().unwrap()).unwrap_err();
+            assert!(error.contains(expected), "{case}: {error}");
+        }
+
+        // A normalization other than the per-crop 1/99 [0, 1] contract.
+        let model = write_test_prototype_bundle(&root, "3.0.0", |_| {});
+        std::fs::write(
+            model.parent().unwrap().join("norm_params.json"),
+            r#"{"scheme":"per_crop_percentile","p_lo":0.5,"p_hi":99.5,"scale_to":[0.0,1.0]}"#,
+        )
+        .unwrap();
+        assert!(verify_prototype_bundle(model.parent().unwrap())
+            .unwrap_err()
+            .contains("norm_params"));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The ordinary resolver and `FqeRunner::new` are unchanged; only
+    /// prototype mode with a verified block yields a prototype runner.
+    #[test]
+    fn prototype_mode_needs_both_the_flag_and_a_verified_bundle() {
+        let root = scratch_root("prototype_mode");
+        let prototype_model = write_test_prototype_bundle(&root, "1.1.0", |_| {});
+        let plain_model = write_test_prototype_bundle(&root, "1.2.0", drop_prototype_block);
+        let root_str = root.to_str().unwrap();
+        assert!(resolve_latest_model(root_str)
+            .unwrap()
+            .ends_with("focus_quality/1.2.0/model.onnx"));
+        assert!(resolve_latest_prototype_model(root_str)
+            .unwrap()
+            .ends_with("focus_quality/1.1.0/model.onnx"));
+
+        let path = |model: &PathBuf| Some(model.to_string_lossy().into_owned());
+        let flag_off = FqeRunner::new(path(&prototype_model)).unwrap();
+        assert!(flag_off.is_loaded());
+        assert!(flag_off.prototype().is_none());
+        assert!(flag_off.prototype_refusal().is_none());
+
+        let prototype = FqeRunner::new_with_prototype(path(&prototype_model), true).unwrap();
+        assert!(prototype.is_loaded());
+        assert_eq!(prototype.model_version(), Some("1.1.0"));
+        assert!(
+            !prototype.is_calibrated(),
+            "public bundles ship an uncalibrated sigma"
+        );
+        assert_eq!(
+            prototype.prototype().unwrap().run_name.as_deref(),
+            Some("fixture-s0")
+        );
+        assert!(prototype.prototype_refusal().is_none());
+
+        let refused = FqeRunner::new_with_prototype(path(&plain_model), true).unwrap();
+        assert!(refused.is_loaded());
+        assert!(refused.prototype().is_none());
+        assert!(refused
+            .prototype_refusal()
+            .unwrap()
+            .contains("no training_info.prototype block"));
+
+        // A different graph beside the verified one (as `--quantize` writes
+        // `model.int8.onnx`), configured explicitly: it loads, but it is not
+        // the graph the prototype block's hash and gate describe, so it is
+        // refused. Stand-in: model.onnx with a ModelProto doc_string (field
+        // 6) appended, a valid ONNX file with other bytes.
+        let bundle = prototype_model.parent().unwrap();
+        let mut other_graph = std::fs::read(&prototype_model).unwrap();
+        let doc = b"int8 stand-in";
+        other_graph.extend_from_slice(&[0x32, doc.len() as u8]);
+        other_graph.extend_from_slice(doc);
+        let int8 = bundle.join("model.int8.onnx");
+        std::fs::write(&int8, &other_graph).unwrap();
+        let int8_runner = FqeRunner::new_with_prototype(path(&int8), true).unwrap();
+        assert!(
+            int8_runner.is_loaded(),
+            "the stand-in must be a valid graph"
+        );
+        assert!(int8_runner.prototype().is_none());
+        let reason = int8_runner.prototype_refusal().unwrap();
+        assert!(
+            reason.contains("metadata sha256 does not match model.int8.onnx"),
+            "{reason}"
+        );
+        // The binding is to the bytes, not the file name: an identical copy
+        // is the gated graph.
+        let copy = bundle.join("model.copy.onnx");
+        std::fs::copy(&prototype_model, &copy).unwrap();
+        let copied = FqeRunner::new_with_prototype(path(&copy), true).unwrap();
+        assert_eq!(
+            copied.prototype().map(|p| p.model_sha256.clone()),
+            prototype.prototype().map(|p| p.model_sha256.clone())
+        );
+        // The resolver still selects the bundle's own model.onnx.
+        assert!(resolve_latest_prototype_model(root_str)
+            .unwrap()
+            .ends_with("focus_quality/1.1.0/model.onnx"));
+
+        let nothing = FqeRunner::new_with_prototype(None, true).unwrap();
+        assert!(!nothing.is_loaded() && nothing.prototype().is_none());
+        assert!(nothing.prototype_refusal().is_some());
+        assert!(FqeRunner::disabled_prototype("why".into())
+            .prototype()
+            .is_none());
+
+        std::fs::remove_dir_all(prototype_model.parent().unwrap()).unwrap();
+        assert!(resolve_latest_prototype_model(root_str).is_none());
+        std::fs::remove_dir_all(&root).ok();
     }
 }

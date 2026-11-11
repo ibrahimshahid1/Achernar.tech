@@ -171,6 +171,26 @@ describe("mapSharedObservation background contract", () => {
         expect(v2.cloudUnavailableReason).toBe("partial_detection_area");
     });
 
+    it("labels FQE prototype predictions and defaults the flag off", () => {
+        const shadow = mapSharedObservation(observation({ fqe_hfr_px: 2.1 }))!;
+        expect(shadow.fqePrototype).toBe(false);
+
+        const prototype = mapSharedObservation(
+            observation({
+                fqe_hfr_px: 2.1,
+                fqe_star_count: 9,
+                fqe_model_version: "1.1.0",
+                fqe_calibrated: false,
+                fqe_prototype: true,
+            }),
+        )!;
+        expect(prototype.fqePrototype).toBe(true);
+        expect(prototype.fqeHfrPx).toBe(2.1);
+        expect(prototype.fqeModelVersion).toBe("1.1.0");
+        expect(prototype.fqeCalibrated).toBe(false);
+        expect(mapSharedObservation(observation({ fqe_prototype: "yes" }))!.fqePrototype).toBe(false);
+    });
+
     it("rejects non-objects", () => {
         expect(mapSharedObservation(null)).toBeNull();
         expect(mapSharedObservation("x")).toBeNull();

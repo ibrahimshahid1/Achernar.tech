@@ -44,6 +44,20 @@ sweep_radius_points = 3
 # which is a decision a night's script makes rather than a file does.
 sweep_pattern = "monotonic"
 
+# Which HFR the V-curve fit uses: "classical" (default) or "fqe_prototype".
+#
+# "fqe_prototype" is a PROTOTYPE, NOT QUALIFIED FOR R50/Z114, OFF BY DEFAULT
+# (owner authorization F-006, FQE run 20261111T0038). Each sweep sample's fit
+# HFR is the FQE prototype's frame HFR when that frame has a finite prototype
+# prediction from >= 3 stars, otherwise the sample's classical HFR. The source
+# used is recorded per sample (the frame's quality_json autofocus_hfr_source)
+# and counted per run (hfr_source_counts in the run response; the move-to-best
+# focus_actions.reason). focus_samples.hfr, the verification verdict and the
+# drift forecaster stay classical; a run whose fit used the prototype does not
+# teach the forecaster. The daemon refuses to start with "fqe_prototype"
+# unless [vision.fqe] prototype = true.
+hfr_source = "classical"
+
 [focus.safety]                # Hard limits enforced by safety_guard.rs (7.3.3)
 min_position = 0
 max_position = 50000
@@ -397,3 +411,25 @@ blend_test = "dip_annulus_v2"
 # blend test (a failed family is tallied "deblended"). No effect when
 # accept_deblended_for_focus = true.
 regroup_deblended = true
+
+[vision.fqe]                        # FQE prototype switch
+# PROTOTYPE, NOT QUALIFIED FOR R50/Z114, OFF BY DEFAULT (owner authorization
+# F-006, FQE run 20261111T0038). Off, nothing changes: no FQE bundle is
+# qualified for the A03 analysis domain, so the vision loop never runs the
+# FQE ("FQE disabled: no model bundle is qualified for the A03 analysis
+# domain/version").
+# true: the newest models/focus_quality/<semver> bundle (or an explicit
+# focus.models.quality_model_path) whose metadata.json has runtime_eligible =
+# true, promotion_status "shadow" AND the prototype provenance block that
+# ml/pipelines/rebuild_fqe.py --from-run ... --prototype-runtime-eligible
+# writes (a passed fqe-prototype-gate-evidence-v1 gate with ONNX parity) runs,
+# and only when the sha256 of the graph file actually loaded equals that
+# metadata's sha256 (an explicit path to e.g. model.int8.onnx is refused). It
+# runs on the accepted focus stars only (at most 16 per frame): 64x64 crops centred
+# as the archive training crops were, per-crop 1/99 percentile normalisation
+# to [0, 1]; a crop with a masked, saturated or non-finite pixel is skipped.
+# Its fields on the vision bus and in quality_json carry fqe_prototype = true;
+# classical HFR remains the authority. A bundle without the prototype block is
+# never enabled by this flag. The weights were trained on public archive data
+# (synthetic + HST); nothing about them is evidence of R50 accuracy.
+prototype = false

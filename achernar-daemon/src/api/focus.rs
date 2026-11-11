@@ -56,7 +56,10 @@ use crate::equipment::types::{
     OpOutcome, Priority,
 };
 use crate::error::{AchernarError, FocusError, HardwareError};
-use crate::focus::focus_agent::{FocusRunContext, FocusRunState, FocusSample};
+use crate::focus::focus_agent::{
+    choose_fit_hfr, FitHfrSource, FocusRunContext, FocusRunState, FocusSample, FqeReading,
+    HfrSource, HfrSourceCounts,
+};
 use crate::focus::fop_features::{self, CfzInputs, FopInputs, HistorySample, VerifiedFilter};
 use crate::hardware::ols_ffi::{OlsBayerType, OlsCamOptionId, OlsStreamType};
 use crate::state::{AppState, CameraActivity};
@@ -93,6 +96,10 @@ pub struct FocusRunResponse {
     /// that could not be resumed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Curve-fit HFR sources of an `[focus] hfr_source = "fqe_prototype"`
+    /// run (prototype, not qualified for R50/Z114). Omitted on classical runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hfr_source_counts: Option<HfrSourceCounts>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -238,6 +245,7 @@ pub async fn get_focus_status(
             samples_count: 0,
             verified: None,
             warnings: Vec::new(),
+            hfr_source_counts: None,
         }))
     }
 }
@@ -261,6 +269,7 @@ fn response_from_run(run: &FocusRunContext) -> FocusRunResponse {
         samples_count: run.samples.len() as u32,
         verified: None,
         warnings: Vec::new(),
+        hfr_source_counts: run.hfr_source_counts.clone(),
     }
 }
 
@@ -889,6 +898,10 @@ async fn run_autofocus_session(
         format!("guiding_during_autofocus={guiding:?}"),
         format!("simulation={simulation}"),
     ];
+    if config.hfr_source != HfrSource::Classical {
+        // PROTOTYPE curve fit (F-006): on the audit record of the run.
+        annotations.push(format!("hfr_source={}", config.hfr_source.as_str()));
+    }
     for warning in &warnings {
         tracing::warn!("autofocus: {warning}");
         annotations.push(format!("warning: {warning}"));
@@ -1137,7 +1150,7 @@ async fn sweep_and_verify(
         from_position: Some(from_position),
         to_position: Some(best_position),
         steps: Some(best_position - from_position),
-        reason: Some("classical_hfr_curve_fit".into()),
+        reason: Some(curve_fit_reason(&run)),
         focuser_move_id: final_move.move_id,
     };
     let record = FocusVerification {
@@ -1182,8 +1195,15 @@ async fn sweep_and_verify(
 
     // H5: only a verified, non-simulator run teaches the FDF, at the
     // verification frame's time and the hub's ambient temperature (H6).
+    // A best position chosen by the FQE prototype's curve teaches nothing:
+    // the forecaster learns from the classical authority only.
     let ambient = state.equipment.ambient_temperature();
-    match drift_learning_temperature(ctx.simulation, verification.verified, &ambient) {
+    match drift_learning_gate(
+        ctx.simulation,
+        verification.verified,
+        fit_used_prototype(&run),
+        &ambient,
+    ) {
         Ok(temperature_c) => {
             let position = verification.position_readback.unwrap_or(best_position);
             let measured_at = verification.measured_at.unwrap_or_else(Utc::now);
@@ -1200,6 +1220,53 @@ async fn sweep_and_verify(
     Ok(SweepResult {
         response,
         not_verified,
+    })
+}
+
+/// `[focus] hfr_source`: which HFR one sample gives the curve fit. `None` on
+/// classical runs, on verification frames (judged classically, never
+/// fitted) and when the frame has no positive classical HFR (no sample is
+/// recorded then). `FocusSample::hfr` stays the classical measurement.
+fn sample_fit_hfr(
+    role: SampleRole,
+    source: HfrSource,
+    observation: &SharedObservation,
+) -> Option<crate::focus::focus_agent::FitHfr> {
+    if role != SampleRole::Sweep {
+        return None;
+    }
+    let classical = f64_of(observation.hfr_px).filter(|hfr| *hfr > 0.0)?;
+    choose_fit_hfr(
+        source,
+        classical,
+        &FqeReading {
+            hfr_px: f64_of(observation.fqe_hfr_px),
+            star_count: observation.fqe_star_count,
+            prototype: observation.fqe_prototype,
+            model_version: observation.fqe_model_version.as_deref(),
+        },
+    )
+}
+
+/// `focus_actions.reason` of the move to best focus: which HFR the curve was
+/// fitted on. Classical runs keep `classical_hfr_curve_fit`.
+fn curve_fit_reason(run: &FocusRunContext) -> String {
+    match &run.hfr_source_counts {
+        Some(counts) if counts.requested == HfrSource::FqePrototype => format!(
+            "fqe_prototype_hfr_curve_fit fqe_samples={} classical_fallback_samples={}",
+            counts.fqe_prototype, counts.classical
+        ),
+        _ => "classical_hfr_curve_fit".to_string(),
+    }
+}
+
+/// Whether any sample's curve-fit HFR came from the FQE prototype.
+fn fit_used_prototype(run: &FocusRunContext) -> bool {
+    run.samples.iter().any(|sample| {
+        sample
+            .fit_hfr
+            .as_ref()
+            .is_some_and(|fit| fit.source == FitHfrSource::FqePrototype)
     })
 }
 
@@ -2039,6 +2106,7 @@ async fn record_sample(
             star_count: observation.star_count,
             fqe_hfr_px: f64_of(observation.fqe_hfr_px),
             fqe_sigma_log_hfr: f64_of(observation.fqe_sigma_log_hfr),
+            fqe_prototype: observation.fqe_prototype,
             quality_uncertainty: f64_of(observation.quality_uncertainty),
             background_adu: fop_background_input(observation),
             saturation_fraction: f64_of(observation.saturation_fraction),
@@ -2054,8 +2122,27 @@ async fn record_sample(
         })
     });
 
+    let fit_hfr = sample_fit_hfr(role, ctx.config.hfr_source, observation);
+
     let mut extra = serde_json::Map::new();
     extra.insert("autofocus_role".into(), json!(role.as_str()));
+    if let Some(fit) = &fit_hfr {
+        extra.insert(
+            "autofocus_hfr_source".into(),
+            json!({
+                "requested": ctx.config.hfr_source,
+                "used": fit.source,
+                "fit_hfr_px": fit.hfr,
+                "classical_hfr_px": observation.hfr_px,
+                "fallback_reason": fit.fallback_reason,
+                "fqe_hfr_px": fit.fqe_hfr_px,
+                "fqe_star_count": fit.fqe_star_count,
+                "fqe_model_version": fit.fqe_model_version,
+                "fqe_prototype": observation.fqe_prototype,
+                "min_fqe_star_count": crate::focus::focus_agent::FQE_PROTOTYPE_MIN_STARS,
+            }),
+        );
+    }
     extra.insert(
         "a06".into(),
         json!({
@@ -2123,7 +2210,8 @@ async fn record_sample(
     let mut plan = finalise;
     plan.input.frame_id = committed.frame_id.clone();
     crate::api::camera::equipment::spawn_finaliser(state, plan);
-    let sample = sample_from_observation(position, observation, &committed, temperature.0)?;
+    let sample =
+        sample_from_observation(position, observation, &committed, temperature.0, fit_hfr)?;
 
     let age_ms = temperature
         .0
@@ -2348,6 +2436,23 @@ fn drift_learning_temperature(
         return Err("no_ambient_temperature");
     }
     Ok(reading.celsius)
+}
+
+/// H5 plus `[focus] hfr_source`: [`drift_learning_temperature`], and a best
+/// position chosen by a curve that took any sample's HFR from the FQE
+/// prototype (`prototype_fit`, see [`fit_used_prototype`]) teaches nothing.
+/// The forecaster learns from the classical authority only.
+fn drift_learning_gate(
+    simulation: bool,
+    verified: bool,
+    prototype_fit: bool,
+    ambient: &Observed<TemperatureReading>,
+) -> Result<f64, &'static str> {
+    let temperature = drift_learning_temperature(simulation, verified, ambient)?;
+    if prototype_fit {
+        return Err("fqe_prototype_fit");
+    }
+    Ok(temperature)
 }
 
 /// Fold a verified best-focus read-back into `forecaster` at `measured_at`,
@@ -3278,7 +3383,7 @@ fn autofocus_quality_json(
     temperature_state: crate::storage::capture_store::TemperatureState,
     temperature_source: Option<String>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut quality = serde_json::json!({
             "source": "autofocus_simulation",
             "acquisition_domain": "simulation",
             "training_label_eligible": false,
@@ -3354,7 +3459,14 @@ fn autofocus_quality_json(
             "temperature_state": temperature_state,
             "temperature_source": temperature_source,
             "observation_valid": observation.observation_valid,
-    })
+    });
+    // PROTOTYPE label (F-006): written only when the fqe_* values above came
+    // from the opt-in prototype, so other frames' records are unchanged.
+    if observation.fqe_prototype {
+        quality["fqe_prototype"] = json!(true);
+        quality["fqe_unavailable_reason"] = json!(observation.fqe_unavailable_reason);
+    }
+    quality
 }
 
 fn connected_rig_id(state: &AppState) -> String {
@@ -3382,6 +3494,7 @@ fn sample_from_observation(
     observation: &SharedObservation,
     committed: &CommittedCapture,
     temperature: Option<f64>,
+    fit_hfr: Option<crate::focus::focus_agent::FitHfr>,
 ) -> crate::error::Result<FocusSample> {
     if committed.status != "committed"
         || committed.capture_id.trim().is_empty()
@@ -3421,6 +3534,7 @@ fn sample_from_observation(
         temperature,
         timestamp: observation.timestamp,
         frame_id: Some(committed.frame_id.clone()),
+        fit_hfr,
     })
 }
 
@@ -3848,7 +3962,8 @@ mod tests {
                     == Some(sensor_asset.id.as_str())));
             assert!(ids.insert(committed.capture_id.clone()));
             let sample =
-                sample_from_observation(1200, &observed.observation, &committed, None).unwrap();
+                sample_from_observation(1200, &observed.observation, &committed, None, None)
+                    .unwrap();
             assert_eq!(
                 sample.frame_id.as_deref(),
                 Some(committed.frame_id.as_str())
@@ -3865,10 +3980,14 @@ mod tests {
             );
             let mut invalid = committed.clone();
             invalid.status = "native_incomplete";
-            assert!(sample_from_observation(1200, &observed.observation, &invalid, None).is_err());
+            assert!(
+                sample_from_observation(1200, &observed.observation, &invalid, None, None).is_err()
+            );
             invalid.status = "committed";
             invalid.assets.retain(|a| a.role != "sensor_fits");
-            assert!(sample_from_observation(1200, &observed.observation, &invalid, None).is_err());
+            assert!(
+                sample_from_observation(1200, &observed.observation, &invalid, None, None).is_err()
+            );
         }
         drop(archive);
         local.pool().close().await;
@@ -3947,6 +4066,126 @@ mod tests {
         ] {
             assert!(json[key].is_null(), "{key} should be null when unmeasured");
         }
+    }
+
+    /// The F-006 prototype label is written only for prototype predictions,
+    /// so every other frame's quality_json keeps exactly its old keys.
+    #[test]
+    fn quality_json_labels_fqe_prototype_predictions_only() {
+        let mut observation = SharedObservation::empty_for_test();
+        observation.fqe_hfr_px = Some(3.25);
+        observation.fqe_star_count = Some(5);
+        let shadow = quality_json_for(&observation);
+        assert!(shadow.get("fqe_prototype").is_none());
+        assert!(shadow.get("fqe_unavailable_reason").is_none());
+
+        observation.fqe_prototype = true;
+        let prototype = quality_json_for(&observation);
+        assert_eq!(prototype["fqe_prototype"], json!(true));
+        assert!(prototype["fqe_unavailable_reason"].is_null());
+        let mut without_label = prototype.clone();
+        let object = without_label.as_object_mut().unwrap();
+        object.remove("fqe_prototype");
+        object.remove("fqe_unavailable_reason");
+        assert_eq!(without_label, shadow);
+    }
+
+    /// `[focus] hfr_source` per sample: classical runs and verification
+    /// frames carry no fit HFR; an `fqe_prototype` sweep sample takes the
+    /// prototype's frame HFR from >= 3 stars, otherwise its classical HFR,
+    /// and says which.
+    #[test]
+    fn sample_fit_hfr_follows_hfr_source_role_and_the_prototype_label() {
+        let mut observation = SharedObservation::empty_for_test();
+        observation.hfr_px = Some(2.5);
+        observation.fqe_hfr_px = Some(1.75);
+        observation.fqe_star_count = Some(4);
+        observation.fqe_model_version = Some("1.1.0".to_string());
+        observation.fqe_prototype = true;
+        let prototype = HfrSource::FqePrototype;
+
+        assert!(sample_fit_hfr(SampleRole::Sweep, HfrSource::Classical, &observation).is_none());
+        assert!(sample_fit_hfr(SampleRole::Verification, prototype, &observation).is_none());
+
+        let fit = sample_fit_hfr(SampleRole::Sweep, prototype, &observation).unwrap();
+        assert_eq!(fit.source, FitHfrSource::FqePrototype);
+        assert!((fit.hfr - 1.75).abs() < 1e-6);
+        assert_eq!(fit.fqe_model_version.as_deref(), Some("1.1.0"));
+
+        let fallback = |edit: fn(&mut SharedObservation)| {
+            let mut changed = observation.clone();
+            edit(&mut changed);
+            sample_fit_hfr(SampleRole::Sweep, prototype, &changed).unwrap()
+        };
+        for (edit, reason) in [
+            (
+                (|o: &mut SharedObservation| o.fqe_star_count = Some(2)) as fn(&mut _),
+                "fqe_too_few_stars",
+            ),
+            (|o| o.fqe_hfr_px = None, "no_fqe_prediction"),
+            (|o| o.fqe_prototype = false, "fqe_not_prototype"),
+            // A non-finite bus value reads as absent (`f64_of`).
+            (|o| o.fqe_hfr_px = Some(f32::NAN), "no_fqe_prediction"),
+            (|o| o.fqe_hfr_px = Some(0.0), "fqe_not_finite"),
+        ] {
+            let fit = fallback(edit);
+            assert_eq!(fit.source, FitHfrSource::Classical, "{reason}");
+            assert!((fit.hfr - 2.5).abs() < 1e-6, "{reason}");
+            assert_eq!(fit.fallback_reason.as_deref(), Some(reason));
+        }
+
+        // No classical HFR: no sample, so nothing to choose.
+        observation.hfr_px = None;
+        assert!(sample_fit_hfr(SampleRole::Sweep, prototype, &observation).is_none());
+    }
+
+    /// The move-to-best record names the fit's HFR source, and only a fit
+    /// that actually used a prototype sample counts as one (the FDF then
+    /// does not learn from the run).
+    #[test]
+    fn curve_fit_reason_and_prototype_use_come_from_the_samples() {
+        use crate::focus::focus_agent::{choose_fit_hfr, hfr_source_counts, FqeReading};
+        let reading = |stars| FqeReading {
+            hfr_px: Some(1.5),
+            star_count: Some(stars),
+            prototype: true,
+            model_version: Some("1.1.0"),
+        };
+        let mut run = FocusRunContext {
+            run_id: uuid::Uuid::new_v4(),
+            state: FocusRunState::Converged,
+            rig_id: "rig".into(),
+            filter_name: None,
+            temperature: None,
+            start_position: 10_000,
+            started_at: Utc::now(),
+            samples: vec![sample(10_000, 2.0), sample(10_100, 2.2)],
+            best_position: Some(10_000),
+            best_hfr: Some(2.0),
+            hfr_source_counts: None,
+        };
+        assert_eq!(curve_fit_reason(&run), "classical_hfr_curve_fit");
+        assert!(!fit_used_prototype(&run));
+
+        let prototype = HfrSource::FqePrototype;
+        run.samples[0].fit_hfr = choose_fit_hfr(prototype, 2.0, &reading(5));
+        run.samples[1].fit_hfr = choose_fit_hfr(prototype, 2.2, &reading(1));
+        run.hfr_source_counts = hfr_source_counts(prototype, &run.samples);
+        assert_eq!(
+            curve_fit_reason(&run),
+            "fqe_prototype_hfr_curve_fit fqe_samples=1 classical_fallback_samples=1"
+        );
+        assert!(fit_used_prototype(&run));
+
+        // Requested, but every sample fell back: still recorded as a
+        // prototype-requested fit, yet no prototype value shaped the curve.
+        run.samples[0].fit_hfr = choose_fit_hfr(prototype, 2.0, &reading(2));
+        run.hfr_source_counts = hfr_source_counts(prototype, &run.samples);
+        assert_eq!(
+            curve_fit_reason(&run),
+            "fqe_prototype_hfr_curve_fit fqe_samples=0 classical_fallback_samples=2"
+        );
+        assert!(!fit_used_prototype(&run));
     }
 
     /// quality_json carries the versioned background and detection objects;
@@ -4132,6 +4371,7 @@ mod tests {
             samples: Vec::new(),
             best_position: Some(10_120),
             best_hfr: Some(2.4),
+            hfr_source_counts: None,
         };
 
         persist_focus_run(&store, &run, &HashMap::new())
@@ -4424,6 +4664,10 @@ mod tests {
         /// Triple the HFR of frames taken off the 100-step sweep grid (the
         /// fitted optimum's verification frame), so H4 fails.
         degrade_off_grid: bool,
+        /// The FQE prototype reading the vision loop would publish at a
+        /// position: `(fqe_hfr_px, fqe_star_count)`, labelled prototype.
+        /// `None` (the default, or per position): no FQE prediction.
+        fqe: Option<fn(i32) -> Option<(f32, u32)>>,
     }
 
     fn v_curve_hfr(position: i32, best: i32) -> f64 {
@@ -4440,6 +4684,7 @@ mod tests {
                 interval_s: 0.03,
                 best,
                 degrade_off_grid: false,
+                fqe: None,
             }
         }
     }
@@ -4464,6 +4709,13 @@ mod tests {
             observed.observation.hfr_px = Some(hfr as f32);
             observed.observation.star_count = 30;
             observed.observation.timestamp = Utc::now();
+            if let Some((fqe_hfr, stars)) = self.fqe.and_then(|script| script(position)) {
+                let observation = &mut observed.observation;
+                observation.fqe_hfr_px = Some(fqe_hfr);
+                observation.fqe_star_count = Some(stars);
+                observation.fqe_prototype = true;
+                observation.fqe_model_version = Some("1.1.0".into());
+            }
             Some(observed)
         }
 
@@ -5154,6 +5406,249 @@ mod tests {
         );
     }
 
+    /// Separates the fitted minimum of the scripted stream fitted on the
+    /// prototype mix (3.21 px) from the same stream fitted classically
+    /// (2.52 px).
+    const PROTOTYPE_VS_CLASSICAL_MINIMUM_PX: f64 = 2.85;
+
+    /// The scripted FQE prototype reading: the classical V-curve plus
+    /// 0.75 px, from five stars; two stars at 1 300 and no prediction at 700
+    /// (on an `fqe_prototype` run both fall back to classical).
+    fn scripted_prototype_fqe(position: i32) -> Option<(f32, u32)> {
+        let stars = match position {
+            700 => return None,
+            1_300 => 2,
+            _ => 5,
+        };
+        Some(((v_curve_hfr(position, 1_050) + 0.75) as f32, stars))
+    }
+
+    /// `[focus] hfr_source = "fqe_prototype"` through `run_autofocus_session`
+    /// (`record_sample` and `sweep_and_verify`): each sweep frame's
+    /// quality_json says which HFR the fit took and why, `focus_samples.hfr`
+    /// stays classical, the curve is fitted on the mix (its minimum carries
+    /// the FQE's +0.75 px), the move-to-best reason and the
+    /// response count the sources, and the verification frame stays
+    /// classical. The drift gate on a prototype-shaped fit is
+    /// [`a_prototype_shaped_fit_never_teaches_the_fdf`] (a simulator run is
+    /// refused earlier, as `simulator_run`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_prototype_hfr_source_run_fits_the_fqe_and_records_each_sample() {
+        use crate::focus::focus_agent::HfrSourceCounts;
+        use sqlx::Row;
+        let mut fx = fixture(crate::hardware::focuser::SimFocuser::new(1_000), true).await;
+        fx.config.initial_step_size = 100;
+        fx.config.samples_per_position = 1;
+        fx.config.sweep_radius_points = 3;
+        fx.config.hfr_source = HfrSource::FqePrototype;
+        let forecaster = Arc::new(tokio::sync::Mutex::new(
+            crate::focus::focus_drift::FocusDriftForecaster::new(),
+        ));
+        fx.state.focus_drift = Some(forecaster.clone());
+
+        let mut camera = ScriptedCamera::new(fx.sim.clone(), 1_050);
+        camera.fqe = Some(scripted_prototype_fqe);
+        let response = run_autofocus_session(
+            &fx.state,
+            fx.config.clone(),
+            None,
+            Arc::new(camera),
+            GuidingDuringAutofocus::Keep,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{}: {}", err.code, err.message));
+        assert_eq!(response.state, "Converged");
+        assert_eq!(response.samples_count, 7);
+        assert_eq!(response.verified, Some(true), "{:?}", response.warnings);
+        assert_eq!(
+            response.hfr_source_counts,
+            Some(HfrSourceCounts {
+                requested: HfrSource::FqePrototype,
+                fqe_prototype: 5,
+                classical: 2,
+                fallback_reasons: [
+                    ("fqe_too_few_stars".to_string(), 1),
+                    ("no_fqe_prediction".to_string(), 1),
+                ]
+                .into_iter()
+                .collect(),
+            })
+        );
+        // The fitted minimum carries the FQE's +0.75 px: 3.21 px here, where
+        // the same stream fitted classically gives 2.52 px
+        // (`a_classical_run_ignores_prototype_fqe_readings`). Deterministic:
+        // the sweep positions and the scripted HFRs are exact.
+        let best_hfr = response.best_hfr.unwrap();
+        assert!(
+            best_hfr > PROTOTYPE_VS_CLASSICAL_MINIMUM_PX,
+            "fitted minimum {best_hfr}"
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["hfr_source_counts"]["requested"], "fqe_prototype");
+
+        let pool = fx.state.local_store.pool();
+        let rows = sqlx::query(
+            "SELECT position, hfr, frame_id FROM focus_samples WHERE run_id = ? ORDER BY id",
+        )
+        .bind(&response.run_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 7);
+        let mut used = std::collections::BTreeMap::new();
+        for row in &rows {
+            let position: i32 = row.get::<i64, _>("position") as i32;
+            let classical = v_curve_hfr(position, 1_050);
+            let stored_hfr: f64 = row.get("hfr");
+            assert!(
+                (stored_hfr - classical).abs() < 1e-5,
+                "focus_samples.hfr stays classical at {position}: {stored_hfr}"
+            );
+            let frame_id: String = row.get("frame_id");
+            let (quality,): (String,) =
+                sqlx::query_as("SELECT quality_json FROM frames WHERE id = ?")
+                    .bind(&frame_id)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            let quality: Value = serde_json::from_str(&quality).unwrap();
+            assert_eq!(quality["autofocus_role"], "sweep");
+            let source = &quality["autofocus_hfr_source"];
+            assert_eq!(source["requested"], "fqe_prototype", "{position}: {source}");
+            assert_eq!(source["min_fqe_star_count"], 3);
+            let fit = source["fit_hfr_px"].as_f64().unwrap();
+            let (expected_used, expected_fit, expected_reason) = match position {
+                700 => ("classical", classical, Value::from("no_fqe_prediction")),
+                1_300 => ("classical", classical, Value::from("fqe_too_few_stars")),
+                _ => ("fqe_prototype", classical + 0.75, Value::Null),
+            };
+            assert_eq!(source["used"], expected_used, "{position}: {source}");
+            assert!((fit - expected_fit).abs() < 1e-5, "{position}: {source}");
+            assert!(
+                (source["classical_hfr_px"].as_f64().unwrap() - classical).abs() < 1e-5,
+                "{position}: {source}"
+            );
+            assert_eq!(source["fallback_reason"], expected_reason, "{position}");
+            if position == 700 {
+                assert!(source["fqe_hfr_px"].is_null());
+                assert_eq!(source["fqe_prototype"], false);
+            } else {
+                assert_eq!(source["fqe_prototype"], true);
+                assert_eq!(source["fqe_model_version"], "1.1.0");
+                assert_eq!(quality["fqe_prototype"], true, "{position}");
+            }
+            *used.entry(expected_used).or_insert(0) += 1;
+        }
+        assert_eq!(used.get("fqe_prototype"), Some(&5));
+        assert_eq!(used.get("classical"), Some(&2));
+
+        // The move to best focus says which HFR the curve was fitted on; the
+        // verification frame is judged classically and carries no fit HFR.
+        let action = sqlx::query(
+            "SELECT reason, verified, verification_frame_id FROM focus_actions WHERE run_id = ?",
+        )
+        .bind(&response.run_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            action.get::<Option<String>, _>("reason").as_deref(),
+            Some("fqe_prototype_hfr_curve_fit fqe_samples=5 classical_fallback_samples=2")
+        );
+        assert_eq!(action.get::<Option<bool>, _>("verified"), Some(true));
+        let verification_frame: String = action
+            .get::<Option<String>, _>("verification_frame_id")
+            .unwrap();
+        let (quality,): (String,) = sqlx::query_as("SELECT quality_json FROM frames WHERE id = ?")
+            .bind(&verification_frame)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let quality: Value = serde_json::from_str(&quality).unwrap();
+        assert_eq!(quality["autofocus_role"], "verification");
+        assert!(quality.get("autofocus_hfr_source").is_none(), "{quality}");
+
+        // The agent's stored run carries each sample's fit HFR beside the
+        // classical one.
+        let run = fx
+            .state
+            .focus_agent
+            .lock()
+            .await
+            .history()
+            .iter()
+            .find(|run| run.run_id.to_string() == response.run_id)
+            .cloned()
+            .unwrap();
+        assert!(fit_used_prototype(&run));
+        assert_eq!(
+            run.samples
+                .iter()
+                .filter(|sample| sample.fit_hfr.is_some())
+                .count(),
+            7
+        );
+        assert_eq!(forecaster.lock().await.update_count(), 0);
+        assert!(fx.state.equipment.gate().is_idle());
+    }
+
+    /// The same scripted stream with the default `hfr_source`: no fit HFR is
+    /// recorded anywhere and the move-to-best reason is the classical one,
+    /// even though every frame carries a prototype FQE reading.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_classical_run_ignores_prototype_fqe_readings() {
+        use sqlx::Row;
+        let mut fx = fixture(crate::hardware::focuser::SimFocuser::new(1_000), true).await;
+        fx.config.initial_step_size = 100;
+        fx.config.samples_per_position = 1;
+        fx.config.sweep_radius_points = 3;
+        assert_eq!(fx.config.hfr_source, HfrSource::Classical);
+        let mut camera = ScriptedCamera::new(fx.sim.clone(), 1_050);
+        camera.fqe = Some(scripted_prototype_fqe);
+        let response = run_autofocus_session(
+            &fx.state,
+            fx.config.clone(),
+            None,
+            Arc::new(camera),
+            GuidingDuringAutofocus::Keep,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{}: {}", err.code, err.message));
+        assert_eq!(response.verified, Some(true), "{:?}", response.warnings);
+        assert!(response.hfr_source_counts.is_none());
+        assert!(serde_json::to_value(&response)
+            .unwrap()
+            .get("hfr_source_counts")
+            .is_none());
+        // The classical fit's minimum (2.52 px), below the prototype run's.
+        assert!(
+            response.best_hfr.unwrap() < PROTOTYPE_VS_CLASSICAL_MINIMUM_PX,
+            "{:?}",
+            response.best_hfr
+        );
+        let pool = fx.state.local_store.pool();
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT reason FROM focus_actions WHERE run_id = ?")
+                .bind(&response.run_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(reason.as_deref(), Some("classical_hfr_curve_fit"));
+        let frames = sqlx::query(
+            "SELECT f.quality_json FROM focus_samples s JOIN frames f ON f.id = s.frame_id \
+             WHERE s.run_id = ?",
+        )
+        .bind(&response.run_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert_eq!(frames.len(), 7);
+        for row in &frames {
+            let quality: Value = serde_json::from_str(&row.get::<String, _>(0)).unwrap();
+            assert!(quality.get("autofocus_hfr_source").is_none(), "{quality}");
+        }
+    }
+
     /// H4: a run that converges but whose verification frame does not
     /// confirm focus returns the converged result with `verified: false`, and
     /// its audit outcome and `operation_ended` say failed
@@ -5239,6 +5734,7 @@ mod tests {
             temperature: None,
             timestamp: Utc::now(),
             frame_id: None,
+            fit_hfr: None,
         }
     }
 
@@ -5320,6 +5816,27 @@ mod tests {
         assert_eq!(
             drift_learning_temperature(false, true, &Observed::not_set(Source::Derived)),
             Err("no_ambient_temperature")
+        );
+    }
+
+    /// The gate `sweep_and_verify` applies: a run that would teach the FDF
+    /// teaches nothing once any sample's fit HFR came from the FQE
+    /// prototype; the H5 refusals keep their own reasons.
+    #[test]
+    fn a_prototype_shaped_fit_never_teaches_the_fdf() {
+        let weather = reading(TemperatureSourceKind::Weather, 4.5, ObsState::Fresh);
+        assert_eq!(drift_learning_gate(false, true, false, &weather), Ok(4.5));
+        assert_eq!(
+            drift_learning_gate(false, true, true, &weather),
+            Err("fqe_prototype_fit")
+        );
+        assert_eq!(
+            drift_learning_gate(true, true, true, &weather),
+            Err("simulator_run")
+        );
+        assert_eq!(
+            drift_learning_gate(false, false, true, &weather),
+            Err("not_verified")
         );
     }
 

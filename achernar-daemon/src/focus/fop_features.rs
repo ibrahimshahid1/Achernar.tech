@@ -180,6 +180,12 @@ pub struct FopInputs<'a> {
     pub star_count: u32,
     pub fqe_hfr_px: Option<f64>,
     pub fqe_sigma_log_hfr: Option<f64>,
+    /// The FQE reading came from the opt-in F-006 prototype
+    /// (`[vision.fqe] prototype = true`): public-archive weights, not
+    /// qualified for R50/Z114. It is not the FQE these rows are meant to
+    /// train on, so #0 is masked `fqe_prototype_excluded` and #2 falls back
+    /// to the classical uncertainty.
+    pub fqe_prototype: bool,
     pub quality_uncertainty: Option<f64>,
     pub background_adu: Option<f64>,
     pub saturation_fraction: Option<f64>,
@@ -349,12 +355,17 @@ pub fn build(inputs: &FopInputs<'_>) -> FopFeatureVector {
     let dp: Vec<i64> = positions.windows(2).map(|w| w[1] - w[0]).collect();
     let dh: Vec<f64> = hfrs.windows(2).map(|w| w[1] - w[0]).collect();
 
-    // Quality (#0-#2).
-    b.set(0, inputs.fqe_hfr_px, "fqe_not_loaded");
+    // Quality (#0-#2). A prototype FQE reading never enters a FOP row.
+    if inputs.fqe_prototype {
+        b.set(0, None, "fqe_prototype_excluded");
+    } else {
+        b.set(0, inputs.fqe_hfr_px, "fqe_not_loaded");
+    }
     b.set(1, None, "rejected_by_contract");
+    let fqe_sigma = inputs.fqe_sigma_log_hfr.filter(|_| !inputs.fqe_prototype);
     b.set(
         2,
-        inputs.fqe_sigma_log_hfr.or(inputs.quality_uncertainty),
+        fqe_sigma.or(inputs.quality_uncertainty),
         "uncertainty_unavailable",
     );
 
@@ -571,6 +582,7 @@ mod tests {
             star_count: 40,
             fqe_hfr_px: None,
             fqe_sigma_log_hfr: None,
+            fqe_prototype: false,
             quality_uncertainty: None,
             background_adu: Some(812.0),
             saturation_fraction: Some(0.0),
@@ -652,6 +664,29 @@ mod tests {
         // Unknown focuser state: no label.
         assert!(!v.label_eligible);
         assert_eq!(v.label(1_200, Some(1_250)), None);
+    }
+
+    /// An FQE reading feeds #0/#2; an F-006 prototype reading does not.
+    #[test]
+    fn a_prototype_fqe_reading_never_enters_the_quality_features() {
+        let ambient = ambient(8.0, ObsState::Fresh, false);
+        let mut fqe = inputs(&[], &ambient, None);
+        fqe.fqe_hfr_px = Some(2.2);
+        fqe.fqe_sigma_log_hfr = Some(0.08);
+        fqe.quality_uncertainty = Some(0.3);
+        let v = build(&fqe);
+        assert_eq!(v.get("predicted_hfr"), Some(2.2));
+        assert_eq!(v.get("quality_uncertainty"), Some(0.08));
+
+        fqe.fqe_prototype = true;
+        let v = build(&fqe);
+        assert_eq!(v.get("predicted_hfr"), None);
+        assert_eq!(
+            v.missing.get("predicted_hfr"),
+            Some(&"fqe_prototype_excluded")
+        );
+        assert_eq!(v.get("quality_uncertainty"), Some(0.3));
+        assert_eq!(v.get("classical_hfr"), Some(2.5));
     }
 
     #[test]

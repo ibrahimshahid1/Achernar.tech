@@ -355,6 +355,25 @@ def verify_prototype_gate(role_info: dict, evidence_path, *, contract=None) -> d
                           ("contract_sha256", tracked.sha256)):
         if evidence.get(key) != expected:
             raise RebuildRefusal(f"prototype gate evidence {key} is {evidence.get(key)!r}, expected {expected}")
+    # The evidence's own gate verdict and every one of its checks (including
+    # the HST dev-crop and log_var ONNX parity that are not re-derived here)
+    # must have passed; a FAIL record never installs, whatever its schema says.
+    gate_block = evidence.get("gate")
+    if not isinstance(gate_block, dict) or gate_block.get("passed") is not True:
+        raise RebuildRefusal("prototype gate evidence does not record gate.passed: true")
+    checks = gate_block.get("checks")
+    if isinstance(checks, dict):
+        check_items = list(checks.items())
+    elif isinstance(checks, list):
+        check_items = [(str(c.get("id", i)) if isinstance(c, dict) else str(i), c) for i, c in enumerate(checks)]
+    else:
+        check_items = []
+    if not check_items:
+        raise RebuildRefusal("prototype gate evidence lists no gate.checks")
+    failed_checks = [name for name, check in check_items
+                     if not isinstance(check, dict) or check.get("passed") is not True]
+    if failed_checks:
+        raise RebuildRefusal(f"prototype gate evidence has failed or malformed checks: {failed_checks}")
     if evidence.get("test_partition_used") is not False:
         raise RebuildRefusal("prototype gate evidence must state test_partition_used: false (the test is sealed)")
     if evidence.get("candidate_outputs_finite") is not True:

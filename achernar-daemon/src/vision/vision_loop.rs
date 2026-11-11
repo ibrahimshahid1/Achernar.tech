@@ -687,45 +687,10 @@ fn observation_with_context(
     // FQE shadow inference on the gate-surviving classical stars that also admit
     // a centered 64 px crop. Published alongside the classical fields; any failure logs
     // and degrades to None — it can never affect the classical measurement.
-    let mut fqe_hfr_px = None;
-    let mut fqe_sigma_log_hfr = None;
-    let mut fqe_star_count = None;
-    let mut fqe_model_version = None;
-    let mut fqe_calibrated = None;
-    let fqe_unavailable_reason = preprocess::fqe_unavailable_reason(&luma).map(str::to_string);
-    if let Some(runner) = fqe.filter(|r| r.is_loaded() && fqe_unavailable_reason.is_none()) {
-        if !quality.used_stars.is_empty() {
-            let crops: Vec<ndarray::Array2<f32>> = quality
-                .used_stars
-                .iter()
-                .filter_map(|star| preprocess::fqe_input_from_frame(&luma, star.x, star.y))
-                .collect();
-            if !crops.is_empty() {
-                match runner.predict_batch(&crops) {
-                    Ok(outputs) => {
-                        if let Some((hfr, sigma)) = aggregate_fqe(&outputs) {
-                            fqe_hfr_px = Some(hfr as f32);
-                            fqe_sigma_log_hfr = Some((sigma * runner.frame_sigma_scale()) as f32);
-                            fqe_star_count = Some(crops.len() as u32);
-                            fqe_model_version = runner.model_version().map(str::to_string);
-                            fqe_calibrated = Some(runner.is_calibrated());
-                            if let Some(classical) = quality.hfr_px {
-                                tracing::debug!(
-                                    "FQE shadow: hfr={hfr:.2}px sigma_log={sigma:.3} \
-                                     classical={classical:.2}px delta={:+.2}px ({} stars)",
-                                    hfr as f32 - classical,
-                                    crops.len()
-                                );
-                            }
-                        }
-                    }
-                    Err(err) => {
-                        tracing::debug!("FQE shadow inference skipped: {err}");
-                    }
-                }
-            }
-        }
-    }
+    let fqe_shadow = match fqe.filter(|runner| runner.prototype().is_some()) {
+        Some(runner) => fqe_prototype_shadow(&luma, &quality, runner),
+        None => fqe_disabled_shadow(&luma, &quality, fqe),
+    };
     // An unavailable frame is not a change of measurement semantics; only a
     // measured result can restart the references (BGE-19).
     if background.result.level_status == LevelStatus::Measured {
@@ -766,7 +731,7 @@ fn observation_with_context(
         timestamp: chrono::Utc::now(),
         analysis_descriptor: luma.analysis_descriptor.clone(),
         analysis_unavailable_reason: None,
-        fqe_unavailable_reason,
+        fqe_unavailable_reason: fqe_shadow.unavailable_reason,
         status: quality.status,
         rejection_reasons: quality.rejection_reasons,
         hfr_px: quality.hfr_px,
@@ -782,11 +747,12 @@ fn observation_with_context(
         star_rejections: quality.star_rejections,
         gate_diagnostics: Some(quality.gate_diagnostics),
         star_gates_config_sha256: Some(quality.star_gates_config_sha256),
-        fqe_hfr_px,
-        fqe_sigma_log_hfr,
-        fqe_star_count,
-        fqe_model_version,
-        fqe_calibrated,
+        fqe_hfr_px: fqe_shadow.hfr_px,
+        fqe_sigma_log_hfr: fqe_shadow.sigma_log_hfr,
+        fqe_star_count: fqe_shadow.star_count,
+        fqe_model_version: fqe_shadow.model_version,
+        fqe_calibrated: fqe_shadow.calibrated,
+        fqe_prototype: fqe_shadow.prototype,
         cloud_probability,
         cloud_event,
         cloud_unavailable_reason: cloud_unavailable_reason.map(str::to_string),
@@ -821,6 +787,129 @@ fn observation_with_context(
     };
     observation.set_background(background.result, detection);
     Ok(context.apply(observation))
+}
+
+/// The FQE fields of one observation.
+#[derive(Debug, Default)]
+struct FqeShadow {
+    hfr_px: Option<f32>,
+    sigma_log_hfr: Option<f32>,
+    star_count: Option<u32>,
+    model_version: Option<String>,
+    calibrated: Option<bool>,
+    unavailable_reason: Option<String>,
+    prototype: bool,
+}
+
+/// No verified prototype is running: the A03 gate keeps the FQE off, exactly
+/// as before prototype mode existed. When `[vision.fqe] prototype = true`
+/// found no verified bundle, the reason says so after the A03 reason.
+fn fqe_disabled_shadow(
+    luma: &quality::LumaFrame,
+    quality: &quality::QualityMetrics,
+    fqe: Option<&FqeRunner>,
+) -> FqeShadow {
+    let mut shadow = FqeShadow {
+        unavailable_reason: preprocess::fqe_unavailable_reason(luma).map(str::to_string),
+        ..Default::default()
+    };
+    if let Some(runner) = fqe.filter(|r| r.is_loaded() && shadow.unavailable_reason.is_none()) {
+        if !quality.used_stars.is_empty() {
+            let crops: Vec<ndarray::Array2<f32>> = quality
+                .used_stars
+                .iter()
+                .filter_map(|star| preprocess::fqe_input_from_frame(luma, star.x, star.y))
+                .collect();
+            if !crops.is_empty() {
+                match runner.predict_batch(&crops) {
+                    Ok(outputs) => {
+                        if let Some((hfr, sigma)) = aggregate_fqe(&outputs) {
+                            shadow.hfr_px = Some(hfr as f32);
+                            shadow.sigma_log_hfr =
+                                Some((sigma * runner.frame_sigma_scale()) as f32);
+                            shadow.star_count = Some(crops.len() as u32);
+                            shadow.model_version = runner.model_version().map(str::to_string);
+                            shadow.calibrated = Some(runner.is_calibrated());
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!("FQE shadow inference skipped: {err}");
+                    }
+                }
+            }
+        }
+    }
+    if let (Some(reason), Some(refusal)) = (
+        shadow.unavailable_reason.as_mut(),
+        fqe.and_then(FqeRunner::prototype_refusal),
+    ) {
+        reason.push_str(&format!(
+            "; [vision.fqe] prototype = true but no verified prototype bundle is loaded ({refusal})"
+        ));
+    }
+    shadow
+}
+
+/// `[vision.fqe] prototype = true` with a verified prototype bundle (F-006):
+/// the FQE runs on the accepted stars' crops (`preprocess::prototype_inputs`)
+/// and every result is labelled `fqe_prototype`. The classical fields are
+/// untouched and remain the authority.
+fn fqe_prototype_shadow(
+    luma: &quality::LumaFrame,
+    quality: &quality::QualityMetrics,
+    runner: &FqeRunner,
+) -> FqeShadow {
+    let mut shadow = FqeShadow {
+        prototype: true,
+        model_version: runner.model_version().map(str::to_string),
+        ..Default::default()
+    };
+    if let Some(reason) = preprocess::prototype_domain_reason(luma) {
+        shadow.unavailable_reason = Some(reason);
+        return shadow;
+    }
+    if quality.used_stars.is_empty() {
+        shadow.unavailable_reason =
+            Some("FQE prototype: no accepted star in this frame".to_string());
+        return shadow;
+    }
+    let inputs = preprocess::prototype_inputs(luma, &quality.used_stars);
+    if inputs.crops.is_empty() {
+        shadow.unavailable_reason = Some(format!(
+            "FQE prototype: none of the {} accepted stars admits a centred unmasked 64 px crop \
+             (edge {}, masked {}, non-finite {})",
+            inputs.offered, inputs.skipped_edge, inputs.skipped_masked, inputs.skipped_non_finite
+        ));
+        return shadow;
+    }
+    match runner.predict_batch(&inputs.crops) {
+        Ok(outputs) => match aggregate_fqe(&outputs) {
+            Some((hfr, sigma)) => {
+                shadow.hfr_px = Some(hfr as f32);
+                shadow.sigma_log_hfr = Some((sigma * runner.frame_sigma_scale()) as f32);
+                shadow.star_count = Some(inputs.crops.len() as u32);
+                shadow.calibrated = Some(runner.is_calibrated());
+                tracing::debug!(
+                    "FQE prototype: hfr={hfr:.2}px sigma_log={sigma:.3} classical={:?}px \
+                     ({} of {} accepted stars; edge {}, masked {}, non-finite {})",
+                    quality.hfr_px,
+                    inputs.crops.len(),
+                    inputs.offered,
+                    inputs.skipped_edge,
+                    inputs.skipped_masked,
+                    inputs.skipped_non_finite
+                );
+            }
+            None => {
+                shadow.unavailable_reason =
+                    Some("FQE prototype: inference returned no outputs".to_string());
+            }
+        },
+        Err(err) => {
+            shadow.unavailable_reason = Some(format!("FQE prototype inference failed: {err}"));
+        }
+    }
+    shadow
 }
 
 /// Below this share of the usable frame searched by detection, a star count
@@ -1319,6 +1408,231 @@ mod analysis_domain_tests {
             legacy.detection.unwrap().method,
             DetectionMethod::LegacyConnectedComponents
         );
+    }
+
+    /// A 448x320 Mono8 frame: sky 40 ADU, +-3 ADU quantized noise and a 5x4
+    /// grid of twenty 1.8 px-sigma stars, each at least 48 px from the edges
+    /// (more stars than the classical used-star cap of 16).
+    fn star_grid_frame() -> FrameData {
+        let (w, h) = (448usize, 320usize);
+        let centres: Vec<(f32, f32)> = (0..5)
+            .flat_map(|i| (0..4).map(move |j| (48.0 + 88.0 * i as f32, 48.0 + 75.0 * j as f32)))
+            .collect();
+        let mut data = vec![0u8; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                let noise = ((i as u64).wrapping_mul(2_654_435_761) % 7) as f32 - 3.0;
+                let mut value = 40.0 + noise;
+                for (cx, cy) in &centres {
+                    let r2: f32 = (x as f32 - cx).powi(2) + (y as f32 - cy).powi(2);
+                    if r2 < 400.0 {
+                        value += 150.0 * (-r2 / (2.0 * 1.8 * 1.8)).exp();
+                    }
+                }
+                data[i] = value.round().clamp(0.0, 254.0) as u8;
+            }
+        }
+        let mut frame = mono_frame();
+        frame.width = w as i32;
+        frame.height = h as i32;
+        frame.data = data;
+        let descriptor = frame.sensor_descriptor.as_mut().unwrap();
+        descriptor.width = w;
+        descriptor.height = h;
+        descriptor.row_stride_bytes = w;
+        frame
+    }
+
+    fn fqe_scratch(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("vision_fqe_{tag}_{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        root
+    }
+
+    /// The observation as JSON without its wall-clock timestamp, optionally
+    /// without the FQE fields.
+    fn observation_json(observation: &SharedObservation, drop_fqe: bool) -> serde_json::Value {
+        let mut json = serde_json::to_value(observation).unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("timestamp");
+        if drop_fqe {
+            object.retain(|key, _| !key.starts_with("fqe_"));
+        }
+        json
+    }
+
+    /// `[vision.fqe] prototype` (F-006). Off, the observation is exactly what
+    /// it was before prototype mode existed, whatever bundle is loaded. On
+    /// with a verified prototype bundle (the random-weight test fixture), the
+    /// accepted stars yield finite, prototype-labelled FQE fields and every
+    /// classical field is unchanged. On with a bundle lacking the block, the
+    /// FQE stays disabled and says why.
+    #[test]
+    fn fqe_prototype_runs_only_with_the_flag_and_a_verified_bundle() {
+        use crate::vision::fqe_runner::{write_test_prototype_bundle, FqeRunner};
+        use crate::vision::preprocess::FQE_A03_DISABLED_REASON;
+        let root = fqe_scratch("prototype");
+        let prototype_model = write_test_prototype_bundle(&root, "1.1.0", |_| {});
+        let plain_model = write_test_prototype_bundle(&root, "1.2.0", |metadata| {
+            metadata["training_info"]
+                .as_object_mut()
+                .unwrap()
+                .remove("prototype");
+        });
+        let path = |model: &std::path::PathBuf| Some(model.to_string_lossy().into_owned());
+        let frame = star_grid_frame();
+        let analyse = |fqe: Option<&FqeRunner>| {
+            observation_from_frame_with_trends(&frame, &mut VisionTrendState::default(), None, fqe)
+                .unwrap()
+        };
+
+        let baseline = analyse(None);
+        assert!(baseline.hfr_px.is_some());
+        assert_eq!(
+            baseline.fqe_unavailable_reason.as_deref(),
+            Some(FQE_A03_DISABLED_REASON)
+        );
+        assert!(!baseline.fqe_prototype && baseline.fqe_hfr_px.is_none());
+        let baseline_json = observation_json(&baseline, false);
+        assert!(baseline_json.get("fqe_prototype").is_none());
+
+        // prototype = false: unchanged, even with a prototype bundle loaded
+        // through the ordinary resolver path.
+        for runner in [
+            FqeRunner::new(path(&prototype_model)).unwrap(),
+            FqeRunner::new(path(&plain_model)).unwrap(),
+            FqeRunner::disabled(),
+        ] {
+            assert_eq!(
+                observation_json(&analyse(Some(&runner)), false),
+                baseline_json
+            );
+        }
+
+        // prototype = true with the verified bundle.
+        let runner = FqeRunner::new_with_prototype(path(&prototype_model), true).unwrap();
+        let observation = analyse(Some(&runner));
+        assert!(observation.fqe_prototype);
+        assert_eq!(observation.fqe_unavailable_reason, None);
+        let hfr = observation.fqe_hfr_px.unwrap();
+        assert!(hfr.is_finite() && hfr > 0.0, "fqe_hfr_px {hfr}");
+        assert!(observation.fqe_sigma_log_hfr.unwrap().is_finite());
+        assert_eq!(observation.fqe_model_version.as_deref(), Some("1.1.0"));
+        assert_eq!(observation.fqe_calibrated, Some(false));
+        // Accepted stars only, at most the classical used-star cap; all of
+        // this frame's accepted stars admit a centred unmasked crop.
+        assert_eq!(
+            observation.fqe_star_count,
+            Some(observation.star_count_used)
+        );
+        assert!((3..=16).contains(&observation.star_count_used));
+        // Classical authority: every non-FQE field equals the baseline.
+        assert_eq!(
+            observation_json(&observation, true),
+            observation_json(&baseline, true)
+        );
+        assert_eq!(observation.hfr_px, baseline.hfr_px);
+        assert_eq!(
+            serde_json::to_value(&observation).unwrap()["fqe_prototype"],
+            serde_json::json!(true)
+        );
+
+        // prototype = true, but the bundle has no prototype block.
+        let refused = FqeRunner::new_with_prototype(path(&plain_model), true).unwrap();
+        let observation = analyse(Some(&refused));
+        assert!(!observation.fqe_prototype && observation.fqe_hfr_px.is_none());
+        let reason = observation.fqe_unavailable_reason.unwrap();
+        assert!(reason.starts_with(FQE_A03_DISABLED_REASON), "{reason}");
+        assert!(
+            reason.contains("no training_info.prototype block"),
+            "{reason}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Host timing of one prototype FQE pass per frame (crop extraction +
+    /// normalization of the accepted stars, one batched ONNX run, pooling).
+    /// `cargo test -- --ignored --nocapture fqe_prototype_pass_timing`. The
+    /// checked-in 1.0.0 graph is a tiny placeholder; set `FQE_TIMING_ONNX` to
+    /// an exported MobileNetV3-Small FQE graph for representative numbers.
+    #[test]
+    #[ignore = "timing probe; run explicitly"]
+    fn fqe_prototype_pass_timing() {
+        use crate::vision::fqe_runner::{
+            write_test_prototype_bundle, write_test_prototype_bundle_from, FqeRunner,
+        };
+        let root = fqe_scratch("timing");
+        let model = match std::env::var("FQE_TIMING_ONNX") {
+            Ok(graph) => write_test_prototype_bundle_from(
+                &root,
+                "1.1.0",
+                std::path::Path::new(&graph),
+                |_| {},
+            ),
+            Err(_) => write_test_prototype_bundle(&root, "1.1.0", |_| {}),
+        };
+        let runner =
+            FqeRunner::new_with_prototype(Some(model.to_string_lossy().into_owned()), true)
+                .unwrap();
+        let frame = star_grid_frame();
+        let luma = quality::luma_from_frame(&frame).unwrap();
+        let settings = BackgroundSettings::default();
+        let background = background_dispatch::analyze_background(&luma, &settings);
+        let quality = quality::estimate_quality_with_policy(
+            &luma,
+            &background,
+            quality::FocusSourcePolicy::new(
+                &quality::StarGateSettings::default(),
+                settings.detection.accept_deblended_for_focus,
+            ),
+        );
+        let time = |iterations: usize, mut work: Box<dyn FnMut() + '_>| {
+            work();
+            let mut samples: Vec<f64> = (0..iterations)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    work();
+                    start.elapsed().as_secs_f64() * 1e3
+                })
+                .collect();
+            samples.sort_by(f64::total_cmp);
+            (samples[iterations / 2], samples[iterations * 9 / 10])
+        };
+        let crops = preprocess::prototype_inputs(&luma, &quality.used_stars).crops;
+        let (pre_median, pre_p90) = time(
+            50,
+            Box::new(|| {
+                preprocess::prototype_inputs(&luma, &quality.used_stars);
+            }),
+        );
+        let (onnx_median, onnx_p90) = time(
+            50,
+            Box::new(|| {
+                runner.predict_batch(&crops).unwrap();
+            }),
+        );
+        let (pass_median, pass_p90) = time(
+            50,
+            Box::new(|| {
+                assert!(fqe_prototype_shadow(&luma, &quality, &runner)
+                    .hfr_px
+                    .is_some());
+            }),
+        );
+        eprintln!(
+            "FQE_PROTOTYPE_TIMING graph_bytes={} stars={} crops_only median={pre_median:.3}ms \
+             p90={pre_p90:.3}ms; onnx_batch median={onnx_median:.3}ms p90={onnx_p90:.3}ms; \
+             full_pass median={pass_median:.3}ms p90={pass_p90:.3}ms (profile={})",
+            std::fs::metadata(&model).unwrap().len(),
+            crops.len(),
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        );
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

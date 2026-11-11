@@ -151,6 +151,13 @@ pub struct SharedObservation {
     /// validation groups and hash-bound to this exact model artifact.
     #[serde(default)]
     pub fqe_calibrated: Option<bool>,
+    /// `true` when the FQE fields came from the opt-in prototype path
+    /// (`[vision.fqe] prototype = true` with a bundle carrying the F-006
+    /// prototype block): public-archive weights, not qualified for R50/Z114,
+    /// never the authority. Omitted (false) otherwise, so observations
+    /// without prototype mode serialize exactly as before.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fqe_prototype: bool,
 
     // --- From CloudObstructionClassifier ---
     /// `None` when the frame carried no cloud evidence (analysis unavailable,
@@ -328,6 +335,7 @@ impl SharedObservation {
             fqe_star_count: None,
             fqe_model_version: None,
             fqe_calibrated: None,
+            fqe_prototype: false,
             cloud_probability: None,
             cloud_event: CloudEvent::None,
             cloud_unavailable_reason: None,

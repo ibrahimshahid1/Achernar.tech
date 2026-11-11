@@ -223,6 +223,8 @@ def _evidence(tmp_path: Path, run: Path, contract_sha: str, *, name="gate.json",
         "candidate_comparator": "fqe_candidate",
         "classical_comparator": rebuild.PROTOTYPE_CLASSICAL_COMPARATOR,
         "paired_comparison": comparison or _comparison(candidate_mae, classical_mae),
+        "gate": {"passed": True, "checks": {"finite": {"passed": True}, "onnx_parity": {"passed": True},
+                                            "mae_and_coverage": {"passed": True}}},
     }
     evidence.update(overrides)
     path = tmp_path / name
@@ -441,3 +443,18 @@ def test_pinned_public_source_recognises_excluded_digest_and_fails_closed(tmp_pa
     monkeypatch.setattr(fqe_sources, "load_contract", _broken)
     with pytest.raises(ValueError):
         tfq.pinned_public_source(tmp_path / "x.npz", sha256="0" * 64)
+
+
+@pytest.mark.parametrize("gate", [
+    {"passed": False, "checks": {"onnx_parity": {"passed": False}}},
+    {"passed": True, "checks": {"onnx_parity": {"passed": False}, "finite": {"passed": True}}},
+    {"passed": True, "checks": {}},
+    None,
+])
+def test_prototype_gate_refuses_failed_or_missing_gate_verdict(tmp_path, dev_run, sealed, tracked_fixture, gate):
+    """A FAIL record (or one with any failed/malformed check) never installs,
+    even if its schema field claims the accepted evidence schema."""
+    evidence = _evidence(tmp_path, dev_run, tracked_fixture.sha256, gate=gate)
+    with pytest.raises(RebuildRefusal, match="gate"):
+        rebuild.main(_prototype_args(tmp_path, dev_run, evidence))
+    assert not (tmp_path / "models").exists() or not any((tmp_path / "models").rglob("metadata.json"))

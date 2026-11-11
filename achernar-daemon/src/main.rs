@@ -78,6 +78,21 @@ async fn main() -> anyhow::Result<()> {
     // Section 5.4 — the daemon now honors achernar.toml, not just env vars.
     // Set ACHERNAR_CONFIG to point at a specific file, otherwise ./achernar.toml.
     let config = config::AchernarConfig::load().unwrap_or_default();
+    // Cross-section rules (e.g. `[focus] hfr_source = "fqe_prototype"` needs
+    // `[vision.fqe] prototype = true`): refuse to start rather than run a
+    // configuration nobody chose.
+    if let Err(reason) = config.validate() {
+        tracing::error!("Invalid configuration: {reason}");
+        return Err(anyhow::anyhow!("invalid configuration: {reason}"));
+    }
+    if config.vision.fqe.prototype {
+        tracing::warn!(
+            "[vision.fqe] prototype = true: an F-006 FQE prototype bundle may run (not \
+             qualified for R50/Z114; classical HFR stays the authority); autofocus \
+             hfr_source = {}",
+            config.focus.hfr_source.as_str()
+        );
+    }
     info!(
         "Config: daemon.port={}, log_level={}, focus.safety.max_position={}, mount.max_slew_rate={}",
         config.daemon.port,
@@ -185,6 +200,7 @@ async fn main() -> anyhow::Result<()> {
     .with_auto_solve(&config.plate_solve)
     .with_background_settings(config.vision.background.clone())
     .with_star_gate_settings(config.vision.star_gates)
+    .with_fqe_prototype(config.vision.fqe.prototype)
     .with_equipment(&equipment_configs, site, Some(equipment_store));
     // Sequence numbers continue from the journal (§4.3).
     match storage::equipment_events_repo::max_seq(app_state.local_store.pool()).await {

@@ -64,6 +64,143 @@ impl SweepPattern {
     }
 }
 
+/// Which HFR the autofocus curve fit uses: `[focus] hfr_source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HfrSource {
+    /// The classical curve-of-growth HFR, the authority (default).
+    #[default]
+    Classical,
+    /// PROTOTYPE (owner authorization F-006; public-archive weights, not
+    /// qualified for R50/Z114). Each sweep sample's fit HFR is the FQE frame
+    /// HFR when the prototype produced a finite prediction from at least
+    /// [`FQE_PROTOTYPE_MIN_STARS`] stars, otherwise that sample's classical
+    /// HFR. Requires `[vision.fqe] prototype = true` (config validation).
+    /// `FocusSample::hfr`, verification and the drift forecaster stay
+    /// classical.
+    FqePrototype,
+}
+
+impl HfrSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Classical => "classical",
+            Self::FqePrototype => "fqe_prototype",
+        }
+    }
+}
+
+/// Fewest FQE crops behind a frame prediction before the prototype may stand
+/// in for that sample's classical HFR.
+pub const FQE_PROTOTYPE_MIN_STARS: u32 = 3;
+
+/// Which measurement a sample's curve-fit HFR is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FitHfrSource {
+    Classical,
+    FqePrototype,
+}
+
+/// The curve-fit HFR of one sweep sample on a run whose `hfr_source` is not
+/// classical, and where it came from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FitHfr {
+    /// The value the curve fit used (px).
+    pub hfr: f64,
+    pub source: FitHfrSource,
+    /// Why the classical HFR stood in, when the run asked for the prototype.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    /// The frame's FQE reading that was consulted (`None` when absent).
+    #[serde(default)]
+    pub fqe_hfr_px: Option<f64>,
+    #[serde(default)]
+    pub fqe_star_count: Option<u32>,
+    #[serde(default)]
+    pub fqe_model_version: Option<String>,
+}
+
+/// A frame's FQE reading, as the vision loop published it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FqeReading<'a> {
+    pub hfr_px: Option<f64>,
+    pub star_count: Option<u32>,
+    /// The reading came from the verified prototype path (`fqe_prototype`).
+    pub prototype: bool,
+    pub model_version: Option<&'a str>,
+}
+
+/// The fit HFR for one sweep sample. `None` for [`HfrSource::Classical`]
+/// (the fit uses `FocusSample::hfr`, as it always has).
+pub fn choose_fit_hfr(
+    source: HfrSource,
+    classical_hfr: f64,
+    fqe: &FqeReading<'_>,
+) -> Option<FitHfr> {
+    if source == HfrSource::Classical {
+        return None;
+    }
+    let fallback = match (fqe.hfr_px, fqe.star_count) {
+        (None, _) => Some("no_fqe_prediction"),
+        (Some(_), _) if !fqe.prototype => Some("fqe_not_prototype"),
+        (Some(hfr), _) if !(hfr.is_finite() && hfr > 0.0) => Some("fqe_not_finite"),
+        (Some(_), stars) if stars.unwrap_or(0) < FQE_PROTOTYPE_MIN_STARS => {
+            Some("fqe_too_few_stars")
+        }
+        _ => None,
+    };
+    Some(FitHfr {
+        hfr: match fallback {
+            None => fqe.hfr_px.unwrap_or(classical_hfr),
+            Some(_) => classical_hfr,
+        },
+        source: match fallback {
+            None => FitHfrSource::FqePrototype,
+            Some(_) => FitHfrSource::Classical,
+        },
+        fallback_reason: fallback.map(str::to_string),
+        fqe_hfr_px: fqe.hfr_px,
+        fqe_star_count: fqe.star_count,
+        fqe_model_version: fqe.model_version.map(str::to_string),
+    })
+}
+
+/// How many of a non-classical run's samples the curve fit took from each
+/// source.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct HfrSourceCounts {
+    pub requested: HfrSource,
+    pub fqe_prototype: u32,
+    pub classical: u32,
+    /// Classical stand-ins by reason (`no_fqe_prediction`,
+    /// `fqe_too_few_stars`, ...).
+    pub fallback_reasons: BTreeMap<String, u32>,
+}
+
+/// Counts over `samples`, or `None` on a classical run.
+pub fn hfr_source_counts(source: HfrSource, samples: &[FocusSample]) -> Option<HfrSourceCounts> {
+    if source == HfrSource::Classical {
+        return None;
+    }
+    let mut counts = HfrSourceCounts {
+        requested: source,
+        ..Default::default()
+    };
+    for fit in samples.iter().filter_map(|sample| sample.fit_hfr.as_ref()) {
+        match fit.source {
+            FitHfrSource::FqePrototype => counts.fqe_prototype += 1,
+            FitHfrSource::Classical => {
+                counts.classical += 1;
+                if let Some(reason) = &fit.fallback_reason {
+                    *counts.fallback_reasons.entry(reason.clone()).or_default() += 1;
+                }
+            }
+        }
+    }
+    Some(counts)
+}
+
 /// State machine for an autofocus run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FocusRunState {
@@ -91,7 +228,14 @@ pub struct FocusRunContext {
     pub started_at: chrono::DateTime<chrono::Utc>,
     pub samples: Vec<FocusSample>,
     pub best_position: Option<i32>,
+    /// The fitted curve's HFR at `best_position`, in the units of the fit's
+    /// input: classical HFR, or on an `fqe_prototype` run the per-sample mix
+    /// counted in `hfr_source_counts`.
     pub best_hfr: Option<f64>,
+    /// Curve-fit HFR sources, on a run whose `[focus] hfr_source` is not
+    /// classical. `None` (omitted) on classical runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hfr_source_counts: Option<HfrSourceCounts>,
 }
 
 /// A single focus measurement sample.
@@ -118,6 +262,19 @@ pub struct FocusSample {
     /// Id of the preserved frame (`frames.id`) this sample was measured from.
     #[serde(default)]
     pub frame_id: Option<String>,
+    /// What the curve fit used for this sample on a run whose `hfr_source`
+    /// is not classical. `None` (omitted): the fit used `hfr`. `hfr` is the
+    /// classical measurement either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fit_hfr: Option<FitHfr>,
+}
+
+impl FocusSample {
+    /// The HFR the curve fit consumes: `fit_hfr` when the run chose one,
+    /// otherwise the classical `hfr`.
+    pub fn curve_fit_hfr(&self) -> f64 {
+        self.fit_hfr.as_ref().map_or(self.hfr, |fit| fit.hfr)
+    }
 }
 
 /// The focus agent orchestrates an autofocus run.
@@ -215,6 +372,7 @@ impl FocusAgent {
             samples: Vec::new(),
             best_position: None,
             best_hfr: None,
+            hfr_source_counts: hfr_source_counts(config.hfr_source, &[]),
         };
         self.transition(FocusRunState::Initializing);
         self.current_run = Some(run.clone());
@@ -259,6 +417,7 @@ impl FocusAgent {
                 run.temperature = Some(temperature);
             }
             run.samples.extend(samples);
+            run.hfr_source_counts = hfr_source_counts(config.hfr_source, &run.samples);
             self.current_run = Some(run.clone());
         }
 
@@ -371,11 +530,11 @@ impl FocusAgent {
 
 fn aggregate_samples_by_position(samples: &[FocusSample]) -> (Vec<i32>, Vec<f64>) {
     let mut grouped: BTreeMap<i32, Vec<f64>> = BTreeMap::new();
-    for sample in samples
-        .iter()
-        .filter(|sample| sample.hfr.is_finite() && sample.hfr > 0.0)
-    {
-        grouped.entry(sample.position).or_default().push(sample.hfr);
+    for sample in samples {
+        let hfr = sample.curve_fit_hfr();
+        if hfr.is_finite() && hfr > 0.0 {
+            grouped.entry(sample.position).or_default().push(hfr);
+        }
     }
     let mut positions = Vec::with_capacity(grouped.len());
     let mut hfr_values = Vec::with_capacity(grouped.len());
@@ -462,8 +621,155 @@ fn order_sweep(ascending: Vec<i32>, start_position: i32, pattern: SweepPattern) 
 
 #[cfg(test)]
 mod tests {
-    use super::{sweep_positions, FocusAgent, FocusRunState, FocusSample, SweepPattern};
+    use super::{
+        choose_fit_hfr, sweep_positions, FitHfrSource, FocusAgent, FocusRunState, FocusSample,
+        FqeReading, HfrSource, SweepPattern, FQE_PROTOTYPE_MIN_STARS,
+    };
     use crate::config::FocusConfig;
+
+    fn prototype_reading(hfr: f64, stars: u32) -> FqeReading<'static> {
+        FqeReading {
+            hfr_px: Some(hfr),
+            star_count: Some(stars),
+            prototype: true,
+            model_version: Some("1.1.0"),
+        }
+    }
+
+    #[test]
+    fn classical_hfr_source_leaves_the_fit_on_the_classical_hfr() {
+        assert_eq!(HfrSource::default(), HfrSource::Classical);
+        assert!(choose_fit_hfr(HfrSource::Classical, 2.0, &prototype_reading(3.0, 9)).is_none());
+    }
+
+    #[test]
+    fn fqe_prototype_uses_a_finite_prediction_from_enough_stars_else_classical() {
+        let fqe = HfrSource::FqePrototype;
+        let used =
+            choose_fit_hfr(fqe, 2.0, &prototype_reading(3.0, FQE_PROTOTYPE_MIN_STARS)).unwrap();
+        assert_eq!((used.hfr, used.source), (3.0, FitHfrSource::FqePrototype));
+        assert_eq!(used.fallback_reason, None);
+        assert_eq!(used.fqe_model_version.as_deref(), Some("1.1.0"));
+
+        let cases = [
+            (FqeReading::default(), "no_fqe_prediction"),
+            (
+                FqeReading {
+                    prototype: false,
+                    ..prototype_reading(3.0, 9)
+                },
+                "fqe_not_prototype",
+            ),
+            (prototype_reading(f64::NAN, 9), "fqe_not_finite"),
+            (prototype_reading(0.0, 9), "fqe_not_finite"),
+            (
+                prototype_reading(3.0, FQE_PROTOTYPE_MIN_STARS - 1),
+                "fqe_too_few_stars",
+            ),
+            (
+                FqeReading {
+                    star_count: None,
+                    ..prototype_reading(3.0, 9)
+                },
+                "fqe_too_few_stars",
+            ),
+        ];
+        for (reading, reason) in cases {
+            let fallback = choose_fit_hfr(fqe, 2.0, &reading).unwrap();
+            assert_eq!(fallback.hfr, 2.0, "{reason}");
+            assert_eq!(fallback.source, FitHfrSource::Classical, "{reason}");
+            assert_eq!(fallback.fallback_reason.as_deref(), Some(reason));
+        }
+    }
+
+    /// The classical V-curve bottoms at 10 000, the FQE's at 10 100. With
+    /// `fqe_prototype` the fit follows the FQE where it has >= 3 stars; one
+    /// position (10 050, where both curves read 1.45 px) has only two FQE
+    /// stars and falls back to its classical HFR.
+    #[tokio::test]
+    async fn fqe_prototype_run_fits_the_fqe_hfr_and_records_its_sources() {
+        let mut config = FocusConfig::default();
+        config.initial_step_size = 50;
+        config.safety.min_position = 0;
+        config.safety.max_position = 20_000;
+        config.safety.max_step_single = 500;
+        config.safety.max_total_travel_per_run = 1_000;
+
+        let measure = |source: HfrSource| {
+            move |position: i32| async move {
+                let classical = 1.2 + ((position - 10_000) as f64 / 100.0).powi(2);
+                let fqe_hfr = 1.2 + ((position - 10_100) as f64 / 100.0).powi(2);
+                let stars = if position == 10_050 { 2 } else { 5 };
+                Ok(vec![FocusSample {
+                    position,
+                    hfr: classical,
+                    hfd: Some(classical * 2.0),
+                    fwhm: None,
+                    star_count: 6,
+                    quality_score: None,
+                    temperature: None,
+                    timestamp: chrono::Utc::now(),
+                    frame_id: None,
+                    fit_hfr: choose_fit_hfr(source, classical, &prototype_reading(fqe_hfr, stars)),
+                }])
+            }
+        };
+
+        let mut agent = FocusAgent::new();
+        let classical = agent
+            .run_autofocus(
+                &config,
+                "rig".into(),
+                None,
+                10_000,
+                measure(HfrSource::Classical),
+            )
+            .await
+            .unwrap();
+        assert_eq!(classical.best_position, Some(10_000));
+        assert!(classical.hfr_source_counts.is_none());
+        assert!(classical
+            .samples
+            .iter()
+            .all(|sample| sample.fit_hfr.is_none()));
+        let json = serde_json::to_value(&classical).unwrap();
+        assert!(json.get("hfr_source_counts").is_none());
+        assert!(json["samples"][0].get("fit_hfr").is_none());
+
+        config.hfr_source = HfrSource::FqePrototype;
+        let prototype = agent
+            .run_autofocus(
+                &config,
+                "rig".into(),
+                None,
+                10_000,
+                measure(HfrSource::FqePrototype),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prototype.state, FocusRunState::Converged);
+        let best = prototype.best_position.unwrap();
+        assert!((10_050..=10_150).contains(&best), "best {best}");
+        let counts = prototype.hfr_source_counts.clone().unwrap();
+        assert_eq!(counts.requested, HfrSource::FqePrototype);
+        assert_eq!((counts.fqe_prototype, counts.classical), (6, 1));
+        assert_eq!(counts.fallback_reasons.get("fqe_too_few_stars"), Some(&1));
+        // `hfr` stays classical; the fit value and its source ride beside it.
+        let fallback = prototype
+            .samples
+            .iter()
+            .find(|sample| sample.position == 10_050)
+            .unwrap();
+        assert_eq!(fallback.curve_fit_hfr(), fallback.hfr);
+        assert_eq!(fallback.fit_hfr.as_ref().unwrap().fqe_star_count, Some(2));
+        let fqe_sample = prototype
+            .samples
+            .iter()
+            .find(|sample| sample.position == 10_100)
+            .unwrap();
+        assert!((fqe_sample.curve_fit_hfr() - 1.2).abs() < 1e-12);
+        assert!((fqe_sample.hfr - 2.2).abs() < 1e-12);
+    }
 
     #[tokio::test]
     async fn autofocus_converges_on_synthetic_u_curve() {
@@ -493,6 +799,7 @@ mod tests {
                         temperature: Some(5.0),
                         timestamp: chrono::Utc::now(),
                         frame_id: None,
+                        fit_hfr: None,
                     }])
                 },
             )
@@ -538,6 +845,7 @@ mod tests {
                             temperature: Some(5.0),
                             timestamp: chrono::Utc::now(),
                             frame_id: Some(format!("frame-{position}-{i}")),
+                            fit_hfr: None,
                         })
                         .collect())
                 },
@@ -584,6 +892,7 @@ mod tests {
                         temperature: None,
                         timestamp: chrono::Utc::now(),
                         frame_id: None,
+                        fit_hfr: None,
                     }])
                 },
             )

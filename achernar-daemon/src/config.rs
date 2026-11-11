@@ -57,6 +57,25 @@ pub struct VisionConfig {
     /// Applies to every background backend.
     #[serde(default)]
     pub star_gates: crate::vision::quality::StarGateSettings,
+    /// `[vision.fqe]`: the opt-in FQE prototype switch.
+    #[serde(default)]
+    pub fqe: FqeConfig,
+}
+
+/// `[vision.fqe]` in `achernar.toml`.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct FqeConfig {
+    /// PROTOTYPE, not qualified for R50/Z114, off by default (owner
+    /// authorization F-006, FQE run 20261111T0038). When true, a
+    /// `models/focus_quality/<semver>` bundle whose metadata carries the
+    /// prototype provenance block `rebuild_fqe.py --prototype-runtime-eligible`
+    /// writes (`fqe_runner::verify_prototype_graph`, which also binds the
+    /// loaded graph's sha256 to that metadata) runs in the vision loop
+    /// despite the A03 gate; its predictions are labelled `fqe_prototype` and
+    /// classical HFR stays the authority. A bundle without that block is never
+    /// enabled by this flag. False: behaviour is unchanged.
+    #[serde(default)]
+    pub prototype: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -122,6 +141,13 @@ pub struct FocusConfig {
     /// roughly one run in three to be a reversal.
     #[serde(default)]
     pub sweep_pattern: crate::focus::focus_agent::SweepPattern,
+
+    /// The HFR the autofocus curve fit uses: `"classical"` (default) or
+    /// `"fqe_prototype"` (PROTOTYPE, not qualified for R50/Z114; requires
+    /// `[vision.fqe] prototype = true`, which [`AchernarConfig::validate`]
+    /// enforces). See `focus_agent::HfrSource`.
+    #[serde(default)]
+    pub hfr_source: crate::focus::focus_agent::HfrSource,
 }
 
 impl Default for FocusConfig {
@@ -136,6 +162,7 @@ impl Default for FocusConfig {
             settle_ms: default_settle_ms(),
             sweep_radius_points: default_sweep_radius_points(),
             sweep_pattern: crate::focus::focus_agent::SweepPattern::default(),
+            hfr_source: crate::focus::focus_agent::HfrSource::default(),
         }
     }
 }
@@ -1573,6 +1600,24 @@ impl AchernarConfig {
     }
 }
 
+impl AchernarConfig {
+    /// Cross-section rules serde cannot express. The daemon refuses to start
+    /// on an error rather than run a configuration nobody chose.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.focus.hfr_source == crate::focus::focus_agent::HfrSource::FqePrototype
+            && !self.vision.fqe.prototype
+        {
+            return Err(
+                "[focus] hfr_source = \"fqe_prototype\" requires [vision.fqe] \
+                 prototype = true (the FQE prototype is opt-in, not qualified for \
+                 R50/Z114)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for AchernarConfig {
     fn default() -> Self {
         Self {
@@ -1654,6 +1699,43 @@ mod example_config_tests {
         assert_eq!(config.plate_solve.search_radius_deg, 30.0);
         assert_eq!(config.plate_solve.timeout_s, 300);
         assert_eq!(config.plate_solve.astap_path, None);
+    }
+
+    /// The FQE prototype keys default off/classical, parse when given, and
+    /// `hfr_source = "fqe_prototype"` is refused without the prototype.
+    #[test]
+    fn the_fqe_prototype_keys_default_off_and_validate() {
+        use super::*;
+        use crate::focus::focus_agent::HfrSource;
+        let empty: AchernarConfig = toml::from_str("").unwrap();
+        assert!(!empty.vision.fqe.prototype);
+        assert_eq!(empty.focus.hfr_source, HfrSource::Classical);
+        assert!(empty.validate().is_ok());
+        assert!(AchernarConfig::default().validate().is_ok());
+
+        let example: AchernarConfig = toml::from_str(include_str!("../achernar.example.toml"))
+            .expect("achernar.example.toml must parse");
+        assert!(!example.vision.fqe.prototype);
+        assert_eq!(example.focus.hfr_source, HfrSource::Classical);
+        assert!(example.validate().is_ok());
+
+        let refused: AchernarConfig =
+            toml::from_str("[focus]\nhfr_source = \"fqe_prototype\"\n").unwrap();
+        assert_eq!(refused.focus.hfr_source, HfrSource::FqePrototype);
+        let error = refused.validate().unwrap_err();
+        assert!(error.contains("[vision.fqe] prototype = true"), "{error}");
+
+        let both: AchernarConfig = toml::from_str(
+            "[focus]\nhfr_source = \"fqe_prototype\"\n[vision.fqe]\nprototype = true\n",
+        )
+        .unwrap();
+        assert!(both.vision.fqe.prototype);
+        assert!(both.validate().is_ok());
+        let prototype_only: AchernarConfig =
+            toml::from_str("[vision.fqe]\nprototype = true\n").unwrap();
+        assert_eq!(prototype_only.focus.hfr_source, HfrSource::Classical);
+        assert!(prototype_only.validate().is_ok());
+        assert!(toml::from_str::<AchernarConfig>("[focus]\nhfr_source = \"fqe\"\n").is_err());
     }
 
     /// O11 g: `[filter_wheel] max_switches_per_hour` (60) and `[site]

@@ -349,8 +349,7 @@ impl AppState {
         // Resolve the FQE shadow model: explicit config path wins; otherwise the
         // newest semver under <models_root>/focus_quality/. Any load failure
         // degrades to a disabled runner — never a crashed daemon.
-        let models_root =
-            std::env::var("ACHERNAR_MODELS_DIR").unwrap_or_else(|_| "models".to_string());
+        let models_root = Self::models_root();
         let fqe_path = focus_config.models.quality_model_path.clone().or_else(|| {
             crate::vision::fqe_runner::resolve_latest_model(&models_root)
                 .map(|p| p.to_string_lossy().to_string())
@@ -491,6 +490,44 @@ impl AppState {
     ) -> Self {
         self.background_settings = Arc::new(settings);
         self
+    }
+
+    /// `[vision.fqe] prototype`. False leaves the runner [`AppState::new`]
+    /// resolved untouched. True re-resolves it in prototype mode: the
+    /// explicit `focus.models.quality_model_path` still wins, otherwise the
+    /// newest runtime-eligible bundle carrying a verified F-006 prototype
+    /// block (`fqe_runner::resolve_latest_prototype_model`). The runner only
+    /// runs a graph whose loaded bytes pass `fqe_runner::verify_prototype_graph`
+    /// (their sha256 is the bundle metadata's, so an explicit path to another
+    /// file in a verified bundle, e.g. `model.int8.onnx`, is refused).
+    pub fn with_fqe_prototype(mut self, enabled: bool) -> Self {
+        if !enabled {
+            return self;
+        }
+        let path = self
+            .focus_config
+            .models
+            .quality_model_path
+            .clone()
+            .or_else(|| {
+                crate::vision::fqe_runner::resolve_latest_prototype_model(&Self::models_root())
+                    .map(|p| p.to_string_lossy().to_string())
+            });
+        self.fqe_runner = Arc::new(
+            crate::vision::fqe_runner::FqeRunner::new_with_prototype(path, true).unwrap_or_else(
+                |err| {
+                    tracing::warn!("FQE prototype runner failed to load ({err}); FQE disabled");
+                    crate::vision::fqe_runner::FqeRunner::disabled_prototype(format!(
+                        "load failed: {err}"
+                    ))
+                },
+            ),
+        );
+        self
+    }
+
+    fn models_root() -> String {
+        std::env::var("ACHERNAR_MODELS_DIR").unwrap_or_else(|_| "models".to_string())
     }
 
     /// `[vision.star_gates]` for the vision loop.

@@ -115,6 +115,11 @@ export interface SharedObservation {
     fqeModelVersion: string | null;
     /** Whether per-star and post-pooling frame calibration were both applied. */
     fqeCalibrated: boolean | null;
+    /** The fqe* values came from the opt-in FQE prototype (`[vision.fqe]
+     *  prototype = true`, owner authorization F-006): public-archive weights,
+     *  not qualified for R50/Z114, never the authority. Label them as such.
+     *  `false` when the daemon omits the key (every non-prototype payload). */
+    fqePrototype: boolean;
     cloudProbability: number | null;
     cloudEvent: string;
     /** Why a measured frame gave no cloud evidence (`partial_detection_area`). */
@@ -221,6 +226,7 @@ export function mapSharedObservation(raw: unknown): SharedObservation | null {
         fqeStarCount: num(obs.fqe_star_count),
         fqeModelVersion: str(obs.fqe_model_version),
         fqeCalibrated: typeof obs.fqe_calibrated === "boolean" ? obs.fqe_calibrated : null,
+        fqePrototype: obs.fqe_prototype === true,
         cloudProbability: num(obs.cloud_probability),
         cloudEvent: str(obs.cloud_event) ?? "None",
         cloudUnavailableReason: str(obs.cloud_unavailable_reason),
