@@ -144,18 +144,11 @@ hardware-support guarantee.
 ## 📁 Repository Structure
 ```
 achernar.tech/
-├── packages/
-│   ├── ui/                     # Shared React components (@achernar/ui)
-│   │   ├── components/         # Reusable UI components
-│   │   ├── hooks/             # Custom React hooks
-│   │   └── types/             # TypeScript interfaces
-│   ├── web/                    # Cloud frontend (Vite + React)
-│   │   └── src/
-│   │       ├── pages/         # Route pages
-│   │       └── services/      # API clients
-│   └── desktop/                # Desktop app (Tauri 2.0)
-│       ├── src/               # React frontend
-│       └── src-tauri/         # Rust backend
+├── achernar-frontend/          # Web UI (Vite + React 19)
+│   └── src/                   # Pages, components, hooks, API clients
+│
+├── achernar-desktop/           # Desktop app (Tauri 2.0), loads the achernar-frontend build
+│   └── src-tauri/             # Rust backend
 │
 ├── achernar-daemon/            # Rust daemon (core system)
 │   ├── src/
@@ -205,7 +198,7 @@ achernar.tech/
 
 ### Prerequisites
 
-- **Node.js** 18+ and **pnpm** 8+
+- **Node.js** 20.19+ and **pnpm** 8+
 - **Python** 3.11+
 - **Rust** 1.70+ (with `cargo`)
 - **Docker** and **Docker Compose**
@@ -268,7 +261,7 @@ achernar.tech/
    cargo run --release
    
    # Terminal 3: Web frontend
-   cd packages/web
+   cd achernar-frontend
    pnpm dev
    
    # Terminal 4: Celery workers
@@ -292,7 +285,7 @@ cargo build --release
 
 ### Building the Desktop App
 ```bash
-cd packages/desktop
+cd achernar-desktop
 pnpm tauri build
 
 # Outputs:
@@ -349,7 +342,7 @@ pnpm test
 
 ### Desktop App
 - **Tauri 2.0** (Rust + WebView)
-- **React** (shared from `@achernar/ui`)
+- **React** (the achernar-frontend build)
 - **Process management** for daemon sidecar
 
 ### AI/ML Stack
