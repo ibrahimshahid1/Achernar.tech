@@ -1,4 +1,3 @@
 packages:
   - 'achernar-frontend'
   - 'achernar-desktop'
-  - 'packages/ui'

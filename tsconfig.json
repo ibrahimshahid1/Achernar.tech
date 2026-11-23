@@ -1,4 +1,10 @@
 {
+    /*
+     * Shared base options only. This file owns no sources ("files": []):
+     * each workspace package type-checks with its own tsconfig
+     * (achernar-frontend/tsconfig.app.json is the CI gate), and nothing
+     * builds or extends this one today.
+     */
     "compilerOptions": {
         "target": "ES2020",
         "useDefineForClassFields": true,
@@ -20,30 +26,7 @@
         "strict": true,
         "noUnusedLocals": true,
         "noUnusedParameters": true,
-        "noFallthroughCasesInSwitch": true,
-        /* Path mapping for monorepo */
-        "baseUrl": ".",
-        "paths": {
-            "@achernar/ui": [
-                "./packages/ui/src"
-            ],
-            "@achernar/ui/*": [
-                "./packages/ui/src/*"
-            ]
-        }
+        "noFallthroughCasesInSwitch": true
     },
-    "include": [
-        "packages/*/src"
-    ],
-    "references": [
-        {
-            "path": "./packages/ui"
-        },
-        {
-            "path": "./packages/web"
-        },
-        {
-            "path": "./packages/desktop"
-        }
-    ]
+    "files": []
 }
