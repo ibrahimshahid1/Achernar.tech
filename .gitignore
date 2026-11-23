@@ -73,6 +73,9 @@ achernar.db-wal
 **/achernar.db
 **/achernar.db-shm
 **/achernar.db-wal
+# The Alpaca ClientID the daemon persists beside its data (equipment/alpaca/client.rs).
+**/alpaca_client_id
+**/alpaca_client_id.tmp-*
 *.sqlite
 *.sqlite3
 
