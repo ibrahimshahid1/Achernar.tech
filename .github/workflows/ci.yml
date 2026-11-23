@@ -1,9 +1,9 @@
 name: Achernar CI
 
-# Gating jobs (frontend typecheck, Django check, daemon fmt + cargo check) fail
-# the build on real regressions — they are intentionally NOT suffixed with
-# "|| true". Advisory jobs (clippy, lint, ML imports, desktop check) report
-# problems without blocking merges.
+# Gating jobs (frontend typecheck, tests and production build, Django check,
+# daemon fmt + cargo check) fail the build on real regressions — they are
+# intentionally NOT suffixed with "|| true". Advisory jobs (clippy, lint, ML
+# imports, desktop check) report problems without blocking merges.
 
 on:
   push:
@@ -21,9 +21,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ── Frontend: TypeScript typecheck (GATING) ─────────────────
+  # ── Frontend: typecheck, tests, build (GATING) ──────────────
   frontend:
-    name: Frontend — typecheck & build
+    name: Frontend — typecheck, test & build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,22 +43,28 @@ jobs:
           key: ${{ runner.os }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
           restore-keys: ${{ runner.os }}-pnpm-
 
-      # Install the whole workspace so the "workspace:*" links resolve.
+      # Install the whole workspace (the root devDependencies supply
+      # @types/node) exactly as pnpm-lock.yaml pins it. --frozen-lockfile
+      # fails the job if a package.json and the lockfile disagree.
       - name: Install workspace dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: pnpm install --frozen-lockfile
 
       # GATING: strict typecheck. Catches broken imports, the kind of
       # split-brain/orphaned-module regressions this gate exists to prevent.
       - name: TypeScript typecheck (web)
         run: pnpm -C achernar-frontend exec tsc --noEmit -p tsconfig.app.json
 
+      # GATING: Vitest (logic tests in node, component tests in jsdom).
+      - name: Unit tests (web)
+        run: pnpm -C achernar-frontend run test
+
       - name: Lint (advisory)
         run: pnpm -C achernar-frontend run lint
         continue-on-error: true
 
-      - name: Production build (advisory)
+      # GATING: tsc -b plus vite build, the bundle the desktop app ships.
+      - name: Production build (web)
         run: pnpm -C achernar-frontend run build
-        continue-on-error: true
 
   # ── Backend: Django system check (GATING) ───────────────────
   backend:
