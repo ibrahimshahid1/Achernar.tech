@@ -34,7 +34,7 @@ echo "  ✓ Python environment ready"
 echo "▶ Setting up frontend..."
 cd "$ROOT_DIR/achernar-frontend"
 if [ ! -d "node_modules" ]; then
-    npm install
+    pnpm install --frozen-lockfile
 fi
 echo "  ✓ Frontend dependencies ready"
 

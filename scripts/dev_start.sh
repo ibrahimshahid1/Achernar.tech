@@ -31,7 +31,7 @@ echo "  PID: $DJANGO_PID"
 # ── Frontend dev server ──
 echo "▶ Starting frontend dev server on :5173..."
 cd "$ROOT_DIR/achernar-frontend"
-npm run dev -- --host &
+pnpm run dev --host &
 FRONTEND_PID=$!
 echo "  PID: $FRONTEND_PID"
 
