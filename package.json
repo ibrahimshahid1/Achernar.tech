@@ -11,15 +11,15 @@
   },
   "devDependencies": {
     "@types/node": "^20.10.0",
-    "@types/react": "^18.2.45",
-    "@types/react-dom": "^18.2.18",
+    "@types/react": "~19.2.18",
+    "@types/react-dom": "~19.2.7",
     "typescript": "^5.3.3",
     "vite": "^5.0.8",
     "prettier": "^3.1.1",
     "eslint": "^8.56.0"
   },
   "engines": {
-    "node": ">=18.0.0",
+    "node": ">=20.19",
     "pnpm": ">=8.0.0"
   },
   "packageManager": "pnpm@8.15.0"
